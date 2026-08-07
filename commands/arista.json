@@ -1,7 +1,8 @@
 {
   "bgp": {
     "command": "show ip bgp summary",
-    "description": "BGP neighbor summary"
+    "description": "BGP neighbor summary",
+    "structured": true
   },
   "hardware": {
     "command": "show inventory",
@@ -9,11 +10,13 @@
   },
   "interfaces": {
     "command": "show interfaces status",
-    "description": "Interface status summary"
+    "description": "Interface status summary",
+    "structured": true
   },
   "mlag": {
     "command": "show mlag",
-    "description": "MLAG status and peers"
+    "description": "MLAG status and peers",
+    "structured": true
   },
   "ospf": {
     "command": "show ip ospf neighbor",
@@ -25,10 +28,12 @@
   },
   "version": {
     "command": "show version",
-    "description": "Software version and uptime"
+    "description": "Software version and uptime",
+    "structured": true
   },
   "vxlan": {
     "command": "show vxlan vtep",
-    "description": "VXLAN VTEP peers"
+    "description": "VXLAN VTEP peers",
+    "structured": true
   }
 }

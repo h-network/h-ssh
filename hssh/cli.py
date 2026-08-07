@@ -13,8 +13,9 @@ from datetime import datetime
 from pathlib import Path
 
 from .core import (
-    Target, load_devices_csv, resolve_command, get_available_commands,
-    read_command_file_lines, parse_inline_target, load_jobs,
+    Target, load_devices_csv, resolve_command, resolve_structured,
+    get_available_commands, read_command_file_lines, parse_inline_target,
+    load_jobs,
 )
 from .runner import run_for_target_async
 from .safety import SafetyGate
@@ -83,8 +84,11 @@ async def main() -> int:
 
     parser.add_argument("--devices", default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
-    parser.add_argument("--transport", choices=["junos", "arista", "ssh", "telnet"], default="junos",
-                        help="Transport type (default: junos)")
+    parser.add_argument("--transport", choices=["junos", "arista", "ssh", "telnet"], default="ssh",
+                        help="Transport for targets that don't declare one (default: ssh)")
+    parser.add_argument("--structured", action="store_true",
+                        help="Return structured data where the vendor supports it "
+                             "(junos NETCONF, arista eAPI); falls back to text elsewhere")
     parser.add_argument("--user", type=str,
                         help="Username (or set HSSH_USER env var)")
     parser.add_argument("--password", type=str,
@@ -197,10 +201,6 @@ async def main() -> int:
                 print(f"ERROR: directory not found: {args.edit_dir}", file=sys.stderr)
                 return 2
 
-        if args.transport == "junos" and args.edit_command:
-            if not args.edit_command.strip().startswith(("set ", "delete ", "commit")):
-                print("ERROR: Junos -eC only accepts 'set ...' commands.", file=sys.stderr)
-                return 2
         if args.edit_broadcast:
             if not Path(args.edit_broadcast).is_file():
                 print(f"ERROR: broadcast file not found: {args.edit_broadcast}", file=sys.stderr)
@@ -225,6 +225,13 @@ async def main() -> int:
         if not targets:
             print("ERROR: no devices found in inventory.", file=sys.stderr)
             return 2
+
+        # Junos set-syntax check keys off the targets, not a global flag —
+        # a mixed inventory can have some devices that care and some that don't.
+        if args.edit_command and any(t.vendor == "junos" for t in targets):
+            if not args.edit_command.strip().startswith(("set ", "delete ", "commit")):
+                print("ERROR: Junos -eC only accepts 'set ...' commands.", file=sys.stderr)
+                return 2
 
         # Mode label
         if args.show_command:
@@ -281,29 +288,29 @@ async def main() -> int:
         else:
             passwd = None
 
-    # Resolve command shortcuts (non-job mode)
+    # Command shortcuts are kept unresolved here and resolved per target, since
+    # each target carries its own vendor and the template library is per vendor.
+    # Resolving once against --transport sends one vendor's command to all of
+    # them, which is wrong the moment an inventory is mixed.
     show_cmd = None
     edit_cmd = None
     batch_cmds = None
     if not job_entries:
-        if args.show_command:
-            show_cmd = resolve_command(args.show_command, args.transport)
-            if show_cmd != args.show_command and not json_mode:
-                print(f"Resolved '{args.show_command}' -> '{show_cmd}'")
-        if args.edit_command:
-            edit_cmd = resolve_command(args.edit_command, args.transport)
-            if edit_cmd != args.edit_command and not json_mode:
-                print(f"Resolved '{args.edit_command}' -> '{edit_cmd}'")
+        show_cmd = args.show_command
+        edit_cmd = args.edit_command
         if args.batch:
-            raw_cmds = read_command_file_lines(Path(args.batch))
-            if not raw_cmds:
+            batch_cmds = read_command_file_lines(Path(args.batch))
+            if not batch_cmds:
                 print("ERROR: batch file is empty after filtering.", file=sys.stderr)
                 return 2
-            batch_cmds = [resolve_command(c, args.transport) for c in raw_cmds]
-            if not json_mode:
-                for raw, resolved in zip(raw_cmds, batch_cmds):
+
+        if not json_mode:
+            # Report resolution once per vendor actually present, not per device.
+            for vendor in sorted({t.vendor for t in targets}):
+                for raw in [c for c in ([show_cmd, edit_cmd] + (batch_cmds or [])) if c]:
+                    resolved = resolve_command(raw, vendor)
                     if resolved != raw:
-                        print(f"Resolved '{raw}' -> '{resolved}'")
+                        print(f"Resolved '{raw}' -> '{resolved}' ({vendor})")
 
     if not json_mode:
         if job_entries:
@@ -393,6 +400,20 @@ async def main() -> int:
                 elif actual_mode.startswith("edit"):
                     actual_edit_cmd = cmd_override
 
+            # Resolve shortcuts against this target's own vendor. Job-mode
+            # entries go through here too, which they previously skipped.
+            binding = None
+            if actual_show_cmd:
+                if args.structured:
+                    binding = resolve_structured(actual_show_cmd, t.vendor)
+                actual_show_cmd = resolve_command(actual_show_cmd, t.vendor)
+            if actual_edit_cmd:
+                actual_edit_cmd = resolve_command(actual_edit_cmd, t.vendor)
+            target_batch_cmds = (
+                [resolve_command(c, t.vendor) for c in batch_cmds]
+                if batch_cmds else None
+            )
+
             return await run_for_target_async(
                 t=t,
                 transport=t.vendor,
@@ -409,8 +430,10 @@ async def main() -> int:
                 commit_confirmed=args.commit_confirmed,
                 save_dir=save_dir,
                 quiet=json_mode,
-                batch_cmds=batch_cmds,
+                batch_cmds=target_batch_cmds,
                 safety_gate=safety_gate,
+                structured=args.structured,
+                structured_binding=binding,
             )
 
     # Create tasks - either job mode or normal mode

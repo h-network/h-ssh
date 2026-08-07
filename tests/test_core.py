@@ -85,7 +85,7 @@ def test_load_csv_name_only():
 
 
 def test_load_csv_default_vendor():
-    """Test that default vendor is 'junos' when not specified."""
+    """Vendor defaults to 'ssh' when the inventory doesn't declare one."""
     with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
         f.write("name,ip\n")
         f.write("CR1,10.0.1.1\n")
@@ -96,7 +96,7 @@ def test_load_csv_default_vendor():
     Path(f.name).unlink()
 
     assert len(targets) == 1
-    assert targets[0].vendor == "junos"
+    assert targets[0].vendor == "ssh"
 
 
 def test_load_csv_file_not_found():
@@ -129,7 +129,7 @@ def test_target_dataclass():
 
     # Test default vendor
     target2 = Target(name="CR2", host="10.0.1.2")
-    assert target2.vendor == "junos"
+    assert target2.vendor == "ssh"
 
 
 if __name__ == "__main__":

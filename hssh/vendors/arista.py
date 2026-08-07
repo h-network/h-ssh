@@ -34,6 +34,38 @@ def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
     return "NO OUTPUT"
 
 
+def show_structured(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
+                    command_timeout: int, port: int = None, vendor_hint: str = None,
+                    binding=None):
+    """Execute a show command and return eAPI's JSON rather than flattened text.
+
+    eAPI already answers in JSON — show() throws that structure away in
+    _format_dict_output. This is the same request, kept intact.
+
+    The binding argument is accepted for interface symmetry with junos and
+    ignored: there is no field map to apply. Commands EOS cannot render as
+    JSON raise pyeapi CommandError ("unconverted command"); that propagates
+    to the caller rather than being silently downgraded to text.
+    """
+    if not AVAILABLE:
+        raise RuntimeError("pyeapi not available in this environment.")
+
+    node = pyeapi.connect(
+        transport='https',
+        host=host,
+        port=port or 443,
+        username=user,
+        password=passwd,
+        timeout=session_timeout
+    )
+
+    result = node.enable([cmd])
+
+    if result and len(result) > 0:
+        return result[0].get('result', {})
+    return {}
+
+
 def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
          command_timeout: int, commit_confirmed: int = None, port: int = None,
          vendor_hint: str = None) -> str:

@@ -51,6 +51,8 @@ def _run_for_target_sync(
     quiet: bool = False,
     batch_cmds: Optional[List[str]] = None,
     safety_gate: Optional[SafetyGate] = None,
+    structured: bool = False,
+    structured_binding: Optional[dict] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Execute task on a single target device (internal sync implementation).
@@ -95,6 +97,16 @@ def _run_for_target_sync(
                 raise ValueError("No show command provided.")
             if dry_run:
                 result = f"DRY-RUN show: {show_cmd}"
+            elif structured and hasattr(vendor_mod, "show_structured"):
+                # Absence of show_structured on a vendor module is the whole
+                # capability check — generic and telnet simply don't have one,
+                # so they fall through to the text path below.
+                data = _with_retry(vendor_mod.show_structured, name, quiet,
+                                   host, user, passwd, show_cmd,
+                                   session_timeout, command_timeout,
+                                   port=t.port, vendor_hint=vendor,
+                                   binding=structured_binding)
+                result = json.dumps(data, indent=2, default=str)
             else:
                 result = _with_retry(vendor_mod.show, name, quiet,
                                      host, user, passwd, show_cmd, session_timeout, command_timeout,
@@ -200,6 +212,8 @@ def run_for_target(
     quiet: bool = False,
     batch_cmds: Optional[List[str]] = None,
     safety_gate: Optional[SafetyGate] = None,
+    structured: bool = False,
+    structured_binding: Optional[dict] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Synchronous public API for library users.
@@ -214,6 +228,7 @@ def run_for_target(
         dry_run=dry_run, commit_confirmed=commit_confirmed,
         save_dir=save_dir, quiet=quiet, batch_cmds=batch_cmds,
         safety_gate=safety_gate,
+        structured=structured, structured_binding=structured_binding,
     )
 
 
@@ -235,6 +250,8 @@ async def run_for_target_async(
     quiet: bool = False,
     batch_cmds: Optional[List[str]] = None,
     safety_gate: Optional[SafetyGate] = None,
+    structured: bool = False,
+    structured_binding: Optional[dict] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -250,6 +267,7 @@ async def run_for_target_async(
         dry_run=dry_run, commit_confirmed=commit_confirmed,
         save_dir=save_dir, quiet=quiet, batch_cmds=batch_cmds,
         safety_gate=safety_gate,
+        structured=structured, structured_binding=structured_binding,
     )
 
 

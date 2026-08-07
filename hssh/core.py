@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple
 class Target:
     name: str
     host: str  # IP or resolvable hostname
-    vendor: str = "junos"  # Default vendor
+    vendor: str = "ssh"  # Default: plain SSH, the transport that assumes least
     port: Optional[int] = None  # None = vendor default (22/23/830)
 
 
@@ -67,7 +67,7 @@ def load_devices_csv(path: str) -> List[Target]:
             continue
         name = r[0].strip()
         ip = r[1].strip() if len(r) > 1 else ""
-        vendor = r[2].strip() if len(r) > 2 else "junos"
+        vendor = r[2].strip() if len(r) > 2 else "ssh"
         port_str = r[3].strip() if len(r) > 3 else ""
         port = int(port_str) if port_str else None
         if not name:
@@ -226,6 +226,31 @@ def resolve_command(cmd: str, vendor: str) -> str:
         return str(entry)
 
     return cmd
+
+
+def resolve_structured(cmd: str, vendor: str) -> Optional[Dict]:
+    """Return the structured binding for a shortcut, or None if it has none.
+
+    A template entry may carry an optional "structured" key. Its meaning is
+    vendor-specific and deliberately not normalised across vendors:
+
+      arista: true          -- ask eAPI for JSON instead of flattening to text
+      junos:  {rpc, item, key, fields}
+                            -- a PyEZ Table/View definition, fetched over
+                               NETCONF as a different request than the CLI one
+
+    Absence of a binding is not an error; the caller falls back to text.
+    """
+    if ' ' in cmd:
+        return None
+
+    commands = _load_commands_json(vendor)
+    entry = commands.get(cmd)
+    if isinstance(entry, dict):
+        binding = entry.get("structured")
+        if binding:
+            return binding if isinstance(binding, dict) else {}
+    return None
 
 
 def get_available_commands(vendor: str) -> Dict[str, str]:

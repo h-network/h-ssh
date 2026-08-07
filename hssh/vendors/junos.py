@@ -63,6 +63,76 @@ def show(host: str, user: str, passwd: str, cmd: str,
         client.close()
 
 
+def show_structured(host: str, user: str, passwd: str, cmd: str,
+                    session_timeout: int, command_timeout: int,
+                    port: int = None, vendor_hint: str = None,
+                    binding: Optional[dict] = None):
+    """Fetch structured data over NETCONF using a PyEZ Table/View binding.
+
+    Note this is *not* a parse of the `cmd` text — it issues the RPC named in
+    the binding, so the CLI path and this path are two different requests
+    against two different representations. `cmd` is accepted only to keep the
+    signature aligned with show().
+
+    The binding is the "structured" entry from commands/junos.json:
+
+        {"rpc": "get-bgp-neighbor-information",
+         "item": "bgp-peer",
+         "key": "peer-address",
+         "fields": {"remote_as": {"peer-as": "int"}, ...}}
+
+    Field values are PyEZ view field specs: either a bare xpath string, or a
+    single-key mapping of xpath to a type or value test ("int", "True=Established").
+    Returns a dict keyed by the binding's key field.
+    """
+    if not AVAILABLE:
+        raise RuntimeError("paramiko and junos-eznc not available.")
+    if not binding:
+        raise ValueError(
+            f"No structured binding for '{cmd}' on junos. "
+            "Add a \"structured\" key to the entry in commands/junos.json."
+        )
+
+    from jnpr.junos.factory import FactoryLoader
+
+    table_name = "hssh_table"
+    view_name = "hssh_view"
+    fields = {}
+    for field, spec in (binding.get("fields") or {}).items():
+        fields[field] = spec
+
+    definition = {
+        table_name: {
+            "rpc": binding["rpc"],
+            "item": binding["item"],
+            "key": binding["key"],
+            "view": view_name,
+        },
+        view_name: {"fields": fields},
+    }
+
+    table_cls = FactoryLoader().load(definition)[table_name]
+
+    conn_params = {
+        "host": host,
+        "user": user,
+        "port": port or 830,
+        "conn_open_timeout": session_timeout,
+    }
+    if passwd:
+        conn_params["passwd"] = passwd
+
+    dev = JunosDevice(**conn_params)
+    dev.open()
+    try:
+        dev.timeout = command_timeout
+        table = table_cls(dev)
+        table.get()
+        return {key: dict(item) for key, item in table.items()}
+    finally:
+        dev.close()
+
+
 def edit(host: str, user: str, passwd: str, payload: str,
          session_timeout: int, command_timeout: int,
          commit_confirmed: int = None, port: int = None,

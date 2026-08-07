@@ -6,7 +6,7 @@
 
 [![Version](https://img.shields.io/badge/version-1.0.0-8B5CF6?style=for-the-badge)](#-quick-start)
 ![Vendors](https://img.shields.io/badge/vendors-junos_%C2%B7_arista_%C2%B7_ssh_%C2%B7_telnet-6366F1?style=for-the-badge)
-![Tests](https://img.shields.io/badge/tests-37_unit_%2B_59_live-22c55e?style=for-the-badge)
+![Tests](https://img.shields.io/badge/tests-46_unit_%2B_59_live-22c55e?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-64748b?style=for-the-badge)
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
@@ -21,7 +21,7 @@ The per-device session is a solved problem; what nobody hands you is everything 
 
 Reads go over plain SSH because they're cheap; config writes go over NETCONF because they need a lock, a diff, and a rollback. Every edit passes a safety gate, prompts before it commits, and lands in a JSONL audit trail — and `--commit-confirmed` puts the device back the way it was if you never confirm.
 
-[Quick start](#-quick-start) · [Modes](#️-modes) · [Transports](#-transports) · [Safety](#-safety) · [Library use](#-library-usage) · [Test results](TESTS.md)
+[Quick start](#-quick-start) · [Modes](#️-modes) · [Transports](#-transports) · [Structured output](#-structured-output) · [Safety](#-safety) · [Library use](#-library-usage) · [Test results](TESTS.md)
 
 </div>
 
@@ -33,7 +33,7 @@ Reads go over plain SSH because they're cheap; config writes go over NETCONF bec
 - **⚡ Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
 - **🎯 One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
 - **🛡️ Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing, per-device rate limit and cooldown, and `--commit-confirmed N` for changes that undo themselves if you lose the session.
-- **📋 Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library; drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
+- **📋 Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
 - **🤖 Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely.
 - **🪶 One runtime dependency.** `paramiko`. Vendor libraries are optional extras, and telnet is a raw socket — no stdlib `telnetlib`, so it still works on Python 3.13+.
 
@@ -98,6 +98,8 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the repo's `./h-ssh.py` 
 ```
 
 Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`. A CSV inventory accepts `name,ip`, `name,ip,vendor`, headers or none, and `#` comments.
+
+**A target that doesn't declare a vendor is treated as plain `ssh`** — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` or `arista` explicitly to get NETCONF or eAPI. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
 ### Authentication
 
@@ -165,6 +167,40 @@ Exit codes: `0` success · `1` a device failed · `2` usage error. Every run als
 [h-ssh] {"targets":3,"ok":2,"fail":1,...}
 ```
 
+## 🧬 Structured output
+
+`--structured` returns parsed data instead of text where the vendor can provide it, and falls back to the normal text path where it can't. There is no capability list to maintain — a vendor module either implements `show_structured` or it doesn't, and that absence *is* the fallback signal.
+
+```bash
+./h-ssh.py --user admin -sC bgp --structured --json --target R1:10.0.1.1:junos
+```
+
+| Vendor | Mechanism | Notes |
+|---|---|---|
+| `arista` | eAPI JSON | The same request — eAPI already answers in JSON, the text path just flattens it |
+| `junos` | PyEZ Table/View over NETCONF | A **different** request: the binding names an RPC, so this is not a parse of the CLI output |
+| `ssh`, `telnet` | — | No bindings; always text |
+
+Bindings live in the same `commands/{vendor}.json` entry as the command, under an optional `structured` key:
+
+```json
+"bgp": {
+  "command": "show bgp summary | no-more",
+  "description": "BGP neighbor summary with session states",
+  "structured": {
+    "rpc":  "get-bgp-neighbor-information",
+    "item": "bgp-peer",
+    "key":  "peer-address",
+    "fields": {
+      "remote_as": {"peer-as": "int"},
+      "is_up":     {"peer-state": "True=Established"}
+    }
+  }
+}
+```
+
+Output is **vendor-shaped, not normalised** — `bgp` returns Junos field names on a router and eAPI's own JSON on a switch. Nothing here promises the two match, which is why there's no cross-vendor schema to keep in sync. Add bindings one command at a time; commands without one keep working exactly as before.
+
 ## 🧩 Library usage
 
 ```python
@@ -211,7 +247,7 @@ h-ssh/
 
 ## 🧪 Tests
 
-37 unit tests, plus 59 live integration tests run against three Junos vMX routers on 24.2R1-S2.5 — covering every mode, both edit paths, concurrency, error handling, exit codes, and the safety gate. Full breakdown in [TESTS.md](TESTS.md).
+46 unit tests, plus 59 live integration tests run against three Junos vMX routers on 24.2R1-S2.5 — covering every mode, both edit paths, concurrency, error handling, exit codes, and the safety gate. Full breakdown in [TESTS.md](TESTS.md).
 
 ```bash
 pip install -e '.[dev]'

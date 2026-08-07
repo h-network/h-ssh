@@ -8,7 +8,7 @@ def test_parse_inline_target_two_parts():
     t = parse_inline_target("R1:10.0.0.1")
     assert t.name == "R1"
     assert t.host == "10.0.0.1"
-    assert t.vendor == "junos"
+    assert t.vendor == "ssh"
     assert t.port is None
 
 

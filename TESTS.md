@@ -2,7 +2,7 @@
 
 Tested against 3 live Junos vMX routers running 24.2R1-S2.5.
 
-## Unit Tests — 37/37 passed
+## Unit Tests — 46/46 passed
 
 | Suite | Tests | Status |
 |-------|-------|--------|
@@ -10,6 +10,7 @@ Tested against 3 live Junos vMX routers running 24.2R1-S2.5.
 | test_safety.py | 12 | Pass |
 | test_job.py | 11 | Pass |
 | test_telnet.py | 6 | Pass |
+| test_structured.py | 9 | Pass |
 
 ## Live Integration Tests — 59/59 passed
 

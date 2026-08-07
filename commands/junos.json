@@ -5,7 +5,35 @@
   },
   "bgp": {
     "command": "show bgp summary | no-more",
-    "description": "BGP neighbor summary with session states"
+    "description": "BGP neighbor summary with session states",
+    "structured": {
+      "fields": {
+        "accepted_prefixes": {
+          "bgp-rib/accepted-prefix-count": "int"
+        },
+        "description": "description",
+        "is_up": {
+          "peer-state": "True=Established"
+        },
+        "local_as": {
+          "local-as": "int"
+        },
+        "peer_state": "peer-state",
+        "received_prefixes": {
+          "bgp-rib/received-prefix-count": "int"
+        },
+        "remote_as": {
+          "peer-as": "int"
+        },
+        "remote_id": "peer-id",
+        "sent_prefixes": {
+          "bgp-rib/advertised-prefix-count": "int"
+        }
+      },
+      "item": "bgp-peer",
+      "key": "peer-address",
+      "rpc": "get-bgp-neighbor-information"
+    }
   },
   "config": {
     "command": "show configuration | display set | no-more",
@@ -21,7 +49,19 @@
   },
   "interfaces": {
     "command": "show interfaces terse",
-    "description": "Interface status summary"
+    "description": "Interface status summary",
+    "structured": {
+      "fields": {
+        "admin_status": "admin-status",
+        "description": "description",
+        "mtu": "mtu",
+        "oper_status": "oper-status",
+        "speed": "speed"
+      },
+      "item": "physical-interface",
+      "key": "name",
+      "rpc": "get-interface-information"
+    }
   },
   "isis": {
     "command": "show isis adjacency | no-more",
