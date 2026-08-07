@@ -1,0 +1,34 @@
+{
+  "bgp": {
+    "command": "show ip bgp summary",
+    "description": "BGP neighbor summary"
+  },
+  "hardware": {
+    "command": "show inventory",
+    "description": "Hardware inventory"
+  },
+  "interfaces": {
+    "command": "show interfaces status",
+    "description": "Interface status summary"
+  },
+  "mlag": {
+    "command": "show mlag",
+    "description": "MLAG status and peers"
+  },
+  "ospf": {
+    "command": "show ip ospf neighbor",
+    "description": "OSPF neighbor table"
+  },
+  "routes": {
+    "command": "show ip route summary",
+    "description": "Routing table summary"
+  },
+  "version": {
+    "command": "show version",
+    "description": "Software version and uptime"
+  },
+  "vxlan": {
+    "command": "show vxlan vtep",
+    "description": "VXLAN VTEP peers"
+  }
+}

@@ -1,0 +1,5 @@
+name,ip,vendor
+R1,10.0.1.1,junos
+R2,10.0.1.2,junos
+SW1,10.0.2.1,arista
+SRV1,10.0.3.1,ssh

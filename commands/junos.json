@@ -1,0 +1,62 @@
+{
+  "alarms": {
+    "command": "show chassis alarms",
+    "description": "Chassis alarm status"
+  },
+  "bgp": {
+    "command": "show bgp summary | no-more",
+    "description": "BGP neighbor summary with session states"
+  },
+  "config": {
+    "command": "show configuration | display set | no-more",
+    "description": "Full configuration in set format"
+  },
+  "environment": {
+    "command": "show chassis environment",
+    "description": "Chassis environment (temps, fans, PSUs)"
+  },
+  "hardware": {
+    "command": "show chassis hardware",
+    "description": "Chassis hardware inventory"
+  },
+  "interfaces": {
+    "command": "show interfaces terse",
+    "description": "Interface status summary"
+  },
+  "isis": {
+    "command": "show isis adjacency | no-more",
+    "description": "IS-IS adjacency table"
+  },
+  "lacp": {
+    "command": "show lacp interfaces",
+    "description": "LACP interface status"
+  },
+  "ldp": {
+    "command": "show ldp neighbor | no-more",
+    "description": "LDP neighbor table"
+  },
+  "mpls": {
+    "command": "show mpls lsp extensive | no-more",
+    "description": "MPLS LSP details"
+  },
+  "ospf": {
+    "command": "show ospf neighbor | no-more",
+    "description": "OSPF neighbor table"
+  },
+  "route-summary": {
+    "command": "show route summary",
+    "description": "Routing table summary by protocol"
+  },
+  "routes": {
+    "command": "show route protocol bgp active-path | no-more",
+    "description": "Active BGP routes"
+  },
+  "rsvp": {
+    "command": "show rsvp neighbor | no-more",
+    "description": "RSVP neighbor table"
+  },
+  "version": {
+    "command": "show version | no-more",
+    "description": "Software version and uptime"
+  }
+}

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h-ssh"
+dynamic = ["version"]
+description = "Multi-vendor network automation framework with parallel execution, job mode, and safety gate"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "paramiko",
+]
+
+[project.optional-dependencies]
+junos = ["junos-eznc"]
+arista = ["pyeapi"]
+all = ["junos-eznc", "pyeapi"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "junos-eznc",
+    "pyeapi",
+]
+
+[project.scripts]
+h-ssh = "hssh.cli:main_sync"
+
+[tool.setuptools.dynamic]
+version = {attr = "hssh.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
