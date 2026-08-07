@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/banner.svg" alt="h-ssh — multi-vendor network automation, parallel by default" width="860">
+<img src="docs/assets/banner.svg" alt="h-ssh — the fleet loop, not the session" width="860">
 
 <br/>
 
@@ -15,9 +15,11 @@
 ![Size](https://img.shields.io/badge/~2800_lines-pure_Python-8B5CF6?style=flat-square)
 ![telnetlib](https://img.shields.io/badge/no_stdlib_telnetlib-3.13_ready-475569?style=flat-square)
 
-**Run a command across a fleet of network devices in parallel — Juniper, Arista, any SSH box, and kit still on a telnet console — from one CLI or one Python import.**
+**h-ssh is the fleet loop, not the session. Point it at one device or three hundred — Juniper, Arista, any SSH box, kit still on a telnet console — and get the output back, in parallel, with the connection handling gone.**
 
-Reads go over plain SSH because they're cheap; config writes go over NETCONF because they need a lock, a diff, and a rollback. Every edit passes a rate-limited safety gate, prompts before it commits, and lands in a JSONL audit trail — and `--commit-confirmed` puts the device back the way it was if you never confirm.
+The per-device session is a solved problem; what nobody hands you is everything *around* it. The thread pool. Collecting results per device. Making sure one dead box doesn't sink the run. A rate limiter so you don't hammer a router you've already failed against. A record of what you changed. That's the part you'd otherwise rewrite in every script, and it's what this is.
+
+Reads go over plain SSH because they're cheap; config writes go over NETCONF because they need a lock, a diff, and a rollback. Every edit passes a safety gate, prompts before it commits, and lands in a JSONL audit trail — and `--commit-confirmed` puts the device back the way it was if you never confirm.
 
 [Quick start](#-quick-start) · [Modes](#️-modes) · [Transports](#-transports) · [Safety](#-safety) · [Library use](#-library-usage) · [Test results](TESTS.md)
 

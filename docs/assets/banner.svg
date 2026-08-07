@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="h-ssh — multi-vendor network automation, parallel by default">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="h-ssh — the fleet loop, not the session">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0B1221"/>
@@ -28,7 +28,7 @@
 
   <!-- wordmark + tagline -->
   <text x="164" y="112" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="58" font-weight="800" fill="#F8FAFC">h-ssh</text>
-  <text x="166" y="152" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" fill="#A79BC4">Multi-vendor network automation &#183; parallel by default</text>
+  <text x="166" y="152" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" fill="#A79BC4">One command across the fleet &#183; the SSH burden removed</text>
 
   <!-- pipeline: inventory in, devices out, safety in the middle -->
   <g font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="17" font-weight="600">
@@ -50,5 +50,5 @@
   </g>
 
   <!-- footer strapline -->
-  <text x="82" y="322" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="13" letter-spacing="2" fill="#C4B5FD">READS OVER SSH &#183; WRITES OVER NETCONF &#183; EVERY EDIT AUDITED &#160;&#8212;&#160; dry-run first, rollback on silence</text>
+  <text x="82" y="322" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="13" letter-spacing="2" fill="#C4B5FD">THE FLEET LOOP, NOT THE SESSION &#160;&#8212;&#160; rate-limited, audited, rollback on silence</text>
 </svg>
