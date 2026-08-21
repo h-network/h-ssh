@@ -5,7 +5,7 @@
 <br/>
 
 [![Version](https://img.shields.io/badge/version-1.0.0-8B5CF6?style=for-the-badge)](#-quick-start)
-![Vendors](https://img.shields.io/badge/vendors-junos_%C2%B7_arista_%C2%B7_ssh_%C2%B7_telnet-6366F1?style=for-the-badge)
+![Vendors](https://img.shields.io/badge/vendors-junos_%C2%B7_arista_%C2%B7_ssh_%C2%B7_openssh_%C2%B7_telnet-6366F1?style=for-the-badge)
 ![Tests](https://img.shields.io/badge/tests-46_unit_%2B_59_live-22c55e?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-64748b?style=for-the-badge)
 
@@ -35,7 +35,7 @@ Reads go over plain SSH because they're cheap; config writes go over NETCONF bec
 - **🛡️ Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing, per-device rate limit and cooldown, and `--commit-confirmed N` for changes that undo themselves if you lose the session.
 - **📋 Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
 - **🤖 Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely.
-- **🪶 One runtime dependency.** `paramiko`. Vendor libraries are optional extras, and telnet is a raw socket — no stdlib `telnetlib`, so it still works on Python 3.13+.
+- **🪶 One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
 
 ## ⚙️ How it works
 
@@ -46,9 +46,9 @@ Reads go over plain SSH because they're cheap; config writes go over NETCONF bec
                     ▼                          │           edit → PyEZ NETCONF
         ┌───────────────────────┐              │                  lock → load → diff
         │ safety gate           │              │                  → commit → unlock
-        │ rate limit 10/device  │──▶ workers ──┤
-        │ cooldown 120s on fail │              ├─ arista   eAPI over HTTPS
-        │ flock'd, cross-process│              ├─ ssh      exec_command
+        │ rate limit 10/device  │──▶ workers ──┼─ arista   eAPI over HTTPS
+        │ cooldown 120s on fail │              ├─ ssh      exec_command
+        │ flock'd, cross-process│              ├─ openssh  the ssh binary, no deps
         └───────────────────────┘              └─ telnet   raw TCP + prompt match
                     │                                          │
                     └──────────── every edit ──────────────────┴──▶ audit.jsonl
@@ -63,6 +63,8 @@ git clone …/h-ssh.git && cd h-ssh
 python3 -m venv .venv && . .venv/bin/activate
 
 pip install -e .                  # core (paramiko) — SSH + telnet
+                                  # nothing installable? the openssh transport
+                                  # runs straight from the checkout, no deps
 pip install -e '.[junos]'         # + junos-eznc (NETCONF config)
 pip install -e '.[arista]'        # + pyeapi
 pip install -e '.[all]'           # + both
@@ -140,11 +142,34 @@ cat jobs.json | ./h-ssh.py --user admin --job - --json
 | `junos` | SSH + NETCONF | paramiko + junos-eznc | paramiko `exec_command` | PyEZ lock/load/diff/commit |
 | `arista` | eAPI (HTTPS) | pyeapi | eAPI enable | eAPI config |
 | `ssh` | SSH | paramiko | `exec_command` | `exec_command` |
+| `openssh` | OpenSSH client | built-in | `ssh host cmd` | `ssh host cmd` |
 | `telnet` | Raw socket | built-in | raw TCP | config mode |
 | `telnet-ios` | Raw socket, IOS prompts | built-in | raw TCP | `configure terminal` |
 | `telnet-junos` | Raw socket, Junos prompts | built-in | raw TCP | `configure` / `commit` |
 
 Every transport reuses a single connection per device for batch work.
+
+### `openssh` — for hosts where you cannot install anything
+
+`openssh` needs no Python packages at all. It drives the system `ssh` binary: `subprocess` for key
+auth, and a PTY for password auth, because OpenSSH refuses to read a password from a pipe. Batch work
+reuses one TCP connection and one authentication through OpenSSH connection multiplexing
+(`ControlMaster`), so each command still comes back cleanly separated.
+
+Use it on locked-down jump hosts — no package index, no `ensurepip`, no root — where `pip install
+paramiko` is not on the table but `ssh` is already there:
+
+```bash
+./h-ssh.py --target R1:10.0.1.1:openssh -sC "show version" --user admin
+```
+
+It inherits your `~/.ssh/config`, keys, agent and `known_hosts`, so jump-host `ProxyJump` stanzas and
+per-host identities work with no extra flags. Host key policy defaults to `accept-new`; override with
+`HSSH_HOST_KEY_POLICY=yes` (strict) or `no` (skip).
+
+Two limits, both deliberate: `--structured` has no bindings here, and `--commit-confirmed` is
+rejected rather than silently ignored — a confirmed commit needs the NETCONF `junos` transport, and
+dropping the rollback timer without saying so would be worse than refusing.
 
 ## 🔒 Safety
 
@@ -179,7 +204,7 @@ Exit codes: `0` success · `1` a device failed · `2` usage error. Every run als
 |---|---|---|
 | `arista` | eAPI JSON | The same request — eAPI already answers in JSON, the text path just flattens it |
 | `junos` | PyEZ Table/View over NETCONF | A **different** request: the binding names an RPC, so this is not a parse of the CLI output |
-| `ssh`, `telnet` | — | No bindings; always text |
+| `ssh`, `openssh`, `telnet` | — | No bindings; always text |
 
 Bindings live in the same `commands/{vendor}.json` entry as the command, under an optional `structured` key:
 
@@ -238,6 +263,7 @@ h-ssh/
 │       ├── junos.py     # paramiko show + PyEZ NETCONF config
 │       ├── arista.py    # eAPI
 │       ├── generic.py   # paramiko SSH
+│       ├── openssh.py   # the OpenSSH binary — zero dependencies
 │       └── telnet.py    # raw socket, per-flavour prompt handling
 ├── commands/            # per-vendor template library (JSON)
 ├── tests/
