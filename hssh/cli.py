@@ -13,7 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 from .core import (
-    Target, load_devices_csv, resolve_command, resolve_structured,
+    Target, load_devices_csv, load_config, get_config_path,
+    resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs,
 )
@@ -115,7 +116,9 @@ async def main() -> int:
                         help="Return structured data where the vendor supports it "
                              "(junos NETCONF, arista eAPI); falls back to text elsewhere")
     parser.add_argument("--user", type=str,
-                        help="Username (or set HSSH_USER env var)")
+                        help="Username (or HSSH_USER env var, or 'user' in ~/.h-ssh/config)")
+    parser.add_argument("--config", type=str,
+                        help="Config file with defaults (default: ~/.h-ssh/config)")
     parser.add_argument("--password", type=str,
                         help="Password (or set HSSH_PASSWORD env var)")
 
@@ -290,8 +293,10 @@ async def main() -> int:
         save_dir = args.save_output
         Path(save_dir).mkdir(parents=True, exist_ok=True)
 
-    # Credentials
-    user = args.user or os.environ.get("HSSH_USER")
+    # Credentials. Flag beats environment beats config file; the password is
+    # never read from the config file, so a shell alias cannot leak it to disk.
+    config = load_config(args.config)
+    user = args.user or os.environ.get("HSSH_USER") or config.get("user")
     passwd = args.password or os.environ.get("HSSH_PASSWORD")
     if args.raw and args.verbose:
         print("ERROR: --raw and -v are mutually exclusive.", file=sys.stderr)
@@ -307,9 +312,12 @@ async def main() -> int:
 
     if not user:
         if not sys.stdin.isatty():
-            print("ERROR: No username provided and stdin is not a TTY. Use --user or HSSH_USER env var.", file=sys.stderr)
+            print("ERROR: No username provided and stdin is not a TTY. "
+                  "Use --user, HSSH_USER, or set 'user' in %s." % get_config_path(),
+                  file=sys.stderr)
             return 2
-        user = input("Username: ").strip()
+        default_user = getpass.getuser()
+        user = input(f"Username [{default_user}]: ").strip() or default_user
 
     if not passwd:
         needs_password = any(t.vendor in ("arista",) for t in targets)

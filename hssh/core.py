@@ -78,6 +78,35 @@ def load_devices_csv(path: str) -> List[Target]:
     return targets
 
 
+
+def get_config_path() -> Path:
+    """Where per-user defaults live, alongside devices.csv."""
+    return Path.home() / ".h-ssh" / "config"
+
+
+def load_config(path: str = None) -> Dict[str, str]:
+    """Read 'key = value' defaults. Missing file is not an error.
+
+    Deliberately not INI or YAML: no sections to get wrong, no dependency, and
+    the same '#' comment handling the devices file already has.
+    """
+    p = Path(path) if path else get_config_path()
+    if not p.is_file():
+        return {}
+
+    config = {}
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        value = value.strip().strip('"').strip("'")
+        if key and value:
+            config[key] = value
+    return config
+
+
 def parse_inline_target(spec: str) -> Target:
     """Parse inline target string: NAME:HOST[:VENDOR][:PORT] or NAME:HOST[:PORT][:VENDOR].
 

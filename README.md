@@ -176,6 +176,22 @@ Two limits, both deliberate: `--structured` has no bindings here, and `--commit-
 rejected rather than silently ignored — a confirmed commit needs the NETCONF `junos` transport, and
 dropping the rollback timer without saying so would be worse than refusing.
 
+## ⚙️ Defaults
+
+Typing `--user` on every run gets old. `~/.h-ssh/config` holds per-user defaults:
+
+```ini
+# ~/.h-ssh/config
+user = EF
+```
+
+Precedence is `--user` → `HSSH_USER` → config file → prompt. The prompt now offers your system
+username as the default, so Enter accepts it.
+
+**Passwords are never read from this file.** A config file on a shared jump host is the wrong place
+for a secret; use `HSSH_PASSWORD`, `--password`, the prompt, or keys. `--config PATH` points at a
+different file.
+
 ## 📤 Output
 
 | Flag | Prints |
