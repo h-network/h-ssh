@@ -219,6 +219,35 @@ preference. The command echo (`$ show version`) belongs to the framed view — `
 both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
 `output`.
 
+## ⏱️ Failure handling
+
+A device that black-holes packets used to cost the full timeout three times over. Failures are now
+classified before anything is retried:
+
+| Failure | Behaviour |
+|---|---|
+| Unreachable — timed out, refused, no route, network unreachable | fail immediately |
+| Authentication, host key, unresolvable name, rejected command | fail immediately |
+| Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2) |
+
+The split is whether a connection was established. A connect-phase failure has already spent the
+full `ConnectTimeout`; spending it twice more is what lets one dead device dominate a fleet run.
+Unreachable means unreachable for the duration of the run. Once a session exists, a failure may well
+be transient, so those still get retried.
+
+Retrying an authentication failure cannot succeed either, and on a fleet it spends three real login
+attempts per device against accounts that may lock out. Those stop at one.
+
+One unreachable device in a three-device lab run, at default settings: **28s** before, **8s** now —
+a single timeout rather than three plus backoff.
+
+`--workers` above ~32 stops helping — the blocking vendor calls run on `asyncio.to_thread`, whose
+default executor caps at `min(32, cpu+4)`.
+
+Ctrl-C stops the run, reports which devices finished, and exits `130`. Output already written to
+stdout stays valid; the interrupted notice goes to stderr, so a truncated `--raw` run cannot look
+like a complete one.
+
 ## 🔒 Safety
 
 Layered, and every layer is off the critical path until you ask for a write.

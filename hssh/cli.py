@@ -137,6 +137,9 @@ async def main() -> int:
                         help="JSON job file with per-device commands (use - for stdin)")
 
     # Behavior
+    parser.add_argument("--retries", type=int, default=2,
+                        help="Retries per device after the first attempt (default: 2). "
+                             "Permanent failures never retry.")
     parser.add_argument("--workers", type=int, default=8,
                         help="Parallel workers (default: 8)")
     parser.add_argument("--session-timeout", type=int, default=30,
@@ -475,6 +478,7 @@ async def main() -> int:
                 commit_confirmed=args.commit_confirmed,
                 save_dir=save_dir,
                 quiet=not show_progress,
+                max_attempts=max(1, args.retries + 1),
                 batch_cmds=target_batch_cmds,
                 safety_gate=safety_gate,
                 structured=args.structured,
@@ -490,8 +494,17 @@ async def main() -> int:
     else:
         tasks = [asyncio.create_task(_bounded_run(t)) for t in targets]
 
+    interrupted = False
     for coro in asyncio.as_completed(tasks):
-        name, ok, out_text, duration_ms = await coro
+        try:
+            name, ok, out_text, duration_ms = await coro
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # Ctrl-C: stop starting work, let what is in flight go, and report
+            # the devices that did finish rather than losing the whole run.
+            interrupted = True
+            for task in tasks:
+                task.cancel()
+            break
 
         t = target_map[name]
         entry = {
@@ -708,11 +721,17 @@ async def main() -> int:
                         print()
                 print("--- End diff ---")
 
+        if interrupted:
+            # Always reported, and always on stderr, so --raw stdout stays
+            # device output and a truncated run can never look complete.
+            print(f"Interrupted. Completed {len(json_results)} of {len(targets)} device(s).",
+                  file=sys.stderr)
+
         if not raw_mode:
             print("")
             if failures:
                 print(f"Done. Failures: {failures}")
-            else:
+            elif not interrupted:
                 print("Done. All devices OK.")
         elif failures:
             # stdout is device output only; the verdict belongs on stderr.
@@ -753,9 +772,15 @@ async def main() -> int:
     if safety_gate is not None:
         safety_gate.close()
 
+    if interrupted:
+        return 130  # 128 + SIGINT, the shell convention
     return 1 if failures else 0
 
 
 def main_sync() -> None:
     """Synchronous entry point for console_scripts."""
-    sys.exit(asyncio.run(main()))
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)

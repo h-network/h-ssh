@@ -15,20 +15,65 @@ from . import vendors
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 3]  # seconds between attempt 1->2, 2->3
 
+# Failures that the same call cannot fix. Retrying them costs a full timeout
+# each and, for the auth cases, spends real login attempts against a device
+# that may well lock the account out.
+_PERMANENT = (
+    # Unreachable is unreachable for the duration of a run. A connect-phase
+    # failure has already spent the full ConnectTimeout; spending it twice more
+    # is what makes one dead device dominate a fleet run.
+    "connect to host",
+    "connection timed out",
+    "connection refused",
+    "no route to host",
+    "network is unreachable",
+    "unable to connect to port",
+    "authentication failed",
+    "permission denied",
+    "host key verification",
+    "cannot resolve",
+    "could not resolve",
+    "no such file",
+    "unknown vendor",
+    "not supported by",
+    "no username",
+    "openssh >= ",
+    "rejected the operational command",
+    "no 'ssh' binary",
+    "invalid",
+    "syntax error",
+)
 
-def _with_retry(fn, name, quiet, *args, **kwargs):
-    """Call fn with up to MAX_RETRIES attempts. Backoff between retries."""
+
+def is_permanent_failure(exc) -> bool:
+    """True when another identical attempt cannot plausibly succeed."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _PERMANENT)
+
+
+def _backoff(attempt: int) -> int:
+    """Seconds before attempt+1. Falls back to the last step once the table runs out."""
+    if attempt <= len(RETRY_BACKOFF):
+        return RETRY_BACKOFF[attempt - 1]
+    return RETRY_BACKOFF[-1] if RETRY_BACKOFF else 1
+
+
+def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
+    """Call fn until it succeeds, up to max_attempts. Permanent failures stop at one."""
+    attempts = max(1, int(max_attempts))
     last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, attempts + 1):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             last_err = e
-            if attempt < MAX_RETRIES:
-                delay = RETRY_BACKOFF[attempt - 1]
+            if is_permanent_failure(e):
+                raise
+            if attempt < attempts:
+                delay = _backoff(attempt)
                 if not quiet:
                     timestamp = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{timestamp}] {name:16s} RETRY {attempt}/{MAX_RETRIES - 1} in {delay}s ({e})")
+                    print(f"[{timestamp}] {name:16s} RETRY {attempt}/{attempts - 1} in {delay}s ({e})")
                 time.sleep(delay)
     raise last_err
 
@@ -53,6 +98,7 @@ def _run_for_target_sync(
     safety_gate: Optional[SafetyGate] = None,
     structured: bool = False,
     structured_binding: Optional[dict] = None,
+    max_attempts: int = MAX_RETRIES,
 ) -> Tuple[str, bool, str, int]:
     """
     Execute task on a single target device (internal sync implementation).
@@ -101,14 +147,14 @@ def _run_for_target_sync(
                 # Absence of show_structured on a vendor module is the whole
                 # capability check — generic and telnet simply don't have one,
                 # so they fall through to the text path below.
-                data = _with_retry(vendor_mod.show_structured, name, quiet,
+                data = _with_retry(vendor_mod.show_structured, name, quiet, max_attempts,
                                    host, user, passwd, show_cmd,
                                    session_timeout, command_timeout,
                                    port=t.port, vendor_hint=vendor,
                                    binding=structured_binding)
                 result = json.dumps(data, indent=2, default=str)
             else:
-                result = _with_retry(vendor_mod.show, name, quiet,
+                result = _with_retry(vendor_mod.show, name, quiet, max_attempts,
                                      host, user, passwd, show_cmd, session_timeout, command_timeout,
                                      port=t.port, vendor_hint=vendor)
             output.append(result.rstrip())
@@ -120,7 +166,7 @@ def _run_for_target_sync(
             if dry_run:
                 result = f"DRY-RUN edit: {edit_cmd}"
             else:
-                result = _with_retry(vendor_mod.edit, name, quiet,
+                result = _with_retry(vendor_mod.edit, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout, command_timeout,
                                      commit_confirmed, port=t.port, vendor_hint=vendor)
             output.append(result.rstrip())
@@ -132,7 +178,7 @@ def _run_for_target_sync(
             if dry_run:
                 result = f"DRY-RUN from {config_dir}/{name}.set:\n{payload}"
             else:
-                result = _with_retry(vendor_mod.edit, name, quiet,
+                result = _with_retry(vendor_mod.edit, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout, command_timeout,
                                      commit_confirmed, port=t.port, vendor_hint=vendor)
             output.append(result.rstrip())
@@ -144,7 +190,7 @@ def _run_for_target_sync(
             if dry_run:
                 result = f"DRY-RUN broadcast from {broadcast_file}:\n{payload}"
             else:
-                result = _with_retry(vendor_mod.edit, name, quiet,
+                result = _with_retry(vendor_mod.edit, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout, command_timeout,
                                      commit_confirmed, port=t.port, vendor_hint=vendor)
             output.append(result.rstrip())
@@ -155,7 +201,7 @@ def _run_for_target_sync(
             if dry_run:
                 cmd_results = [{"command": c, "ok": True, "output": f"DRY-RUN show: {c}"} for c in batch_cmds]
             else:
-                cmd_results = _with_retry(vendor_mod.show_batch, name, quiet,
+                cmd_results = _with_retry(vendor_mod.show_batch, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
                                           port=t.port, vendor_hint=vendor)
             all_ok = all(r["ok"] for r in cmd_results)
@@ -214,6 +260,7 @@ def run_for_target(
     safety_gate: Optional[SafetyGate] = None,
     structured: bool = False,
     structured_binding: Optional[dict] = None,
+    max_attempts: int = MAX_RETRIES,
 ) -> Tuple[str, bool, str, int]:
     """
     Synchronous public API for library users.
@@ -229,6 +276,7 @@ def run_for_target(
         save_dir=save_dir, quiet=quiet, batch_cmds=batch_cmds,
         safety_gate=safety_gate,
         structured=structured, structured_binding=structured_binding,
+        max_attempts=max_attempts,
     )
 
 
@@ -252,6 +300,7 @@ async def run_for_target_async(
     safety_gate: Optional[SafetyGate] = None,
     structured: bool = False,
     structured_binding: Optional[dict] = None,
+    max_attempts: int = MAX_RETRIES,
 ) -> Tuple[str, bool, str, int]:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -268,6 +317,7 @@ async def run_for_target_async(
         save_dir=save_dir, quiet=quiet, batch_cmds=batch_cmds,
         safety_gate=safety_gate,
         structured=structured, structured_binding=structured_binding,
+        max_attempts=max_attempts,
     )
 
 

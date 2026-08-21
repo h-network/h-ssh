@@ -11,4 +11,10 @@ import sys
 from hssh.cli import main
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        # Ctrl-C is a normal way to stop a fleet run; a stack trace is not a
+        # useful thing to print at someone who already knows what they did.
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
