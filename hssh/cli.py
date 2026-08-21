@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import concurrent.futures
 import difflib
 import getpass
 import json
@@ -64,6 +65,51 @@ def strip_result_header(out_text: str, command: str = None) -> str:
     return "\n".join(lines[i:]).strip("\n")
 
 
+
+# A thread per in-flight device, so the ceiling is an operator's choice rather
+# than a property of the machine. Capped because each one is an ssh process.
+MAX_WORKERS = 256
+
+
+def resolve_workers(requested: int) -> int:
+    """Clamp --workers to something a thread pool can honour."""
+    try:
+        n = int(requested)
+    except (TypeError, ValueError):
+        return 8
+    return max(1, min(n, MAX_WORKERS))
+
+
+
+# Everything here may be set in ~/.h-ssh/config. The password may not: a config
+# file on a shared host is the wrong home for a secret.
+CONFIG_DEFAULTS = {
+    "workers": 8,
+    "session_timeout": 30,
+    "command_timeout": 20,
+    "retries": 2,
+    "transport": "ssh",
+}
+
+
+def apply_config_defaults(args, config: dict) -> None:
+    """Fill unset options from the config file, then from the built-in default.
+
+    Precedence is flag, then environment (handled per option), then config file,
+    then default. An option given on the command line is never overridden.
+    """
+    for key, fallback in CONFIG_DEFAULTS.items():
+        if getattr(args, key, None) is not None:
+            continue
+        value = config.get(key, fallback)
+        if isinstance(fallback, int):
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = fallback
+        setattr(args, key, value)
+
+
 def get_default_devices_path() -> str:
     """Get default devices CSV path, preferring ~/.h-ssh/devices.csv if it exists."""
     home_path = Path.home() / ".h-ssh" / "devices.csv"
@@ -110,7 +156,7 @@ async def main() -> int:
 
     parser.add_argument("--devices", default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
-    parser.add_argument("--transport", choices=["junos", "arista", "ssh", "openssh", "telnet"], default="ssh",
+    parser.add_argument("--transport", choices=["junos", "arista", "ssh", "openssh", "telnet"], default=None,
                         help="Transport for targets that don't declare one (default: ssh)")
     parser.add_argument("--structured", action="store_true",
                         help="Return structured data where the vendor supports it "
@@ -137,14 +183,14 @@ async def main() -> int:
                         help="JSON job file with per-device commands (use - for stdin)")
 
     # Behavior
-    parser.add_argument("--retries", type=int, default=2,
+    parser.add_argument("--retries", type=int, default=None,
                         help="Retries per device after the first attempt (default: 2). "
                              "Permanent failures never retry.")
-    parser.add_argument("--workers", type=int, default=8,
+    parser.add_argument("--workers", type=int, default=None,
                         help="Parallel workers (default: 8)")
-    parser.add_argument("--session-timeout", type=int, default=30,
+    parser.add_argument("--session-timeout", type=int, default=None,
                         help="Timeout for establishing connection/session (default: 30)")
-    parser.add_argument("--command-timeout", type=int, default=20,
+    parser.add_argument("--command-timeout", type=int, default=None,
                         help="Timeout for individual commands/operations (default: 20)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Do not push, only show what would happen")
@@ -180,6 +226,11 @@ async def main() -> int:
                         help="Safety gate JSON file for per-device rate limiting and cooldown")
 
     args = parser.parse_args()
+
+    # Resolved before anything reads them, so --list-commands and the banner
+    # see the same values the run will use.
+    file_config = load_config(args.config)
+    apply_config_defaults(args, file_config)
 
     # Handle --list-commands
     if args.list_commands:
@@ -298,7 +349,7 @@ async def main() -> int:
 
     # Credentials. Flag beats environment beats config file; the password is
     # never read from the config file, so a shell alias cannot leak it to disk.
-    config = load_config(args.config)
+    config = file_config
     user = args.user or os.environ.get("HSSH_USER") or config.get("user")
     passwd = args.password or os.environ.get("HSSH_PASSWORD")
     if args.raw and args.verbose:
@@ -434,7 +485,17 @@ async def main() -> int:
     if args.safety_file:
         safety_gate = SafetyGate(safety_file=args.safety_file)
 
-    sem = asyncio.Semaphore(args.workers)
+    # asyncio.to_thread runs on the loop's default executor, which sizes itself
+    # min(32, cpu+4) — 6 threads on a 2-vCPU jump host. Without this, --workers
+    # silently caps at that number and the semaphore below is the smaller lie:
+    # devices queue behind threads, and blocked ones (a 30s connect timeout)
+    # hold a thread the whole time, stalling everything behind them.
+    workers = resolve_workers(args.workers)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="hssh"))
+
+    sem = asyncio.Semaphore(workers)
 
     async def _bounded_run(t, mode_override=None, cmd_override=None):
         async with sem:

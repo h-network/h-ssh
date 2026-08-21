@@ -76,3 +76,81 @@ def test_password_is_not_read_from_config(tmp_path, monkeypatch):
     # It must not have authenticated with a config-supplied password; the run
     # fails on connection, never on a password read out of the file.
     assert "hunter2" not in proc.stdout + proc.stderr
+
+
+def test_config_fills_unset_options():
+    from hssh.cli import apply_config_defaults
+
+    class Args:
+        workers = None
+        session_timeout = None
+        command_timeout = None
+        retries = None
+        transport = None
+
+    args = Args()
+    apply_config_defaults(args, {"workers": "16", "session_timeout": "5"})
+    assert args.workers == 16
+    assert args.session_timeout == 5
+
+
+def test_flags_beat_the_config_file():
+    from hssh.cli import apply_config_defaults
+
+    class Args:
+        workers = 4
+        session_timeout = None
+        command_timeout = None
+        retries = None
+        transport = None
+
+    args = Args()
+    apply_config_defaults(args, {"workers": "16"})
+    assert args.workers == 4, "a value given on the command line must win"
+
+
+def test_built_in_defaults_apply_with_no_config():
+    from hssh.cli import apply_config_defaults, CONFIG_DEFAULTS
+
+    class Args:
+        workers = None
+        session_timeout = None
+        command_timeout = None
+        retries = None
+        transport = None
+
+    args = Args()
+    apply_config_defaults(args, {})
+    for key, expected in CONFIG_DEFAULTS.items():
+        assert getattr(args, key) == expected
+
+
+def test_unparsable_numbers_fall_back_to_the_default():
+    from hssh.cli import apply_config_defaults
+
+    class Args:
+        workers = None
+        session_timeout = None
+        command_timeout = None
+        retries = None
+        transport = None
+
+    args = Args()
+    apply_config_defaults(args, {"workers": "lots"})
+    assert args.workers == 8
+
+
+def test_retries_zero_from_config_is_honoured():
+    """0 is a meaningful value and must not be mistaken for unset."""
+    from hssh.cli import apply_config_defaults
+
+    class Args:
+        workers = None
+        session_timeout = None
+        command_timeout = None
+        retries = None
+        transport = None
+
+    args = Args()
+    apply_config_defaults(args, {"retries": "0"})
+    assert args.retries == 0

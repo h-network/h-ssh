@@ -117,3 +117,41 @@ def test_backoff_extends_past_the_table():
     assert _backoff(1) == 1
     assert _backoff(2) == 3
     assert _backoff(9) == 3  # last step repeats rather than indexing off the end
+
+
+def test_workers_are_clamped_to_a_usable_range():
+    from hssh.cli import resolve_workers, MAX_WORKERS
+    assert resolve_workers(8) == 8
+    assert resolve_workers(0) == 1
+    assert resolve_workers(-5) == 1
+    assert resolve_workers(10_000) == MAX_WORKERS
+    assert resolve_workers("nonsense") == 8
+
+
+def test_workers_actually_run_in_parallel(tmp_path):
+    """--workers must not silently cap at the default executor's min(32, cpu+4)."""
+    import stat
+    import subprocess
+    import time
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    stub = bindir / "ssh"
+    stub.write_text("#!/bin/sh\nsleep 1\necho ok\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+
+    devices = tmp_path / "devices.csv"
+    devices.write_text("name,ip,vendor\n" +
+                       "".join("R%02d,10.0.0.%d,openssh\n" % (i, i + 1) for i in range(24)))
+
+    env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+    hssh = os.path.join(os.path.dirname(__file__), "..", "h-ssh.py")
+
+    start = time.time()
+    subprocess.run([sys.executable, hssh, "--devices", str(devices), "--user", "x",
+                    "--password", "", "-sC", "show version", "--raw", "--workers", "24"],
+                   capture_output=True, text=True, timeout=120, env=env)
+    elapsed = time.time() - start
+
+    # 24 devices x 1s. One batch is ~1s; a capped pool needs two or more.
+    assert elapsed < 2.0, "24 workers took %.1fs, so they did not run concurrently" % elapsed

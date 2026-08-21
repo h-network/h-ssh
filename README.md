@@ -182,11 +182,20 @@ Typing `--user` on every run gets old. `~/.h-ssh/config` holds per-user defaults
 
 ```ini
 # ~/.h-ssh/config
-user = EF
+user      = EF
+workers   = 16
+retries   = 0
+session_timeout = 5
+command_timeout = 15
+transport = openssh
 ```
 
-Precedence is `--user` → `HSSH_USER` → config file → prompt. The prompt now offers your system
-username as the default, so Enter accepts it.
+Precedence is flag → environment → config file → built-in default. A value given on the command
+line always wins, and `--user` additionally falls back to `HSSH_USER` then the prompt, which offers
+your system username so Enter accepts it.
+
+`session_timeout` is the one worth setting. It defaults to 30s, which is how long every unreachable
+device costs you; on a LAN a reachable device connects in well under a second.
 
 **Passwords are never read from this file.** A config file on a shared jump host is the wrong place
 for a secret; use `HSSH_PASSWORD`, `--password`, the prompt, or keys. `--config PATH` points at a
@@ -241,8 +250,10 @@ attempts per device against accounts that may lock out. Those stop at one.
 One unreachable device in a three-device lab run, at default settings: **28s** before, **8s** now —
 a single timeout rather than three plus backoff.
 
-`--workers` above ~32 stops helping — the blocking vendor calls run on `asyncio.to_thread`, whose
-default executor caps at `min(32, cpu+4)`.
+`--workers` is honoured literally, up to 256. The vendor calls block, so each in-flight device holds
+a thread; h-ssh sizes the executor to `--workers` rather than leaving it at asyncio's default of
+`min(32, cpu+4)`, which on a 2-vCPU jump host is **6 threads no matter what you asked for** — and a
+device stuck in a 30s connect timeout holds one of those six the whole time.
 
 Ctrl-C stops the run, reports which devices finished, and exits `130`. Output already written to
 stdout stays valid; the interrupted notice goes to stderr, so a truncated `--raw` run cannot look
