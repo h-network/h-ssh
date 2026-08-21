@@ -110,11 +110,24 @@ def test_port_is_passed_through():
     assert "2222" in openssh._base_opts(8, 2222, None, False)
 
 
-def test_secret_is_erased_after_use():
-    secret = openssh._secret("hunter2")
-    assert bytes(secret) == b"hunter2"
-    openssh._burn(secret)
-    assert len(secret) == 0
+def test_ssh_never_inherits_local_stdin(fake_ssh):
+    """-n plus DEVNULL stdin: nothing local can reach the remote command."""
+    import subprocess
+    seen = {}
+    real = subprocess.run
+
+    def spy(argv, **kwargs):
+        seen["argv"] = argv
+        seen["stdin"] = kwargs.get("stdin")
+        return real(argv, **kwargs)
+
+    subprocess.run = spy
+    try:
+        openssh.show("10.0.1.1", "admin", None, "show version", 5, 10)
+    finally:
+        subprocess.run = real
+    assert "-n" in seen["argv"]
+    assert seen["stdin"] == subprocess.DEVNULL
 
 
 def test_registered_as_a_vendor():
@@ -125,55 +138,122 @@ def test_registered_as_a_vendor():
 
 
 @pytest.fixture
-def prompting_ssh(tmp_path):
-    """A stub that demands a password on its controlling terminal, as OpenSSH does."""
-    script = tmp_path / "ssh-ask"
+def askpass_ssh(tmp_path, monkeypatch):
+    """A stub ssh that authenticates only via SSH_ASKPASS and records session input.
+
+    It also emits device output whose tail looks exactly like a password prompt,
+    which is the shape that made the old PTY implementation type the password
+    into the live session.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = bindir / "ssh"
     script.write_text(
         "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "fd = os.open('/dev/tty', os.O_RDWR)\n"
-        "os.write(fd, b\"admin@host's password: \")\n"
-        "secret = b''\n"
-        "while not secret.endswith(b'\\n'):\n"
-        "    secret += os.read(fd, 1)\n"
-        "if secret.strip() != b'hunter2':\n"
-        "    os.write(fd, b'\\nPermission denied, please try again.\\n')\n"
-        "    sys.exit(255)\n"
-        "os.write(fd, b'\\nauthenticated: ' + sys.argv[-1].encode() + b'\\n')\n"
+        "import os, subprocess, sys, select\n"
+        "helper = os.environ.get('SSH_ASKPASS')\n"
+        "if not helper or os.environ.get('SSH_ASKPASS_REQUIRE') != 'force':\n"
+        "    sys.stderr.write('no askpass configured\\n'); sys.exit(255)\n"
+        "got = subprocess.run([helper, 'p'], capture_output=True, text=True).stdout.strip()\n"
+        "if got != 'hunter2':\n"
+        "    sys.stderr.write('Permission denied (password).\\n'); sys.exit(255)\n"
+        "print('authentication-order password:')\n"
+        "print('radius-server 10.0.0.1;')\n"
+        "r, _, _ = select.select([sys.stdin], [], [], 0.3)\n"
+        "if r:\n"
+        "    data = sys.stdin.read()\n"
+        "    if data.strip():\n"
+        "        print('SESSION-RECEIVED:' + data.strip())\n"
     )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    return str(script)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(openssh, "AVAILABLE", True)
+    return script
 
 
-@pytest.mark.skipif(not openssh._PTY, reason="no pty on this platform")
-def test_pty_answers_the_password_prompt(prompting_ssh):
-    result = openssh._pty_run([prompting_ssh, "show version"], bytearray(b"hunter2"), 10)
-    assert result.returncode == 0
-    assert "authenticated: show version" in result.stdout
+def test_password_auth_goes_through_askpass(askpass_ssh):
+    out = openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
+    assert "radius-server 10.0.0.1;" in out
 
 
-@pytest.mark.skipif(not openssh._PTY, reason="no pty on this platform")
-def test_pty_never_returns_the_secret(prompting_ssh):
-    """A PTY echoes by default; the transcript reaches logs and --save-output."""
-    result = openssh._pty_run([prompting_ssh, "show version"], bytearray(b"hunter2"), 10)
-    assert "hunter2" not in result.stdout
-    assert "password" not in result.stdout.lower()
+def test_wrong_password_fails_cleanly(askpass_ssh):
+    with pytest.raises(RuntimeError, match="Authentication failed."):
+        openssh.show("10.0.1.1", "admin", "wrong", "show configuration", 5, 10)
 
 
-@pytest.mark.skipif(not openssh._PTY, reason="no pty on this platform")
-def test_pty_reports_a_rejected_password(prompting_ssh):
-    result = openssh._pty_run([prompting_ssh, "show version"], bytearray(b"wrong"), 10)
-    assert result.returncode == 255
+def test_password_never_reaches_the_session(askpass_ssh):
+    """Regression: device output ending in '...password:' once matched the prompt
+    pattern on the PTY, and the password was typed into the live session."""
+    out = openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
+    assert "SESSION-RECEIVED" not in out
 
 
-@pytest.mark.skipif(not openssh._PTY, reason="no pty on this platform")
-def test_pty_times_out_on_a_hung_process(tmp_path):
-    script = tmp_path / "ssh-hang"
-    script.write_text("#!/bin/sh\nsleep 30\n")
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    import subprocess
-    with pytest.raises(subprocess.TimeoutExpired):
-        openssh._pty_run([str(script)], bytearray(b"x"), 1)
+def test_password_never_appears_in_output(askpass_ssh):
+    out = openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
+    assert "hunter2" not in out
+
+
+def test_device_output_is_never_rewritten(askpass_ssh):
+    """Regression: scrubbing prompt-shaped lines deleted real config from output."""
+    out = openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
+    assert "authentication-order password:" in out
+
+
+def test_secret_is_not_written_to_disk(askpass_ssh, tmp_path):
+    captured = {}
+    real = openssh._AskPass.__enter__
+
+    def spy(self):
+        result = real(self)
+        if self.path:
+            captured["helper"] = open(self.path).read()
+            captured["mode"] = stat.S_IMODE(os.stat(self.path).st_mode)
+        return result
+
+    openssh._AskPass.__enter__ = spy
+    try:
+        openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
+    finally:
+        openssh._AskPass.__enter__ = real
+    assert "hunter2" not in captured["helper"]
+    assert captured["mode"] == 0o700
+
+
+def test_askpass_helper_is_removed_afterwards(askpass_ssh):
+    seen = {}
+    real = openssh._AskPass.__enter__
+
+    def spy(self):
+        result = real(self)
+        seen["path"] = self.path
+        seen["dir"] = self.dir
+        return result
+
+    openssh._AskPass.__enter__ = spy
+    try:
+        openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
+    finally:
+        openssh._AskPass.__enter__ = real
+    assert not os.path.exists(seen["path"])
+    assert not os.path.exists(seen["dir"])
+
+
+def test_no_askpass_configured_without_a_password(fake_ssh):
+    with openssh._AskPass(None) as ap:
+        assert "SSH_ASKPASS" not in ap.env
+        assert ap.path is None
+
+
+def test_old_openssh_is_refused_for_password_auth(monkeypatch):
+    monkeypatch.setattr(openssh, "_openssh_version", lambda: (8, 3))
+    with pytest.raises(RuntimeError, match="OpenSSH >= 8.4"):
+        with openssh._AskPass("hunter2"):
+            pass
+
+
+def test_version_is_parsed_from_the_banner():
+    version = openssh._openssh_version()
+    assert version == () or (isinstance(version, tuple) and len(version) == 2)
 
 
 def test_command_line_is_reproducible():

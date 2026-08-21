@@ -4,9 +4,16 @@ Exists for hosts where third-party packages cannot be installed: jump hosts
 with no package index, no ensurepip, and no root. Everything here is stdlib
 plus the `ssh` binary, which is already present wherever operators log in.
 
-Key auth runs `ssh` under subprocess. Password auth runs it under a PTY,
-because OpenSSH deliberately refuses to read a password from a pipe. The PTY
-technique is taken from EuroFiber/ef-net (ef_net/device.py).
+Key auth needs nothing but subprocess. Password auth goes through SSH_ASKPASS:
+OpenSSH refuses to read a password from a pipe, so the password is handed to a
+helper that OpenSSH execs on its own, over a channel the session never touches.
+
+The obvious alternative — running ssh on a PTY and answering whatever looks
+like a prompt — is unsafe and was removed. Auth prompts and device output share
+one stream there, so output that happens to end in "...password:" matches the
+prompt pattern and the password gets typed into the live session, echoed back,
+and recorded in the device's command accounting. There is no pattern that
+reliably separates the two, which is why the channel has to be separate.
 
 Multiple commands reuse one TCP connection and one authentication via OpenSSH
 connection multiplexing (ControlMaster), so batch mode keeps per-command
@@ -14,95 +21,98 @@ output cleanly separated instead of parsing one merged stream.
 """
 
 import os
-import re
 import shlex
 import shutil
-import signal
+import stat
 import subprocess
 import tempfile
-import time
 from typing import List, Optional
 
-try:
-    import pty
-    import select
-    _PTY = True
-except ImportError:  # Windows
-    _PTY = False
-
 AVAILABLE = shutil.which("ssh") is not None
-
-# OpenSSH writes auth prompts to the terminal, never to stdout/stderr.
-_AUTH_PROMPT_RE = re.compile(br'(?:password|passphrase)[^\r\n]*:\s*$', re.I)
-
-# Same prompt anywhere in a finished transcript, for scrubbing.
-_PROMPT_LINE_RE = re.compile(r'^.*(?:password|passphrase)[^\r\n]*:.*$\n?', re.I | re.M)
 
 # accept-new trusts a host the first time and pins it after, matching the
 # WarningPolicy the paramiko transport uses. Override for stricter sites.
 _HOST_KEY_POLICY = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
 
+# SSH_ASKPASS_REQUIRE=force is what lets askpass work with no TTY and no
+# DISPLAY. It landed in OpenSSH 8.4; older clients would silently ignore it
+# and fall back to prompting on the terminal, so refuse rather than guess.
+_MIN_OPENSSH = (8, 4)
 
-class _Result:
-    """Stands in for CompletedProcess on the PTY path, where the two streams merge."""
+# The helper carries no secret. OpenSSH passes its own environment to it, so
+# the password travels in the environment of the ssh process, readable only by
+# this user. Nothing is written to disk except this three-line script.
+_ASKPASS_HELPER = """#!/bin/sh
+printf '%s\\n' "$HSSH_ASKPASS_SECRET"
+"""
 
-    def __init__(self, returncode: int, stdout: str, stderr: str = ""):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
 
-
-def _pty_run(argv: List[str], secret: bytearray, timeout: float) -> _Result:
-    """Run OpenSSH on a PTY and answer only recognized auth prompts."""
-    pid, master = pty.fork()
-    if pid == 0:
-        os.execvp(argv[0], argv)
-    output = bytearray()
-    deadline = time.monotonic() + timeout
-    prompts = 0
-    status = None
+def _openssh_version() -> tuple:
+    """(major, minor) of the ssh on PATH, or () if it cannot be determined."""
     try:
-        while status is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(argv, timeout)
-            ready, _, _ = select.select([master], [], [], min(remaining, 0.25))
-            if ready:
-                try:
-                    chunk = os.read(master, 65536)
-                except OSError:
-                    chunk = b""
-                if chunk:
-                    output.extend(chunk)
-                    tail = bytes(output[-512:]).replace(b"\r", b"")
-                    if _AUTH_PROMPT_RE.search(tail):
-                        prompts += 1
-                        # A second prompt means the first answer was wrong;
-                        # a third means we are feeding a password to something
-                        # that keeps asking. Stop rather than spend attempts.
-                        if prompts > 3:
-                            raise OSError("too many authentication prompts")
-                        os.write(master, bytes(secret))
-                        os.write(master, b"\n")
-            waited, status = os.waitpid(pid, os.WNOHANG)
-            if waited == 0:
-                status = None
-        text = output.decode("utf-8", errors="replace").replace("\r", "")
-        # A PTY echoes by default. OpenSSH turns echo off while reading a
-        # password, but a device or jump host in the path may not, and this
-        # transcript flows on to logs, --save-output and the audit trail. Drop
-        # the prompt line outright rather than trust every hop to behave.
-        text = _PROMPT_LINE_RE.sub("", text)
-        return _Result(os.waitstatus_to_exitcode(status), text)
-    except BaseException:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        os.waitpid(pid, 0)
-        raise
-    finally:
-        os.close(master)
+        proc = subprocess.run(["ssh", "-V"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    banner = (proc.stderr or "") + (proc.stdout or "")
+    import re
+    m = re.search(r"OpenSSH_(\d+)\.(\d+)", banner)
+    return (int(m.group(1)), int(m.group(2))) if m else ()
+
+
+class _AskPass:
+    """A short-lived SSH_ASKPASS helper, and the environment that points ssh at it.
+
+    The password reaches OpenSSH through the helper's environment, never through
+    the session, so no amount of device output can be mistaken for a prompt.
+    """
+
+    def __init__(self, passwd: Optional[str]):
+        self.passwd = passwd
+        self.dir = None
+        self.path = None
+
+    def __enter__(self):
+        if not self.passwd:
+            return self
+        version = _openssh_version()
+        if version and version < _MIN_OPENSSH:
+            raise RuntimeError(
+                "password authentication needs OpenSSH >= %d.%d for "
+                "SSH_ASKPASS_REQUIRE (found %d.%d); use key authentication"
+                % (_MIN_OPENSSH + version))
+        self.dir = tempfile.mkdtemp(prefix="hssh-ap-")
+        os.chmod(self.dir, stat.S_IRWXU)
+        self.path = os.path.join(self.dir, "askpass")
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(_ASKPASS_HELPER)
+        return self
+
+    @property
+    def env(self) -> dict:
+        env = os.environ.copy()
+        if not self.passwd:
+            return env
+        env["SSH_ASKPASS"] = self.path
+        env["SSH_ASKPASS_REQUIRE"] = "force"
+        env["HSSH_ASKPASS_SECRET"] = self.passwd
+        # DISPLAY is irrelevant under REQUIRE=force and only invites an X11
+        # askpass dialog on a desktop, which would hang a batch run.
+        env.pop("DISPLAY", None)
+        return env
+
+    def __exit__(self, *_exc):
+        if self.path:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+        if self.dir:
+            try:
+                os.rmdir(self.dir)
+            except OSError:
+                pass
+        return False
 
 
 def _base_opts(session_timeout: int, port: Optional[int],
@@ -129,20 +139,16 @@ def _base_opts(session_timeout: int, port: Optional[int],
     return opts
 
 
-def _exec(host: str, user: str, secret: Optional[bytearray], cmd: str,
+def _exec(host: str, user: str, askpass, cmd: str,
           session_timeout: int, command_timeout: int, port: Optional[int],
           control_path: Optional[str]):
     argv = (["ssh", "-n"]
-            + _base_opts(session_timeout, port, control_path, secret is not None)
+            + _base_opts(session_timeout, port, control_path, askpass.passwd is not None)
             + ["%s@%s" % (user, host) if user else host, cmd])
     timeout = float(session_timeout + command_timeout)
-    if secret is not None:
-        if not _PTY:
-            raise RuntimeError(
-                "password authentication needs a PTY, unavailable on this platform; "
-                "use key authentication")
-        return _pty_run(argv, secret, timeout)
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(argv, capture_output=True, text=True,
+                          timeout=timeout, env=askpass.env,
+                          stdin=subprocess.DEVNULL)
 
 
 def _describe_failure(host: str, proc) -> str:
@@ -163,19 +169,6 @@ def _describe_failure(host: str, proc) -> str:
     return "ssh exit %d with no diagnostic output." % proc.returncode
 
 
-def _secret(passwd: Optional[str]) -> Optional[bytearray]:
-    return bytearray(passwd.encode("utf-8")) if passwd else None
-
-
-def _burn(secret: Optional[bytearray]) -> None:
-    """Best-effort erasure; the copy OpenSSH received is out of our hands."""
-    if secret is None:
-        return
-    for i in range(len(secret)):
-        secret[i] = 0
-    secret.clear()
-
-
 def _format(cmd: str, proc) -> str:
     block = ["$ %s" % cmd]
     out = (proc.stdout or "").rstrip()
@@ -194,27 +187,26 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
-    secret = _secret(passwd)
     tmpdir = tempfile.mkdtemp(prefix="hssh-") if len(commands) > 1 else None
     # Unix socket paths cap near 104 bytes, so keep the name short.
     control_path = os.path.join(tmpdir, "cm") if tmpdir else None
     try:
-        outputs = []
-        for cmd in commands:
-            try:
-                proc = _exec(host, user, secret, cmd, session_timeout,
-                             command_timeout, port, control_path)
-            except subprocess.TimeoutExpired:
-                raise RuntimeError("Command timed out after %ds: %s"
-                                   % (session_timeout + command_timeout, cmd))
-            except OSError as exc:
-                raise RuntimeError("SSH transport failed: %s" % exc)
-            if proc.returncode != 0:
-                raise RuntimeError(_describe_failure(host, proc))
-            outputs.append(_format(cmd, proc))
-        return "\n\n".join(outputs).strip() + "\n"
+        with _AskPass(passwd) as askpass:
+            outputs = []
+            for cmd in commands:
+                try:
+                    proc = _exec(host, user, askpass, cmd, session_timeout,
+                                 command_timeout, port, control_path)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError("Command timed out after %ds: %s"
+                                       % (session_timeout + command_timeout, cmd))
+                except OSError as exc:
+                    raise RuntimeError("SSH transport failed: %s" % exc)
+                if proc.returncode != 0:
+                    raise RuntimeError(_describe_failure(host, proc))
+                outputs.append(_format(cmd, proc))
+            return "\n\n".join(outputs).strip() + "\n"
     finally:
-        _burn(secret)
         _close_master(host, user, control_path, tmpdir, session_timeout, port)
 
 
@@ -269,26 +261,25 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
-    secret = _secret(passwd)
     tmpdir = tempfile.mkdtemp(prefix="hssh-")
     control_path = os.path.join(tmpdir, "cm")
     try:
-        results = []
-        for cmd in cmds:
-            try:
-                proc = _exec(host, user, secret, cmd, session_timeout,
-                             command_timeout, port, control_path)
-                if proc.returncode != 0:
-                    results.append({"command": cmd, "ok": False,
-                                    "error": _describe_failure(host, proc)})
-                else:
-                    results.append({"command": cmd, "ok": True,
-                                    "output": _format(cmd, proc)})
-            except Exception as exc:
-                results.append({"command": cmd, "ok": False, "error": str(exc)})
-        return results
+        with _AskPass(passwd) as askpass:
+            results = []
+            for cmd in cmds:
+                try:
+                    proc = _exec(host, user, askpass, cmd, session_timeout,
+                                 command_timeout, port, control_path)
+                    if proc.returncode != 0:
+                        results.append({"command": cmd, "ok": False,
+                                        "error": _describe_failure(host, proc)})
+                    else:
+                        results.append({"command": cmd, "ok": True,
+                                        "output": _format(cmd, proc)})
+                except Exception as exc:
+                    results.append({"command": cmd, "ok": False, "error": str(exc)})
+            return results
     finally:
-        _burn(secret)
         _close_master(host, user, control_path, tmpdir, session_timeout, port)
 
 

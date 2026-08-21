@@ -152,9 +152,14 @@ Every transport reuses a single connection per device for batch work.
 ### `openssh` — for hosts where you cannot install anything
 
 `openssh` needs no Python packages at all. It drives the system `ssh` binary: `subprocess` for key
-auth, and a PTY for password auth, because OpenSSH refuses to read a password from a pipe. Batch work
-reuses one TCP connection and one authentication through OpenSSH connection multiplexing
+auth, and `SSH_ASKPASS` for password auth, because OpenSSH refuses to read a password from a pipe.
+The password reaches OpenSSH through a helper it execs itself, on a channel the session never
+touches — never through the terminal, where device output and auth prompts would share one stream.
+Batch work reuses one TCP connection and one authentication through OpenSSH connection multiplexing
 (`ControlMaster`), so each command still comes back cleanly separated.
+
+Password auth needs OpenSSH 8.4+ for `SSH_ASKPASS_REQUIRE=force`; older clients are refused rather
+than silently falling back to a terminal prompt. Key auth has no such floor.
 
 Use it on locked-down jump hosts — no package index, no `ensurepip`, no root — where `pip install
 paramiko` is not on the table but `ssh` is already there:
