@@ -176,6 +176,33 @@ Two limits, both deliberate: `--structured` has no bindings here, and `--commit-
 rejected rather than silently ignored — a confirmed commit needs the NETCONF `junos` transport, and
 dropping the rollback timer without saying so would be worse than refusing.
 
+## 📤 Output
+
+| Flag | Prints |
+|---|---|
+| *(none)* | one status line per device |
+| `-v` | status plus a framed block per device |
+| `--raw` | device output only, nothing else on stdout |
+| `--json` | one object per device, with `command` and `output` fields |
+
+`--raw` is the pipe-friendly one: no banner, no progress lines, no summary. Each device gets a
+`name:` line and its output, and that is all stdout carries — failures and the verdict go to stderr,
+so `--raw > out.txt` keeps the file clean even on a partial run.
+
+```console
+$ h-ssh -sC "show version | match Junos:" --raw
+cr1:
+Junos: 24.2R1-S2.5
+
+cr2:
+Junos: 24.2R1-S2.5
+```
+
+`--raw`, `-v` and `--json` are mutually exclusive; asking for two is an error rather than a silent
+preference. The command echo (`$ show version`) belongs to the framed view — `--raw` and `--json`
+both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
+`output`.
+
 ## 🔒 Safety
 
 Layered, and every layer is off the critical path until you ask for a write.

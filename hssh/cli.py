@@ -39,6 +39,30 @@ VENDOR_INSTALL = {
 }
 
 
+
+_RESULT_HEADER_KEYS = ("DEVICE:", "HOST:", "MODE:", "VENDOR:")
+
+
+def strip_result_header(out_text: str, command: str = None) -> str:
+    """Return just what the device said.
+
+    The runner prefixes each result with DEVICE/HOST/MODE/VENDOR and a blank
+    line, and text transports echo the command as '$ cmd'. Both are framing for
+    the human-readable view; --raw wants neither.
+    """
+    lines = out_text.splitlines()
+    i = 0
+    while i < len(lines) and lines[i].startswith(_RESULT_HEADER_KEYS):
+        i += 1
+    if i and i < len(lines) and not lines[i].strip():
+        i += 1
+    # Only drop the echo when it is exactly the command we sent, so device
+    # output that happens to start with '$ ' survives intact.
+    if command and i < len(lines) and lines[i] == "$ %s" % command:
+        i += 1
+    return "\n".join(lines[i:]).strip("\n")
+
+
 def get_default_devices_path() -> str:
     """Get default devices CSV path, preferring ~/.h-ssh/devices.csv if it exists."""
     home_path = Path.home() / ".h-ssh" / "devices.csv"
@@ -126,6 +150,8 @@ async def main() -> int:
                         help="Show detailed output for all operations")
     parser.add_argument("--diff", action="store_true",
                         help="Compare output across devices (show modes only, first device is baseline)")
+    parser.add_argument("--raw", action="store_true",
+                        help="Print only each device's output, no progress lines or headers")
     parser.add_argument("--list-commands", action="store_true",
                         help="List available command shortcuts for the selected transport")
 
@@ -267,7 +293,17 @@ async def main() -> int:
     # Credentials
     user = args.user or os.environ.get("HSSH_USER")
     passwd = args.password or os.environ.get("HSSH_PASSWORD")
+    if args.raw and args.verbose:
+        print("ERROR: --raw and -v are mutually exclusive.", file=sys.stderr)
+        return 2
+    if args.raw and args.json:
+        print("ERROR: --raw and --json are mutually exclusive.", file=sys.stderr)
+        return 2
+
     json_mode = args.json
+    raw_mode = args.raw
+    # Progress chatter only. Edit pre-flight and confirmation stay visible.
+    show_progress = not (json_mode or raw_mode)
 
     if not user:
         if not sys.stdin.isatty():
@@ -313,7 +349,7 @@ async def main() -> int:
                     if resolved != raw:
                         print(f"Resolved '{raw}' -> '{resolved}' ({vendor})")
 
-    if not json_mode:
+    if show_progress:
         if job_entries:
             print(f"\nMode: job | Targets: {len(targets)} | Workers: {args.workers}")
         else:
@@ -375,7 +411,7 @@ async def main() -> int:
         elif not json_mode:
             print("(--yes flag provided, skipping confirmation)")
 
-    if not json_mode:
+    if show_progress:
         print()
 
     failures = 0
@@ -430,7 +466,7 @@ async def main() -> int:
                 dry_run=args.dry_run,
                 commit_confirmed=args.commit_confirmed,
                 save_dir=save_dir,
-                quiet=json_mode,
+                quiet=not show_progress,
                 batch_cmds=target_batch_cmds,
                 safety_gate=safety_gate,
                 structured=args.structured,
@@ -460,6 +496,9 @@ async def main() -> int:
 
         if mode == "show-batch":
             cmd_results = json.loads(out_text)
+            for cr in cmd_results:
+                if cr.get("ok") and "output" in cr:
+                    cr["output"] = strip_result_header(cr["output"], cr["command"])
             entry["commands"] = cmd_results
             if not ok:
                 for cr in cmd_results:
@@ -469,15 +508,11 @@ async def main() -> int:
                 else:
                     entry["error"] = "unknown error"
         elif ok:
-            lines = out_text.strip().splitlines()
-            content_lines = []
-            past_header = False
-            for ln in lines:
-                if past_header:
-                    content_lines.append(ln)
-                elif ln.strip() == "":
-                    past_header = True
-            entry["output"] = "\n".join(content_lines).strip()
+            # Resolved per target, so a shortcut can differ device to device.
+            resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
+            if resolved_cmd:
+                entry["command"] = resolved_cmd
+            entry["output"] = strip_result_header(out_text, resolved_cmd)
         else:
             for ln in reversed(out_text.splitlines()):
                 if ln.startswith("ERROR:"):
@@ -507,7 +542,28 @@ async def main() -> int:
                 commit_confirmed=args.commit_confirmed,
             )
 
-        if not json_mode:
+        if raw_mode:
+            if mode == "show-batch":
+                cmd_results = json.loads(out_text)
+                print(f"{name}:")
+                for cr in cmd_results:
+                    if cr["ok"]:
+                        print(strip_result_header(cr["output"], cr["command"]))
+                    else:
+                        print(f"{name}: {cr['command']}: {cr['error']}", file=sys.stderr)
+                print()
+            elif ok:
+                resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
+                print(f"{name}:")
+                print(strip_result_header(out_text, resolved_cmd))
+                print()
+            else:
+                # stdout stays device output only, so failures go to stderr.
+                detail = next((ln for ln in out_text.splitlines()
+                               if ln.startswith("ERROR:")), "failed")
+                print(f"{name}: {detail}", file=sys.stderr)
+
+        if not json_mode and not raw_mode:
             timestamp = datetime.now().strftime("%H:%M:%S")
             if mode == "show-batch":
                 cmd_results = json.loads(out_text)
@@ -644,11 +700,15 @@ async def main() -> int:
                         print()
                 print("--- End diff ---")
 
-        print("")
-        if failures:
-            print(f"Done. Failures: {failures}")
-        else:
-            print("Done. All devices OK.")
+        if not raw_mode:
+            print("")
+            if failures:
+                print(f"Done. Failures: {failures}")
+            else:
+                print("Done. All devices OK.")
+        elif failures:
+            # stdout is device output only; the verdict belongs on stderr.
+            print(f"Done. Failures: {failures}", file=sys.stderr)
 
         if args.commit_confirmed and not args.dry_run and mode in ["edit-cmd", "edit-dir", "edit-broadcast"]:
             print("")
