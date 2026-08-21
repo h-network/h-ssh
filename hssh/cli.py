@@ -20,18 +20,19 @@ from .core import (
 from .runner import run_for_target_async
 from .safety import SafetyGate
 from .audit import write_audit_entry
-from .vendors import junos, arista, generic, telnet
+from .vendors import junos, arista, generic, openssh, telnet
 
 
 # Supported vendor names for validation
 VENDOR_MODULES = {
-    "junos": junos, "arista": arista, "ssh": generic,
+    "junos": junos, "arista": arista, "ssh": generic, "openssh": openssh,
     "telnet": telnet, "telnet-ios": telnet, "telnet-junos": telnet,
     "telnet-arista": telnet, "telnet-nxos": telnet,
 }
 
 VENDOR_INSTALL = {
     "junos": "junos-eznc", "arista": "pyeapi", "ssh": "paramiko",
+    "openssh": "the OpenSSH client ('ssh' on PATH)",
     "telnet": "(built-in)", "telnet-ios": "(built-in)",
     "telnet-junos": "(built-in)", "telnet-arista": "(built-in)",
     "telnet-nxos": "(built-in)",
@@ -84,7 +85,7 @@ async def main() -> int:
 
     parser.add_argument("--devices", default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
-    parser.add_argument("--transport", choices=["junos", "arista", "ssh", "telnet"], default="ssh",
+    parser.add_argument("--transport", choices=["junos", "arista", "ssh", "openssh", "telnet"], default="ssh",
                         help="Transport for targets that don't declare one (default: ssh)")
     parser.add_argument("--structured", action="store_true",
                         help="Return structured data where the vendor supports it "

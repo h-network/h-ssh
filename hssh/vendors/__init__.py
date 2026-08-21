@@ -4,11 +4,13 @@ from . import junos
 from . import arista
 from . import generic
 from . import telnet
+from . import openssh
 
 VENDORS = {
     "junos": junos,
     "arista": arista,
     "ssh": generic,
+    "openssh": openssh,
     "telnet": telnet,
     "telnet-ios": telnet,
     "telnet-junos": telnet,
@@ -16,7 +18,7 @@ VENDORS = {
     "telnet-nxos": telnet,
 }
 
-__all__ = ['junos', 'arista', 'generic', 'telnet', 'VENDORS']
+__all__ = ['junos', 'arista', 'generic', 'openssh', 'telnet', 'VENDORS']
 
 
 def get(name: str):
