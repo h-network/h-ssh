@@ -222,22 +222,105 @@ def read_command_file_lines(path: Path) -> List[str]:
     return out
 
 
+DEFAULT_VENDOR_PORTS = {
+    "junos": 830,
+    "telnet": 23,
+    "telnet-ios": 23,
+    "telnet-junos": 23,
+    "telnet-arista": 23,
+    "telnet-nxos": 23,
+    "arista": 443,
+    "ssh": 22,
+    "openssh": 22,
+}
+
+
+def resolve_target_port(target: Target) -> int:
+    """Resolve port for a target, falling back to vendor default."""
+    if target.port is not None:
+        return target.port
+    return DEFAULT_VENDOR_PORTS.get(target.vendor, 22)
+
+
+JUNOS_SET_PREFIX_VERBS = (
+    "set ",
+    "delete ",
+    "activate ",
+    "deactivate ",
+    "insert ",
+    "rename ",
+    "copy ",
+    "annotate ",
+    "protect ",
+    "unprotect ",
+)
+JUNOS_SET_EXACT_VERBS = ("commit", "commit;")
+JUNOS_SET_VERBS = JUNOS_SET_PREFIX_VERBS + ("commit",)
+
+
+def validate_junos_set_syntax(payload: str, allow_commit: bool = True) -> Tuple[bool, str]:
+    """Validate that every non-empty, non-comment line starts with a valid Junos set verb.
+
+    Allows comments (#) and blank lines.
+    Rejects any non-empty, non-comment line that does not start with one of the valid Junos set verbs.
+    If allow_commit is False (e.g. for -eD/-eB config files), 'commit' commands are rejected.
+    Returns (is_valid, error_description).
+    """
+    lines = payload.splitlines()
+    non_empty_count = 0
+    for idx, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        non_empty_count += 1
+        lower = line.lower()
+        is_valid_verb = (
+            any(lower.startswith(verb) for verb in JUNOS_SET_PREFIX_VERBS)
+            or (allow_commit and lower in JUNOS_SET_EXACT_VERBS)
+        )
+        if not is_valid_verb:
+            if not allow_commit and lower in JUNOS_SET_EXACT_VERBS:
+                return False, f"line {idx}: 'commit' is not permitted in configuration files (-eD/-eB)"
+            return False, f"line {idx}: invalid Junos set command {raw_line.strip()!r} (must start with a valid set verb such as 'set', 'delete', 'activate', etc.)"
+    if non_empty_count == 0:
+        return False, "configuration payload contains no commands"
+    return True, ""
+
+
 def _load_commands_json(vendor: str) -> Dict:
     """Load command templates from JSON file for a vendor.
 
     Lookup order:
+    - Package shipped defaults (commands/{vendor}.json relative to package)
+    - Local ./commands/{vendor}.json (if different from package path)
     - ~/.h-ssh/commands/{vendor}.json (user overrides)
-    - ./commands/{vendor}.json (shipped defaults)
     """
     commands = {}
 
-    local_path = Path("commands") / f"{vendor}.json"
-    if local_path.is_file():
-        commands.update(json.loads(local_path.read_text(encoding="utf-8")))
+    # Shipped defaults relative to package root
+    package_dir = Path(__file__).resolve().parent.parent / "commands"
+    package_path = package_dir / f"{vendor}.json"
+    if package_path.is_file():
+        try:
+            commands.update(json.loads(package_path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
 
+    # Current working directory overrides (if distinct from package path)
+    local_path = Path("commands") / f"{vendor}.json"
+    try:
+        if local_path.is_file() and local_path.resolve() != package_path.resolve():
+            commands.update(json.loads(local_path.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+
+    # User home overrides
     home_path = Path.home() / ".h-ssh" / "commands" / f"{vendor}.json"
     if home_path.is_file():
-        commands.update(json.loads(home_path.read_text(encoding="utf-8")))
+        try:
+            commands.update(json.loads(home_path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
 
     return commands
 

@@ -19,7 +19,7 @@
 
 The per-device session is a solved problem; what nobody hands you is everything *around* it. The thread pool. Collecting results per device. Making sure one dead box doesn't sink the run. A rate limiter so you don't hammer a router you've already failed against. A record of what you changed. That's the part you'd otherwise rewrite in every script, and it's what this is.
 
-Reads go over plain SSH because they're cheap; config writes go over NETCONF because they need a lock, a diff, and a rollback. Every edit passes a safety gate, prompts before it commits, and lands in a JSONL audit trail — and `--commit-confirmed` puts the device back the way it was if you never confirm.
+On Junos, everything goes through PyEZ over NETCONF — reads and writes alike — because the official library gives one session, real RPC errors, and the lock, diff and rollback that config changes need. Every edit passes a safety gate, prompts before it commits, and lands in a JSONL audit trail — and `--commit-confirmed` puts the device back the way it was if you never confirm.
 
 [Quick start](#-quick-start) · [Modes](#️-modes) · [Transports](#-transports) · [Structured output](#-structured-output) · [Safety](#-safety) · [Library use](#-library-usage) · [Test results](TESTS.md)
 
@@ -29,7 +29,7 @@ Reads go over plain SSH because they're cheap; config writes go over NETCONF bec
 
 ## ✨ What it is
 
-- **🔌 Four transports, one interface.** Juniper (SSH for show, NETCONF for config), Arista (eAPI), any generic SSH device, and raw-socket telnet — including IOS- and Junos-flavoured prompt handling. Same flags whichever you point it at.
+- **🔌 Four transports, one interface.** Juniper (PyEZ over NETCONF), Arista (eAPI), any generic SSH device, and raw-socket telnet — including IOS- and Junos-flavoured prompt handling. Same flags whichever you point it at.
 - **⚡ Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
 - **🎯 One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
 - **🛡️ Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing, per-device rate limit and cooldown, and `--commit-confirmed N` for changes that undo themselves if you lose the session.
@@ -42,8 +42,8 @@ Reads go over plain SSH because they're cheap; config writes go over NETCONF bec
 ```
   devices.csv / --target / --job              per device, up to --workers at once
   ──────────────────────────────────           ─────────────────────────────────────
-                    │                          ┌─ junos    show → paramiko SSH
-                    ▼                          │           edit → PyEZ NETCONF
+                    │                          ┌─ junos    PyEZ over NETCONF (830)
+                    ▼                          │           show/edit → PyEZ NETCONF
         ┌───────────────────────┐              │                  lock → load → diff
         │ safety gate           │              │                  → commit → unlock
         │ rate limit 10/device  │──▶ workers ──┼─ arista   eAPI over HTTPS
@@ -54,7 +54,7 @@ Reads go over plain SSH because they're cheap; config writes go over NETCONF bec
                     └──────────── every edit ──────────────────┴──▶ audit.jsonl
 ```
 
-Show commands take the cheap path — a paramiko session with `| no-more` appended — because a read doesn't need a config database. Config changes take the expensive one: PyEZ locks the candidate, loads, diffs, runs `commit_check`, commits, and unlocks, rolling back if any step fails.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first.
 
 ## 📦 Install
 
@@ -139,7 +139,7 @@ cat jobs.json | ./h-ssh.py --user admin --job - --json
 
 | Vendor | Transport | Library | Show | Edit |
 |---|---|---|---|---|
-| `junos` | SSH + NETCONF | paramiko + junos-eznc | paramiko `exec_command` | PyEZ lock/load/diff/commit |
+| `junos` | NETCONF | junos-eznc | PyEZ `Device.cli()` | PyEZ lock/load/diff/commit |
 | `arista` | eAPI (HTTPS) | pyeapi | eAPI enable | eAPI config |
 | `ssh` | SSH | paramiko | `exec_command` | `exec_command` |
 | `openssh` | OpenSSH client | built-in | `ssh host cmd` | `ssh host cmd` |
@@ -241,8 +241,10 @@ classified before anything is retried:
 
 The split is whether a connection was established. A connect-phase failure has already spent the
 full `ConnectTimeout`; spending it twice more is what lets one dead device dominate a fleet run.
-Unreachable means unreachable for the duration of the run. Once a session exists, a failure may well
-be transient, so those still get retried.
+Unreachable means unreachable for the duration of the run. Once a session exists, a read failure may well
+be transient, so those still get retried. **Edits are different:** a config push is retried only when
+the driver reports that nothing reached the device (for Junos: connect or candidate-lock failure).
+Any other failure — above all a timeout around a commit — is reported once and left for you to check.
 
 Retrying an authentication failure cannot succeed either, and on a fleet it spends three real login
 attempts per device against accounts that may lock out. Those stop at one.
@@ -267,10 +269,13 @@ Layered, and every layer is off the critical path until you ask for a write.
 |---|---|---|
 | Pre-flight check | *(automatic)* | Edits verify reachability before touching config |
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
-| Dry run | `--dry-run` | Loads and diffs the candidate, never commits |
-| Commit confirmed | `--commit-confirmed N` | Junos rolls back after N minutes unless confirmed |
-| Safety gate | `--safety-file PATH` | 10 attempts per device per run; 120 s cooldown after a failure, held in a `flock`'d JSON file so it survives across processes |
-| Audit trail | `--audit-log PATH` | Every edit appended as JSONL |
+| Dry run | `--dry-run` | Junos (NETCONF and telnet-junos): loads, runs `commit_check`, diffs, then discards the candidate. Other transports **refuse** `--dry-run` for edits instead of pretending |
+| Commit confirmed | `--commit-confirmed N` | Junos rolls back after N minutes unless confirmed (confirm with `-eC "commit"`). Transports that cannot do this (`ssh`, `arista`, telnet IOS/NX-OS/Arista, `openssh`) refuse it rather than commit with no timer |
+| Junos syntax guard | *(automatic)* | Enforces set-style syntax (`set`, `delete`, `activate`, `deactivate`, etc.) with `#`-only comments for `junos` and `telnet-junos`. `commit` is only valid as an exact command in `-eC` or `--job`, never inside `-eD`/`-eB` configuration files |
+| Safety gate | `--safety-file PATH` | Opt-in sliding-window rate limit (10 attempts / host / 60 s); 120 s cooldown after connection/auth failure, held in a `flock`'d 0600 JSON file so it persists safely across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
+| Audit trail | `--audit-log PATH` | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). Tracks edits, pre-flight aborts, and user cancellations; records diffs for edits and suppresses diffs on show operations. In edit modes, audit write failures fail the run |
+
+A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
 
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a crash mid-run leaves it blocked rather than open.
 
@@ -348,7 +353,7 @@ h-ssh/
 │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   ├── audit.py         # JSONL audit trail
 │   └── vendors/
-│       ├── junos.py     # paramiko show + PyEZ NETCONF config
+│       ├── junos.py     # PyEZ NETCONF: show, structured, config
 │       ├── arista.py    # eAPI
 │       ├── generic.py   # paramiko SSH
 │       ├── openssh.py   # the OpenSSH binary — zero dependencies

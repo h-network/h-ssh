@@ -132,5 +132,94 @@ def test_target_dataclass():
     assert target2.vendor == "ssh"
 
 
+def test_resolve_target_port():
+    from hssh.core import resolve_target_port
+
+    # Explicit port takes precedence
+    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="junos", port=2222)) == 2222
+    # Junos defaults to 830
+    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="junos")) == 830
+    # Arista defaults to 443
+    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="arista")) == 443
+    # Telnet defaults to 23
+    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="telnet")) == 23
+    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="telnet-ios")) == 23
+    # SSH defaults to 22
+    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="ssh")) == 22
+
+
+def test_validate_junos_set_syntax():
+    from hssh.core import validate_junos_set_syntax
+
+    # Valid set commands with # comments and blank lines
+    payload = """
+    # Set system hostname
+    set system host-name R1
+    
+    # Interface config
+    set interfaces ge-0/0/0 unit 0 family inet address 192.0.2.1/24
+    delete interfaces ge-0/0/1
+    deactivate interfaces ge-0/0/2
+    activate interfaces ge-0/0/3
+    annotate interfaces ge-0/0/0 "Uplink"
+    protect system
+    unprotect system
+    commit
+    commit;
+    """
+    valid, err = validate_junos_set_syntax(payload)
+    assert valid is True
+    assert err == ""
+
+    # Multi-line bypass attempt (line 1 valid set, line 2 invalid command)
+    bypass_payload = "set system host-name R1\nreboot"
+    valid, err = validate_junos_set_syntax(bypass_payload)
+    assert valid is False
+    assert "line 2" in err
+    assert "reboot" in err
+
+    # Curly brace hierarchy rejection
+    curly_payload = "interfaces {\n  ge-0/0/0 {\n    unit 0 {}\n  }\n}"
+    valid, err = validate_junos_set_syntax(curly_payload)
+    assert valid is False
+    assert "line 1" in err
+
+    # Empty payload
+    valid, err = validate_junos_set_syntax("  \n# only comments\n  ")
+    assert valid is False
+    assert "no commands" in err
+
+    # Reject 'commitfoo'
+    valid, err = validate_junos_set_syntax("commitfoo")
+    assert valid is False
+    assert "invalid Junos set command" in err
+
+    # Reject 'commit confirmed' as raw command (must use --commit-confirmed flag)
+    valid, err = validate_junos_set_syntax("commit confirmed")
+    assert valid is False
+    assert "invalid Junos set command" in err
+
+    # Reject C-style and Cisco-style comments (! and /*)
+    valid, err = validate_junos_set_syntax("/* comment */\nset system host-name R1")
+    assert valid is False
+    assert "line 1" in err
+
+    valid, err = validate_junos_set_syntax("! comment\nset system host-name R1")
+    assert valid is False
+    assert "line 1" in err
+
+
+def test_command_template_path_resolution(tmp_path, monkeypatch):
+    """Template resolution should work even when CWD is outside the repo."""
+    from hssh.core import resolve_command
+
+    # Change CWD to an empty temporary directory
+    monkeypatch.chdir(tmp_path)
+
+    # Shipped templates should still be found relative to the hssh package
+    cmd = resolve_command("bgp", "junos")
+    assert "bgp" in cmd
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from .errors import NotAppliedError
 from .core import Target, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
 from . import vendors
@@ -51,6 +52,11 @@ def is_permanent_failure(exc) -> bool:
     return any(marker in text for marker in _PERMANENT)
 
 
+def _is_local_error(exc) -> bool:
+    """True for failures raised before any device I/O: validation and missing files."""
+    return isinstance(exc, (ValueError, FileNotFoundError))
+
+
 def _backoff(attempt: int) -> int:
     """Seconds before attempt+1. Falls back to the last step once the table runs out."""
     if attempt <= len(RETRY_BACKOFF):
@@ -58,8 +64,7 @@ def _backoff(attempt: int) -> int:
     return RETRY_BACKOFF[-1] if RETRY_BACKOFF else 1
 
 
-def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
-    """Call fn until it succeeds, up to max_attempts. Permanent failures stop at one."""
+def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, **kwargs):
     attempts = max(1, int(max_attempts))
     last_err = None
     for attempt in range(1, attempts + 1):
@@ -67,7 +72,7 @@ def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
             return fn(*args, **kwargs)
         except Exception as e:
             last_err = e
-            if is_permanent_failure(e):
+            if is_permanent_failure(e) or not should_retry(e):
                 raise
             if attempt < attempts:
                 delay = _backoff(attempt)
@@ -76,6 +81,42 @@ def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
                     print(f"[{timestamp}] {name:16s} RETRY {attempt}/{attempts - 1} in {delay}s ({e})")
                 time.sleep(delay)
     raise last_err
+
+
+def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
+    """Call fn until it succeeds, up to max_attempts. Permanent failures stop at one."""
+    return _retry_loop(fn, name, quiet, max_attempts, lambda e: True, *args, **kwargs)
+
+
+# Transports whose edit() can really validate a candidate and discard it, and
+# the ones that can really arm a commit-confirmed rollback timer. Everything
+# else must refuse rather than quietly do something weaker.
+DRY_RUN_EDIT_VENDORS = frozenset({"junos", "telnet-junos"})
+COMMIT_CONFIRMED_VENDORS = frozenset({"junos", "telnet-junos"})
+
+
+def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
+                payload, session_timeout, command_timeout, commit_confirmed,
+                port, dry_run=False):
+    """Push configuration. An edit is not idempotent, so it is only retried when
+    the driver says nothing reached the device (NotAppliedError); any other
+    failure, and above all a timeout around a commit, is reported, not repeated."""
+    if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
+        raise ValueError(
+            f"--commit-confirmed is not supported by the '{vendor}' transport; "
+            "the change would be applied with no rollback timer")
+    kwargs = {"port": port, "vendor_hint": vendor}
+    if dry_run:
+        if vendor not in DRY_RUN_EDIT_VENDORS:
+            raise ValueError(
+                f"--dry-run is not supported by the '{vendor}' transport for edits; "
+                "nothing was sent to the device")
+        kwargs["dry_run"] = True
+    return _retry_loop(
+        vendor_mod.edit, name, quiet, max_attempts,
+        lambda e: isinstance(e, NotAppliedError),
+        host, user, passwd, payload, session_timeout, command_timeout,
+        commit_confirmed, **kwargs)
 
 
 def _run_for_target_sync(
@@ -163,36 +204,37 @@ def _run_for_target_sync(
             if not edit_cmd:
                 raise ValueError("No edit command provided.")
             payload = edit_cmd.strip() + "\n"
-            if dry_run:
-                result = f"DRY-RUN edit: {edit_cmd}"
+            if payload.strip() == "commit" and hasattr(vendor_mod, "confirm"):
+                # Only a literal -eC "commit" confirms a pending commit-confirmed;
+                # the same word inside an -eD/-eB file is just (invalid) config.
+                if dry_run:
+                    raise ValueError("--dry-run cannot preview a commit confirmation")
+                result = _retry_loop(vendor_mod.confirm, name, quiet, max_attempts,
+                                     lambda e: isinstance(e, NotAppliedError),
+                                     host, user, passwd, session_timeout, command_timeout,
+                                     port=t.port, vendor_hint=vendor)
             else:
-                result = _with_retry(vendor_mod.edit, name, quiet, max_attempts,
-                                     host, user, passwd, payload, session_timeout, command_timeout,
-                                     commit_confirmed, port=t.port, vendor_hint=vendor)
+                result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
+                                     host, user, passwd, payload, session_timeout,
+                                     command_timeout, commit_confirmed, t.port, dry_run)
             output.append(result.rstrip())
 
         elif mode == "edit-dir":
             if not config_dir:
                 raise ValueError("No config directory provided for -eD.")
             payload = _read_config_file(config_dir, name)
-            if dry_run:
-                result = f"DRY-RUN from {config_dir}/{name}.set:\n{payload}"
-            else:
-                result = _with_retry(vendor_mod.edit, name, quiet, max_attempts,
-                                     host, user, passwd, payload, session_timeout, command_timeout,
-                                     commit_confirmed, port=t.port, vendor_hint=vendor)
+            result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
+                                 host, user, passwd, payload, session_timeout,
+                                 command_timeout, commit_confirmed, t.port, dry_run)
             output.append(result.rstrip())
 
         elif mode == "edit-broadcast":
             if not broadcast_file:
                 raise ValueError("No broadcast file provided for -eB.")
             payload = _read_broadcast_file(broadcast_file)
-            if dry_run:
-                result = f"DRY-RUN broadcast from {broadcast_file}:\n{payload}"
-            else:
-                result = _with_retry(vendor_mod.edit, name, quiet, max_attempts,
-                                     host, user, passwd, payload, session_timeout, command_timeout,
-                                     commit_confirmed, port=t.port, vendor_hint=vendor)
+            result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
+                                 host, user, passwd, payload, session_timeout,
+                                 command_timeout, commit_confirmed, t.port, dry_run)
             output.append(result.rstrip())
 
         elif mode == "show-batch":
@@ -230,7 +272,13 @@ def _run_for_target_sync(
 
     except Exception as e:
         if safety_gate is not None:
-            safety_gate.set_cooldown(host)
+            if _is_local_error(e):
+                # Nothing reached the device (bad arguments, missing file, a
+                # transport that refuses the request). Cooling the device for
+                # that would punish it for our own mistake.
+                safety_gate.release_device(host)
+            else:
+                safety_gate.set_cooldown(host)
         output.append(f"ERROR: {e}")
         final_out = "\n".join(output).strip() + "\n"
         duration_ms = int((time.time() - start_time) * 1000)

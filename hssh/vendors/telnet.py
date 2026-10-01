@@ -305,8 +305,12 @@ def show(host: str, user: str, passwd: str, cmd: str,
 def edit(host: str, user: str, passwd: str, payload: str,
          session_timeout: int, command_timeout: int,
          commit_confirmed: int = None, port: int = None,
-         vendor_hint: str = "telnet") -> str:
-    """Send configuration commands via raw-socket telnet."""
+         vendor_hint: str = "telnet", dry_run: bool = False) -> str:
+    """Send configuration commands via raw-socket telnet.
+
+    dry_run is honoured for Junos only (the candidate is diffed and rolled back);
+    the runner rejects it for the other sub-vendors before getting here.
+    """
     effective_port = port if port is not None else 23
     sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint.startswith("telnet") else vendor_hint
     if sub_vendor == "telnet":
@@ -316,7 +320,7 @@ def edit(host: str, user: str, passwd: str, payload: str,
                                          session_timeout, sub_vendor)
     try:
         if sub_vendor == "junos":
-            return _edit_junos(sock, prompt_re, payload, dry_run=False,
+            return _edit_junos(sock, prompt_re, payload, dry_run=dry_run,
                                confirmed_minutes=commit_confirmed or 0)
         else:
             return _edit_ios(sock, prompt_re, payload, dry_run=False)

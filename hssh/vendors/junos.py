@@ -1,66 +1,97 @@
-"""Hybrid Junos transport — paramiko SSH for show commands, PyEZ NETCONF for configuration.
+"""Junos transport — PyEZ (NETCONF) for show, structured show and configuration.
 
-Show path uses paramiko exec_command (fast, low overhead).
-Config path uses PyEZ NETCONF (lock -> load -> diff -> commit/rollback -> unlock).
+Everything goes through junos-eznc, the official Juniper library, over a single
+NETCONF session per call: show uses Device.cli(), structured show uses a
+Table/View, and config uses lock -> load -> commit_check -> diff -> commit
+(or rollback for --dry-run) -> unlock. The NETCONF port defaults to 830
+everywhere; set the target's port to use NETCONF over SSH on 22.
 """
 
 from typing import List, Optional
 
+from ..core import JUNOS_SET_PREFIX_VERBS
+from ..errors import AmbiguousCommitError, NotAppliedError
+
 try:
-    import paramiko
     from jnpr.junos import Device as JunosDevice
     from jnpr.junos.utils.config import Config as JunosConfig
     from jnpr.junos.exception import (
-        ConnectError, LockError, ConfigLoadError, CommitError,
+        ConnectError, LockError, ConfigLoadError, CommitError, RpcTimeoutError,
     )
     AVAILABLE = True
 except ImportError:
     AVAILABLE = False
+    JunosDevice = JunosConfig = None
+
+    class ConnectError(Exception):
+        pass
+
+    class LockError(Exception):
+        pass
+
+    class ConfigLoadError(Exception):
+        pass
+
+    class CommitError(Exception):
+        pass
+
+    class RpcTimeoutError(Exception):
+        pass
+
+DEFAULT_PORT = 830
 
 
-def _ssh_connect(host: str, user: str, passwd: Optional[str],
-                 session_timeout: int, port: int = None) -> "paramiko.SSHClient":
-    """Create a paramiko SSH connection."""
-    client = paramiko.SSHClient()
-    client.load_system_host_keys()
-    client.set_missing_host_key_policy(paramiko.WarningPolicy())
-    kwargs = {
-        "hostname": host,
-        "username": user,
-        "port": port or 22,
-        "timeout": session_timeout,
-        "allow_agent": True,
-        "look_for_keys": True,
+def _require() -> None:
+    if not AVAILABLE:
+        raise RuntimeError("junos-eznc (PyEZ) not available.")
+
+
+def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
+          command_timeout: int, port: Optional[int]):
+    """Open a NETCONF session. Failures here mean nothing reached the device."""
+    params = {
+        "host": host,
+        "user": user,
+        "port": port or DEFAULT_PORT,
+        "gather_facts": False,
+        "conn_open_timeout": session_timeout,
     }
     if passwd:
-        kwargs["password"] = passwd
-    client.connect(**kwargs)
-    return client
+        params["passwd"] = passwd
+    dev = JunosDevice(**params)
+    try:
+        dev.open()
+    except ConnectError as e:
+        raise NotAppliedError(f"NETCONF connect failed: {e}") from e
+    dev.timeout = command_timeout
+    return dev
 
 
-def _ssh_exec(client: "paramiko.SSHClient", command: str, timeout: int) -> str:
-    """Execute a command over SSH and return output."""
-    _, stdout, stderr = client.exec_command(command, timeout=timeout)
-    out = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace")
-    if err and "warning:" not in err.lower():
-        return out + "\n" + err if out else err
-    return out
+def _close(dev) -> None:
+    try:
+        dev.close()
+    except Exception:
+        pass
+
+
+def _cli(dev, cmd: str) -> str:
+    # NETCONF returns the whole reply, so a pager hint is meaningless here.
+    if cmd.rstrip().endswith("| no-more"):
+        cmd = cmd.rstrip()[: -len("| no-more")].rstrip()
+    out = dev.cli(cmd, warning=False)
+    return (out or "").rstrip()
 
 
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
          port: int = None, vendor_hint: str = None) -> str:
-    """Execute a show command via paramiko SSH (fast path)."""
-    if not AVAILABLE:
-        raise RuntimeError("paramiko and junos-eznc not available.")
-    if "| no-more" not in cmd:
-        cmd = cmd + " | no-more"
-    client = _ssh_connect(host, user, passwd, session_timeout, port=port)
+    """Execute a show command over NETCONF."""
+    _require()
+    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
     try:
-        return _ssh_exec(client, cmd, command_timeout).rstrip()
+        return _cli(dev, cmd)
     finally:
-        client.close()
+        _close(dev)
 
 
 def show_structured(host: str, user: str, passwd: str, cmd: str,
@@ -85,8 +116,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
     single-key mapping of xpath to a type or value test ("int", "True=Established").
     Returns a dict keyed by the binding's key field.
     """
-    if not AVAILABLE:
-        raise RuntimeError("paramiko and junos-eznc not available.")
+    _require()
     if not binding:
         raise ValueError(
             f"No structured binding for '{cmd}' on junos. "
@@ -113,121 +143,144 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
 
     table_cls = FactoryLoader().load(definition)[table_name]
 
-    conn_params = {
-        "host": host,
-        "user": user,
-        "port": port or 830,
-        "conn_open_timeout": session_timeout,
-    }
-    if passwd:
-        conn_params["passwd"] = passwd
-
-    dev = JunosDevice(**conn_params)
-    dev.open()
+    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
     try:
-        dev.timeout = command_timeout
         table = table_cls(dev)
         table.get()
         return {key: dict(item) for key, item in table.items()}
     finally:
-        dev.close()
+        _close(dev)
+
+
+def _config_format(payload: str) -> str:
+    """"set" when every meaningful line is a set-style command, else "text"."""
+    lines = [ln.strip() for ln in payload.splitlines()]
+    lines = [ln for ln in lines if ln and not ln.startswith("#")]
+    if lines and all(ln.startswith(JUNOS_SET_PREFIX_VERBS) for ln in lines):
+        return "set"
+    return "text"
+
+
+def _strip_comments(payload: str) -> str:
+    return "\n".join(ln for ln in payload.splitlines()
+                     if ln.strip() and not ln.strip().startswith("#"))
+
+
+def _unlock_quietly(cu) -> Optional[str]:
+    try:
+        cu.unlock()
+        return None
+    except Exception as e:
+        return str(e)
 
 
 def edit(host: str, user: str, passwd: str, payload: str,
          session_timeout: int, command_timeout: int,
          commit_confirmed: int = None, port: int = None,
-         vendor_hint: str = None) -> str:
-    """Apply set-style configuration via PyEZ NETCONF."""
-    if not AVAILABLE:
-        raise RuntimeError("paramiko and junos-eznc not available.")
+         vendor_hint: str = None, dry_run: bool = False) -> str:
+    """Apply configuration over NETCONF.
 
-    conn_params = {
-        "host": host,
-        "user": user,
-        "port": port or 22,
-        "gather_facts": False,
-        "timeout": session_timeout,
-    }
-    if passwd:
-        conn_params["passwd"] = passwd
-    else:
-        conn_params["ssh_private_key_file"] = None
+    lock -> load -> diff -> commit_check -> commit (or rollback when dry_run)
+    -> unlock. With dry_run the candidate is validated and diffed on the device
+    and then discarded; nothing is committed.
 
-    # Bare commit: confirm a pending commit-confirmed
-    if payload.strip() == "commit":
-        with JunosDevice(**conn_params) as dev:
-            cu = JunosConfig(dev)
-            cu.commit(timeout=command_timeout)
-            return "COMMIT CONFIRMED OK"
-
-    dev = JunosDevice(**conn_params)
-    dev.open()
+    Raises NotAppliedError for failures before anything could change on the
+    device, AmbiguousCommitError when a commit was sent and its outcome is
+    unknown, and RuntimeError for rejected config. Only NotAppliedError is safe
+    to retry.
+    """
+    _require()
+    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
+    cu = None
+    locked = False
+    committed = False
     try:
         cu = JunosConfig(dev)
-        cu.lock()
         try:
-            fmt = "set" if payload.strip().startswith(("set ", "delete ")) else "text"
-            cu.load(payload, format=fmt)
-            diff = cu.diff()
+            cu.lock()
+        except LockError as e:
+            raise NotAppliedError(f"Failed to lock config: {e}") from e
+        locked = True
 
-            if diff is None:
-                diff = ""
-
+        fmt = _config_format(payload)
+        body = _strip_comments(payload) if fmt == "set" else payload
+        try:
+            cu.load(body, format=fmt)
+            diff = (cu.diff() or "")
             if not diff.strip():
-                cu.rollback()
-                cu.unlock()
                 return "NO CHANGES"
-
-            # Validate before committing
             cu.commit_check(timeout=command_timeout)
+        except (ConfigLoadError, CommitError) as e:
+            raise RuntimeError(f"Config error: {e}") from e
 
+        if dry_run:
+            return f"DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
+
+        try:
             if commit_confirmed and commit_confirmed > 0:
                 cu.commit(confirm=commit_confirmed, timeout=command_timeout)
-                cu.unlock()
-                return f"COMMIT CONFIRMED ({commit_confirmed} minutes)\n\nDIFF:\n{diff}"
             else:
                 cu.commit(timeout=command_timeout)
-                cu.unlock()
-                return f"COMMIT OK\n\nDIFF:\n{diff}"
+        except CommitError as e:
+            raise RuntimeError(f"Config error: {e}") from e
+        except Exception as e:
+            # The commit RPC was sent. We cannot tell whether it landed.
+            locked = False  # leave the candidate alone; the session is suspect
+            raise AmbiguousCommitError(
+                f"commit outcome unknown ({type(e).__name__}: {e}); "
+                "check the device before retrying") from e
+        committed = True
 
-        except (ConfigLoadError, CommitError) as e:
-            cu.rollback()
-            cu.unlock()
-            raise RuntimeError(f"Config error: {e}")
-        except Exception:
-            try:
-                cu.rollback()
-                cu.unlock()
-            except Exception:
-                pass
-            raise
-    except LockError as e:
-        raise RuntimeError(f"Failed to lock config: {e}")
-    except ConnectError as e:
-        raise RuntimeError(f"NETCONF connect failed: {e}")
+        if commit_confirmed and commit_confirmed > 0:
+            head = f"COMMIT CONFIRMED ({commit_confirmed} minutes)"
+        else:
+            head = "COMMIT OK"
+        return f"{head}\n\nDIFF:\n{diff}"
     finally:
+        if cu is not None and locked:
+            if not committed:
+                try:
+                    cu.rollback()
+                except Exception:
+                    pass
+            _unlock_quietly(cu)
+        _close(dev)
+
+
+def confirm(host: str, user: str, passwd: str,
+            session_timeout: int, command_timeout: int,
+            port: int = None, vendor_hint: str = None) -> str:
+    """Confirm a pending commit-confirmed by issuing a plain commit."""
+    _require()
+    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
+    try:
+        cu = JunosConfig(dev)
         try:
-            dev.close()
-        except Exception:
-            pass
+            cu.commit(timeout=command_timeout)
+        except CommitError as e:
+            raise RuntimeError(f"Commit failed: {e}") from e
+        except Exception as e:
+            raise AmbiguousCommitError(
+                f"commit outcome unknown ({type(e).__name__}: {e}); "
+                "check the device before retrying") from e
+        return "COMMIT CONFIRMED OK"
+    finally:
+        _close(dev)
 
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
                port: int = None, vendor_hint: str = None) -> List[dict]:
-    """Execute multiple show commands on a single SSH connection."""
-    if not AVAILABLE:
-        raise RuntimeError("paramiko and junos-eznc not available.")
-    client = _ssh_connect(host, user, passwd, session_timeout, port=port)
+    """Execute several show commands on one NETCONF session."""
+    _require()
+    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
     try:
         results = []
         for cmd in cmds:
             try:
-                full_cmd = cmd if "| no-more" in cmd else cmd + " | no-more"
-                output = _ssh_exec(client, full_cmd, command_timeout)
-                results.append({"command": cmd, "ok": True, "output": output.rstrip()})
+                results.append({"command": cmd, "ok": True, "output": _cli(dev, cmd)})
             except Exception as e:
                 results.append({"command": cmd, "ok": False, "error": str(e)})
         return results
     finally:
-        client.close()
+        _close(dev)
