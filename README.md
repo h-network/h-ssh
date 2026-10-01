@@ -274,6 +274,8 @@ Layered, and every layer is off the critical path until you ask for a write.
 | Safety gate | `--safety-file PATH` | 10 attempts per device per run; 120 s cooldown after a failure, held in a `flock`'d JSON file so it survives across processes |
 | Audit trail | `--audit-log PATH` | Every edit appended as JSONL |
 
+A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
+
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a crash mid-run leaves it blocked rather than open.
 
 Exit codes: `0` success · `1` a device failed · `2` usage error. Every run also prints a structured summary to stderr:

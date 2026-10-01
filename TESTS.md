@@ -16,7 +16,7 @@ Tested against 3 live Junos vMX routers running 24.2R1-S2.5.
 | test_config.py | 17 | Pass |
 | test_retry.py | 25 | Pass |
 | test_junos.py | 24 | Pass |
-| test_runner_edit.py | 15 | Pass |
+| test_runner_edit.py | 17 | Pass |
 
 ## Live Integration Tests — 59/59 passed
 

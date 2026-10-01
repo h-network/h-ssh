@@ -116,3 +116,43 @@ def test_commit_in_a_config_file_is_config(monkeypatch, tmp_path):
     v = FakeVendor(with_confirm=True)
     run(monkeypatch, "junos", v, mode="edit-dir", edit_cmd=None, config_dir=str(tmp_path))
     assert v.confirm_calls == [] and len(v.edit_calls) == 1
+
+
+class FakeGate:
+    def __init__(self):
+        self.events = []
+
+    def check_device(self, host):
+        self.events.append("check")
+        return True, "ok"
+
+    def release_device(self, host):
+        self.events.append("release")
+
+    def set_cooldown(self, host):
+        self.events.append("cooldown")
+
+
+def run_gated(monkeypatch, vendor_name, mod, gate, **kw):
+    monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
+    return runner.run_for_target(
+        t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode="edit-cmd",
+        show_cmd=None, edit_cmd="set a b", config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=kw.get("dry_run", False), commit_confirmed=kw.get("commit_confirmed"),
+        save_dir=None, quiet=True, safety_gate=gate, max_attempts=1)
+
+
+def test_refused_request_does_not_cool_the_device(monkeypatch):
+    gate = FakeGate()
+    _, ok, _, _ = run_gated(monkeypatch, "ssh", FakeVendor(), gate, dry_run=True)
+    assert not ok
+    assert gate.events == ["check", "release"]
+
+
+def test_device_failure_does_cool_the_device(monkeypatch):
+    gate = FakeGate()
+    v = FakeVendor([RuntimeError("session reset")])
+    _, ok, _, _ = run_gated(monkeypatch, "junos", v, gate)
+    assert not ok
+    assert gate.events == ["check", "cooldown"]
