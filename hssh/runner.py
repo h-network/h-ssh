@@ -52,6 +52,11 @@ def is_permanent_failure(exc) -> bool:
     return any(marker in text for marker in _PERMANENT)
 
 
+def _is_local_error(exc) -> bool:
+    """True for failures raised before any device I/O: validation and missing files."""
+    return isinstance(exc, (ValueError, FileNotFoundError))
+
+
 def _backoff(attempt: int) -> int:
     """Seconds before attempt+1. Falls back to the last step once the table runs out."""
     if attempt <= len(RETRY_BACKOFF):
@@ -267,7 +272,13 @@ def _run_for_target_sync(
 
     except Exception as e:
         if safety_gate is not None:
-            safety_gate.set_cooldown(host)
+            if _is_local_error(e):
+                # Nothing reached the device (bad arguments, missing file, a
+                # transport that refuses the request). Cooling the device for
+                # that would punish it for our own mistake.
+                safety_gate.release_device(host)
+            else:
+                safety_gate.set_cooldown(host)
         output.append(f"ERROR: {e}")
         final_out = "\n".join(output).strip() + "\n"
         duration_ms = int((time.time() - start_time) * 1000)

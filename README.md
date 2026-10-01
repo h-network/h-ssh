@@ -275,6 +275,8 @@ Layered, and every layer is off the critical path until you ask for a write.
 | Safety gate | `--safety-file PATH` | Opt-in sliding-window rate limit (10 attempts / host / 60 s); 120 s cooldown after connection/auth failure, held in a `flock`'d 0600 JSON file so it persists safely across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
 | Audit trail | `--audit-log PATH` | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). Tracks edits, pre-flight aborts, and user cancellations; records diffs for edits and suppresses diffs on show operations. In edit modes, audit write failures fail the run |
 
+A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
+
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a crash mid-run leaves it blocked rather than open.
 
 Exit codes: `0` success · `1` a device failed · `2` usage error. Every run also prints a structured summary to stderr:

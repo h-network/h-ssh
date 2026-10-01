@@ -15,7 +15,7 @@ Tested against 3 live Junos vMX routers running 24.2R1-S2.5.
 | test_openssh.py | 25 | Pass |
 | test_raw.py | 10 | Pass |
 | test_retry.py | 25 | Pass |
-| test_runner_edit.py | 15 | Pass |
+| test_runner_edit.py | 17 | Pass |
 | test_safety.py | 19 | Pass |
 | test_structured.py | 9 | Pass |
 | test_telnet.py | 6 | Pass |
