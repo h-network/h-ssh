@@ -150,12 +150,73 @@ def test_concurrent_file_access():
         # Both should be persisted without corruption
         with open(tmp) as f:
             data = json.load(f)
+        assert "10.0.1.1" in data
         assert "10.0.1.2" in data
 
         gate1.close()
         gate2.close()
     finally:
         Path(tmp).unlink(missing_ok=True)
+        Path(f"{tmp}.lock").unlink(missing_ok=True)
+
+
+def test_fail_closed_on_corrupt_file():
+    """Corrupted safety file must cause check_device to fail-closed."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write("{this is invalid json content")
+        tmp = f.name
+
+    try:
+        gate = SafetyGate(safety_file=tmp)
+        allowed, reason = gate.check_device("10.0.1.1")
+        assert allowed is False
+        assert "corrupt" in reason.lower()
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+        Path(f"{tmp}.lock").unlink(missing_ok=True)
+
+
+def test_file_permissions_0600():
+    """Safety file and lockfile must be created with 0600 permissions."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        tmp = f.name
+
+    try:
+        gate = SafetyGate(safety_file=tmp, cooldown_seconds=120)
+        gate.set_cooldown("10.0.1.1")
+        gate.close()
+
+        # Check permissions
+        mode = os.stat(tmp).st_mode & 0o777
+        assert mode == 0o600
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+        Path(f"{tmp}.lock").unlink(missing_ok=True)
+
+
+def test_thread_safety_active_set():
+    """Concurrent threads checking distinct devices must all succeed safely."""
+    import threading
+
+    gate = SafetyGate(rate_limit=100)
+    errors = []
+
+    def worker(idx):
+        try:
+            allowed, _ = gate.check_device(f"10.0.1.{idx}")
+            if not allowed:
+                errors.append(f"Worker {idx} not allowed")
+            gate.release_device(f"10.0.1.{idx}")
+        except Exception as e:
+            errors.append(str(e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
 
 
 # T10: Expired pruning

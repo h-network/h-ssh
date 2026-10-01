@@ -17,7 +17,7 @@ from .core import (
     Target, load_devices_csv, load_config, get_config_path,
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
-    load_jobs,
+    load_jobs, resolve_target_port, validate_junos_set_syntax,
 )
 from .runner import run_for_target_async
 from .safety import SafetyGate
@@ -120,12 +120,7 @@ def get_default_devices_path() -> str:
 
 async def check_reachability(target, timeout: int = 2) -> tuple:
     """Quick reachability check for a target."""
-    if target.port is not None:
-        port = target.port
-    elif target.vendor.startswith("telnet"):
-        port = 23
-    else:
-        port = 22
+    port = resolve_target_port(target)
 
     loop = asyncio.get_running_loop()
     try:
@@ -267,6 +262,12 @@ async def main() -> int:
         targets = [entry.target for entry in job_entries]
         has_edits = any(e.mode.startswith("edit") for e in job_entries)
         mode = "job"
+        for je in job_entries:
+            if je.target.vendor == "junos" and je.mode.startswith("edit"):
+                valid, err = validate_junos_set_syntax(je.command)
+                if not valid:
+                    print(f"ERROR: Junos job command for '{je.target.name}' only accepts set-style commands: {err}", file=sys.stderr)
+                    return 2
     else:
         # Determine mode
         modes = [
@@ -312,10 +313,37 @@ async def main() -> int:
 
         # Junos set-syntax check keys off the targets, not a global flag —
         # a mixed inventory can have some devices that care and some that don't.
-        if args.edit_command and any(t.vendor == "junos" for t in targets):
-            if not args.edit_command.strip().startswith(("set ", "delete ", "commit")):
-                print("ERROR: Junos -eC only accepts 'set ...' commands.", file=sys.stderr)
-                return 2
+        has_junos = any(t.vendor == "junos" for t in targets)
+        if has_junos:
+            if args.edit_command:
+                valid, err = validate_junos_set_syntax(args.edit_command)
+                if not valid:
+                    print(f"ERROR: Junos -eC only accepts 'set ...' commands: {err}", file=sys.stderr)
+                    return 2
+            elif args.edit_broadcast:
+                try:
+                    b_content = Path(args.edit_broadcast).read_text(encoding="utf-8")
+                except Exception as e:
+                    print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
+                    return 2
+                valid, err = validate_junos_set_syntax(b_content)
+                if not valid:
+                    print(f"ERROR: Junos broadcast file '{args.edit_broadcast}' only accepts 'set ...' commands: {err}", file=sys.stderr)
+                    return 2
+            elif args.edit_dir:
+                for t in targets:
+                    if t.vendor == "junos":
+                        set_file = Path(args.edit_dir) / f"{t.name}.set"
+                        if set_file.is_file():
+                            try:
+                                d_content = set_file.read_text(encoding="utf-8")
+                            except Exception as e:
+                                print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
+                                return 2
+                            valid, err = validate_junos_set_syntax(d_content)
+                            if not valid:
+                                print(f"ERROR: Junos config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
+                                return 2
 
         # Mode label
         if args.show_command:
@@ -447,6 +475,20 @@ async def main() -> int:
                 unreachable.append(name)
 
         if unreachable:
+            if args.audit_log:
+                for unreach_name in unreachable:
+                    ut = target_map.get(unreach_name)
+                    if ut:
+                        write_audit_entry(
+                            path=args.audit_log,
+                            device=ut.name,
+                            host=ut.host,
+                            vendor=ut.vendor,
+                            mode=mode if 'mode' in locals() else "preflight",
+                            payload="",
+                            ok=False,
+                            error="preflight reachability check failed (aborted)",
+                        )
             if json_mode:
                 err = {"error": f"{len(unreachable)} device(s) unreachable", "unreachable": unreachable}
                 print(json.dumps(err))
@@ -465,9 +507,33 @@ async def main() -> int:
             try:
                 confirm = input("\nProceed with changes? [y/N]: ").strip().lower()
                 if confirm not in ['y', 'yes']:
+                    if args.audit_log:
+                        for target in targets:
+                            write_audit_entry(
+                                path=args.audit_log,
+                                device=target.name,
+                                host=target.host,
+                                vendor=target.vendor,
+                                mode=mode,
+                                payload="",
+                                ok=False,
+                                error="aborted by user confirmation",
+                            )
                     print("Aborted by user.")
                     return 0
             except (KeyboardInterrupt, EOFError):
+                if args.audit_log:
+                    for target in targets:
+                        write_audit_entry(
+                            path=args.audit_log,
+                            device=target.name,
+                            host=target.host,
+                            vendor=target.vendor,
+                            mode=mode,
+                            payload="",
+                            ok=False,
+                            error="aborted by user interrupt",
+                        )
                 print("\nAborted by user.")
                 return 0
         elif not json_mode:
@@ -481,9 +547,8 @@ async def main() -> int:
     json_results = []
     run_start = time.time()
 
-    safety_gate = None
-    if args.safety_file:
-        safety_gate = SafetyGate(safety_file=args.safety_file)
+    safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
+    safety_gate = SafetyGate(safety_file=safety_file)
 
     # asyncio.to_thread runs on the loop's default executor, which sizes itself
     # min(32, cpu+4) — 6 threads on a 2-vCPU jump host. Without this, --workers
@@ -577,18 +642,32 @@ async def main() -> int:
         }
 
         if mode == "show-batch":
-            cmd_results = json.loads(out_text)
-            for cr in cmd_results:
-                if cr.get("ok") and "output" in cr:
-                    cr["output"] = strip_result_header(cr["output"], cr["command"])
-            entry["commands"] = cmd_results
-            if not ok:
+            cmd_results = None
+            try:
+                cmd_results = json.loads(out_text)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                cmd_results = None
+
+            if isinstance(cmd_results, list):
                 for cr in cmd_results:
-                    if not cr["ok"]:
-                        entry["error"] = cr["error"]
+                    if cr.get("ok") and "output" in cr:
+                        cr["output"] = strip_result_header(cr["output"], cr["command"])
+                entry["commands"] = cmd_results
+                if not ok:
+                    for cr in cmd_results:
+                        if not cr.get("ok"):
+                            entry["error"] = cr.get("error", "unknown error")
+                            break
+                    else:
+                        entry["error"] = "unknown error"
+            else:
+                entry["commands"] = []
+                for ln in reversed(out_text.splitlines()):
+                    if ln.startswith("ERROR:"):
+                        entry["error"] = ln[len("ERROR:"):].strip()
                         break
                 else:
-                    entry["error"] = "unknown error"
+                    entry["error"] = out_text.strip() or "unknown error"
         elif ok:
             # Resolved per target, so a shortcut can differ device to device.
             resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
@@ -604,21 +683,42 @@ async def main() -> int:
                 entry["error"] = "unknown error"
         json_results.append(entry)
 
-        # Audit logging for edit operations
-        if args.audit_log and mode != "show" and mode != "show-batch":
-            job_cmd = ""
-            if job_entries:
-                for je in job_entries:
-                    if je.target.name == name:
-                        job_cmd = je.command
-                        break
+        # Audit logging for operations
+        if args.audit_log:
+            audit_payload = ""
+            if mode == "edit-cmd":
+                audit_payload = edit_cmd or ""
+            elif mode == "edit-dir":
+                set_file = Path(args.edit_dir) / f"{name}.set"
+                if set_file.is_file():
+                    try:
+                        audit_payload = set_file.read_text(encoding="utf-8")
+                    except Exception:
+                        audit_payload = f"<failed to read {set_file}>"
+            elif mode == "edit-broadcast":
+                if args.edit_broadcast and Path(args.edit_broadcast).is_file():
+                    try:
+                        audit_payload = Path(args.edit_broadcast).read_text(encoding="utf-8")
+                    except Exception:
+                        audit_payload = f"<failed to read {args.edit_broadcast}>"
+            elif mode == "job":
+                if job_entries:
+                    for je in job_entries:
+                        if je.target.name == name:
+                            audit_payload = je.command
+                            break
+            elif mode == "show":
+                audit_payload = resolve_command(show_cmd, t.vendor) if show_cmd else ""
+            elif mode == "show-batch":
+                audit_payload = json.dumps(batch_cmds) if batch_cmds else ""
+
             write_audit_entry(
                 path=args.audit_log,
                 device=name, host=t.host, vendor=t.vendor,
                 mode=entry.get("_mode", mode),
-                payload=job_cmd or edit_cmd or args.edit_broadcast or "",
+                payload=audit_payload,
                 ok=ok,
-                diff=entry.get("output", ""),
+                diff=entry.get("output", "") if ok else None,
                 error=entry.get("error"),
                 dry_run=args.dry_run,
                 commit_confirmed=args.commit_confirmed,
@@ -626,14 +726,24 @@ async def main() -> int:
 
         if raw_mode:
             if mode == "show-batch":
-                cmd_results = json.loads(out_text)
-                print(f"{name}:")
-                for cr in cmd_results:
-                    if cr["ok"]:
-                        print(strip_result_header(cr["output"], cr["command"]))
-                    else:
-                        print(f"{name}: {cr['command']}: {cr['error']}", file=sys.stderr)
-                print()
+                cmd_results = None
+                try:
+                    cmd_results = json.loads(out_text)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    cmd_results = None
+
+                if isinstance(cmd_results, list):
+                    print(f"{name}:")
+                    for cr in cmd_results:
+                        if cr.get("ok"):
+                            print(strip_result_header(cr["output"], cr["command"]))
+                        else:
+                            print(f"{name}: {cr.get('command')}: {cr.get('error')}", file=sys.stderr)
+                    print()
+                else:
+                    detail = next((ln for ln in out_text.splitlines()
+                                   if ln.startswith("ERROR:")), "failed")
+                    print(f"{name}: {detail}", file=sys.stderr)
             elif ok:
                 resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
                 print(f"{name}:")
@@ -648,28 +758,46 @@ async def main() -> int:
         if not json_mode and not raw_mode:
             timestamp = datetime.now().strftime("%H:%M:%S")
             if mode == "show-batch":
-                cmd_results = json.loads(out_text)
-                ok_count = sum(1 for r in cmd_results if r["ok"])
-                total = len(cmd_results)
-                if ok:
-                    status = f"OK ({ok_count}/{total} commands)"
-                elif ok_count > 0:
-                    status = f"PARTIAL ({ok_count}/{total} commands)"
+                cmd_results = None
+                try:
+                    cmd_results = json.loads(out_text)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    cmd_results = None
+
+                if isinstance(cmd_results, list):
+                    ok_count = sum(1 for r in cmd_results if r.get("ok"))
+                    total = len(cmd_results)
+                    if ok:
+                        status = f"OK ({ok_count}/{total} commands)"
+                    elif ok_count > 0:
+                        status = f"PARTIAL ({ok_count}/{total} commands)"
+                    else:
+                        status = "FAIL"
+                    print(f"[{timestamp}] {name:16s} {status}")
+                    if args.verbose:
+                        for cr in cmd_results:
+                            print(f"\n--- {name}: {cr.get('command')} ---")
+                            if cr.get("ok"):
+                                print(cr.get("output", ""))
+                            else:
+                                print(f"  ERROR: {cr.get('error')}")
+                            print(f"--- end ---")
+                    elif not ok:
+                        for cr in cmd_results:
+                            if not cr.get("ok"):
+                                print(f"  ERROR: {cr.get('command')}: {cr.get('error')}")
                 else:
                     status = "FAIL"
-                print(f"[{timestamp}] {name:16s} {status}")
-                if args.verbose:
-                    for cr in cmd_results:
-                        print(f"\n--- {name}: {cr['command']} ---")
-                        if cr["ok"]:
-                            print(cr["output"])
-                        else:
-                            print(f"  ERROR: {cr['error']}")
-                        print(f"--- end ---")
-                elif not ok:
-                    for cr in cmd_results:
-                        if not cr["ok"]:
-                            print(f"  ERROR: {cr['command']}: {cr['error']}")
+                    print(f"[{timestamp}] {name:16s} {status}")
+                    if args.verbose:
+                        print(f"\n--- Output from {name} ---")
+                        print(out_text)
+                        print(f"--- End of {name} ---\n")
+                    elif not ok:
+                        for ln in reversed(out_text.splitlines()):
+                            if ln.startswith("ERROR:"):
+                                print(f"  {ln}")
+                                break
             else:
                 status = "OK" if ok else "FAIL"
                 print(f"[{timestamp}] {name:16s} {status}")
