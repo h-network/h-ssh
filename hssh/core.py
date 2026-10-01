@@ -67,7 +67,7 @@ def load_devices_csv(path: str) -> List[Target]:
             continue
         name = r[0].strip()
         ip = r[1].strip() if len(r) > 1 else ""
-        vendor = r[2].strip() if len(r) > 2 else "ssh"
+        vendor = r[2].strip().lower() if len(r) > 2 else "ssh"
         port_str = r[3].strip() if len(r) > 3 else ""
         port = int(port_str) if port_str else None
         if not name:
@@ -125,11 +125,11 @@ def parse_inline_target(spec: str) -> Target:
     elif len(parts) == 3:
         if parts[2].isdigit():
             return Target(name=name, host=host, port=int(parts[2]))
-        return Target(name=name, host=host, vendor=parts[2])
+        return Target(name=name, host=host, vendor=parts[2].lower())
     elif len(parts) == 4:
         if parts[2].isdigit():
-            return Target(name=name, host=host, port=int(parts[2]), vendor=parts[3])
-        return Target(name=name, host=host, vendor=parts[2], port=int(parts[3]))
+            return Target(name=name, host=host, port=int(parts[2]), vendor=parts[3].lower())
+        return Target(name=name, host=host, vendor=parts[2].lower(), port=int(parts[3]))
     else:
         raise ValueError(f"Invalid target: {spec!r}")
 
@@ -263,27 +263,38 @@ def validate_junos_set_syntax(payload: str, allow_commit: bool = True) -> Tuple[
 
     Allows comments (#) and blank lines.
     Rejects any non-empty, non-comment line that does not start with one of the valid Junos set verbs.
+    If allow_commit is True, a single standalone 'commit' or 'commit;' command is permitted (for confirming).
+    'commit' cannot be mixed with set commands.
     If allow_commit is False (e.g. for -eD/-eB config files), 'commit' commands are rejected.
     Returns (is_valid, error_description).
     """
     lines = payload.splitlines()
-    non_empty_count = 0
+    meaningful = []
     for idx, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        non_empty_count += 1
-        lower = line.lower()
-        is_valid_verb = (
-            any(lower.startswith(verb) for verb in JUNOS_SET_PREFIX_VERBS)
-            or (allow_commit and lower in JUNOS_SET_EXACT_VERBS)
-        )
-        if not is_valid_verb:
-            if not allow_commit and lower in JUNOS_SET_EXACT_VERBS:
-                return False, f"line {idx}: 'commit' is not permitted in configuration files (-eD/-eB)"
-            return False, f"line {idx}: invalid Junos set command {raw_line.strip()!r} (must start with a valid set verb such as 'set', 'delete', 'activate', etc.)"
-    if non_empty_count == 0:
+        meaningful.append((idx, line))
+
+    if not meaningful:
         return False, "configuration payload contains no commands"
+
+    # Standalone commit command is only permitted if allow_commit is True and it is the single command
+    if len(meaningful) == 1:
+        idx, line = meaningful[0]
+        lower = line.lower()
+        if lower in JUNOS_SET_EXACT_VERBS:
+            if not allow_commit:
+                return False, f"line {idx}: 'commit' is not permitted in configuration files (-eD/-eB)"
+            return True, ""
+
+    for idx, line in meaningful:
+        lower = line.lower()
+        if lower in JUNOS_SET_EXACT_VERBS:
+            return False, f"line {idx}: 'commit' cannot be combined with set commands (standalone only)"
+        if not any(lower.startswith(verb) for verb in JUNOS_SET_PREFIX_VERBS):
+            return False, f"line {idx}: invalid Junos set command {line!r} (must start with a valid set verb such as 'set', 'delete', 'activate', etc.)"
+
     return True, ""
 
 
@@ -291,15 +302,18 @@ def _load_commands_json(vendor: str) -> Dict:
     """Load command templates from JSON file for a vendor.
 
     Lookup order:
-    - Package shipped defaults (commands/{vendor}.json relative to package)
+    - Package shipped defaults (hssh/commands/{vendor}.json or commands/{vendor}.json relative to package)
     - Local ./commands/{vendor}.json (if different from package path)
     - ~/.h-ssh/commands/{vendor}.json (user overrides)
     """
     commands = {}
 
-    # Shipped defaults relative to package root
-    package_dir = Path(__file__).resolve().parent.parent / "commands"
-    package_path = package_dir / f"{vendor}.json"
+    # Shipped defaults: check hssh/commands/ then ../commands/ relative to core.py
+    pkg_dir = Path(__file__).resolve().parent
+    package_path = pkg_dir / "commands" / f"{vendor}.json"
+    if not package_path.is_file():
+        package_path = pkg_dir.parent / "commands" / f"{vendor}.json"
+
     if package_path.is_file():
         try:
             commands.update(json.loads(package_path.read_text(encoding="utf-8")))
