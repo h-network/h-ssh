@@ -157,8 +157,8 @@ def test_validate_junos_set_syntax():
     set system host-name R1
     
     # Interface config
-    SET interfaces ge-0/0/0 unit 0 family inet address 192.0.2.1/24
-    DELETE interfaces ge-0/0/1
+    set interfaces ge-0/0/0 unit 0 family inet address 192.0.2.1/24
+    delete interfaces ge-0/0/1
     deactivate interfaces ge-0/0/2
     activate interfaces ge-0/0/3
     annotate interfaces ge-0/0/0 "Uplink"
@@ -174,9 +174,18 @@ def test_validate_junos_set_syntax():
     assert valid is True
     assert err == ""
 
-    valid, err = validate_junos_set_syntax("COMMIT;", allow_commit=True)
+    valid, err = validate_junos_set_syntax("commit;", allow_commit=True)
     assert valid is True
     assert err == ""
+
+    # Uppercase verbs are rejected by guard
+    valid, err = validate_junos_set_syntax("SET system host-name R1", allow_commit=True)
+    assert valid is False
+    assert "invalid Junos set command" in err
+
+    valid, err = validate_junos_set_syntax("COMMIT", allow_commit=True)
+    assert valid is False
+    assert "invalid Junos set command" in err
 
     # Standalone commit is rejected when allow_commit is False (-eD/-eB)
     valid, err = validate_junos_set_syntax("commit", allow_commit=False)
