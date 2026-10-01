@@ -282,17 +282,16 @@ def validate_junos_set_syntax(payload: str, allow_commit: bool = True) -> Tuple[
     # Standalone commit command is only permitted if allow_commit is True and it is the single command
     if len(meaningful) == 1:
         idx, line = meaningful[0]
-        lower = line.lower()
-        if lower in JUNOS_SET_EXACT_VERBS:
+        if line in JUNOS_SET_EXACT_VERBS:
             if not allow_commit:
                 return False, f"line {idx}: 'commit' is not permitted in configuration files (-eD/-eB)"
             return True, ""
 
     for idx, line in meaningful:
-        lower = line.lower()
-        if lower in JUNOS_SET_EXACT_VERBS:
+        if line in JUNOS_SET_EXACT_VERBS:
             return False, f"line {idx}: 'commit' cannot be combined with set commands (standalone only)"
-        if not any(lower.startswith(verb) for verb in JUNOS_SET_PREFIX_VERBS):
+        # Junos CLI requires lowercase set verbs (reject uppercase like 'SET')
+        if not any(line.startswith(verb) for verb in JUNOS_SET_PREFIX_VERBS):
             return False, f"line {idx}: invalid Junos set command {line!r} (must start with a valid set verb such as 'set', 'delete', 'activate', etc.)"
 
     return True, ""

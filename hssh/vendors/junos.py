@@ -156,7 +156,7 @@ def _config_format(payload: str) -> str:
     """"set" when every meaningful line is a set-style command, else "text"."""
     lines = [ln.strip() for ln in payload.splitlines()]
     lines = [ln for ln in lines if ln and not ln.startswith("#")]
-    if lines and all(ln.lower().startswith(JUNOS_SET_PREFIX_VERBS) for ln in lines):
+    if lines and all(ln.startswith(JUNOS_SET_PREFIX_VERBS) for ln in lines):
         return "set"
     return "text"
 
