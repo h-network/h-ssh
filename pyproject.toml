@@ -30,5 +30,9 @@ h-ssh = "hssh.cli:main_sync"
 [tool.setuptools.dynamic]
 version = {attr = "hssh.__version__"}
 
+[tool.setuptools.package-data]
+"*" = ["*.json", "commands/*.json"]
+"hssh" = ["commands/*.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

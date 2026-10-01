@@ -157,19 +157,36 @@ def test_validate_junos_set_syntax():
     set system host-name R1
     
     # Interface config
-    set interfaces ge-0/0/0 unit 0 family inet address 192.0.2.1/24
-    delete interfaces ge-0/0/1
+    SET interfaces ge-0/0/0 unit 0 family inet address 192.0.2.1/24
+    DELETE interfaces ge-0/0/1
     deactivate interfaces ge-0/0/2
     activate interfaces ge-0/0/3
     annotate interfaces ge-0/0/0 "Uplink"
     protect system
     unprotect system
-    commit
-    commit;
     """
     valid, err = validate_junos_set_syntax(payload)
     assert valid is True
     assert err == ""
+
+    # Standalone commit is valid when allow_commit is True
+    valid, err = validate_junos_set_syntax("commit", allow_commit=True)
+    assert valid is True
+    assert err == ""
+
+    valid, err = validate_junos_set_syntax("COMMIT;", allow_commit=True)
+    assert valid is True
+    assert err == ""
+
+    # Standalone commit is rejected when allow_commit is False (-eD/-eB)
+    valid, err = validate_junos_set_syntax("commit", allow_commit=False)
+    assert valid is False
+    assert "not permitted in configuration files" in err
+
+    # Commit cannot be combined with set commands
+    valid, err = validate_junos_set_syntax("set system host-name R1\ncommit", allow_commit=True)
+    assert valid is False
+    assert "cannot be combined" in err
 
     # Multi-line bypass attempt (line 1 valid set, line 2 invalid command)
     bypass_payload = "set system host-name R1\nreboot"
