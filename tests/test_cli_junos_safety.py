@@ -116,3 +116,46 @@ def test_cli_audit_logging_preflight_abort(tmp_path):
     assert record["device"] == "CR1"
     assert record["ok"] is False
     assert "preflight" in record["error"]
+
+
+def test_cli_opt_in_safety_gate_no_file(tmp_path):
+    """H2: Without --safety-file, SafetyGate is not active and does not block >10 commands."""
+    devices = tmp_path / "devices.csv"
+    # 12 targets sharing the same host
+    lines = [f"R{i},127.0.0.1:1,ssh" for i in range(1, 13)]
+    devices.write_text("\n".join(lines) + "\n")
+
+    hssh = Path(__file__).resolve().parent.parent / "h-ssh.py"
+
+    res = subprocess.run(
+        [sys.executable, str(hssh), "--devices", str(devices), "-sC", "uptime",
+         "--user", "test", "--password", "test", "--session-timeout", "1", "--json"],
+        capture_output=True,
+        text=True,
+    )
+    # Output should not contain rate limiting error
+    assert "rate limited" not in res.stdout
+    assert "rate limited" not in res.stderr
+
+
+def test_cli_audit_show_has_no_diff(tmp_path):
+    """M3: Show commands do not record diff in audit log."""
+    devices = tmp_path / "devices.csv"
+    devices.write_text("R1,127.0.0.1:1,ssh\n")
+    audit_file = tmp_path / "audit.jsonl"
+
+    hssh = Path(__file__).resolve().parent.parent / "h-ssh.py"
+
+    res = subprocess.run(
+        [sys.executable, str(hssh), "--devices", str(devices), "-sC", "show version",
+         "--user", "test", "--password", "test", "--session-timeout", "1",
+         "--audit-log", str(audit_file)],
+        capture_output=True,
+        text=True,
+    )
+    if audit_file.exists() and audit_file.stat().st_size > 0:
+        lines = audit_file.read_text().splitlines()
+        for line in lines:
+            record = json.loads(line)
+            assert "diff" not in record
+

@@ -47,7 +47,6 @@ class SafetyGate:
 
         # Tier 1: in-memory state
         self._active: set[str] = set()
-        self._attempt_count: dict[str, int] = {}
         self._attempt_timestamps: dict[str, list[float]] = {}
 
         # Tier 2: file-based state
@@ -96,15 +95,11 @@ class SafetyGate:
             self._attempt_timestamps[host] = timestamps
 
             count = len(timestamps)
-            legacy_count = self._attempt_count.get(host, 0)
-            effective_count = max(count, legacy_count)
-
-            if effective_count >= self._rate_limit:
-                return False, f"rate limited {effective_count}/{self._rate_limit}"
+            if count >= self._rate_limit:
+                return False, f"rate limited {count}/{self._rate_limit}"
 
             # Allow and mark active (fail-closed)
             self._active.add(host)
-            self._attempt_count[host] = legacy_count + 1
             self._attempt_timestamps[host].append(now)
             return True, "ok"
 
@@ -125,6 +120,8 @@ class SafetyGate:
     def close(self) -> None:
         """Prune expired cooldowns and persist to file."""
         with self._lock:
+            if self._corrupt:
+                return
             self._prune_expired()
             if self._safety_file:
                 self._save_cooldowns()
@@ -156,14 +153,37 @@ class SafetyGate:
             logger.warning("Could not lock safety file %s: %s (continuing without file lock)", lock_path, e)
             yield
 
+    def _mark_corrupt(self, path: Path) -> None:
+        """Mark as corrupt and move corrupt file aside to .corrupt."""
+        self._corrupt = True
+        try:
+            if path.exists():
+                corrupt_path = Path(f"{self._safety_file}.corrupt")
+                os.replace(str(path), str(corrupt_path))
+        except OSError:
+            pass
+
     def _load_cooldowns(self) -> None:
         """Load cooldown data from file, merging with in-memory entries."""
+        if not self._safety_file:
+            return
+
+        corrupt_path = Path(f"{self._safety_file}.corrupt")
+        if corrupt_path.exists():
+            self._corrupt = True
+            return
+
         path = Path(self._safety_file)
         if not path.exists():
             self._corrupt = False
             return
 
         try:
+            # 0-byte file is treated as empty dictionary
+            if path.stat().st_size == 0:
+                self._corrupt = False
+                return
+
             with open(path, "r", encoding="utf-8") as f:
                 fcntl.flock(f, fcntl.LOCK_SH)
                 try:
@@ -171,30 +191,39 @@ class SafetyGate:
                 finally:
                     fcntl.flock(f, fcntl.LOCK_UN)
 
+            if not isinstance(data, dict):
+                self._mark_corrupt(path)
+                logger.error("Safety file %s has invalid non-dictionary structure", self._safety_file)
+                return
+
             self._corrupt = False
             now = time.time()
-            if isinstance(data, dict):
-                disk_cooldowns = {
-                    host: float(expires)
-                    for host, expires in data.items()
-                    if float(expires) > now
-                }
-                # Merge: disk entries and memory entries
-                for host, expires in disk_cooldowns.items():
-                    if host not in self._cooldowns or expires > self._cooldowns[host]:
-                        self._cooldowns[host] = expires
-            else:
-                self._corrupt = True
-                logger.error("Safety file %s has invalid non-dictionary structure", self._safety_file)
+            disk_cooldowns = {}
+            for host, expires in data.items():
+                if expires is not None:
+                    try:
+                        exp_float = float(expires)
+                        if exp_float > now:
+                            disk_cooldowns[str(host)] = exp_float
+                    except (TypeError, ValueError):
+                        continue
+
+            # Merge: disk entries and memory entries
+            for host, expires in disk_cooldowns.items():
+                if host not in self._cooldowns or expires > self._cooldowns[host]:
+                    self._cooldowns[host] = expires
 
         except (json.JSONDecodeError, ValueError) as e:
-            self._corrupt = True
+            self._mark_corrupt(path)
             logger.error("Could not parse safety file %s: %s (fail-closed)", self._safety_file, e)
         except OSError as e:
             logger.warning("Could not read safety file %s: %s (continuing in-memory only)", self._safety_file, e)
 
     def _save_cooldowns(self) -> None:
         """Persist cooldown data to file with exclusive lock, merge, and atomic replace."""
+        if self._corrupt:
+            return
+
         path = Path(self._safety_file)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -206,14 +235,19 @@ class SafetyGate:
             now = time.time()
             # Read current on-disk entries to merge
             merged: dict[str, float] = {}
-            if path.exists():
+            if path.exists() and path.stat().st_size > 0:
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         disk_data = json.load(f)
                         if isinstance(disk_data, dict):
                             for h, exp in disk_data.items():
-                                if float(exp) > now:
-                                    merged[h] = float(exp)
+                                if exp is not None:
+                                    try:
+                                        exp_val = float(exp)
+                                        if exp_val > now:
+                                            merged[str(h)] = exp_val
+                                    except (TypeError, ValueError):
+                                        pass
                 except Exception:
                     pass
 

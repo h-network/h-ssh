@@ -271,8 +271,9 @@ Layered, and every layer is off the critical path until you ask for a write.
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
 | Dry run | `--dry-run` | Junos (NETCONF and telnet-junos): loads, runs `commit_check`, diffs, then discards the candidate. Other transports **refuse** `--dry-run` for edits instead of pretending |
 | Commit confirmed | `--commit-confirmed N` | Junos rolls back after N minutes unless confirmed (confirm with `-eC "commit"`). Transports that cannot do this (`ssh`, `arista`, telnet IOS/NX-OS/Arista, `openssh`) refuse it rather than commit with no timer |
-| Safety gate | `--safety-file PATH` | 10 attempts per device per run; 120 s cooldown after a failure, held in a `flock`'d JSON file so it survives across processes |
-| Audit trail | `--audit-log PATH` | Every edit appended as JSONL |
+| Junos syntax guard | *(automatic)* | Enforces set-style syntax (`set`, `delete`, `activate`, `deactivate`, etc.) with `#`-only comments for `junos` and `telnet-junos`. `commit` is only valid as an exact command in `-eC` or `--job`, never inside `-eD`/`-eB` configuration files |
+| Safety gate | `--safety-file PATH` | Opt-in sliding-window rate limit (10 attempts / host / 60 s); 120 s cooldown after connection/auth failure, held in a `flock`'d 0600 JSON file so it persists safely across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
+| Audit trail | `--audit-log PATH` | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). Tracks edits, pre-flight aborts, and user cancellations; records diffs for edits and suppresses diffs on show operations. In edit modes, audit write failures fail the run |
 
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a crash mid-run leaves it blocked rather than open.
 

@@ -151,12 +151,12 @@ def test_resolve_target_port():
 def test_validate_junos_set_syntax():
     from hssh.core import validate_junos_set_syntax
 
-    # Valid set commands with comments and blank lines
+    # Valid set commands with # comments and blank lines
     payload = """
     # Set system hostname
     set system host-name R1
     
-    /* Interface config */
+    # Interface config
     set interfaces ge-0/0/0 unit 0 family inet address 192.0.2.1/24
     delete interfaces ge-0/0/1
     deactivate interfaces ge-0/0/2
@@ -164,6 +164,8 @@ def test_validate_junos_set_syntax():
     annotate interfaces ge-0/0/0 "Uplink"
     protect system
     unprotect system
+    commit
+    commit;
     """
     valid, err = validate_junos_set_syntax(payload)
     assert valid is True
@@ -186,6 +188,25 @@ def test_validate_junos_set_syntax():
     valid, err = validate_junos_set_syntax("  \n# only comments\n  ")
     assert valid is False
     assert "no commands" in err
+
+    # Reject 'commitfoo'
+    valid, err = validate_junos_set_syntax("commitfoo")
+    assert valid is False
+    assert "invalid Junos set command" in err
+
+    # Reject 'commit confirmed' as raw command (must use --commit-confirmed flag)
+    valid, err = validate_junos_set_syntax("commit confirmed")
+    assert valid is False
+    assert "invalid Junos set command" in err
+
+    # Reject C-style and Cisco-style comments (! and /*)
+    valid, err = validate_junos_set_syntax("/* comment */\nset system host-name R1")
+    assert valid is False
+    assert "line 1" in err
+
+    valid, err = validate_junos_set_syntax("! comment\nset system host-name R1")
+    assert valid is False
+    assert "line 1" in err
 
 
 def test_command_template_path_resolution(tmp_path, monkeypatch):

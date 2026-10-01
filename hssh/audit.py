@@ -17,6 +17,10 @@ _REDACT_PATTERNS = [
      r'\1[REDACTED]'),
     (re.compile(r'((?:password|secret|token|api[_-]?key|passwd)\s*[:=]\s*)(?:("[^"]*"|\'[^\']*\'|[^\s,;]+))', re.IGNORECASE),
      r'\1[REDACTED]'),
+    (re.compile(r'(\bcommunity\s+)(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+     r'\1[REDACTED]'),
+    (re.compile(r'(\b(?:pre-shared-key|ascii-text|hexadecimal|hex-key|key-hex)\s+(?:(?:ascii-text|hexadecimal|hex-key|key-hex)\s+)?)(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+     r'\1[REDACTED]'),
 ]
 
 
@@ -65,7 +69,7 @@ def write_audit_entry(
         if diff:
             entry["diff"] = redact_secrets(diff)
         if error:
-            entry["error"] = error
+            entry["error"] = redact_secrets(error)
 
         log_path = Path(path)
         log_path.parent.mkdir(parents=True, exist_ok=True)

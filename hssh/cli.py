@@ -263,8 +263,8 @@ async def main() -> int:
         has_edits = any(e.mode.startswith("edit") for e in job_entries)
         mode = "job"
         for je in job_entries:
-            if je.target.vendor == "junos" and je.mode.startswith("edit"):
-                valid, err = validate_junos_set_syntax(je.command)
+            if je.target.vendor in ("junos", "telnet-junos") and je.mode.startswith("edit"):
+                valid, err = validate_junos_set_syntax(je.command, allow_commit=True)
                 if not valid:
                     print(f"ERROR: Junos job command for '{je.target.name}' only accepts set-style commands: {err}", file=sys.stderr)
                     return 2
@@ -313,10 +313,10 @@ async def main() -> int:
 
         # Junos set-syntax check keys off the targets, not a global flag —
         # a mixed inventory can have some devices that care and some that don't.
-        has_junos = any(t.vendor == "junos" for t in targets)
+        has_junos = any(t.vendor in ("junos", "telnet-junos") for t in targets)
         if has_junos:
             if args.edit_command:
-                valid, err = validate_junos_set_syntax(args.edit_command)
+                valid, err = validate_junos_set_syntax(args.edit_command, allow_commit=True)
                 if not valid:
                     print(f"ERROR: Junos -eC only accepts 'set ...' commands: {err}", file=sys.stderr)
                     return 2
@@ -326,13 +326,13 @@ async def main() -> int:
                 except Exception as e:
                     print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
                     return 2
-                valid, err = validate_junos_set_syntax(b_content)
+                valid, err = validate_junos_set_syntax(b_content, allow_commit=False)
                 if not valid:
                     print(f"ERROR: Junos broadcast file '{args.edit_broadcast}' only accepts 'set ...' commands: {err}", file=sys.stderr)
                     return 2
             elif args.edit_dir:
                 for t in targets:
-                    if t.vendor == "junos":
+                    if t.vendor in ("junos", "telnet-junos"):
                         set_file = Path(args.edit_dir) / f"{t.name}.set"
                         if set_file.is_file():
                             try:
@@ -340,7 +340,7 @@ async def main() -> int:
                             except Exception as e:
                                 print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
                                 return 2
-                            valid, err = validate_junos_set_syntax(d_content)
+                            valid, err = validate_junos_set_syntax(d_content, allow_commit=False)
                             if not valid:
                                 print(f"ERROR: Junos config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
                                 return 2
@@ -548,7 +548,7 @@ async def main() -> int:
     run_start = time.time()
 
     safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
-    safety_gate = SafetyGate(safety_file=safety_file)
+    safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
 
     # asyncio.to_thread runs on the loop's default executor, which sizes itself
     # min(32, cpu+4) — 6 threads on a 2-vCPU jump host. Without this, --workers
@@ -687,7 +687,7 @@ async def main() -> int:
         if args.audit_log:
             audit_payload = ""
             if mode == "edit-cmd":
-                audit_payload = edit_cmd or ""
+                audit_payload = resolve_command(edit_cmd, t.vendor) if edit_cmd else ""
             elif mode == "edit-dir":
                 set_file = Path(args.edit_dir) / f"{name}.set"
                 if set_file.is_file():
@@ -705,24 +705,42 @@ async def main() -> int:
                 if job_entries:
                     for je in job_entries:
                         if je.target.name == name:
-                            audit_payload = je.command
+                            audit_payload = resolve_command(je.command, t.vendor) if je.command else ""
                             break
             elif mode == "show":
                 audit_payload = resolve_command(show_cmd, t.vendor) if show_cmd else ""
             elif mode == "show-batch":
-                audit_payload = json.dumps(batch_cmds) if batch_cmds else ""
+                audit_payload = (
+                    json.dumps([resolve_command(c, t.vendor) for c in batch_cmds])
+                    if batch_cmds else ""
+                )
 
-            write_audit_entry(
+            audit_mode = mode
+            if mode == "job" and job_entries:
+                for je in job_entries:
+                    if je.target.name == name:
+                        audit_mode = je.mode
+                        break
+
+            is_show_op = audit_mode in ("show", "show-batch")
+            audit_diff = entry.get("output", "") if (ok and not is_show_op) else None
+
+            audit_ok = write_audit_entry(
                 path=args.audit_log,
-                device=name, host=t.host, vendor=t.vendor,
-                mode=entry.get("_mode", mode),
+                device=name,
+                host=t.host,
+                vendor=t.vendor,
+                mode=audit_mode,
                 payload=audit_payload,
                 ok=ok,
-                diff=entry.get("output", "") if ok else None,
+                diff=audit_diff,
                 error=entry.get("error"),
                 dry_run=args.dry_run,
                 commit_confirmed=args.commit_confirmed,
             )
+            if not audit_ok and (has_edits or not is_show_op):
+                print(f"ERROR: Failed to write audit entry for {name}", file=sys.stderr)
+                failures += 1
 
         if raw_mode:
             if mode == "show-batch":

@@ -242,7 +242,7 @@ def resolve_target_port(target: Target) -> int:
     return DEFAULT_VENDOR_PORTS.get(target.vendor, 22)
 
 
-JUNOS_SET_VERBS = (
+JUNOS_SET_PREFIX_VERBS = (
     "set ",
     "delete ",
     "activate ",
@@ -253,26 +253,34 @@ JUNOS_SET_VERBS = (
     "annotate ",
     "protect ",
     "unprotect ",
-    "commit",
 )
+JUNOS_SET_EXACT_VERBS = ("commit", "commit;")
+JUNOS_SET_VERBS = JUNOS_SET_PREFIX_VERBS + ("commit",)
 
 
-def validate_junos_set_syntax(payload: str) -> Tuple[bool, str]:
+def validate_junos_set_syntax(payload: str, allow_commit: bool = True) -> Tuple[bool, str]:
     """Validate that every non-empty, non-comment line starts with a valid Junos set verb.
 
-    Allows comments (#, /* ... */, !, //) and blank lines.
+    Allows comments (#) and blank lines.
     Rejects any non-empty, non-comment line that does not start with one of the valid Junos set verbs.
+    If allow_commit is False (e.g. for -eD/-eB config files), 'commit' commands are rejected.
     Returns (is_valid, error_description).
     """
     lines = payload.splitlines()
     non_empty_count = 0
     for idx, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
-        if not line or line.startswith(("#", "!", "//", "/*")):
+        if not line or line.startswith("#"):
             continue
         non_empty_count += 1
         lower = line.lower()
-        if not any(lower.startswith(verb) or lower == verb.rstrip() for verb in JUNOS_SET_VERBS):
+        is_valid_verb = (
+            any(lower.startswith(verb) for verb in JUNOS_SET_PREFIX_VERBS)
+            or (allow_commit and lower in JUNOS_SET_EXACT_VERBS)
+        )
+        if not is_valid_verb:
+            if not allow_commit and lower in JUNOS_SET_EXACT_VERBS:
+                return False, f"line {idx}: 'commit' is not permitted in configuration files (-eD/-eB)"
             return False, f"line {idx}: invalid Junos set command {raw_line.strip()!r} (must start with a valid set verb such as 'set', 'delete', 'activate', etc.)"
     if non_empty_count == 0:
         return False, "configuration payload contains no commands"

@@ -39,7 +39,7 @@ def test_release_and_reallow():
 
     allowed, reason = gate.check_device("10.0.1.1")
     assert allowed is True
-    assert gate._attempt_count["10.0.1.1"] == 2
+    assert len(gate._attempt_timestamps["10.0.1.1"]) == 2
 
 
 # T4: Rate limit (10/device)
@@ -174,6 +174,7 @@ def test_fail_closed_on_corrupt_file():
     finally:
         Path(tmp).unlink(missing_ok=True)
         Path(f"{tmp}.lock").unlink(missing_ok=True)
+        Path(f"{tmp}.corrupt").unlink(missing_ok=True)
 
 
 def test_file_permissions_0600():
@@ -264,6 +265,101 @@ def test_fail_closed_active_before_return():
     allowed2, reason2 = gate.check_device("10.0.1.1")
     assert allowed2 is False
     assert "active connection" in reason2
+
+
+def test_sliding_window_budget_frees():
+    """H1: Rate limit budget frees after rate_window expires without accumulating permanently."""
+    gate = SafetyGate(rate_limit=3, rate_window=0.2)
+    host = "10.0.1.1"
+
+    # Exhaust budget of 3
+    for _ in range(3):
+        allowed, reason = gate.check_device(host)
+        assert allowed is True
+        gate.release_device(host)
+
+    # 4th attempt immediately should be blocked
+    allowed, reason = gate.check_device(host)
+    assert allowed is False
+    assert "rate limited 3/3" in reason
+
+    # Wait for the sliding window to expire
+    time.sleep(0.25)
+
+    # Budget should now be freed
+    allowed, reason = gate.check_device(host)
+    assert allowed is True
+    assert reason == "ok"
+    gate.release_device(host)
+
+
+def test_corrupt_file_rename_no_silent_heal():
+    """M1: Corrupted safety file is renamed to .corrupt and fails closed across runs without silent heal."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write("{invalid: json,")
+        tmp = f.name
+    corrupt_file = Path(f"{tmp}.corrupt")
+
+    try:
+        gate1 = SafetyGate(safety_file=tmp)
+        allowed, reason = gate1.check_device("10.0.1.1")
+        assert allowed is False
+        assert "corrupt" in reason.lower()
+        assert corrupt_file.exists()
+
+        # close() should NOT overwrite with {} or heal the file
+        gate1.close()
+        assert corrupt_file.exists()
+
+        # Second instance must also fail closed
+        gate2 = SafetyGate(safety_file=tmp)
+        allowed2, reason2 = gate2.check_device("10.0.1.1")
+        assert allowed2 is False
+        assert "corrupt" in reason2.lower()
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+        Path(f"{tmp}.lock").unlink(missing_ok=True)
+        corrupt_file.unlink(missing_ok=True)
+
+
+def test_safety_file_null_values():
+    """M1: Null values in JSON cooldowns must not raise TypeError."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        future = time.time() + 300
+        json.dump({"10.0.1.1": None, "10.0.1.2": future}, f)
+        tmp = f.name
+
+    try:
+        gate = SafetyGate(safety_file=tmp)
+        # 10.0.1.1 has null cooldown, should be allowed
+        allowed1, _ = gate.check_device("10.0.1.1")
+        assert allowed1 is True
+        gate.release_device("10.0.1.1")
+
+        # 10.0.1.2 has active cooldown, should be blocked
+        allowed2, reason2 = gate.check_device("10.0.1.2")
+        assert allowed2 is False
+        assert "cooldown active" in reason2
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+        Path(f"{tmp}.lock").unlink(missing_ok=True)
+
+
+def test_safety_file_zero_byte():
+    """M1: 0-byte safety file is treated as empty dictionary without corrupting."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        tmp = f.name  # 0 bytes
+
+    try:
+        gate = SafetyGate(safety_file=tmp)
+        allowed, reason = gate.check_device("10.0.1.1")
+        assert allowed is True
+        assert reason == "ok"
+        gate.release_device("10.0.1.1")
+        assert not Path(f"{tmp}.corrupt").exists()
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+        Path(f"{tmp}.lock").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -123,3 +123,66 @@ def test_audit_graceful_failure():
         ok=True,
     )
     assert ok is False
+
+
+def test_audit_extended_secret_redaction():
+    """M3: Audit redacts community, pre-shared-key, ascii-text, hex keys, and error messages."""
+    text_samples = [
+        ('set snmp community public authorization read-only', 'public'),
+        ('snmp-server community secret123 RO', 'secret123'),
+        ('pre-shared-key ascii-text "$9$secret"', '$9$secret'),
+        ('pre-shared-key hexadecimal 1234abcd', '1234abcd'),
+        ('pre-shared-key rawsecret', 'rawsecret'),
+        ('ascii-text plainsecret', 'plainsecret'),
+        ('hex-key deadbeef1234', 'deadbeef1234'),
+        ('hexadecimal abcd5678', 'abcd5678'),
+    ]
+    for sample, secret in text_samples:
+        redacted = redact_secrets(sample)
+        assert secret not in redacted, f"Failed to redact {secret} from {sample}"
+        assert "[REDACTED]" in redacted
+
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+        tmp = f.name
+    try:
+        write_audit_entry(
+            path=tmp,
+            device="R1",
+            host="10.0.1.1",
+            vendor="junos",
+            mode="edit-cmd",
+            payload='set snmp community secretcomm',
+            ok=False,
+            error='failed on pre-shared-key ascii-text "$9$badpass"',
+        )
+        with open(tmp, "r", encoding="utf-8") as f:
+            record = json.loads(f.readline())
+        assert "secretcomm" not in record["payload"]
+        assert "$9$badpass" not in record["error"]
+        assert "[REDACTED]" in record["payload"]
+        assert "[REDACTED]" in record["error"]
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def test_audit_show_diff_suppressed():
+    """M3: Show operations do not record diff."""
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+        tmp = f.name
+    try:
+        write_audit_entry(
+            path=tmp,
+            device="R1",
+            host="10.0.1.1",
+            vendor="junos",
+            mode="show",
+            payload="show version",
+            ok=True,
+            diff=None,
+        )
+        with open(tmp, "r", encoding="utf-8") as f:
+            record = json.loads(f.readline())
+        assert "diff" not in record
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
