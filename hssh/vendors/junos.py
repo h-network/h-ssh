@@ -9,6 +9,7 @@ everywhere; set the target's port to use NETCONF over SSH on 22.
 
 from typing import List, Optional
 
+from ..core import JUNOS_SET_PREFIX_VERBS
 from ..errors import AmbiguousCommitError, NotAppliedError
 
 try:
@@ -36,10 +37,6 @@ except ImportError:
 
     class RpcTimeoutError(Exception):
         pass
-
-# Config lines the "set" loader understands. Anything else is loaded as text.
-_SET_VERBS = ("set ", "delete ", "activate ", "deactivate ", "insert ",
-              "rename ", "copy ", "annotate ", "protect ", "unprotect ")
 
 DEFAULT_PORT = 830
 
@@ -159,7 +156,7 @@ def _config_format(payload: str) -> str:
     """"set" when every meaningful line is a set-style command, else "text"."""
     lines = [ln.strip() for ln in payload.splitlines()]
     lines = [ln for ln in lines if ln and not ln.startswith("#")]
-    if lines and all(ln.startswith(_SET_VERBS) for ln in lines):
+    if lines and all(ln.startswith(JUNOS_SET_PREFIX_VERBS) for ln in lines):
         return "set"
     return "text"
 
