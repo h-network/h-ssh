@@ -371,10 +371,12 @@ The unit suite (187 tests at the time of writing) needs no devices. Beyond it, 5
 routers on 24.2R1-S2.5, covering every mode, both edit paths, concurrency, error handling, exit codes and the safety gate. Breakdown in
 [TESTS.md](TESTS.md).
 
-## See also
+## Related global repos
 
 - [`h-network/junos-mcp-server`](https://github.com/h-network/junos-mcp-server): the same device access exposed to an LLM over MCP
 - [`h-network/h-cli`](https://github.com/h-network/h-cli): AI-driven infrastructure management this feeds into
+- [`h-network/h-agent`](https://github.com/h-network/h-agent): unattended launcher for claude, codex and agy
+- [`h-network/h-mesh`](https://github.com/h-network/h-mesh): agentic office framework
 
 ## License
 
