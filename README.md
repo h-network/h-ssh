@@ -1,43 +1,39 @@
 <div align="center">
 
-<img src="docs/assets/banner.svg" alt="h-ssh — the fleet loop, not the session" width="860">
+<img src="docs/assets/banner.svg" alt="H-SSH // the fleet loop, not the session // h-network" width="600">
 
 <br/>
 
-[![Version](https://img.shields.io/badge/version-1.0.0-8B5CF6?style=for-the-badge)](#-quick-start)
-![Vendors](https://img.shields.io/badge/vendors-junos_%C2%B7_arista_%C2%B7_ssh_%C2%B7_openssh_%C2%B7_telnet-6366F1?style=for-the-badge)
-![Tests](https://img.shields.io/badge/tests-46_unit_%2B_59_live-22c55e?style=for-the-badge)
-![License](https://img.shields.io/badge/license-MIT-64748b?style=for-the-badge)
-
-![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![Runtime dep](https://img.shields.io/badge/runtime_dep-paramiko_only-6366F1?style=flat-square)
-![NETCONF](https://img.shields.io/badge/config_writes-PyEZ_NETCONF-84CC16?style=flat-square)
-![Size](https://img.shields.io/badge/~2800_lines-pure_Python-8B5CF6?style=flat-square)
-![telnetlib](https://img.shields.io/badge/no_stdlib_telnetlib-3.13_ready-475569?style=flat-square)
-
-**h-ssh is the fleet loop, not the session. Point it at one device or three hundred — Juniper, Arista, any SSH box, kit still on a telnet console — and get the output back, in parallel, with the connection handling gone.**
-
-The per-device session is a solved problem; what nobody hands you is everything *around* it. The thread pool. Collecting results per device. Making sure one dead box doesn't sink the run. A rate limiter so you don't hammer a router you've already failed against. A record of what you changed. That's the part you'd otherwise rewrite in every script, and it's what this is.
-
-On Junos, everything goes through PyEZ over NETCONF — reads and writes alike — because the official library gives one session, real RPC errors, and the lock, diff and rollback that config changes need. Every edit passes a safety gate, prompts before it commits, and lands in a JSONL audit trail — and `--commit-confirmed` puts the device back the way it was if you never confirm.
-
-[Quick start](#-quick-start) · [Modes](#️-modes) · [Transports](#-transports) · [Structured output](#-structured-output) · [Safety](#-safety) · [Library use](#-library-usage) · [Test results](TESTS.md)
+[![License: PolyForm Noncommercial 1.0.0](docs/assets/badges/license.svg)](LICENSE)
+![Python 3.10+](docs/assets/badges/python.svg)
+![Vendors: junos arista ssh openssh telnet](docs/assets/badges/vendors.svg)
+![Runtime dependency: paramiko only](docs/assets/badges/deps.svg)
 
 </div>
 
----
+# h-ssh
 
-## ✨ What it is
+`h-ssh` runs commands across a fleet of network devices: one device or three hundred, Juniper, Arista, any SSH host, or a console
+still speaking telnet. Devices are worked in parallel, results are collected per device, and one dead box does not sink the run.
 
-- **🔌 Four transports, one interface.** Juniper (PyEZ over NETCONF), Arista (eAPI), any generic SSH device, and raw-socket telnet — including IOS- and Junos-flavoured prompt handling. Same flags whichever you point it at.
-- **⚡ Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
-- **🎯 One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
-- **🛡️ Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing, per-device rate limit and cooldown, and `--commit-confirmed N` for changes that undo themselves if you lose the session.
-- **📋 Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
-- **🤖 Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely.
-- **🪶 One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
+The per-device session is a solved problem; what is left is everything around it: the thread pool, per-device result collection, a rate
+limiter so a router that already failed is not hammered, and a record of what changed. That is the part h-ssh provides.
 
-## ⚙️ How it works
+On Junos, everything goes through PyEZ over NETCONF, reads and writes alike, which gives one session, real RPC errors, and the lock, diff
+and rollback that config changes need. Every edit passes a safety gate, prompts before it commits, and lands in a JSONL audit trail.
+`--commit-confirmed` puts the device back the way it was if you never confirm.
+
+## Features
+
+- **Four transports, one interface.** Juniper (PyEZ over NETCONF), Arista (eAPI), any generic SSH device, and raw-socket telnet — including IOS- and Junos-flavoured prompt handling. Same flags whichever you point it at.
+- **Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
+- **One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
+- **Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing, per-device rate limit and cooldown, and `--commit-confirmed N` for changes that undo themselves if you lose the session.
+- **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
+- **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely.
+- **One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
+
+## How it works
 
 ```
   devices.csv / --target / --job              per device, up to --workers at once
@@ -56,7 +52,7 @@ On Junos, everything goes through PyEZ over NETCONF — reads and writes alike �
 
 On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first.
 
-## 📦 Install
+## Install
 
 ```bash
 git clone …/h-ssh.git && cd h-ssh
@@ -73,7 +69,7 @@ pip install -e '.[dev]'           # + pytest, both vendor libs
 
 Requires Python 3.10+. Installs an `h-ssh` entry point; the repo's `./h-ssh.py` works uninstalled too.
 
-## 🚀 Quick start
+## Quick start
 
 ```bash
 # show command across two routers, inline targets
@@ -111,7 +107,7 @@ Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`. A CSV inventory accep
 export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 ```
 
-## 🎛️ Modes
+## Modes
 
 | Flag | Mode | What it does |
 |---|---|---|
@@ -135,7 +131,7 @@ export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 cat jobs.json | ./h-ssh.py --user admin --job - --json
 ```
 
-## 🔌 Transports
+## Transports
 
 | Vendor | Transport | Library | Show | Edit |
 |---|---|---|---|---|
@@ -176,7 +172,7 @@ Two limits, both deliberate: `--structured` has no bindings here, and `--commit-
 rejected rather than silently ignored — a confirmed commit needs the NETCONF `junos` transport, and
 dropping the rollback timer without saying so would be worse than refusing.
 
-## ⚙️ Defaults
+## Defaults
 
 Typing `--user` on every run gets old. `~/.h-ssh/config` holds per-user defaults:
 
@@ -201,7 +197,7 @@ device costs you; on a LAN a reachable device connects in well under a second.
 for a secret; use `HSSH_PASSWORD`, `--password`, the prompt, or keys. `--config PATH` points at a
 different file.
 
-## 📤 Output
+## Output
 
 | Flag | Prints |
 |---|---|
@@ -228,7 +224,7 @@ preference. The command echo (`$ show version`) belongs to the framed view — `
 both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
 `output`.
 
-## ⏱️ Failure handling
+## Failure handling
 
 A device that black-holes packets used to cost the full timeout three times over. Failures are now
 classified before anything is retried:
@@ -261,7 +257,7 @@ Ctrl-C stops the run, reports which devices finished, and exits `130`. Output al
 stdout stays valid; the interrupted notice goes to stderr, so a truncated `--raw` run cannot look
 like a complete one.
 
-## 🔒 Safety
+## Safety
 
 Layered, and every layer is off the critical path until you ask for a write.
 
@@ -285,7 +281,7 @@ Exit codes: `0` success · `1` a device failed · `2` usage error. Every run als
 [h-ssh] {"targets":3,"ok":2,"fail":1,...}
 ```
 
-## 🧬 Structured output
+## Structured output
 
 `--structured` returns parsed data instead of text where the vendor can provide it, and falls back to the normal text path where it can't. There is no capability list to maintain — a vendor module either implements `show_structured` or it doesn't, and that absence *is* the fallback signal.
 
@@ -319,7 +315,7 @@ Bindings live in the same `commands/{vendor}.json` entry as the command, under a
 
 Output is **vendor-shaped, not normalised** — `bgp` returns Junos field names on a router and eAPI's own JSON on a switch. Nothing here promises the two match, which is why there's no cross-vendor schema to keep in sync. Add bindings one command at a time; commands without one keep working exactly as before.
 
-## 🧩 Library usage
+## Library usage
 
 ```python
 from hssh import Target, vendors
@@ -342,7 +338,7 @@ name, ok, output, ms = run_for_target(
 
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
 
-## 📁 Package structure
+## Package structure
 
 ```
 h-ssh/
@@ -364,20 +360,23 @@ h-ssh/
 └── devices.csv          # example inventory
 ```
 
-## 🧪 Tests
-
-46 unit tests, plus 59 live integration tests run against three Junos vMX routers on 24.2R1-S2.5 — covering every mode, both edit paths, concurrency, error handling, exit codes, and the safety gate. Full breakdown in [TESTS.md](TESTS.md).
+## Develop
 
 ```bash
 pip install -e '.[dev]'
 pytest
 ```
 
-## 🔗 See also
+The unit suite (187 tests at the time of writing) needs no devices. Beyond it, 59 live integration tests were run against three Junos vMX
+routers on 24.2R1-S2.5, covering every mode, both edit paths, concurrency, error handling, exit codes and the safety gate. Breakdown in
+[TESTS.md](TESTS.md).
 
-- [`h-network/junos-mcp-server`](https://github.com/h-network/junos-mcp-server) — the same device access exposed to an LLM over MCP
-- [`h-network/h-cli`](https://github.com/h-network/h-cli) — AI-driven infrastructure management this feeds into
+## See also
 
-## 📄 License
+- [`h-network/junos-mcp-server`](https://github.com/h-network/junos-mcp-server): the same device access exposed to an LLM over MCP
+- [`h-network/h-cli`](https://github.com/h-network/h-cli): AI-driven infrastructure management this feeds into
 
-MIT — see [LICENSE](LICENSE).
+## License
+
+PolyForm Noncommercial 1.0.0 -- see [`LICENSE`](LICENSE). "h-ssh" and "h-network" naming/branding are covered by
+[`TRADEMARKS.md`](TRADEMARKS.md).

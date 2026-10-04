@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="224" height="28" role="img" aria-label="RUNTIME DEP: PARAMIKO ONLY">
+  <title>RUNTIME DEP: PARAMIKO ONLY</title>
+  <rect width="104" height="28" fill="#555"/>
+  <rect x="104" width="120" height="28" fill="#4EAA25"/>
+  <g fill="#fff" font-family="Verdana,DejaVu Sans,Geneva,sans-serif" font-size="10" font-weight="bold" letter-spacing="1.5" text-anchor="middle">
+    <text x="52.0" y="17.5">RUNTIME DEP</text>
+    <text x="164.0" y="17.5">PARAMIKO ONLY</text>
+  </g>
+</svg>

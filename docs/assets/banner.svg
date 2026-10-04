@@ -1,54 +1,10 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360" role="img" aria-label="h-ssh — the fleet loop, not the session">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#0B1221"/>
-      <stop offset="1" stop-color="#140C24"/>
-    </linearGradient>
-    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0" stop-color="#A78BFA"/>
-      <stop offset="1" stop-color="#6366F1"/>
-    </linearGradient>
-    <radialGradient id="glow" cx="0.22" cy="0.0" r="0.9">
-      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.22"/>
-      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
-    </radialGradient>
-  </defs>
-
-  <!-- backdrop -->
-  <rect width="1200" height="360" rx="18" fill="url(#bg)"/>
-  <rect width="1200" height="360" rx="18" fill="url(#glow)"/>
-  <rect x="1.5" y="1.5" width="1197" height="357" rx="17" fill="none" stroke="#2A2145" stroke-width="2"/>
-
-  <!-- logo mark: a shell prompt, the thing on the far end of every session -->
-  <rect x="80" y="70" width="64" height="64" rx="16" fill="url(#accent)"/>
-  <g fill="none" stroke="#160E28" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round">
-    <path d="M97 90 L109 102 L97 114"/>
-    <path d="M114 115 L129 115"/>
-  </g>
-
-  <!-- wordmark + tagline -->
-  <text x="164" y="112" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="58" font-weight="800" fill="#F8FAFC">h-ssh</text>
-  <text x="166" y="152" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" fill="#A79BC4">One command across the fleet &#183; the SSH burden removed</text>
-
-  <!-- pipeline: inventory in, devices out, safety in the middle -->
-  <g font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="17" font-weight="600">
-    <!-- inventory -->
-    <rect x="80" y="222" width="138" height="48" rx="10" fill="#171331" stroke="#4A3F6B"/>
-    <text x="149" y="252" fill="#CBD5E1" text-anchor="middle">inventory</text>
-    <text x="231" y="252" fill="#475569" text-anchor="middle" font-size="20">&#8594;</text>
-    <!-- safety gate -->
-    <rect x="244" y="222" width="170" height="48" rx="10" fill="#171331" stroke="#34D399" stroke-opacity="0.6"/>
-    <text x="329" y="252" fill="#6EE7B7" text-anchor="middle">safety gate</text>
-    <text x="427" y="252" fill="#475569" text-anchor="middle" font-size="20">&#8594;</text>
-    <!-- workers -->
-    <rect x="440" y="222" width="160" height="48" rx="10" fill="#171331" stroke="#A78BFA" stroke-opacity="0.6"/>
-    <text x="520" y="252" fill="#C4B5FD" text-anchor="middle">workers &#215;8</text>
-    <text x="613" y="252" fill="#475569" text-anchor="middle" font-size="20">&#8594;</text>
-    <!-- devices -->
-    <rect x="626" y="222" width="494" height="48" rx="10" fill="url(#accent)"/>
-    <text x="873" y="252" fill="#160E28" text-anchor="middle" font-weight="700">junos &#183; arista &#183; ssh &#183; telnet</text>
-  </g>
-
-  <!-- footer strapline -->
-  <text x="82" y="322" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="13" letter-spacing="2" fill="#C4B5FD">THE FLEET LOOP, NOT THE SESSION &#160;&#8212;&#160; rate-limited, audited, rollback on silence</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="637" height="212" viewBox="0 0 637 212">
+<rect width="100%" height="100%" fill="#0d1117"/>
+<text x="10" y="30" font-family="Menlo, Consolas, monospace" font-size="20" fill="#e3b341" xml:space="preserve">  ██╗  ██╗      ███████╗███████╗██╗  ██╗</text>
+<text x="10" y="54" font-family="Menlo, Consolas, monospace" font-size="20" fill="#e3b341" xml:space="preserve">  ██║  ██║      ██╔════╝██╔════╝██║  ██║</text>
+<text x="10" y="78" font-family="Menlo, Consolas, monospace" font-size="20" fill="#e3b341" xml:space="preserve">  ███████║█████╗███████╗███████╗███████║</text>
+<text x="10" y="102" font-family="Menlo, Consolas, monospace" font-size="20" fill="#e3b341" xml:space="preserve">  ██╔══██║╚════╝╚════██║╚════██║██╔══██║</text>
+<text x="10" y="126" font-family="Menlo, Consolas, monospace" font-size="20" fill="#e3b341" xml:space="preserve">  ██║  ██║      ███████║███████║██║  ██║</text>
+<text x="10" y="150" font-family="Menlo, Consolas, monospace" font-size="20" fill="#e3b341" xml:space="preserve">  ╚═╝  ╚═╝      ╚══════╝╚══════╝╚═╝  ╚═╝</text>
+<text x="10" y="184" font-family="Menlo, Consolas, monospace" font-size="20" fill="#56d4dd" xml:space="preserve">  H-SSH // the fleet loop, not the session // h-network</text>
 </svg>
