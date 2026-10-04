@@ -7,7 +7,7 @@ name = "h-ssh"
 dynamic = ["version"]
 description = "Multi-vendor network automation framework with parallel execution, job mode, and safety gate"
 readme = "README.md"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 requires-python = ">=3.10"
 dependencies = [
     "paramiko",
