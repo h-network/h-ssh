@@ -2,7 +2,7 @@
 
 Tested against 3 live Junos vMX routers running 24.2R1-S2.5.
 
-## Unit Tests — 185/185 passed
+## Unit Tests — 187/187 passed
 
 | Suite | Tests | Status |
 |-------|-------|--------|
