@@ -30,6 +30,9 @@ h-ssh = "hssh.cli:main_sync"
 [tool.setuptools.dynamic]
 version = {attr = "hssh.__version__"}
 
+[tool.setuptools.packages.find]
+include = ["hssh*"]
+
 [tool.setuptools.package-data]
 hssh = ["commands/*.json"]
 
