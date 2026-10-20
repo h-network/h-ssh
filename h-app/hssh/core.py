@@ -301,8 +301,8 @@ def _load_commands_json(vendor: str) -> Dict:
     """Load command templates from JSON file for a vendor.
 
     Lookup order:
-    - Package shipped defaults (hssh/commands/{vendor}.json or commands/{vendor}.json relative to package)
-    - Local ./commands/{vendor}.json (if different from package path)
+    - Package shipped defaults (hssh/commands/{vendor}.json, or the checkout's
+      h-app/commands/{vendor}.json next to the package)
     - ~/.h-ssh/commands/{vendor}.json (user overrides)
     """
     commands = {}
@@ -318,14 +318,6 @@ def _load_commands_json(vendor: str) -> Dict:
             commands.update(json.loads(package_path.read_text(encoding="utf-8")))
         except Exception:
             pass
-
-    # Current working directory overrides (if distinct from package path)
-    local_path = Path("commands") / f"{vendor}.json"
-    try:
-        if local_path.is_file() and local_path.resolve() != package_path.resolve():
-            commands.update(json.loads(local_path.read_text(encoding="utf-8")))
-    except Exception:
-        pass
 
     # User home overrides
     home_path = Path.home() / ".h-ssh" / "commands" / f"{vendor}.json"

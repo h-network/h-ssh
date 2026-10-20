@@ -59,7 +59,7 @@ def test_vendorless_target_is_ssh_not_junos():
 
 def test_every_declared_binding_is_well_formed():
     """A junos binding must carry what FactoryLoader needs."""
-    for path in Path("commands").glob("*.json"):
+    for path in (Path(__file__).resolve().parent.parent / "commands").glob("*.json"):
         entries = json.loads(path.read_text())
         for name, entry in entries.items():
             if not isinstance(entry, dict) or "structured" not in entry:

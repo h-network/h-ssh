@@ -1,13 +1,13 @@
 <div align="center">
 
-<img src="docs/assets/banner.svg" alt="H-SSH // the fleet loop, not the session // h-network" width="600">
+<img src="assets/banner.svg" alt="H-SSH // the fleet loop, not the session // h-network" width="600">
  
 <br/>
 
-[![License: PolyForm Noncommercial 1.0.0](docs/assets/badges/license.svg)](LICENSE)
-![Python 3.10+](docs/assets/badges/python.svg)
-![Vendors: junos arista ssh openssh telnet](docs/assets/badges/vendors.svg)
-![Runtime dependency: paramiko only](docs/assets/badges/deps.svg)
+[![License: PolyForm Noncommercial 1.0.0](assets/badges/license.svg)](LICENSE)
+![Python 3.10+](assets/badges/python.svg)
+![Vendors: junos arista ssh openssh telnet](assets/badges/vendors.svg)
+![Runtime dependency: paramiko only](assets/badges/deps.svg)
 
 </div>
 
@@ -67,32 +67,32 @@ pip install -e '.[all]'           # + both
 pip install -e '.[dev]'           # + pytest, both vendor libs
 ```
 
-Requires Python 3.10+. Installs an `h-ssh` entry point; the repo's `./h-ssh.py` works uninstalled too.
+Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/h-ssh.py` works uninstalled too.
 
 ## Quick start
 
 ```bash
 # show command across two routers, inline targets
-./h-ssh.py --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
+./h-app/h-ssh.py --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
 # ... or from a CSV inventory, as JSON
-./h-ssh.py --user admin --json -sC "show version" --devices devices.csv
+./h-app/h-ssh.py --user admin --json -sC "show version" --devices h-app/devices.csv
 
 # compare one command's output across the fleet
-./h-ssh.py --user admin -sC bgp --diff --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
+./h-app/h-ssh.py --user admin -sC bgp --diff --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
 # config change — look before you leap
-./h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" --dry-run
-./h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" -y
+./h-app/h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" --dry-run
+./h-app/h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" -y
 
 # a change that rolls itself back in 10 minutes unless you confirm
-./h-ssh.py --user admin -eB configs/all.set --commit-confirmed 10 -y
+./h-app/h-ssh.py --user admin -eB configs/all.set --commit-confirmed 10 -y
 
 # several commands per device, one connection
-./h-ssh.py --user admin --batch commands.txt --target R1:10.0.1.1:junos
+./h-app/h-ssh.py --user admin --batch commands.txt --target R1:10.0.1.1:junos
 
 # a console server still speaking telnet
-./h-ssh.py --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
+./h-app/h-ssh.py --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
 ```
 
 Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`. A CSV inventory accepts `name,ip`, `name,ip,vendor`, headers or none, and `#` comments.
@@ -102,8 +102,8 @@ Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`. A CSV inventory accep
 ### Authentication
 
 ```bash
-./h-ssh.py --user admin -sC bgp                     # SSH agent / key, no password
-./h-ssh.py --user admin --password secret -sC bgp   # explicit
+./h-app/h-ssh.py --user admin -sC bgp                     # SSH agent / key, no password
+./h-app/h-ssh.py --user admin --password secret -sC bgp   # explicit
 export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 ```
 
@@ -127,8 +127,8 @@ export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 ```
 
 ```bash
-./h-ssh.py --user admin --job jobs.json --json
-cat jobs.json | ./h-ssh.py --user admin --job - --json
+./h-app/h-ssh.py --user admin --job jobs.json --json
+cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json
 ```
 
 ## Transports
@@ -161,7 +161,7 @@ Use it on locked-down jump hosts — no package index, no `ensurepip`, no root �
 paramiko` is not on the table but `ssh` is already there:
 
 ```bash
-./h-ssh.py --target R1:10.0.1.1:openssh -sC "show version" --user admin
+./h-app/h-ssh.py --target R1:10.0.1.1:openssh -sC "show version" --user admin
 ```
 
 It inherits your `~/.ssh/config`, keys, agent and `known_hosts`, so jump-host `ProxyJump` stanzas and
@@ -286,7 +286,7 @@ Exit codes: `0` success · `1` a device failed · `2` usage error. Every run als
 `--structured` returns parsed data instead of text where the vendor can provide it, and falls back to the normal text path where it can't. There is no capability list to maintain — a vendor module either implements `show_structured` or it doesn't, and that absence *is* the fallback signal.
 
 ```bash
-./h-ssh.py --user admin -sC bgp --structured --json --target R1:10.0.1.1:junos
+./h-app/h-ssh.py --user admin -sC bgp --structured --json --target R1:10.0.1.1:junos
 ```
 
 | Vendor | Mechanism | Notes |
@@ -295,7 +295,7 @@ Exit codes: `0` success · `1` a device failed · `2` usage error. Every run als
 | `junos` | PyEZ Table/View over NETCONF | A **different** request: the binding names an RPC, so this is not a parse of the CLI output |
 | `ssh`, `openssh`, `telnet` | — | No bindings; always text |
 
-Bindings live in the same `commands/{vendor}.json` entry as the command, under an optional `structured` key:
+Bindings live in the same `h-app/commands/{vendor}.json` entry as the command, under an optional `structured` key:
 
 ```json
 "bgp": {
@@ -367,22 +367,26 @@ after. The CLI never enables the pool, so `h-ssh` runs behave exactly as before.
 
 ```
 h-ssh/
-├── hssh/
-│   ├── core.py          # Target, CSV loader, template resolver, job parser
-│   ├── cli.py           # argument parsing + orchestration
-│   ├── runner.py        # concurrent execution engine
-│   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
-│   ├── audit.py         # JSONL audit trail
-│   └── vendors/
-│       ├── junos.py     # PyEZ NETCONF: show, structured, config
-│       ├── arista.py    # eAPI
-│       ├── generic.py   # paramiko SSH
-│       ├── openssh.py   # the OpenSSH binary — zero dependencies
-│       └── telnet.py    # raw socket, per-flavour prompt handling
-├── commands/            # per-vendor template library (JSON)
-├── tests/
-├── h-ssh.py             # CLI entry point
-└── devices.csv          # example inventory
+├── h-app/
+│   ├── hssh/
+│   │   ├── core.py          # Target, CSV loader, template resolver, job parser
+│   │   ├── cli.py           # argument parsing + orchestration
+│   │   ├── runner.py        # concurrent execution engine
+│   │   ├── pool.py          # opt-in session pool for library use
+│   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
+│   │   ├── audit.py         # JSONL audit trail
+│   │   └── vendors/
+│   │       ├── junos.py     # PyEZ NETCONF: show, structured, config
+│   │       ├── arista.py    # eAPI
+│   │       ├── generic.py   # paramiko SSH
+│   │       ├── openssh.py   # the OpenSSH binary — zero dependencies
+│   │       └── telnet.py    # raw socket, per-flavour prompt handling
+│   ├── commands/            # per-vendor template library (JSON)
+│   ├── tests/
+│   ├── h-ssh.py             # CLI entry point
+│   └── devices.csv          # example inventory
+├── assets/                  # banner, badges
+└── pyproject.toml           # installs the `h-ssh` entry point from h-app/
 ```
 
 ## Develop

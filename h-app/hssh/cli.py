@@ -244,7 +244,7 @@ async def main() -> int:
         else:
             print(f"\nNo command shortcuts found for '{args.transport}'.")
             print(f"Create shortcuts in: ~/.h-ssh/commands/{args.transport}.json")
-            print(f"See commands/junos.json for format example.\n")
+            print(f"See h-app/commands/junos.json for format example.\n")
         return 0
 
     # ------ JOB MODE ------
@@ -950,7 +950,7 @@ async def main() -> int:
             print(" " * 15 + "DON'T FORGET TO CONFIRM THE COMMIT!")
             print("=" * 70)
             print(f"Run this command to confirm within {args.commit_confirmed} minutes:")
-            confirm_cmd = "  ./h-ssh.py -eC \"commit\""
+            confirm_cmd = "  ./h-app/h-ssh.py -eC \"commit\""
             if args.user:
                 confirm_cmd += f" --user {args.user}"
             if args.devices != get_default_devices_path():
