@@ -338,6 +338,31 @@ name, ok, output, ms = run_for_target(
 
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
 
+### Connection pooling
+
+Every call above opens its own NETCONF session and closes it — right for a one-shot CLI run, wasteful
+for a script that goes back to the same router twenty times. Enable the session pool once and every
+Junos call reuses the router's open session:
+
+```python
+from hssh import pool
+pool.enable()                     # idle sessions close after 300 s; pool.enable(idle_timeout=60) to change
+
+for cmd in ("show version", "show bgp summary", "show route summary"):
+    vendors.junos.show("10.0.1.1", "admin", None, cmd, 30, 20)   # one NETCONF session, three RPCs
+
+print(pool.POOL.stats)            # {'opens': 1, 'reuses': 2, 'discards': 0, 'reaped': 0}
+pool.close_all()                  # also runs at interpreter exit
+```
+
+One session per `(host, port, user)`. Calls against the same router from several threads queue on
+that session; different routers run in parallel as before. A session is dropped, never handed to
+the next caller, when something left it in doubt: a commit whose outcome is unknown, a rollback or
+unlock that failed, an RPC timeout, or the router closing it. A read (`show`, `show_structured`,
+`show_batch`) that finds its reused session dead opens a new one and runs once more; an edit never
+does — it reports `NotAppliedError` if the session died before the lock, and the usual verdicts
+after. The CLI never enables the pool, so `h-ssh` runs behave exactly as before.
+
 ## Package structure
 
 ```

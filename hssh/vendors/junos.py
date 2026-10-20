@@ -1,22 +1,30 @@
 """Junos transport — PyEZ (NETCONF) for show, structured show and configuration.
 
-Everything goes through junos-eznc, the official Juniper library, over a single
-NETCONF session per call: show uses Device.cli(), structured show uses a
-Table/View, and config uses lock -> load -> commit_check -> diff -> commit
-(or rollback for --dry-run) -> unlock. The NETCONF port defaults to 830
-everywhere; set the target's port to use NETCONF over SSH on 22.
+Everything goes through junos-eznc, the official Juniper library, over a
+NETCONF session: show uses Device.cli(), structured show uses a Table/View,
+and config uses lock -> load -> commit_check -> diff -> commit (or rollback
+for --dry-run) -> unlock. The NETCONF port defaults to 830 everywhere; set
+the target's port to use NETCONF over SSH on 22.
+
+A session is opened and closed per call unless the session pool is enabled
+(hssh.pool.enable()), in which case each call borrows the router's open
+session and gives it back. A session that fails underneath a call is
+discarded, never handed to the next caller.
 """
 
+from contextlib import contextmanager
 from typing import List, Optional
 
 from ..core import JUNOS_SET_PREFIX_VERBS
 from ..errors import AmbiguousCommitError, NotAppliedError
+from ..pool import POOL
 
 try:
     from jnpr.junos import Device as JunosDevice
     from jnpr.junos.utils.config import Config as JunosConfig
     from jnpr.junos.exception import (
-        ConnectError, LockError, ConfigLoadError, CommitError, RpcTimeoutError,
+        ConnectError, ConnectClosedError, LockError, ConfigLoadError, CommitError,
+        RpcTimeoutError,
     )
     AVAILABLE = True
 except ImportError:
@@ -24,6 +32,9 @@ except ImportError:
     JunosDevice = JunosConfig = None
 
     class ConnectError(Exception):
+        pass
+
+    class ConnectClosedError(ConnectError):
         pass
 
     class LockError(Exception):
@@ -38,7 +49,20 @@ except ImportError:
     class RpcTimeoutError(Exception):
         pass
 
+try:
+    from ncclient.transport.errors import TransportError
+except ImportError:
+    class TransportError(Exception):
+        pass
+
 DEFAULT_PORT = 830
+
+# A pooled session idle this long is probed with a cheap RPC before reuse, so
+# a router that silently dropped it is noticed here and not under an edit.
+PROBE_AFTER = 30
+# The probe, and closing a session, never deserve the command timeout: a dead
+# socket would otherwise stall every caller queued on this router behind it.
+SHORT_TIMEOUT = 5
 
 
 def _require() -> None:
@@ -69,9 +93,78 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
 
 def _close(dev) -> None:
     try:
+        dev.timeout = SHORT_TIMEOUT
         dev.close()
     except Exception:
-        pass
+        # close-session got no answer; PyEZ has already marked the Device
+        # closed, so drop the transport ourselves or its reader thread lingers.
+        try:
+            dev._conn._session.close()
+        except Exception:
+            pass
+
+
+def _alive(dev, idle: float) -> bool:
+    """Is a pooled session worth reusing? PyEZ only clears `connected` when it
+    closed the session itself; one the router dropped without a FIN still
+    says connected, so after a long idle ask the router."""
+    if not getattr(dev, "connected", True):
+        return False
+    if idle >= PROBE_AFTER:
+        dev.rpc.get_system_uptime_information(dev_timeout=SHORT_TIMEOUT)
+    return True
+
+
+def _chain(exc: BaseException):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+def _session_lost(exc: BaseException) -> bool:
+    """True when the error, or what PyEZ wrapped it around, says the NETCONF
+    session itself is gone."""
+    return any(isinstance(e, (ConnectClosedError, TransportError, OSError))
+               for e in _chain(exc))
+
+
+def _timed_out(exc: BaseException) -> bool:
+    return any(isinstance(e, RpcTimeoutError) for e in _chain(exc))
+
+
+@contextmanager
+def _session(host: str, user: str, passwd: Optional[str], session_timeout: int,
+             command_timeout: int, port: Optional[int]):
+    """A session for this router: fresh, or borrowed from the pool."""
+    key = (host, port or DEFAULT_PORT, user)
+    with POOL.lease(
+        key,
+        opener=lambda: _open(host, user, passwd, session_timeout, command_timeout, port),
+        closer=_close,
+        alive=_alive,
+    ) as lease:
+        lease.dev.timeout = command_timeout
+        yield lease
+
+
+def _on_session(host, user, passwd, session_timeout, command_timeout, port, fn):
+    """Run fn(lease) on the router's session. A read is idempotent, so if a
+    *reused* session turns out to be dead, open a new one and run it again
+    once; a timeout or a dead fresh session is reported as before."""
+    for attempt in (1, 2):
+        with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+            try:
+                return fn(lease)
+            except Exception as e:
+                if _session_lost(e):
+                    lease.discard()
+                    if lease.reused and attempt == 1:
+                        continue
+                elif _timed_out(e):
+                    lease.discard()  # a reply may still be in flight
+                raise
 
 
 def _cli(dev, cmd: str) -> str:
@@ -87,11 +180,8 @@ def show(host: str, user: str, passwd: str, cmd: str,
          port: int = None, vendor_hint: str = None) -> str:
     """Execute a show command over NETCONF."""
     _require()
-    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
-    try:
-        return _cli(dev, cmd)
-    finally:
-        _close(dev)
+    return _on_session(host, user, passwd, session_timeout, command_timeout, port,
+                       lambda lease: _cli(lease.dev, cmd))
 
 
 def show_structured(host: str, user: str, passwd: str, cmd: str,
@@ -143,13 +233,12 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
 
     table_cls = FactoryLoader().load(definition)[table_name]
 
-    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
-    try:
-        table = table_cls(dev)
+    def fetch(lease):
+        table = table_cls(lease.dev)
         table.get()
         return {key: dict(item) for key, item in table.items()}
-    finally:
-        _close(dev)
+
+    return _on_session(host, user, passwd, session_timeout, command_timeout, port, fetch)
 
 
 def _config_format(payload: str) -> str:
@@ -188,63 +277,83 @@ def edit(host: str, user: str, passwd: str, payload: str,
     device, AmbiguousCommitError when a commit was sent and its outcome is
     unknown, and RuntimeError for rejected config. Only NotAppliedError is safe
     to retry.
+
+    A pooled session is discarded whenever this leaves it in doubt: a commit
+    whose outcome is unknown, a rollback or unlock that failed, a timeout, or
+    the session dying underneath — so no candidate lock outlives the call.
     """
     _require()
-    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
-    cu = None
-    locked = False
-    committed = False
-    try:
-        cu = JunosConfig(dev)
+    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+        dev = lease.dev
+        cu = None
+        locked = False
+        committed = False
         try:
-            cu.lock()
-        except LockError as e:
-            raise NotAppliedError(f"Failed to lock config: {e}") from e
-        locked = True
+            cu = JunosConfig(dev)
+            try:
+                cu.lock()
+            except LockError as e:
+                # PyEZ wraps a timed-out or dead-session lock RPC in LockError
+                # too; the device may have granted that lock, so the session
+                # goes, which releases it, and the retry gets a fresh one.
+                if _session_lost(e) or _timed_out(e):
+                    lease.discard()
+                raise NotAppliedError(f"Failed to lock config: {e}") from e
+            except Exception as e:
+                if _session_lost(e):
+                    lease.discard()
+                    raise NotAppliedError(f"NETCONF session lost before lock: {e}") from e
+                raise
+            locked = True
 
-        fmt = _config_format(payload)
-        body = _strip_comments(payload) if fmt == "set" else payload
-        try:
-            cu.load(body, format=fmt)
-            diff = (cu.diff() or "")
-            if not diff.strip():
-                return "NO CHANGES"
-            cu.commit_check(timeout=command_timeout)
-        except (ConfigLoadError, CommitError) as e:
-            raise RuntimeError(f"Config error: {e}") from e
+            fmt = _config_format(payload)
+            body = _strip_comments(payload) if fmt == "set" else payload
+            try:
+                cu.load(body, format=fmt)
+                diff = (cu.diff() or "")
+                if not diff.strip():
+                    return "NO CHANGES"
+                cu.commit_check(timeout=command_timeout)
+            except (ConfigLoadError, CommitError) as e:
+                raise RuntimeError(f"Config error: {e}") from e
 
-        if dry_run:
-            return f"DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
+            if dry_run:
+                return f"DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
 
-        try:
+            try:
+                if commit_confirmed and commit_confirmed > 0:
+                    cu.commit(confirm=commit_confirmed, timeout=command_timeout)
+                else:
+                    cu.commit(timeout=command_timeout)
+            except CommitError as e:
+                raise RuntimeError(f"Config error: {e}") from e
+            except Exception as e:
+                # The commit RPC was sent. We cannot tell whether it landed.
+                locked = False  # leave the candidate alone; the session is suspect
+                lease.discard()
+                raise AmbiguousCommitError(
+                    f"commit outcome unknown ({type(e).__name__}: {e}); "
+                    "check the device before retrying") from e
+            committed = True
+
             if commit_confirmed and commit_confirmed > 0:
-                cu.commit(confirm=commit_confirmed, timeout=command_timeout)
+                head = f"COMMIT CONFIRMED ({commit_confirmed} minutes)"
             else:
-                cu.commit(timeout=command_timeout)
-        except CommitError as e:
-            raise RuntimeError(f"Config error: {e}") from e
+                head = "COMMIT OK"
+            return f"{head}\n\nDIFF:\n{diff}"
         except Exception as e:
-            # The commit RPC was sent. We cannot tell whether it landed.
-            locked = False  # leave the candidate alone; the session is suspect
-            raise AmbiguousCommitError(
-                f"commit outcome unknown ({type(e).__name__}: {e}); "
-                "check the device before retrying") from e
-        committed = True
-
-        if commit_confirmed and commit_confirmed > 0:
-            head = f"COMMIT CONFIRMED ({commit_confirmed} minutes)"
-        else:
-            head = "COMMIT OK"
-        return f"{head}\n\nDIFF:\n{diff}"
-    finally:
-        if cu is not None and locked:
-            if not committed:
-                try:
-                    cu.rollback()
-                except Exception:
-                    pass
-            _unlock_quietly(cu)
-        _close(dev)
+            if _session_lost(e) or _timed_out(e):
+                lease.discard()
+            raise
+        finally:
+            if cu is not None and locked:
+                if not committed:
+                    try:
+                        cu.rollback()
+                    except Exception:
+                        lease.discard()
+                if _unlock_quietly(cu) is not None:
+                    lease.discard()
 
 
 def confirm(host: str, user: str, passwd: str,
@@ -252,35 +361,43 @@ def confirm(host: str, user: str, passwd: str,
             port: int = None, vendor_hint: str = None) -> str:
     """Confirm a pending commit-confirmed by issuing a plain commit."""
     _require()
-    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
-    try:
-        cu = JunosConfig(dev)
+    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+        cu = JunosConfig(lease.dev)
         try:
             cu.commit(timeout=command_timeout)
         except CommitError as e:
             raise RuntimeError(f"Commit failed: {e}") from e
         except Exception as e:
+            lease.discard()
             raise AmbiguousCommitError(
                 f"commit outcome unknown ({type(e).__name__}: {e}); "
                 "check the device before retrying") from e
         return "COMMIT CONFIRMED OK"
-    finally:
-        _close(dev)
 
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
                port: int = None, vendor_hint: str = None) -> List[dict]:
-    """Execute several show commands on one NETCONF session."""
+    """Execute several show commands on one NETCONF session.
+
+    A rejected or timed-out command is reported in its own result and the
+    batch goes on (after a timeout the session is not kept, a late reply may
+    still be coming). A session that dies is a failure of the whole batch:
+    reads are idempotent, so a reused session gets the same reopen-once
+    treatment as show()."""
     _require()
-    dev = _open(host, user, passwd, session_timeout, command_timeout, port)
-    try:
+
+    def run(lease):
         results = []
         for cmd in cmds:
             try:
-                results.append({"command": cmd, "ok": True, "output": _cli(dev, cmd)})
+                results.append({"command": cmd, "ok": True, "output": _cli(lease.dev, cmd)})
             except Exception as e:
+                if _session_lost(e):
+                    raise
+                if _timed_out(e):
+                    lease.discard()
                 results.append({"command": cmd, "ok": False, "error": str(e)})
         return results
-    finally:
-        _close(dev)
+
+    return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
