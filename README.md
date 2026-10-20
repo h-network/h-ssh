@@ -1,7 +1,7 @@
 <div align="center">
 
 <img src="docs/assets/banner.svg" alt="H-SSH // the fleet loop, not the session // h-network" width="600">
-
+ 
 <br/>
 
 [![License: PolyForm Noncommercial 1.0.0](docs/assets/badges/license.svg)](LICENSE)
