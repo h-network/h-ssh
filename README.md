@@ -31,6 +31,7 @@ and rollback that config changes need. Every edit passes a safety gate, prompts 
 - **Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing, per-device rate limit and cooldown, and `--commit-confirmed N` for changes that undo themselves if you lose the session.
 - **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
 - **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely.
+- **Built for a maintenance, not just a run.** A session pool keeps one NETCONF session per router open for a whole script; `rpc()` and `--format json|xml` return the router's own data instead of CLI text; `begin()` holds a diffed candidate open until a gate decides; `--rollback N`, commit comments, `--commit-status` and `guarded_commit()` cover the commit-confirmed lifecycle without a `| match` in sight.
 - **One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
 
 ## How it works
@@ -459,9 +460,11 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (187 tests at the time of writing) needs no devices. Beyond it, 59 live integration tests were run against three Junos vMX
-routers on 24.2R1-S2.5, covering every mode, both edit paths, concurrency, error handling, exit codes and the safety gate. Breakdown in
-[TESTS.md](TESTS.md).
+The unit suite (303 tests) needs no devices and runs on every push and pull request (GitHub Actions, Python 3.10–3.13, plain
+`python` containers, no JavaScript actions). Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
+edit paths, the RPC/JSON paths and a full commit-confirmed maintenance flow; the earlier 59-test run covered every CLI mode, both
+edit paths, concurrency, error handling, exit codes and the safety gate. What was run on which code, and what is still pending
+before a release, is in [TESTS.md](TESTS.md).
 
 ## Related global repos
 
