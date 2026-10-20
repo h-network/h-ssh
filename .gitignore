@@ -49,3 +49,6 @@ wheels/
 
 # Claude Code local state (agent worktrees, local settings)
 .claude/
+
+# Local scripts and data of whoever uses h-ssh from a checkout (not part of the tool)
+scripts/
