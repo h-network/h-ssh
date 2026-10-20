@@ -39,6 +39,21 @@ class FakeDevice:
         return out
 
 
+class FakeHost:
+    """The attributes PyEZ's exceptions format themselves with."""
+    hostname = "10.0.0.1"
+    user = "u"
+    _port = 830
+
+
+def connect_error(msg="boom"):
+    return junos.ConnectError(FakeHost(), msg)
+
+
+def rpc_timeout(cmd="commit", timeout=30):
+    return junos.RpcTimeoutError(FakeHost(), cmd, timeout)
+
+
 class FakeConfig:
     instances = []
     diff_text = "[edit]\n+  system host-name r1;"
@@ -120,7 +135,7 @@ def test_explicit_port_is_honoured():
 
 
 def test_connect_failure_is_not_applied():
-    FakeDevice.open_error = junos.ConnectError("boom")
+    FakeDevice.open_error = connect_error()
     with pytest.raises(NotAppliedError):
         junos.show("10.0.0.1", "u", "p", "show version", 5, 30)
 
@@ -181,7 +196,7 @@ def test_unlock_failure_after_commit_does_not_fail_the_edit():
 
 
 def test_commit_timeout_is_ambiguous_and_not_rolled_back():
-    FakeConfig.raise_on = {"commit": junos.RpcTimeoutError("timed out")}
+    FakeConfig.raise_on = {"commit": rpc_timeout()}
     with pytest.raises(AmbiguousCommitError, match="outcome unknown"):
         edit(commit_confirmed=5)
     assert "rollback" not in cfg().names
@@ -225,7 +240,7 @@ def test_confirm_issues_a_plain_commit():
 
 
 def test_confirm_timeout_is_ambiguous():
-    FakeConfig.raise_on = {"commit": junos.RpcTimeoutError("t")}
+    FakeConfig.raise_on = {"commit": rpc_timeout()}
     with pytest.raises(AmbiguousCommitError):
         junos.confirm("10.0.0.1", "u", "p", 5, 30)
 
