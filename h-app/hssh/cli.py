@@ -178,6 +178,12 @@ async def main() -> int:
                         help="JSON job file with per-device commands (use - for stdin)")
     parser.add_argument("--rollback", type=int, metavar="N",
                         help="Return every target to rollback N (0-49), with the same gates as an edit (Junos only)")
+    parser.add_argument("--commit-status", action="store_true",
+                        help="Show the commit history as data: sequence, time, user, comment, pending commit-confirmed timer (Junos only)")
+    parser.add_argument("--comment", type=str, metavar="TEXT",
+                        help="Log this comment with the commit; it shows in 'show system commit' (Junos only)")
+    parser.add_argument("--show-diff", action="store_true",
+                        help="Edits: run a dry-run on every target, print the diffs, then ask once before committing")
 
     # Behavior
     parser.add_argument("--retries", type=int, default=None,
@@ -252,8 +258,8 @@ async def main() -> int:
     # ------ JOB MODE ------
     job_entries = None
     if args.job:
-        if any([args.show_command, args.edit_command, args.edit_dir, args.edit_broadcast, args.batch, args.rollback is not None]):
-            print("ERROR: --job cannot be combined with -sC, -eC, -eD, -eB, --batch, or --rollback.", file=sys.stderr)
+        if any([args.show_command, args.edit_command, args.edit_dir, args.edit_broadcast, args.batch, args.rollback is not None, args.commit_status]):
+            print("ERROR: --job cannot be combined with -sC, -eC, -eD, -eB, --batch, --rollback, or --commit-status.", file=sys.stderr)
             return 2
         try:
             job_entries = load_jobs(args.job)
@@ -279,9 +285,10 @@ async def main() -> int:
             bool(args.edit_broadcast),
             bool(args.batch),
             args.rollback is not None,
+            bool(args.commit_status),
         ]
         if sum(modes) != 1:
-            print("ERROR: choose exactly one of -sC, -eC, -eD, -eB, --batch, --rollback, or --job.", file=sys.stderr)
+            print("ERROR: choose exactly one of -sC, -eC, -eD, -eB, --batch, --rollback, --commit-status, or --job.", file=sys.stderr)
             return 2
         if args.rollback is not None and not 0 <= args.rollback <= 49:
             print(f"ERROR: --rollback takes a number from 0 to 49, not {args.rollback}.", file=sys.stderr)
@@ -362,10 +369,19 @@ async def main() -> int:
             mode = "show-batch"
         elif args.rollback is not None:
             mode = "rollback"
+        elif args.commit_status:
+            mode = "commit-status"
         else:
             mode = "edit-dir"
 
         has_edits = mode.startswith("edit") or mode == "rollback"
+
+    if args.comment is not None and not has_edits:
+        print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
+        return 2
+    if args.show_diff and (not has_edits or args.dry_run):
+        print("ERROR: --show-diff goes with an edit that is not already a --dry-run.", file=sys.stderr)
+        return 2
 
     # Validate vendor libraries for all targets
     for v in set(t.vendor for t in targets):
@@ -508,7 +524,9 @@ async def main() -> int:
         if not json_mode:
             print(f"\nReady to execute on {len(targets)} device(s).")
 
-        if not args.yes:
+        if args.show_diff:
+            pass  # the diffs are shown first, the question comes after them
+        elif not args.yes:
             if not sys.stdin.isatty():
                 print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
                 return 2
@@ -570,8 +588,9 @@ async def main() -> int:
 
     sem = asyncio.Semaphore(workers)
 
-    async def _bounded_run(t, mode_override=None, cmd_override=None):
+    async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None):
         async with sem:
+            dry_run = args.dry_run if dry_run is None else dry_run
             # For job mode: each target has its own mode and command
             actual_mode = mode_override or mode
             actual_show_cmd = show_cmd
@@ -608,7 +627,7 @@ async def main() -> int:
                 passwd=passwd,
                 session_timeout=args.session_timeout,
                 command_timeout=args.command_timeout,
-                dry_run=args.dry_run,
+                dry_run=dry_run,
                 commit_confirmed=args.commit_confirmed,
                 save_dir=save_dir,
                 quiet=not show_progress,
@@ -617,8 +636,35 @@ async def main() -> int:
                 safety_gate=safety_gate,
                 structured=args.structured,
                 rollback=args.rollback,
+                comment=args.comment,
                 structured_binding=binding,
             )
+
+    # --show-diff: every target's diff first, one question, then the real run.
+    if args.show_diff and has_edits and not args.dry_run:
+        previews = [asyncio.create_task(_bounded_run(e.target, e.mode, e.command, dry_run=True)) for e in job_entries] \
+            if job_entries else [asyncio.create_task(_bounded_run(t, dry_run=True)) for t in targets]
+        preview_failed = []
+        for coro in asyncio.as_completed(previews):
+            name, ok, out_text, _ = await coro
+            print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---")
+            print(out_text.rstrip())
+            if not ok:
+                preview_failed.append(name)
+        if preview_failed:
+            print(f"\nERROR: dry-run failed on {', '.join(preview_failed)}; nothing committed.", file=sys.stderr)
+            return 1
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
+                return 2
+            try:
+                answer = input("\nCommit these changes on all devices? [y/N]: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                answer = ""
+            if answer not in ("y", "yes"):
+                print("Aborted by user.")
+                return 0
 
     # Create tasks - either job mode or normal mode
     if job_entries:
@@ -650,7 +696,25 @@ async def main() -> int:
             "duration_ms": duration_ms,
         }
 
-        if mode == "show-batch":
+        if mode == "commit-status":
+            try:   # the runner's device header comes first; the data is the last line
+                entry["commits"] = json.loads(out_text.strip().splitlines()[-1]) if ok else []
+            except (json.JSONDecodeError, ValueError, TypeError, IndexError):
+                entry["commits"] = []
+            if ok and not json_mode:
+                print(f"\n{name}:")
+                for c in entry["commits"]:
+                    pending = f"  [commit confirmed, rollback in {c['pending_rollback_minutes']} min]" if c.get("pending_rollback_minutes") is not None else ""
+                    note = f"  {c['comment']}" if c.get("comment") else ""
+                    print(f"  {c['seq']:>2}  {c['time']}  by {c['user']} via {c['client']}{pending}{note}")
+            if not ok:
+                for ln in reversed(out_text.splitlines()):
+                    if ln.startswith("ERROR:"):
+                        entry["error"] = ln[len("ERROR:"):].strip()
+                        break
+                else:
+                    entry["error"] = out_text.strip() or "unknown error"
+        elif mode == "show-batch":
             cmd_results = None
             try:
                 cmd_results = json.loads(out_text)
@@ -712,6 +776,8 @@ async def main() -> int:
                         audit_payload = f"<failed to read {args.edit_broadcast}>"
             elif mode == "rollback":
                 audit_payload = f"rollback {args.rollback}"
+            elif mode == "commit-status":
+                audit_payload = "show system commit"
             elif mode == "job":
                 if job_entries:
                     for je in job_entries:
@@ -733,7 +799,7 @@ async def main() -> int:
                         audit_mode = je.mode
                         break
 
-            is_show_op = audit_mode in ("show", "show-batch")
+            is_show_op = audit_mode in ("show", "show-batch", "commit-status")
             audit_diff = entry.get("output", "") if (ok and not is_show_op) else None
 
             audit_ok = write_audit_entry(
@@ -748,6 +814,7 @@ async def main() -> int:
                 error=entry.get("error"),
                 dry_run=args.dry_run,
                 commit_confirmed=args.commit_confirmed,
+                comment=args.comment,
             )
             if not audit_ok and (has_edits or not is_show_op):
                 print(f"ERROR: Failed to write audit entry for {name}", file=sys.stderr)

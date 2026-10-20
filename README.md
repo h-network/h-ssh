@@ -118,6 +118,7 @@ export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 | `--batch` | Batch | Several show commands from a file, one connection per device |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
+| `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
 
 ```json
 [
@@ -267,6 +268,8 @@ Layered, and every layer is off the critical path until you ask for a write.
 | Pre-flight check | *(automatic)* | Edits verify reachability before touching config |
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
 | Dry run | `--dry-run` | Junos (NETCONF and telnet-junos): loads, runs `commit_check`, diffs, then discards the candidate. Other transports **refuse** `--dry-run` for edits instead of pretending |
+| Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` before anything is committed |
+| Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box (Junos) |
 | Commit confirmed | `--commit-confirmed N` | Junos rolls back after N minutes unless confirmed (confirm with `-eC "commit"`). Transports that cannot do this (`ssh`, `arista`, telnet IOS/NX-OS/Arista, `openssh`) refuse it rather than commit with no timer |
 | Junos syntax guard | *(automatic)* | Enforces set-style syntax (`set`, `delete`, `activate`, `deactivate`, etc.) with `#`-only comments for `junos` and `telnet-junos`. `commit` is only valid as an exact command in `-eC` or `--job`, never inside `-eD`/`-eB` configuration files |
 | Safety gate | `--safety-file PATH` | Opt-in sliding-window rate limit (10 attempts / host / 60 s); 120 s cooldown after connection/auth failure, held in a `flock`'d 0600 JSON file so it persists safely across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
@@ -338,6 +341,31 @@ name, ok, output, ms = run_for_target(
 ```
 
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
+
+### Transactions, comments, commit status
+
+A maintenance wants to look at the diff *before* deciding, keep the candidate on the same session, and
+find its commits again on the box afterwards:
+
+```python
+with vendors.junos.begin(host, user, None, payload, 30, 20) as tx:   # lock, load, diff, commit check
+    print(tx.diff)                                                   # tx.show()/tx.rpc() still work here
+    if gate_says_yes(tx.diff):
+        tx.commit(confirmed=10, comment="C1 cutover")                 # or tx.abort(); leaving the block aborts
+
+vendors.junos.confirm(host, user, None, 30, 20, comment="C1 cutover (confirmed)")
+vendors.junos.commit_status(host, user, None, 30, 20)
+# [{'seq': 0, 'user': 'h-lab', 'client': 'netconf', 'time': '…', 'epoch': 1792…, 'comment': 'C1 cutover',
+#   'note': 'commit confirmed, rollback in 10mins', 'pending_rollback_minutes': 10}, …]
+
+vendors.junos.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
+                             check=lambda: checks_pass(), comment="C1 cutover")
+# commit confirmed → check() → confirm, or an immediate `rollback 1` commit; returns what happened
+```
+
+`edit()`, `rollback()` and `confirm()` take `comment=` too; the device's own "rollback in N min" is what
+`pending_rollback_minutes` reports. A session with an open transaction stays borrowed — other threads
+wait for it, the thread holding it may keep using it.
 
 ### Structured output from a script
 

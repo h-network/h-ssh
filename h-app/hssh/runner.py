@@ -93,10 +93,23 @@ def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
 # else must refuse rather than quietly do something weaker.
 DRY_RUN_EDIT_VENDORS = frozenset({"junos", "telnet-junos"})
 COMMIT_CONFIRMED_VENDORS = frozenset({"junos", "telnet-junos"})
+# Only the NETCONF driver logs a comment with the commit.
+COMMENT_VENDORS = frozenset({"junos"})
+
+
+def _comment_kwargs(vendor, comment):
+    """{"comment": ...} for drivers that take one; refused elsewhere rather
+    than silently dropped."""
+    if comment is None:
+        return {}
+    if vendor not in COMMENT_VENDORS:
+        raise ValueError(f"--comment is not supported by the '{vendor}' transport")
+    return {"comment": comment}
 
 
 def _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
-                    n, session_timeout, command_timeout, commit_confirmed, port, dry_run=False):
+                    n, session_timeout, command_timeout, commit_confirmed, port, dry_run=False,
+                    comment=None):
     """Return to rollback n. Same rules as an edit: refused where the transport
     cannot really do it, retried only when nothing reached the device."""
     if not hasattr(vendor_mod, "rollback"):
@@ -113,12 +126,13 @@ def _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts, host, user, p
         vendor_mod.rollback, name, quiet, max_attempts,
         lambda e: isinstance(e, NotAppliedError),
         host, user, passwd, n, session_timeout, command_timeout,
-        port=port, vendor_hint=vendor, dry_run=dry_run, commit_confirmed=commit_confirmed)
+        port=port, vendor_hint=vendor, dry_run=dry_run, commit_confirmed=commit_confirmed,
+        **_comment_kwargs(vendor, comment))
 
 
 def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
                 payload, session_timeout, command_timeout, commit_confirmed,
-                port, dry_run=False):
+                port, dry_run=False, comment=None):
     """Push configuration. An edit is not idempotent, so it is only retried when
     the driver says nothing reached the device (NotAppliedError); any other
     failure, and above all a timeout around a commit, is reported, not repeated."""
@@ -126,7 +140,7 @@ def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passw
         raise ValueError(
             f"--commit-confirmed is not supported by the '{vendor}' transport; "
             "the change would be applied with no rollback timer")
-    kwargs = {"port": port, "vendor_hint": vendor}
+    kwargs = {"port": port, "vendor_hint": vendor, **_comment_kwargs(vendor, comment)}
     if dry_run:
         if vendor not in DRY_RUN_EDIT_VENDORS:
             raise ValueError(
@@ -162,6 +176,7 @@ def _run_for_target_sync(
     structured_binding: Optional[dict] = None,
     max_attempts: int = MAX_RETRIES,
     rollback: Optional[int] = None,
+    comment: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Execute task on a single target device (internal sync implementation).
@@ -234,11 +249,12 @@ def _run_for_target_sync(
                 result = _retry_loop(vendor_mod.confirm, name, quiet, max_attempts,
                                      lambda e: isinstance(e, NotAppliedError),
                                      host, user, passwd, session_timeout, command_timeout,
-                                     port=t.port, vendor_hint=vendor)
+                                     port=t.port, vendor_hint=vendor,
+                                     **_comment_kwargs(vendor, comment))
             else:
                 result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout,
-                                     command_timeout, commit_confirmed, t.port, dry_run)
+                                     command_timeout, commit_confirmed, t.port, dry_run, comment)
             output.append(result.rstrip())
 
         elif mode == "edit-dir":
@@ -247,7 +263,7 @@ def _run_for_target_sync(
             payload = _read_config_file(config_dir, name)
             result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
-                                 command_timeout, commit_confirmed, t.port, dry_run)
+                                 command_timeout, commit_confirmed, t.port, dry_run, comment)
             output.append(result.rstrip())
 
         elif mode == "edit-broadcast":
@@ -256,15 +272,23 @@ def _run_for_target_sync(
             payload = _read_broadcast_file(broadcast_file)
             result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
-                                 command_timeout, commit_confirmed, t.port, dry_run)
+                                 command_timeout, commit_confirmed, t.port, dry_run, comment)
             output.append(result.rstrip())
+
+        elif mode == "commit-status":
+            if not hasattr(vendor_mod, "commit_status"):
+                raise ValueError(f"--commit-status is not supported by the '{vendor}' transport")
+            entries = _with_retry(vendor_mod.commit_status, name, quiet, max_attempts,
+                                  host, user, passwd, session_timeout, command_timeout,
+                                  port=t.port, vendor_hint=vendor)
+            output.append(json.dumps(entries))
 
         elif mode == "rollback":
             if rollback is None:
                 raise ValueError("No rollback number provided for --rollback.")
             result = _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts,
                                      host, user, passwd, rollback, session_timeout,
-                                     command_timeout, commit_confirmed, t.port, dry_run)
+                                     command_timeout, commit_confirmed, t.port, dry_run, comment)
             output.append(result.rstrip())
 
         elif mode == "show-batch":
@@ -340,6 +364,7 @@ def run_for_target(
     structured_binding: Optional[dict] = None,
     max_attempts: int = MAX_RETRIES,
     rollback: Optional[int] = None,
+    comment: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Synchronous public API for library users.
@@ -357,6 +382,7 @@ def run_for_target(
         structured=structured, structured_binding=structured_binding,
         max_attempts=max_attempts,
         rollback=rollback,
+        comment=comment,
     )
 
 
@@ -382,6 +408,7 @@ async def run_for_target_async(
     structured_binding: Optional[dict] = None,
     max_attempts: int = MAX_RETRIES,
     rollback: Optional[int] = None,
+    comment: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -400,6 +427,7 @@ async def run_for_target_async(
         structured=structured, structured_binding=structured_binding,
         max_attempts=max_attempts,
         rollback=rollback,
+        comment=comment,
     )
 
 

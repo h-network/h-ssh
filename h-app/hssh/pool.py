@@ -48,7 +48,9 @@ class _Entry:
     __slots__ = ("lock", "dev", "closer", "last_used", "generation")
 
     def __init__(self):
-        self.lock = threading.Lock()
+        # Re-entrant: a thread holding an open Transaction on this session may
+        # still show()/rpc() through the pool; other threads wait as before.
+        self.lock = threading.RLock()
         self.dev = None
         self.closer: Optional[Callable] = None
         self.last_used = 0.0

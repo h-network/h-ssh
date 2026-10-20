@@ -206,3 +206,45 @@ def test_rollback_retries_only_when_nothing_was_applied(monkeypatch):
     v = RollbackVendor([AmbiguousCommitError("unknown")])
     _, ok, out, _ = run_rollback(monkeypatch, "junos", v)
     assert not ok and "unknown" in out and len(v.rollback_calls) == 1
+
+
+# --- comments and commit status ----------------------------------------------
+
+def test_comment_reaches_the_junos_driver_and_is_refused_elsewhere(monkeypatch):
+    v = FakeVendor()
+    monkeypatch.setitem(vendors.VENDORS, "junos", v)
+    runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="edit-cmd",
+        show_cmd=None, edit_cmd="set a b", config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, comment="C1 cutover")
+    assert v.edit_calls[0]["comment"] == "C1 cutover"
+    v = FakeVendor()
+    monkeypatch.setitem(vendors.VENDORS, "telnet-junos", v)
+    _, ok, out, _ = runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "telnet-junos"), transport="telnet-junos", mode="edit-cmd",
+        show_cmd=None, edit_cmd="set a b", config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, comment="x")
+    assert not ok and "--comment is not supported" in out and v.edit_calls == []
+
+
+def test_commit_status_mode_returns_json(monkeypatch):
+    class V(FakeVendor):
+        def commit_status(self, host, user, passwd, st, ct, port=None, vendor_hint=None):
+            return [{"seq": 0, "user": "h-lab", "pending_rollback_minutes": 5}]
+    monkeypatch.setitem(vendors.VENDORS, "junos", V())
+    name, ok, out, _ = runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="commit-status",
+        show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True)
+    import json as _json
+    assert ok and _json.loads(out.splitlines()[-1]) == [{"seq": 0, "user": "h-lab", "pending_rollback_minutes": 5}]
+    monkeypatch.setitem(vendors.VENDORS, "ssh", FakeVendor())
+    _, ok, out, _ = runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "ssh"), transport="ssh", mode="commit-status",
+        show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True)
+    assert not ok and "not supported" in out

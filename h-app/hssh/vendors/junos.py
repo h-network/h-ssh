@@ -12,6 +12,7 @@ session and gives it back. A session that fails underneath a call is
 discarded, never handed to the next caller.
 """
 
+import re
 from contextlib import contextmanager
 from typing import List, Optional
 
@@ -266,138 +267,249 @@ def _unlock_quietly(cu) -> Optional[str]:
 MAX_ROLLBACK = 49   # Junos keeps rollback 0-49
 
 
-def _transaction(host: str, user: str, passwd: str, session_timeout: int,
-                 command_timeout: int, port: Optional[int], stage, label: str,
-                 dry_run: bool, commit_confirmed: Optional[int]) -> str:
-    """lock -> stage(cu) -> diff -> commit_check -> commit (or rollback when
-    dry_run) -> unlock. `stage` puts the change into the candidate: a load
-    for edit(), a rollback for rollback(). With dry_run the candidate is
-    validated and diffed on the device and then discarded; nothing is
-    committed.
+class Transaction:
+    """An open change on the router's session: locked, loaded, checked and
+    diffed, waiting for commit() or abort(). Made by begin(); meant for a gate
+    that wants to look at `diff` — or at the device, through show()/rpc() on
+    the same session — before deciding. Leaving a `with` block without
+    commit() aborts.
 
-    Raises NotAppliedError for failures before anything could change on the
-    device, AmbiguousCommitError when a commit was sent and its outcome is
-    unknown, and RuntimeError for rejected config. Only NotAppliedError is safe
-    to retry.
-
-    A pooled session is discarded whenever this leaves it in doubt: a commit
-    whose outcome is unknown, a rollback or unlock that failed, a timeout, or
-    the session dying underneath — so no candidate lock outlives the call.
+    The pooled session stays borrowed while the transaction is open: other
+    threads wanting this router wait, this thread may keep using it.
     """
-    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
-        dev = lease.dev
-        cu = None
-        locked = False
-        committed = False
+
+    def __init__(self, cm, lease, cu, diff: str, label: str, command_timeout: int):
+        self._cm = cm
+        self._lease = lease
+        self._cu = cu
+        self.diff = diff
+        self.label = label
+        self._timeout = command_timeout
+        self.open = True
+
+    @property
+    def dev(self):
+        return self._lease.dev
+
+    def show(self, cmd: str) -> str:
+        self._require_open()
+        return _cli(self.dev, cmd)
+
+    def rpc(self, command: str, args: Optional[dict] = None, fmt: str = "json"):
+        self._require_open()
+        return _rpc_on_lease(self._lease, command, args, fmt)
+
+    def commit(self, confirmed: Optional[int] = None, comment: Optional[str] = None) -> str:
+        """Commit the candidate: COMMIT OK, or COMMIT CONFIRMED (n minutes)
+        when `confirmed` is set, with the diff. NO CHANGES if there were none."""
+        self._require_open()
+        if not self.diff.strip():
+            self.abort()
+            return f"{self.label}NO CHANGES"
+        kwargs = {"timeout": self._timeout}
+        if confirmed and confirmed > 0:
+            kwargs["confirm"] = confirmed
+        if comment:
+            kwargs["comment"] = comment
         try:
-            cu = JunosConfig(dev)
-            try:
-                cu.lock()
-            except LockError as e:
-                # PyEZ wraps a timed-out or dead-session lock RPC in LockError
-                # too; the device may have granted that lock, so the session
-                # goes, which releases it, and the retry gets a fresh one.
-                if _session_lost(e) or _timed_out(e):
-                    lease.discard()
-                raise NotAppliedError(f"Failed to lock config: {e}") from e
-            except Exception as e:
-                if _session_lost(e):
-                    lease.discard()
-                    raise NotAppliedError(f"NETCONF session lost before lock: {e}") from e
-                raise
-            locked = True
-
-            try:
-                stage(cu)
-                diff = (cu.diff() or "")
-                if not diff.strip():
-                    return f"{label}NO CHANGES"
-                cu.commit_check(timeout=command_timeout)
-            except (ConfigLoadError, CommitError) as e:
-                raise RuntimeError(f"Config error: {e}") from e
-
-            if dry_run:
-                return f"{label}DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
-
-            try:
-                if commit_confirmed and commit_confirmed > 0:
-                    cu.commit(confirm=commit_confirmed, timeout=command_timeout)
-                else:
-                    cu.commit(timeout=command_timeout)
-            except CommitError as e:
-                raise RuntimeError(f"Config error: {e}") from e
-            except Exception as e:
-                # The commit RPC was sent. We cannot tell whether it landed.
-                locked = False  # leave the candidate alone; the session is suspect
-                lease.discard()
-                raise AmbiguousCommitError(
-                    f"commit outcome unknown ({type(e).__name__}: {e}); "
-                    "check the device before retrying") from e
-            committed = True
-
-            if commit_confirmed and commit_confirmed > 0:
-                head = f"COMMIT CONFIRMED ({commit_confirmed} minutes)"
-            else:
-                head = "COMMIT OK"
-            return f"{label}{head}\n\nDIFF:\n{diff}"
+            self._cu.commit(**kwargs)
+        except CommitError as e:
+            self._finish(rollback=True, unlock=True)
+            raise RuntimeError(f"Config error: {e}") from e
         except Exception as e:
+            # The commit RPC was sent. We cannot tell whether it landed: leave
+            # the candidate alone, drop the session.
+            self._lease.discard()
+            self._finish(rollback=False, unlock=False)
+            raise AmbiguousCommitError(
+                f"commit outcome unknown ({type(e).__name__}: {e}); "
+                "check the device before retrying") from e
+        self._finish(rollback=False, unlock=True)
+        head = f"COMMIT CONFIRMED ({confirmed} minutes)" if confirmed and confirmed > 0 else "COMMIT OK"
+        return f"{self.label}{head}\n\nDIFF:\n{self.diff}"
+
+    def abort(self) -> None:
+        """Discard the candidate and release the lock."""
+        self._finish(rollback=True, unlock=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.open:
+            self.abort()
+        return False
+
+    def _require_open(self) -> None:
+        if not self.open:
+            raise RuntimeError("transaction is no longer open")
+
+    def _finish(self, rollback: bool, unlock: bool) -> None:
+        if not self.open:
+            return
+        self.open = False
+        try:
+            if rollback:
+                try:
+                    self._cu.rollback()
+                except Exception:
+                    self._lease.discard()
+            if unlock and _unlock_quietly(self._cu) is not None:
+                self._lease.discard()
+        finally:
+            self._cm.__exit__(None, None, None)
+
+
+def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
+           command_timeout: int, port: Optional[int], stage, label: str) -> Transaction:
+    """lock -> stage(cu) -> diff -> commit_check, left open as a Transaction.
+    `stage` puts the change into the candidate: a load for edit(), a rollback
+    for rollback(). Raises NotAppliedError for failures before anything could
+    change on the device and RuntimeError for rejected config; on any failure
+    the candidate is discarded and the lock released."""
+    cm = _session(host, user, passwd, session_timeout, command_timeout, port)
+    lease = cm.__enter__()
+    cu = None
+    locked = False
+    try:
+        cu = JunosConfig(lease.dev)
+        try:
+            cu.lock()
+        except LockError as e:
+            # PyEZ wraps a timed-out or dead-session lock RPC in LockError
+            # too; the device may have granted that lock, so the session
+            # goes, which releases it, and the retry gets a fresh one.
             if _session_lost(e) or _timed_out(e):
                 lease.discard()
+            raise NotAppliedError(f"Failed to lock config: {e}") from e
+        except Exception as e:
+            if _session_lost(e):
+                lease.discard()
+                raise NotAppliedError(f"NETCONF session lost before lock: {e}") from e
             raise
-        finally:
-            if cu is not None and locked:
-                if not committed:
-                    try:
-                        cu.rollback()
-                    except Exception:
-                        lease.discard()
-                if _unlock_quietly(cu) is not None:
-                    lease.discard()
+        locked = True
+        try:
+            stage(cu)
+            diff = (cu.diff() or "")
+            if diff.strip():
+                cu.commit_check(timeout=command_timeout)
+        except (ConfigLoadError, CommitError) as e:
+            raise RuntimeError(f"Config error: {e}") from e
+        return Transaction(cm, lease, cu, diff, label, command_timeout)
+    except BaseException as e:
+        if isinstance(e, Exception) and (_session_lost(e) or _timed_out(e)):
+            lease.discard()
+        if cu is not None and locked:
+            try:
+                cu.rollback()
+            except Exception:
+                lease.discard()
+            if _unlock_quietly(cu) is not None:
+                lease.discard()
+        cm.__exit__(type(e), e, e.__traceback__)
+        raise
 
 
-def edit(host: str, user: str, passwd: str, payload: str,
-         session_timeout: int, command_timeout: int,
-         commit_confirmed: int = None, port: int = None,
-         vendor_hint: str = None, dry_run: bool = False) -> str:
-    """Apply configuration over NETCONF: load the payload into the candidate
-    and run it through _transaction() (lock -> load -> diff -> commit_check
-    -> commit, or rollback for dry_run -> unlock)."""
+def _transaction(host: str, user: str, passwd: str, session_timeout: int,
+                 command_timeout: int, port: Optional[int], stage, label: str,
+                 dry_run: bool, commit_confirmed: Optional[int],
+                 comment: Optional[str] = None) -> str:
+    """begin() and finish in one go: commit (confirmed if asked), or for
+    dry_run show the diff the device produced and discard it. Only
+    NotAppliedError is safe to retry; AmbiguousCommitError means a commit was
+    sent and its outcome is unknown."""
+    tx = _begin(host, user, passwd, session_timeout, command_timeout, port, stage, label)
+    if not tx.diff.strip():
+        tx.abort()
+        return f"{label}NO CHANGES"
+    if dry_run:
+        diff = tx.diff
+        tx.abort()
+        return f"{label}DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
+    return tx.commit(confirmed=commit_confirmed, comment=comment)
+
+
+def begin(host: str, user: str, passwd: str, payload: Optional[str],
+          session_timeout: int, command_timeout: int,
+          port: int = None, vendor_hint: str = None, rollback: Optional[int] = None) -> Transaction:
+    """Open a change and hand it back for a decision: `payload` (set/text
+    config) or `rollback=n`, locked, loaded, checked and diffed on the
+    router's session. Then tx.commit(confirmed=, comment=) or tx.abort().
+
+        with vendors.junos.begin(host, user, None, payload, 30, 20) as tx:
+            print(tx.diff)
+            if looks_right(tx.diff):
+                tx.commit(confirmed=10, comment="C1 cutover")
+    """
     _require()
+    if (payload is None) == (rollback is None):
+        raise ValueError("begin() takes a payload or rollback=n, not both and not neither")
+    if rollback is not None:
+        n = _rollback_number(rollback)
+        return _begin(host, user, passwd, session_timeout, command_timeout, port,
+                      stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ")
     fmt = _config_format(payload)
     body = _strip_comments(payload) if fmt == "set" else payload
-    return _transaction(host, user, passwd, session_timeout, command_timeout, port,
-                        stage=lambda cu: cu.load(body, format=fmt), label="",
-                        dry_run=dry_run, commit_confirmed=commit_confirmed)
+    return _begin(host, user, passwd, session_timeout, command_timeout, port,
+                  stage=lambda cu: cu.load(body, format=fmt), label="")
 
 
-def rollback(host: str, user: str, passwd: str, n: int,
-             session_timeout: int, command_timeout: int,
-             port: int = None, vendor_hint: str = None,
-             dry_run: bool = False, commit_confirmed: int = None) -> str:
-    """Return to rollback `n` (0-49) over NETCONF, with the same gates as an
-    edit: lock -> rollback n -> diff -> commit_check -> commit (confirmed if
-    asked), or show the diff and discard it for dry_run. "NO CHANGES" when
-    rollback n equals the running configuration."""
-    _require()
+def _rollback_number(n) -> int:
     try:
         n = int(n)
     except (TypeError, ValueError):
         raise ValueError(f"rollback number must be an integer 0-{MAX_ROLLBACK}, not {n!r}")
     if not 0 <= n <= MAX_ROLLBACK:
         raise ValueError(f"rollback number must be 0-{MAX_ROLLBACK}, not {n}")
+    return n
+
+
+def edit(host: str, user: str, passwd: str, payload: str,
+         session_timeout: int, command_timeout: int,
+         commit_confirmed: int = None, port: int = None,
+         vendor_hint: str = None, dry_run: bool = False,
+         comment: Optional[str] = None) -> str:
+    """Apply configuration over NETCONF: load the payload into the candidate
+    and run it through _transaction() (lock -> load -> diff -> commit_check
+    -> commit, or rollback for dry_run -> unlock). `comment` is logged with
+    the commit and shows in `show system commit`."""
+    _require()
+    fmt = _config_format(payload)
+    body = _strip_comments(payload) if fmt == "set" else payload
+    return _transaction(host, user, passwd, session_timeout, command_timeout, port,
+                        stage=lambda cu: cu.load(body, format=fmt), label="",
+                        dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment)
+
+
+def rollback(host: str, user: str, passwd: str, n: int,
+             session_timeout: int, command_timeout: int,
+             port: int = None, vendor_hint: str = None,
+             dry_run: bool = False, commit_confirmed: int = None,
+             comment: Optional[str] = None) -> str:
+    """Return to rollback `n` (0-49) over NETCONF, with the same gates as an
+    edit: lock -> rollback n -> diff -> commit_check -> commit (confirmed if
+    asked), or show the diff and discard it for dry_run. "NO CHANGES" when
+    rollback n equals the running configuration."""
+    _require()
+    n = _rollback_number(n)
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
                         stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ",
-                        dry_run=dry_run, commit_confirmed=commit_confirmed)
+                        dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment)
+
 
 def confirm(host: str, user: str, passwd: str,
             session_timeout: int, command_timeout: int,
-            port: int = None, vendor_hint: str = None) -> str:
+            port: int = None, vendor_hint: str = None,
+            comment: Optional[str] = None) -> str:
     """Confirm a pending commit-confirmed by issuing a plain commit."""
     _require()
     with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
         cu = JunosConfig(lease.dev)
         try:
-            cu.commit(timeout=command_timeout)
+            if comment:
+                cu.commit(timeout=command_timeout, comment=comment)
+            else:
+                cu.commit(timeout=command_timeout)
         except CommitError as e:
             raise RuntimeError(f"Commit failed: {e}") from e
         except Exception as e:
@@ -465,6 +577,24 @@ def _rpc_element(dev, command: str, args: Optional[dict]):
     return element
 
 
+def _rpc_format(fmt: Optional[str]) -> str:
+    fmt = (fmt or "json").lower()
+    if fmt not in ("json", "xml"):
+        raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
+    return fmt
+
+
+def _rpc_on_lease(lease, command: str, args: Optional[dict], fmt: str):
+    from lxml import etree
+    fmt = _rpc_format(fmt)
+    element = _rpc_element(lease.dev, command, args)
+    if fmt == "json":
+        element.set("format", "json")
+        return lease.dev.execute(element)
+    reply = lease.dev.execute(element)
+    return etree.tostring(reply, pretty_print=True, encoding="unicode")
+
+
 def rpc(host: str, user: str, passwd: str, command: str,
         session_timeout: int, command_timeout: int,
         port: int = None, vendor_hint: str = None,
@@ -482,18 +612,10 @@ def rpc(host: str, user: str, passwd: str, command: str,
     (request-*, ...) is never re-sent: it fails, and the session is dropped.
     """
     _require()
-    fmt = (fmt or "json").lower()
-    if fmt not in ("json", "xml"):
-        raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
-    from lxml import etree
+    fmt = _rpc_format(fmt)
 
     def run(lease):
-        element = _rpc_element(lease.dev, command, args)
-        if fmt == "json":
-            element.set("format", "json")
-            return lease.dev.execute(element)
-        reply = lease.dev.execute(element)
-        return etree.tostring(reply, pretty_print=True, encoding="unicode")
+        return _rpc_on_lease(lease, command, args, fmt)
 
     text = command.strip()
     read_only = text.startswith("show ") or text.startswith("get")
@@ -506,3 +628,80 @@ def rpc(host: str, user: str, passwd: str, command: str,
             if _session_lost(e) or _timed_out(e):
                 lease.discard()
             raise
+
+
+_PENDING = re.compile(r"rollback in (\d+)\s*min", re.I)
+
+
+def commit_status(host: str, user: str, passwd: str,
+                  session_timeout: int, command_timeout: int,
+                  port: int = None, vendor_hint: str = None) -> List[dict]:
+    """`show system commit` as data: one dict per entry, newest first —
+    seq, user, client, time, epoch, comment (what was logged with the
+    commit) and pending_rollback_minutes, set on the entry whose commit
+    confirmed is still waiting ("commit confirmed, rollback in 5mins").
+    The device's own number is the authority on how long is left."""
+    _require()
+    doc = rpc(host, user, passwd, "get-commit-information", session_timeout, command_timeout, port=port)
+
+    def text(d, key):
+        v = d.get(key)
+        return v[0].get("data") if isinstance(v, list) and v and isinstance(v[0], dict) else None
+
+    def attr(d, key, name):
+        v = d.get(key)
+        return (v[0].get("attributes") or {}).get(name) if isinstance(v, list) and v and isinstance(v[0], dict) else None
+
+    out = []
+    info = doc.get("commit-information") or []
+    for entry in (info[0].get("commit-history") if info else []) or []:
+        note = text(entry, "comment") or ""
+        pending = _PENDING.search(note)
+        epoch = attr(entry, "date-time", "junos:seconds")
+        out.append({
+            "seq": int(text(entry, "sequence-number") or 0),
+            "user": text(entry, "user"),
+            "client": text(entry, "client"),
+            "time": text(entry, "date-time"),
+            "epoch": float(epoch) if epoch else None,
+            "comment": text(entry, "log"),
+            "note": note or None,
+            "pending_rollback_minutes": int(pending.group(1)) if pending else None,
+        })
+    return out
+
+
+def pending_commit(entries: List[dict]) -> Optional[dict]:
+    """The entry of commit_status() whose confirmed commit is still waiting, if any."""
+    for e in entries:
+        if e.get("pending_rollback_minutes") is not None:
+            return e
+    return None
+
+
+def guarded_commit(host: str, user: str, passwd: str, payload: str,
+                   session_timeout: int, command_timeout: int, minutes: int, check,
+                   port: int = None, comment: Optional[str] = None) -> dict:
+    """Commit confirmed, run `check()`, then confirm — or roll straight back.
+
+    `check` is the caller's verdict (anything true to keep the change); an
+    exception counts as a failed check. On failure `rollback 1` is committed
+    at once instead of waiting the timer out, so the device is back before
+    the window closes. Returns {"final": "confirmed" | "rolled back" |
+    "no changes", "commit": ..., "checks": ..., "confirm"/"rollback": ...}.
+    """
+    out = edit(host, user, passwd, payload, session_timeout, command_timeout,
+               commit_confirmed=minutes, port=port, comment=comment)
+    if out.startswith("NO CHANGES"):
+        return {"final": "no changes", "commit": out, "checks": None}
+    try:
+        ok, reason = bool(check()), None
+    except Exception as e:
+        ok, reason = False, f"{type(e).__name__}: {e}"
+    if ok:
+        done = confirm(host, user, passwd, session_timeout, command_timeout, port=port,
+                       comment=f"{comment} (confirmed)" if comment else None)
+        return {"final": "confirmed", "commit": out, "checks": True, "confirm": done}
+    back = rollback(host, user, passwd, 1, session_timeout, command_timeout, port=port,
+                    comment=f"{comment} (rolled back: checks failed)" if comment else "rolled back: checks failed")
+    return {"final": "rolled back", "commit": out, "checks": False, "reason": reason, "rollback": back}

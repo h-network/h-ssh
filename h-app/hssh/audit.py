@@ -46,6 +46,7 @@ def write_audit_entry(
     error: Optional[str] = None,
     dry_run: bool = False,
     commit_confirmed: Optional[int] = None,
+    comment: Optional[str] = None,
 ) -> bool:
     """Append a single audit entry (one line of JSON) to the audit log.
 
@@ -66,6 +67,8 @@ def write_audit_entry(
         }
         if commit_confirmed:
             entry["commit_confirmed"] = commit_confirmed
+        if comment:
+            entry["comment"] = comment
         if diff:
             entry["diff"] = redact_secrets(diff)
         if error:

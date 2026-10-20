@@ -86,8 +86,8 @@ class FakeConfig:
     def commit_check(self, timeout=None):
         self._do("commit_check")
 
-    def commit(self, confirm=None, timeout=None):
-        self._do("commit", confirm=confirm)
+    def commit(self, confirm=None, timeout=None, comment=None):
+        self._do("commit", confirm=confirm, comment=comment)
 
     def rollback(self, rb_id=0):
         self._do("rollback", rb_id)
@@ -314,3 +314,105 @@ def test_rollback_keeps_the_edit_verdicts():
     with pytest.raises(AmbiguousCommitError):
         rollback(1)
     assert "unlock" not in cfg().names
+
+
+# --- comments, transactions, guarded commit ---------------------------------
+
+def commit_call():
+    return [c for c in cfg().calls if c[0] == "commit"][0][2]
+
+
+def test_comment_is_logged_with_edit_rollback_and_confirm():
+    edit(comment="C1 cutover")
+    assert commit_call()["comment"] == "C1 cutover"
+    FakeConfig.instances.clear()
+    rollback(1, comment="back")
+    assert commit_call()["comment"] == "back"
+    FakeConfig.instances.clear()
+    junos.confirm("10.0.0.1", "u", "p", 5, 30, comment="done")
+    assert commit_call()["comment"] == "done"
+    FakeConfig.instances.clear()
+    edit()
+    assert commit_call()["comment"] is None
+
+
+def begin(payload="set system host-name r1\n", **kw):
+    return junos.begin("10.0.0.1", "u", "p", payload, 5, 30, **kw)
+
+
+def test_begin_leaves_the_candidate_open_then_commit():
+    tx = begin()
+    assert tx.open and "+  system host-name r1;" in tx.diff
+    assert cfg().names == ["lock", "load", "diff", "commit_check"]
+    assert not FakeDevice.instances[0].closed            # session still borrowed
+    out = tx.commit(confirmed=7, comment="gate said yes")
+    assert out.startswith("COMMIT CONFIRMED (7 minutes)") and not tx.open
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+    assert commit_call() == {"confirm": 7, "comment": "gate said yes"}
+    assert FakeDevice.instances[0].closed                # given back (pool off: closed)
+    with pytest.raises(RuntimeError, match="no longer open"):
+        tx.commit()
+
+
+def test_begin_abort_and_leaving_the_block():
+    tx = begin()
+    tx.abort()
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "rollback", "unlock"]
+    FakeConfig.instances.clear()
+    with begin() as tx:
+        assert tx.show("show version") == "output of show version"   # same session
+    assert not tx.open and cfg().names[-2:] == ["rollback", "unlock"]
+
+
+def test_begin_with_rollback_and_no_changes():
+    tx = begin(None, rollback=2)
+    assert tx.label == "ROLLBACK 2: " and cfg().calls[1] == ("rollback", (2,), {})
+    tx.abort()
+    FakeConfig.instances.clear()
+    FakeConfig.diff_text = ""
+    tx = begin()
+    assert tx.diff == "" and cfg().names == ["lock", "load", "diff"]   # no commit check without a diff
+    assert tx.commit() == "NO CHANGES" and not tx.open
+    with pytest.raises(ValueError):
+        begin(None)
+    with pytest.raises(ValueError):
+        begin("set a b", rollback=1)
+
+
+def test_begin_cleans_up_when_the_load_is_rejected():
+    FakeConfig.raise_on = {"load": junos.ConfigLoadError("syntax")}
+    with pytest.raises(RuntimeError, match="Config error"):
+        begin()
+    assert cfg().names == ["lock", "load", "rollback", "unlock"]
+    assert FakeDevice.instances[0].closed
+
+
+def test_transaction_commit_verdicts_match_edit():
+    FakeConfig.raise_on = {"commit": junos.CommitError("conflict")}
+    tx = begin()
+    with pytest.raises(RuntimeError, match="Config error"):
+        tx.commit()
+    assert cfg().names[-2:] == ["rollback", "unlock"] and not tx.open
+    FakeConfig.instances.clear()
+    FakeConfig.raise_on = {"commit": rpc_timeout()}
+    tx = begin()
+    with pytest.raises(AmbiguousCommitError):
+        tx.commit()
+    assert "rollback" not in cfg().names and "unlock" not in cfg().names and not tx.open
+
+
+def test_guarded_commit_confirms_or_rolls_back():
+    calls = []
+    res = junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5,
+                               check=lambda: calls.append("checked") or True, comment="C1")
+    assert res["final"] == "confirmed" and calls == ["checked"]
+    commits = [c[2] for i in FakeConfig.instances for c in i.calls if c[0] == "commit"]
+    assert commits == [{"confirm": 5, "comment": "C1"}, {"confirm": None, "comment": "C1 (confirmed)"}]
+    FakeConfig.instances.clear()
+    res = junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5,
+                               check=lambda: (_ for _ in ()).throw(RuntimeError("bgp down")), comment="C1")
+    assert res["final"] == "rolled back" and "bgp down" in res["reason"]
+    names = [c[0] for i in FakeConfig.instances for c in i.calls]
+    assert names == ["lock", "load", "diff", "commit_check", "commit", "unlock",
+                     "lock", "rollback", "diff", "commit_check", "commit", "unlock"]
+    assert FakeConfig.instances[1].calls[1][1] == (1,)       # rollback 1
