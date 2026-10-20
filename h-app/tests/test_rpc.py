@@ -195,3 +195,63 @@ def test_commit_status_reads_the_history_as_data():
     assert junos.pending_commit(entries)["seq"] == 0
     assert junos.pending_commit(entries[1:]) is None
     assert sent().tag == "get-commit-information"
+
+
+# --- rpc_batch: several commands on one session --------------------------------
+
+def rpc_batch(cmds, **kw):
+    return junos.rpc_batch("10.0.0.1", "u", None, cmds, 5, 30, **kw)
+
+
+def test_batch_answers_each_command_on_one_session():
+    res = rpc_batch(["show chassis hardware", "get-chassis-inventory"])
+    assert [r["ok"] for r in res] == [True, True]
+    assert [r["output"] for r in res] == [RpcDevice.json_reply] * 2
+    assert [e.tag for e in RpcDevice.executed] == ["get-chassis-inventory"] * 2
+    assert len(FakeDevice.instances) == 1 and FakeDevice.instances[0].closed
+
+
+def test_batch_records_a_command_without_an_rpc_and_goes_on():
+    res = rpc_batch(["show nonsense", "show chassis hardware"], fmt="xml")
+    assert [r["ok"] for r in res] == [False, True]
+    assert res[0]["command"] == "show nonsense" and "no RPC equivalent" in res[0]["error"]
+    assert res[1]["output"].startswith("<chassis-inventory>")
+
+
+def test_batch_checks_the_format_before_opening_a_session():
+    with pytest.raises(ValueError, match="fmt"):
+        rpc_batch(["show chassis hardware"], fmt="yaml")
+    assert FakeDevice.instances == []
+
+
+def test_batch_of_reads_on_a_dead_reused_session_is_rerun_once():
+    pool.enable()
+    rpc("show chassis hardware")
+    dead = FakeDevice.instances[0]
+    RpcDevice.execute_error = junos.TransportError("closed")
+
+    class Fresh(RpcDevice):
+        def execute(self, element):
+            return {"fresh": element.tag}
+
+    junos.JunosDevice = Fresh
+    res = rpc_batch(["show chassis hardware", "get-chassis-inventory"])
+    assert [r["output"] for r in res] == [{"fresh": "get-chassis-inventory"}] * 2
+    assert dead.closed and len(FakeDevice.instances) == 2
+
+
+def test_batch_with_a_request_rpc_is_never_resent():
+    pool.enable()
+    rpc("show chassis hardware")
+    RpcDevice.execute_error = junos.TransportError("closed")
+    with pytest.raises(junos.TransportError):
+        rpc_batch(["show chassis hardware", "request-system-reboot"])
+    assert len(FakeDevice.instances) == 1 and pool.POOL.live() == 0
+
+
+def test_batch_timeout_is_recorded_and_drops_the_pooled_session():
+    pool.enable()
+    RpcDevice.execute_error = rpc_timeout("get-chassis-inventory")
+    res = rpc_batch(["show chassis hardware", "get-chassis-inventory"])
+    assert [r["ok"] for r in res] == [False, False]
+    assert FakeDevice.instances[0].closed and pool.POOL.live() == 0

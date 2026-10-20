@@ -207,6 +207,7 @@ different file.
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only, nothing else on stdout |
 | `--json` | one object per device, with `command` and `output` fields |
+| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string |
 
 `--raw` is the pipe-friendly one: no banner, no progress lines, no summary. Each device gets a
 `name:` line and its output, and that is all stdout carries — failures and the verdict go to stderr,
@@ -319,6 +320,19 @@ Bindings live in the same `h-app/commands/{vendor}.json` entry as the command, u
 
 Output is **vendor-shaped, not normalised** — `bgp` returns Junos field names on a router and eAPI's own JSON on a switch. Nothing here promises the two match, which is why there's no cross-vendor schema to keep in sync. Add bindings one command at a time; commands without one keep working exactly as before.
 
+`--format json` (or `xml`) needs no binding at all: the router is asked for its RPC translation of the
+CLI command (what `| display xml rpc` does) and the reply comes back as the router produces it — the
+whole document, in Junos's own JSON or XML. It works for `-sC`, `--batch` (one session per device; per
+command a translation round trip plus the RPC) and the show entries of a `--job`, on the NETCONF
+`junos` transport; any other transport refuses it rather than handing back text. Edit modes, edit
+entries of a job and `--dry-run` ignore it and keep their text. `--structured` stays the fixed-fields
+path — the binding names the RPC and the few fields to keep — and the two cannot be combined. `--diff`
+with `--format json` compares the pretty-printed text.
+
+```bash
+./h-app/h-ssh.py --user admin -sC "show chassis hardware" --format json --json --target R1:10.0.1.1:junos
+```
+
 ## Library usage
 
 ```python
@@ -381,7 +395,8 @@ vendors.junos.rpc(host, user, None, "get-interface-information", 30, 20,
 vendors.junos.rpc(host, user, None, "show route summary", 30, 20, fmt="xml")   # the reply XML, as text
 ```
 
-`rpc()` runs on the pooled session like everything else. `show_structured()` — a PyEZ Table/View
+`rpc()` runs on the pooled session like everything else, and `rpc_batch()` answers a list of
+commands on one session the way `show_batch()` does. `show_structured()` — a PyEZ Table/View
 binding that returns a fixed, named set of fields — stays as the fallback for when you want a few
 fields keyed by item rather than the whole reply.
 

@@ -65,6 +65,14 @@ def strip_result_header(out_text: str, command: str = None) -> str:
     return "\n".join(lines[i:]).strip("\n")
 
 
+def document_text(output) -> str:
+    """One command's output as it is printed and diffed: a JSON reply (a dict,
+    from --format json) pretty-printed, XML and text as they are."""
+    if isinstance(output, str):
+        return output
+    return json.dumps(output, indent=2)
+
+
 
 # A thread per in-flight device, so the ceiling is an operator's choice rather
 # than a property of the machine. Capped because each one is an ssh process.
@@ -217,6 +225,9 @@ async def main() -> int:
     # Output
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON array (suppresses human-readable output)")
+    parser.add_argument("--format", choices=["text", "json", "xml"], default="text",
+                        help="Show output as the router's own JSON or XML reply, through its RPC "
+                             "translation of the command (junos only; default: text)")
     parser.add_argument("--save-output", type=str,
                         help="Create dir and save per-device output files inside it")
     parser.add_argument("--log", type=str,
@@ -254,6 +265,11 @@ async def main() -> int:
             print(f"Create shortcuts in: ~/.h-ssh/commands/{args.transport}.json")
             print(f"See h-app/commands/junos.json for format example.\n")
         return 0
+
+    # Two different paths: a binding's few fields, or the router's whole reply.
+    if args.structured and args.format != "text":
+        print("ERROR: --structured and --format are mutually exclusive.", file=sys.stderr)
+        return 2
 
     # ------ JOB MODE ------
     job_entries = None
@@ -638,6 +654,7 @@ async def main() -> int:
                 rollback=args.rollback,
                 comment=args.comment,
                 structured_binding=binding,
+                fmt=args.format,
             )
 
     # --show-diff: every target's diff first, one question, then the real run.
@@ -688,6 +705,10 @@ async def main() -> int:
             break
 
         t = target_map[name]
+        # A job entry runs in its own mode; everything else in the run's.
+        dev_mode = mode
+        if job_entries:
+            dev_mode = next((je.mode for je in job_entries if je.target.name == name), mode)
         entry = {
             "device": name,
             "host": t.host,
@@ -723,7 +744,8 @@ async def main() -> int:
 
             if isinstance(cmd_results, list):
                 for cr in cmd_results:
-                    if cr.get("ok") and "output" in cr:
+                    # Only text carries the echo; a --format json reply is data.
+                    if cr.get("ok") and isinstance(cr.get("output"), str):
                         cr["output"] = strip_result_header(cr["output"], cr["command"])
                 entry["commands"] = cmd_results
                 if not ok:
@@ -747,6 +769,12 @@ async def main() -> int:
             if resolved_cmd:
                 entry["command"] = resolved_cmd
             entry["output"] = strip_result_header(out_text, resolved_cmd)
+            if args.format == "json" and dev_mode == "show" and not args.dry_run:
+                # The runner printed the router's reply; --json carries it as data.
+                try:
+                    entry["output"] = json.loads(entry["output"])
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    pass  # a driver that handed back something else: keep it as text
         else:
             for ln in reversed(out_text.splitlines()):
                 if ln.startswith("ERROR:"):
@@ -792,14 +820,7 @@ async def main() -> int:
                     if batch_cmds else ""
                 )
 
-            audit_mode = mode
-            if mode == "job" and job_entries:
-                for je in job_entries:
-                    if je.target.name == name:
-                        audit_mode = je.mode
-                        break
-
-            is_show_op = audit_mode in ("show", "show-batch", "commit-status")
+            is_show_op = dev_mode in ("show", "show-batch", "commit-status")
             audit_diff = entry.get("output", "") if (ok and not is_show_op) else None
 
             audit_ok = write_audit_entry(
@@ -807,7 +828,7 @@ async def main() -> int:
                 device=name,
                 host=t.host,
                 vendor=t.vendor,
-                mode=audit_mode,
+                mode=dev_mode,
                 payload=audit_payload,
                 ok=ok,
                 diff=audit_diff,
@@ -832,7 +853,7 @@ async def main() -> int:
                     print(f"{name}:")
                     for cr in cmd_results:
                         if cr.get("ok"):
-                            print(strip_result_header(cr["output"], cr["command"]))
+                            print(strip_result_header(document_text(cr["output"]), cr["command"]))
                         else:
                             print(f"{name}: {cr.get('command')}: {cr.get('error')}", file=sys.stderr)
                     print()
@@ -874,7 +895,7 @@ async def main() -> int:
                         for cr in cmd_results:
                             print(f"\n--- {name}: {cr.get('command')} ---")
                             if cr.get("ok"):
-                                print(cr.get("output", ""))
+                                print(document_text(cr.get("output", "")))
                             else:
                                 print(f"  ERROR: {cr.get('error')}")
                             print(f"--- end ---")
@@ -943,9 +964,9 @@ async def main() -> int:
             baseline_name = baseline["device"]
 
             if mode == "show":
-                baseline_lines = baseline["output"].splitlines(keepends=True)
+                baseline_lines = document_text(baseline["output"]).splitlines(keepends=True)
                 for other in ok_results[1:]:
-                    other_lines = other["output"].splitlines(keepends=True)
+                    other_lines = document_text(other["output"]).splitlines(keepends=True)
                     diff_lines = list(difflib.unified_diff(
                         baseline_lines, other_lines,
                         fromfile=baseline_name, tofile=other["device"],
@@ -955,7 +976,7 @@ async def main() -> int:
                 baseline["diff"] = "(baseline)"
 
             elif mode == "show-batch":
-                baseline_map = {c["command"]: c["output"] for c in baseline["commands"] if c["ok"]}
+                baseline_map = {c["command"]: document_text(c["output"]) for c in baseline["commands"] if c["ok"]}
                 for other in ok_results[1:]:
                     cmd_diffs = []
                     for cr in other["commands"]:
@@ -964,7 +985,7 @@ async def main() -> int:
                         bl = baseline_map.get(cr["command"], "")
                         diff_lines = list(difflib.unified_diff(
                             bl.splitlines(keepends=True),
-                            cr["output"].splitlines(keepends=True),
+                            document_text(cr["output"]).splitlines(keepends=True),
                             fromfile=baseline_name, tofile=other["device"],
                         ))
                         diff_text = "".join(diff_lines).rstrip()
