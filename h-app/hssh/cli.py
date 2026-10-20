@@ -7,6 +7,7 @@ import difflib
 import getpass
 import json
 import os
+import shlex
 import socket
 import sys
 import time
@@ -19,7 +20,7 @@ from .core import (
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, resolve_target_port, validate_junos_set_syntax,
 )
-from .runner import run_for_target_async
+from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS
 from .safety import SafetyGate
 from .audit import write_audit_entry
 from .vendors import junos, arista, generic, openssh, telnet
@@ -116,6 +117,38 @@ def apply_config_defaults(args, config: dict) -> None:
             except (TypeError, ValueError):
                 value = fallback
         setattr(args, key, value)
+
+
+def format_edit_result(out_text: str) -> str:
+    """The driver's verdict for one edit, indented under its status line.
+
+    COMMIT OK, the diff, or the DRY-RUN verdict is what an edit run is for;
+    a bare OK would hide the diff that --dry-run exists to show. This is the
+    default view, so it drops the header and -v's frame and keeps two spaces
+    of indent, the same as a FAIL line's ERROR.
+    """
+    body = strip_result_header(out_text)
+    return "\n".join("  " + ln if ln.strip() else "" for ln in body.splitlines())
+
+
+def build_confirm_command(user, target_specs, devices: str, transport: str) -> str:
+    """The command that confirms this run's commit-confirmed.
+
+    Rebuilt from the run's own arguments, so it reaches the same devices as
+    the same user: the inline --target specs as typed, or else the inventory
+    file. --transport is kept only when it names a transport that can
+    confirm a commit.
+    """
+    cmd = ['./h-app/h-ssh.py -eC "commit"']
+    if user:
+        cmd.append("--user " + shlex.quote(user))
+    if target_specs:
+        cmd.extend("--target " + shlex.quote(spec) for spec in target_specs)
+    else:
+        cmd.append("--devices " + shlex.quote(devices))
+    if transport in COMMIT_CONFIRMED_VENDORS:
+        cmd.append("--transport " + transport)
+    return " ".join(cmd)
 
 
 def get_default_devices_path() -> str:
@@ -923,6 +956,8 @@ async def main() -> int:
                     print(f"\n--- Output from {name} ---")
                     print(out_text)
                     print(f"--- End of {name} ---\n")
+                elif ok and (dev_mode.startswith("edit") or dev_mode == "rollback"):
+                    print(format_edit_result(out_text))
                 elif not ok:
                     for ln in reversed(out_text.splitlines()):
                         if ln.startswith("ERROR:"):
@@ -1049,14 +1084,7 @@ async def main() -> int:
             print(" " * 15 + "DON'T FORGET TO CONFIRM THE COMMIT!")
             print("=" * 70)
             print(f"Run this command to confirm within {args.commit_confirmed} minutes:")
-            confirm_cmd = "  ./h-app/h-ssh.py -eC \"commit\""
-            if args.user:
-                confirm_cmd += f" --user {args.user}"
-            if args.devices != get_default_devices_path():
-                confirm_cmd += f" --devices {args.devices}"
-            if args.transport != "junos":
-                confirm_cmd += f" --transport {args.transport}"
-            print(confirm_cmd)
+            print("  " + build_confirm_command(user, args.target, args.devices, args.transport))
             print("\nOr the changes will automatically rollback!")
             print("=" * 70)
             print("")

@@ -24,6 +24,16 @@ _PERMANENT = (
     # failure has already spent the full ConnectTimeout; spending it twice more
     # is what makes one dead device dominate a fleet run.
     "connect to host",
+    # PyEZ reports the connect phase by exception class, and the junos driver
+    # wraps it: "NETCONF connect failed: ConnectTimeoutError(host)". The same
+    # dead-router and bad-login cases as above, in a different coat.
+    # ConnectClosedError and RpcTimeoutError are deliberately absent: they
+    # come after the session was up, so the next attempt may succeed.
+    "netconf connect failed",
+    "connecttimeouterror",
+    "connectrefusederror",
+    "connectunknownhosterror",
+    "connectautherror",
     "connection timed out",
     "connection refused",
     "no route to host",

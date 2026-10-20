@@ -6,7 +6,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh.runner import _with_retry, is_permanent_failure, _backoff
+from hssh.errors import NotAppliedError
+from hssh.runner import _retry_loop, _with_retry, is_permanent_failure, _backoff
 
 
 @pytest.mark.parametrize("message", [
@@ -155,3 +156,42 @@ def test_workers_actually_run_in_parallel(tmp_path):
 
     # 24 devices x 1s. One batch is ~1s; a capped pool needs two or more.
     assert elapsed < 2.0, "24 workers took %.1fs, so they did not run concurrently" % elapsed
+
+
+@pytest.mark.parametrize("message", [
+    "NETCONF connect failed: ConnectTimeoutError(10.0.0.1)",
+    "NETCONF connect failed: ConnectRefusedError(10.0.0.1)",
+    "NETCONF connect failed: ConnectUnknownHostError(r1.lab.example)",
+    "NETCONF connect failed: ConnectAuthError(10.0.0.1)",
+    "NETCONF connect failed: ConnectError(host: 10.0.0.1, msg: [Errno 113] No route to host)",
+])
+def test_pyez_connect_failures_are_permanent(message):
+    """PyEZ names the connect phase by exception class and the junos driver
+    wraps that in NotAppliedError. Neither coat may hide a dead router."""
+    assert is_permanent_failure(NotAppliedError(message))
+
+
+@pytest.mark.parametrize("message", [
+    "ConnectClosedError(10.0.0.1)",
+    "RpcTimeoutError(host: 10.0.0.1, cmd: get-software-information, timeout: 20)",
+    "Failed to lock config: LockError(severity: error, bad_element: None, "
+    "message: configuration database locked by: admin terminal pts/0 (pid 1234))",
+])
+def test_pyez_session_failures_are_retried(message):
+    """These arrive after the NETCONF session was up, so the next attempt may succeed."""
+    assert not is_permanent_failure(RuntimeError(message))
+
+
+def test_dead_router_edit_is_attempted_once(monkeypatch):
+    """NotAppliedError is the one failure an edit may retry, but a connect
+    timeout inside it is still a dead router: one timeout, not three plus backoff."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise NotAppliedError("NETCONF connect failed: ConnectTimeoutError(10.0.0.1)")
+
+    with pytest.raises(NotAppliedError):
+        _retry_loop(boom, "r1", True, 3, lambda e: isinstance(e, NotAppliedError))
+    assert len(calls) == 1
