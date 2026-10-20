@@ -584,15 +584,40 @@ def _rpc_format(fmt: Optional[str]) -> str:
     return fmt
 
 
-def _rpc_on_lease(lease, command: str, args: Optional[dict], fmt: str):
+def _rpc_reply(dev, command: str, args: Optional[dict], fmt: str):
+    """Send the RPC for `command` and return the reply as the router produces
+    it: a dict for json, the reply XML as a string for xml."""
     from lxml import etree
-    fmt = _rpc_format(fmt)
-    element = _rpc_element(lease.dev, command, args)
+
+    element = _rpc_element(dev, command, args)
     if fmt == "json":
         element.set("format", "json")
-        return lease.dev.execute(element)
-    reply = lease.dev.execute(element)
+        return dev.execute(element)
+    reply = dev.execute(element)
     return etree.tostring(reply, pretty_print=True, encoding="unicode")
+
+
+def _is_read(command: str) -> bool:
+    """A get-* RPC (any "show ..." command) is a read and safe to send twice."""
+    text = command.strip()
+    return text.startswith("show ") or text.startswith("get")
+
+
+def _on_session_once(host, user, passwd, session_timeout, command_timeout, port, fn):
+    """Run fn(lease) on the router's session exactly once: a failure drops a
+    session left in doubt and is never re-sent, reused session or not."""
+    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+        try:
+            return fn(lease)
+        except Exception as e:
+            if _session_lost(e) or _timed_out(e):
+                lease.discard()
+            raise
+
+
+def _rpc_on_lease(lease, command: str, args: Optional[dict], fmt: str):
+    """_rpc_reply on a borrowed session (what Transaction.rpc() uses)."""
+    return _rpc_reply(lease.dev, command, args, _rpc_format(fmt))
 
 
 def rpc(host: str, user: str, passwd: str, command: str,
@@ -613,21 +638,43 @@ def rpc(host: str, user: str, passwd: str, command: str,
     """
     _require()
     fmt = _rpc_format(fmt)
+    run_on = _on_session if _is_read(command) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port,
+                  lambda lease: _rpc_reply(lease.dev, command, args, fmt))
+
+
+def rpc_batch(host: str, user: str, passwd: str, cmds: List[str],
+              session_timeout: int, command_timeout: int,
+              port: int = None, vendor_hint: str = None,
+              fmt: str = "json") -> List[dict]:
+    """rpc() for several CLI commands on one NETCONF session, each answered
+    in its own {command, ok, output|error} the way show_batch() reports.
+
+    A command the router has no RPC for, or rejects, or that times out, is
+    reported in its result and the batch goes on (after a timeout the session
+    is not kept). A session that dies fails the whole batch; it is reopened
+    and the batch sent once more only when every command is a read, as rpc()
+    does for one.
+    """
+    _require()
+    fmt = _rpc_format(fmt)
 
     def run(lease):
-        return _rpc_on_lease(lease, command, args, fmt)
+        results = []
+        for cmd in cmds:
+            try:
+                results.append({"command": cmd, "ok": True,
+                                "output": _rpc_reply(lease.dev, cmd, None, fmt)})
+            except Exception as e:
+                if _session_lost(e):
+                    raise
+                if _timed_out(e):
+                    lease.discard()
+                results.append({"command": cmd, "ok": False, "error": str(e)})
+        return results
 
-    text = command.strip()
-    read_only = text.startswith("show ") or text.startswith("get")
-    if read_only:
-        return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
-    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
-        try:
-            return run(lease)
-        except Exception as e:
-            if _session_lost(e) or _timed_out(e):
-                lease.discard()
-            raise
+    run_on = _on_session if all(_is_read(c) for c in cmds) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
 
 
 _PENDING = re.compile(r"rollback in (\d+)\s*min", re.I)

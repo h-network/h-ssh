@@ -40,6 +40,7 @@ _PERMANENT = (
     "no username",
     "openssh >= ",
     "rejected the operational command",
+    "no rpc equivalent",
     "no 'ssh' binary",
     "invalid",
     "syntax error",
@@ -154,6 +155,18 @@ def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passw
         commit_confirmed, **kwargs)
 
 
+def _rpc_call(vendor_mod, vendor, batch=False):
+    """The transport's rpc() (rpc_batch() for a batch), or a refusal. Only a
+    driver that can ask the router for a command's own JSON or XML has one;
+    a text transport must say so rather than hand back the text as before."""
+    fn = getattr(vendor_mod, "rpc_batch" if batch else "rpc", None)
+    if fn is None:
+        raise ValueError(
+            f"--format json/xml is not supported by the '{vendor}' transport; "
+            "nothing was sent to the device")
+    return fn
+
+
 def _run_for_target_sync(
     t: Target,
     transport: str,
@@ -177,6 +190,7 @@ def _run_for_target_sync(
     max_attempts: int = MAX_RETRIES,
     rollback: Optional[int] = None,
     comment: Optional[str] = None,
+    fmt: str = "text",
 ) -> Tuple[str, bool, str, int]:
     """
     Execute task on a single target device (internal sync implementation).
@@ -221,6 +235,14 @@ def _run_for_target_sync(
                 raise ValueError("No show command provided.")
             if dry_run:
                 result = f"DRY-RUN show: {show_cmd}"
+            elif fmt != "text":
+                # The router's own JSON or XML for the command, through its
+                # RPC translation. Only the NETCONF driver can do that; a
+                # transport that cannot refuses here, before any device I/O.
+                data = _with_retry(_rpc_call(vendor_mod, vendor), name, quiet, max_attempts,
+                                   host, user, passwd, show_cmd, session_timeout, command_timeout,
+                                   port=t.port, vendor_hint=vendor, fmt=fmt)
+                result = data if fmt == "xml" else json.dumps(data, indent=2)
             elif structured and hasattr(vendor_mod, "show_structured"):
                 # Absence of show_structured on a vendor module is the whole
                 # capability check — generic and telnet simply don't have one,
@@ -296,6 +318,10 @@ def _run_for_target_sync(
                 raise ValueError("No batch commands provided.")
             if dry_run:
                 cmd_results = [{"command": c, "ok": True, "output": f"DRY-RUN show: {c}"} for c in batch_cmds]
+            elif fmt != "text":
+                cmd_results = _with_retry(_rpc_call(vendor_mod, vendor, batch=True), name, quiet, max_attempts,
+                                          host, user, passwd, batch_cmds, session_timeout, command_timeout,
+                                          port=t.port, vendor_hint=vendor, fmt=fmt)
             else:
                 cmd_results = _with_retry(vendor_mod.show_batch, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
@@ -365,6 +391,7 @@ def run_for_target(
     max_attempts: int = MAX_RETRIES,
     rollback: Optional[int] = None,
     comment: Optional[str] = None,
+    fmt: str = "text",
 ) -> Tuple[str, bool, str, int]:
     """
     Synchronous public API for library users.
@@ -383,6 +410,7 @@ def run_for_target(
         max_attempts=max_attempts,
         rollback=rollback,
         comment=comment,
+        fmt=fmt,
     )
 
 
@@ -409,6 +437,7 @@ async def run_for_target_async(
     max_attempts: int = MAX_RETRIES,
     rollback: Optional[int] = None,
     comment: Optional[str] = None,
+    fmt: str = "text",
 ) -> Tuple[str, bool, str, int]:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -428,6 +457,7 @@ async def run_for_target_async(
         max_attempts=max_attempts,
         rollback=rollback,
         comment=comment,
+        fmt=fmt,
     )
 
 
