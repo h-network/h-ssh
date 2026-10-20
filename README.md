@@ -203,7 +203,7 @@ different file.
 
 | Flag | Prints |
 |---|---|
-| *(none)* | one status line per device |
+| *(none)* | one status line per device, plus the verdict and diff under it for edits |
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only, nothing else on stdout |
 | `--json` | one object per device, with `command` and `output` fields |
@@ -242,8 +242,9 @@ The split is whether a connection was established. A connect-phase failure has a
 full `ConnectTimeout`; spending it twice more is what lets one dead device dominate a fleet run.
 Unreachable means unreachable for the duration of the run. Once a session exists, a read failure may well
 be transient, so those still get retried. **Edits are different:** a config push is retried only when
-the driver reports that nothing reached the device (for Junos: connect or candidate-lock failure).
-Any other failure — above all a timeout around a commit — is reported once and left for you to check.
+the driver reports that nothing reached the device (for Junos: a candidate-lock failure; a connect
+failure is unreachable like any other and stops at one). Any other failure — above all a timeout around
+a commit — is reported once and left for you to check.
 
 Retrying an authentication failure cannot succeed either, and on a fleet it spends three real login
 attempts per device against accounts that may lock out. Those stop at one.
