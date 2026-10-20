@@ -338,6 +338,24 @@ name, ok, output, ms = run_for_target(
 
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
 
+### Structured output from a script
+
+`show()` returns the CLI text. For data, ask for the RPC reply instead — the router translates the CLI
+command you know into its RPC (what `| display xml rpc` does), and answers in its own JSON:
+
+```python
+hw = vendors.junos.rpc("10.0.1.1", "admin", None, "show chassis hardware", 30, 20)
+# -> {'chassis-inventory': [{'chassis': [{'serial-number': [{'data': 'VM6AD25B940C'}], ...}]}]}
+
+vendors.junos.rpc(host, user, None, "get-interface-information", 30, 20,
+                  args={"interface-name": "ge-0/0/0", "terse": True})   # RPC name + arguments
+vendors.junos.rpc(host, user, None, "show route summary", 30, 20, fmt="xml")   # the reply XML, as text
+```
+
+`rpc()` runs on the pooled session like everything else. `show_structured()` — a PyEZ Table/View
+binding that returns a fixed, named set of fields — stays as the fallback for when you want a few
+fields keyed by item rather than the whole reply.
+
 ### Connection pooling
 
 Every call above opens its own NETCONF session and closes it — right for a one-shot CLI run, wasteful
