@@ -388,9 +388,30 @@ def test_reap_skips_a_busy_session(pooled):
     show()
     pooled.idle_timeout = 0
     entry = pooled._entry(("10.0.0.1", 830, "u"))
-    with entry.lock:
-        assert pooled.reap() == 0
+    held, release = threading.Event(), threading.Event()
+
+    def borrower():                      # another thread holds the session
+        with entry.lock:
+            held.set()
+            release.wait(2)
+
+    t = threading.Thread(target=borrower)
+    t.start()
+    held.wait(2)
+    assert pooled.reap() == 0
+    release.set()
+    t.join()
     assert pooled.reap() == 1
+
+
+def test_same_thread_may_reuse_its_borrowed_session():
+    """The lock is re-entrant: a show() inside an open borrow (a Transaction)
+    rides the same session instead of deadlocking."""
+    pool.enable()
+    key = ("10.0.0.1", 830, "u")
+    with pool.POOL.lease(key, opener=lambda: FakeDevice(), closer=junos._close) as lease:
+        show()
+        assert len(devices()) == 1 and devices()[0] is lease.dev
 
 
 def test_reaper_thread_is_replaced_not_duplicated(pooled):

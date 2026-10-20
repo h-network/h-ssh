@@ -177,3 +177,21 @@ def test_rpc_timeout_drops_the_pooled_session():
         rpc("get-chassis-inventory")
     assert FakeDevice.instances[0].closed
     assert pool.POOL.live() == 0
+
+
+def test_commit_status_reads_the_history_as_data():
+    RpcDevice.json_reply = {"commit-information": [{"commit-history": [
+        {"sequence-number": [{"data": "0"}], "user": [{"data": "h-lab"}], "client": [{"data": "netconf"}],
+         "date-time": [{"data": "2026-10-20 19:19:11 CEST", "attributes": {"junos:seconds": "1792516751"}}],
+         "comment": [{"data": "commit confirmed, rollback in 5mins"}], "log": [{"data": "C1 cutover"}]},
+        {"sequence-number": [{"data": "1"}], "user": [{"data": "h-lab"}], "client": [{"data": "cli"}],
+         "date-time": [{"data": "2026-10-19 02:33:16 CEST"}]},
+    ]}]}
+    entries = junos.commit_status("10.0.0.1", "u", None, 5, 30)
+    assert entries[0] == {"seq": 0, "user": "h-lab", "client": "netconf", "time": "2026-10-20 19:19:11 CEST",
+                          "epoch": 1792516751.0, "comment": "C1 cutover",
+                          "note": "commit confirmed, rollback in 5mins", "pending_rollback_minutes": 5}
+    assert entries[1]["pending_rollback_minutes"] is None and entries[1]["comment"] is None
+    assert junos.pending_commit(entries)["seq"] == 0
+    assert junos.pending_commit(entries[1:]) is None
+    assert sent().tag == "get-commit-information"

@@ -179,3 +179,12 @@ def test_cli_rollback_is_one_mode_among_the_others(tmp_path):
     assert res.returncode == 2 and "exactly one of" in res.stderr and "--rollback" in res.stderr
     res = _cli("--rollback", "1", "--job", "-", tmp_path=tmp_path)
     assert res.returncode == 2 and "--rollback" in res.stderr
+
+
+def test_cli_comment_show_diff_and_commit_status_usage(tmp_path):
+    res = _cli("-sC", "show version", "--comment", "x", tmp_path=tmp_path)
+    assert res.returncode == 2 and "--comment goes with an edit" in res.stderr
+    res = _cli("-eC", "set system host-name x", "--show-diff", "--dry-run", tmp_path=tmp_path)
+    assert res.returncode == 2 and "--show-diff" in res.stderr
+    res = _cli("--commit-status", "-sC", "show version", tmp_path=tmp_path)
+    assert res.returncode == 2 and "exactly one of" in res.stderr
