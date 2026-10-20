@@ -117,6 +117,7 @@ export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 | `-eB` | Edit broadcast | One config file applied to all targets |
 | `--batch` | Batch | Several show commands from a file, one connection per device |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
+| `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
 
 ```json
 [

@@ -156,3 +156,53 @@ def test_device_failure_does_cool_the_device(monkeypatch):
     _, ok, _, _ = run_gated(monkeypatch, "junos", v, gate)
     assert not ok
     assert gate.events == ["check", "cooldown"]
+
+
+# --- rollback mode -----------------------------------------------------------
+
+class RollbackVendor(FakeVendor):
+    def __init__(self, effects=None):
+        super().__init__(effects)
+        self.rollback_calls = []
+
+    def rollback(self, host, user, passwd, n, st, ct, port=None, vendor_hint=None,
+                 dry_run=False, commit_confirmed=None):
+        self.rollback_calls.append({"n": n, "dry_run": dry_run, "cc": commit_confirmed})
+        if self.effects:
+            eff = self.effects.pop(0)
+            if isinstance(eff, Exception):
+                raise eff
+            return eff
+        return f"ROLLBACK {n}: COMMIT OK"
+
+
+def run_rollback(monkeypatch, vendor_name, mod, n=1, dry_run=False, commit_confirmed=None, attempts=3):
+    monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
+    return runner.run_for_target(
+        t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode="rollback",
+        show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=dry_run, commit_confirmed=commit_confirmed, save_dir=None,
+        quiet=True, max_attempts=attempts, rollback=n)
+
+
+def test_rollback_reaches_the_driver_with_number_and_flags(monkeypatch):
+    v = RollbackVendor()
+    _, ok, out, _ = run_rollback(monkeypatch, "junos", v, n=3, dry_run=True, commit_confirmed=None)
+    assert ok and "ROLLBACK 3" in out
+    assert v.rollback_calls == [{"n": 3, "dry_run": True, "cc": None}]
+
+
+def test_rollback_is_refused_where_the_transport_cannot(monkeypatch):
+    v = FakeVendor()      # no rollback() at all
+    _, ok, out, _ = run_rollback(monkeypatch, "ssh", v, n=1)
+    assert not ok and "not supported" in out and v.edit_calls == []
+
+
+def test_rollback_retries_only_when_nothing_was_applied(monkeypatch):
+    v = RollbackVendor([NotAppliedError("lock"), "ROLLBACK 1: COMMIT OK"])
+    _, ok, out, _ = run_rollback(monkeypatch, "junos", v)
+    assert ok and len(v.rollback_calls) == 2
+    v = RollbackVendor([AmbiguousCommitError("unknown")])
+    _, ok, out, _ = run_rollback(monkeypatch, "junos", v)
+    assert not ok and "unknown" in out and len(v.rollback_calls) == 1

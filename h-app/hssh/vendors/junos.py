@@ -263,15 +263,17 @@ def _unlock_quietly(cu) -> Optional[str]:
         return str(e)
 
 
-def edit(host: str, user: str, passwd: str, payload: str,
-         session_timeout: int, command_timeout: int,
-         commit_confirmed: int = None, port: int = None,
-         vendor_hint: str = None, dry_run: bool = False) -> str:
-    """Apply configuration over NETCONF.
+MAX_ROLLBACK = 49   # Junos keeps rollback 0-49
 
-    lock -> load -> diff -> commit_check -> commit (or rollback when dry_run)
-    -> unlock. With dry_run the candidate is validated and diffed on the device
-    and then discarded; nothing is committed.
+
+def _transaction(host: str, user: str, passwd: str, session_timeout: int,
+                 command_timeout: int, port: Optional[int], stage, label: str,
+                 dry_run: bool, commit_confirmed: Optional[int]) -> str:
+    """lock -> stage(cu) -> diff -> commit_check -> commit (or rollback when
+    dry_run) -> unlock. `stage` puts the change into the candidate: a load
+    for edit(), a rollback for rollback(). With dry_run the candidate is
+    validated and diffed on the device and then discarded; nothing is
+    committed.
 
     Raises NotAppliedError for failures before anything could change on the
     device, AmbiguousCommitError when a commit was sent and its outcome is
@@ -282,7 +284,6 @@ def edit(host: str, user: str, passwd: str, payload: str,
     whose outcome is unknown, a rollback or unlock that failed, a timeout, or
     the session dying underneath — so no candidate lock outlives the call.
     """
-    _require()
     with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
         dev = lease.dev
         cu = None
@@ -306,19 +307,17 @@ def edit(host: str, user: str, passwd: str, payload: str,
                 raise
             locked = True
 
-            fmt = _config_format(payload)
-            body = _strip_comments(payload) if fmt == "set" else payload
             try:
-                cu.load(body, format=fmt)
+                stage(cu)
                 diff = (cu.diff() or "")
                 if not diff.strip():
-                    return "NO CHANGES"
+                    return f"{label}NO CHANGES"
                 cu.commit_check(timeout=command_timeout)
             except (ConfigLoadError, CommitError) as e:
                 raise RuntimeError(f"Config error: {e}") from e
 
             if dry_run:
-                return f"DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
+                return f"{label}DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
 
             try:
                 if commit_confirmed and commit_confirmed > 0:
@@ -340,7 +339,7 @@ def edit(host: str, user: str, passwd: str, payload: str,
                 head = f"COMMIT CONFIRMED ({commit_confirmed} minutes)"
             else:
                 head = "COMMIT OK"
-            return f"{head}\n\nDIFF:\n{diff}"
+            return f"{label}{head}\n\nDIFF:\n{diff}"
         except Exception as e:
             if _session_lost(e) or _timed_out(e):
                 lease.discard()
@@ -355,6 +354,40 @@ def edit(host: str, user: str, passwd: str, payload: str,
                 if _unlock_quietly(cu) is not None:
                     lease.discard()
 
+
+def edit(host: str, user: str, passwd: str, payload: str,
+         session_timeout: int, command_timeout: int,
+         commit_confirmed: int = None, port: int = None,
+         vendor_hint: str = None, dry_run: bool = False) -> str:
+    """Apply configuration over NETCONF: load the payload into the candidate
+    and run it through _transaction() (lock -> load -> diff -> commit_check
+    -> commit, or rollback for dry_run -> unlock)."""
+    _require()
+    fmt = _config_format(payload)
+    body = _strip_comments(payload) if fmt == "set" else payload
+    return _transaction(host, user, passwd, session_timeout, command_timeout, port,
+                        stage=lambda cu: cu.load(body, format=fmt), label="",
+                        dry_run=dry_run, commit_confirmed=commit_confirmed)
+
+
+def rollback(host: str, user: str, passwd: str, n: int,
+             session_timeout: int, command_timeout: int,
+             port: int = None, vendor_hint: str = None,
+             dry_run: bool = False, commit_confirmed: int = None) -> str:
+    """Return to rollback `n` (0-49) over NETCONF, with the same gates as an
+    edit: lock -> rollback n -> diff -> commit_check -> commit (confirmed if
+    asked), or show the diff and discard it for dry_run. "NO CHANGES" when
+    rollback n equals the running configuration."""
+    _require()
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        raise ValueError(f"rollback number must be an integer 0-{MAX_ROLLBACK}, not {n!r}")
+    if not 0 <= n <= MAX_ROLLBACK:
+        raise ValueError(f"rollback number must be 0-{MAX_ROLLBACK}, not {n}")
+    return _transaction(host, user, passwd, session_timeout, command_timeout, port,
+                        stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ",
+                        dry_run=dry_run, commit_confirmed=commit_confirmed)
 
 def confirm(host: str, user: str, passwd: str,
             session_timeout: int, command_timeout: int,

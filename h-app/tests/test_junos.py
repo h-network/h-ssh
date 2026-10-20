@@ -89,8 +89,8 @@ class FakeConfig:
     def commit(self, confirm=None, timeout=None):
         self._do("commit", confirm=confirm)
 
-    def rollback(self):
-        self._do("rollback")
+    def rollback(self, rb_id=0):
+        self._do("rollback", rb_id)
 
     @property
     def names(self):
@@ -263,3 +263,54 @@ def test_set_comments_are_not_sent_to_the_loader():
     edit(payload="# why\nset a b\n")
     load = [c for c in cfg().calls if c[0] == "load"][0]
     assert load[1][0] == "set a b"
+
+
+# --- rollback ---------------------------------------------------------
+
+def rollback(n=1, **kw):
+    return junos.rollback("10.0.0.1", "u", "p", n, 5, 30, **kw)
+
+
+def test_rollback_sequence_and_label():
+    out = rollback(1)
+    assert out.startswith("ROLLBACK 1: COMMIT OK")
+    assert "+  system host-name r1;" in out
+    assert cfg().names == ["lock", "rollback", "diff", "commit_check", "commit", "unlock"]
+    assert cfg().calls[1][1] == (1,)          # rollback 1 went into the candidate
+    assert FakeDevice.instances[0].closed
+
+
+def test_rollback_dry_run_shows_the_diff_and_discards():
+    out = rollback(2, dry_run=True)
+    assert out.startswith("ROLLBACK 2: DRY-RUN")
+    names = cfg().names
+    assert names == ["lock", "rollback", "diff", "commit_check", "rollback", "unlock"]
+    assert cfg().calls[1][1] == (2,) and cfg().calls[4][1] == (0,)   # stage rollback 2, then discard (rollback 0)
+
+
+def test_rollback_commit_confirmed_and_no_changes():
+    out = rollback(3, commit_confirmed=5)
+    assert out.startswith("ROLLBACK 3: COMMIT CONFIRMED (5 minutes)")
+    assert [c for c in cfg().calls if c[0] == "commit"][0][2]["confirm"] == 5
+    FakeConfig.instances.clear()
+    FakeConfig.diff_text = ""
+    assert rollback(0) == "ROLLBACK 0: NO CHANGES"
+    assert cfg().names == ["lock", "rollback", "diff", "rollback", "unlock"]
+
+
+def test_rollback_number_is_checked_before_any_session():
+    for bad in (-1, 50, "x", None):
+        with pytest.raises(ValueError, match="rollback number"):
+            rollback(bad)
+    assert FakeDevice.instances == []
+
+
+def test_rollback_keeps_the_edit_verdicts():
+    FakeConfig.raise_on = {"lock": junos.LockError("held")}
+    with pytest.raises(NotAppliedError):
+        rollback(1)
+    FakeConfig.raise_on = {"commit": rpc_timeout()}
+    FakeConfig.instances.clear()
+    with pytest.raises(AmbiguousCommitError):
+        rollback(1)
+    assert "unlock" not in cfg().names
