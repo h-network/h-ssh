@@ -159,3 +159,23 @@ def test_cli_audit_show_has_no_diff(tmp_path):
             record = json.loads(line)
             assert "diff" not in record
 
+
+
+def _cli(*extra, tmp_path):
+    devices = tmp_path / "devices.csv"
+    devices.write_text("CR1,10.0.1.1,junos\n")
+    hssh = Path(__file__).resolve().parent.parent / "h-ssh.py"
+    return subprocess.run([sys.executable, str(hssh), "--devices", str(devices), "--user", "test",
+                           "--password", "test", *extra], capture_output=True, text=True)
+
+
+def test_cli_rollback_number_range_is_a_usage_error(tmp_path):
+    res = _cli("--rollback", "50", tmp_path=tmp_path)
+    assert res.returncode == 2 and "0 to 49" in res.stderr
+
+
+def test_cli_rollback_is_one_mode_among_the_others(tmp_path):
+    res = _cli("--rollback", "1", "-sC", "show version", tmp_path=tmp_path)
+    assert res.returncode == 2 and "exactly one of" in res.stderr and "--rollback" in res.stderr
+    res = _cli("--rollback", "1", "--job", "-", tmp_path=tmp_path)
+    assert res.returncode == 2 and "--rollback" in res.stderr

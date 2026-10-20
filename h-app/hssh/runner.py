@@ -95,6 +95,27 @@ DRY_RUN_EDIT_VENDORS = frozenset({"junos", "telnet-junos"})
 COMMIT_CONFIRMED_VENDORS = frozenset({"junos", "telnet-junos"})
 
 
+def _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
+                    n, session_timeout, command_timeout, commit_confirmed, port, dry_run=False):
+    """Return to rollback n. Same rules as an edit: refused where the transport
+    cannot really do it, retried only when nothing reached the device."""
+    if not hasattr(vendor_mod, "rollback"):
+        raise ValueError(f"--rollback is not supported by the '{vendor}' transport")
+    if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
+        raise ValueError(
+            f"--commit-confirmed is not supported by the '{vendor}' transport; "
+            "the change would be applied with no rollback timer")
+    if dry_run and vendor not in DRY_RUN_EDIT_VENDORS:
+        raise ValueError(
+            f"--dry-run is not supported by the '{vendor}' transport for edits; "
+            "nothing was sent to the device")
+    return _retry_loop(
+        vendor_mod.rollback, name, quiet, max_attempts,
+        lambda e: isinstance(e, NotAppliedError),
+        host, user, passwd, n, session_timeout, command_timeout,
+        port=port, vendor_hint=vendor, dry_run=dry_run, commit_confirmed=commit_confirmed)
+
+
 def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
                 payload, session_timeout, command_timeout, commit_confirmed,
                 port, dry_run=False):
@@ -140,6 +161,7 @@ def _run_for_target_sync(
     structured: bool = False,
     structured_binding: Optional[dict] = None,
     max_attempts: int = MAX_RETRIES,
+    rollback: Optional[int] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Execute task on a single target device (internal sync implementation).
@@ -237,6 +259,14 @@ def _run_for_target_sync(
                                  command_timeout, commit_confirmed, t.port, dry_run)
             output.append(result.rstrip())
 
+        elif mode == "rollback":
+            if rollback is None:
+                raise ValueError("No rollback number provided for --rollback.")
+            result = _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts,
+                                     host, user, passwd, rollback, session_timeout,
+                                     command_timeout, commit_confirmed, t.port, dry_run)
+            output.append(result.rstrip())
+
         elif mode == "show-batch":
             if not batch_cmds:
                 raise ValueError("No batch commands provided.")
@@ -309,6 +339,7 @@ def run_for_target(
     structured: bool = False,
     structured_binding: Optional[dict] = None,
     max_attempts: int = MAX_RETRIES,
+    rollback: Optional[int] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Synchronous public API for library users.
@@ -325,6 +356,7 @@ def run_for_target(
         safety_gate=safety_gate,
         structured=structured, structured_binding=structured_binding,
         max_attempts=max_attempts,
+        rollback=rollback,
     )
 
 
@@ -349,6 +381,7 @@ async def run_for_target_async(
     structured: bool = False,
     structured_binding: Optional[dict] = None,
     max_attempts: int = MAX_RETRIES,
+    rollback: Optional[int] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -366,6 +399,7 @@ async def run_for_target_async(
         safety_gate=safety_gate,
         structured=structured, structured_binding=structured_binding,
         max_attempts=max_attempts,
+        rollback=rollback,
     )
 
 

@@ -176,6 +176,8 @@ async def main() -> int:
                         help="File containing show commands to run in batch (one per line, # comments)")
     parser.add_argument("--job", type=str,
                         help="JSON job file with per-device commands (use - for stdin)")
+    parser.add_argument("--rollback", type=int, metavar="N",
+                        help="Return every target to rollback N (0-49), with the same gates as an edit (Junos only)")
 
     # Behavior
     parser.add_argument("--retries", type=int, default=None,
@@ -250,8 +252,8 @@ async def main() -> int:
     # ------ JOB MODE ------
     job_entries = None
     if args.job:
-        if any([args.show_command, args.edit_command, args.edit_dir, args.edit_broadcast, args.batch]):
-            print("ERROR: --job cannot be combined with -sC, -eC, -eD, -eB, or --batch.", file=sys.stderr)
+        if any([args.show_command, args.edit_command, args.edit_dir, args.edit_broadcast, args.batch, args.rollback is not None]):
+            print("ERROR: --job cannot be combined with -sC, -eC, -eD, -eB, --batch, or --rollback.", file=sys.stderr)
             return 2
         try:
             job_entries = load_jobs(args.job)
@@ -276,9 +278,13 @@ async def main() -> int:
             bool(args.edit_dir),
             bool(args.edit_broadcast),
             bool(args.batch),
+            args.rollback is not None,
         ]
         if sum(modes) != 1:
-            print("ERROR: choose exactly one of -sC, -eC, -eD, -eB, --batch, or --job.", file=sys.stderr)
+            print("ERROR: choose exactly one of -sC, -eC, -eD, -eB, --batch, --rollback, or --job.", file=sys.stderr)
+            return 2
+        if args.rollback is not None and not 0 <= args.rollback <= 49:
+            print(f"ERROR: --rollback takes a number from 0 to 49, not {args.rollback}.", file=sys.stderr)
             return 2
 
         if args.edit_dir:
@@ -354,10 +360,12 @@ async def main() -> int:
             mode = "edit-broadcast"
         elif args.batch:
             mode = "show-batch"
+        elif args.rollback is not None:
+            mode = "rollback"
         else:
             mode = "edit-dir"
 
-        has_edits = mode.startswith("edit")
+        has_edits = mode.startswith("edit") or mode == "rollback"
 
     # Validate vendor libraries for all targets
     for v in set(t.vendor for t in targets):
@@ -608,6 +616,7 @@ async def main() -> int:
                 batch_cmds=target_batch_cmds,
                 safety_gate=safety_gate,
                 structured=args.structured,
+                rollback=args.rollback,
                 structured_binding=binding,
             )
 
@@ -701,6 +710,8 @@ async def main() -> int:
                         audit_payload = Path(args.edit_broadcast).read_text(encoding="utf-8")
                     except Exception:
                         audit_payload = f"<failed to read {args.edit_broadcast}>"
+            elif mode == "rollback":
+                audit_payload = f"rollback {args.rollback}"
             elif mode == "job":
                 if job_entries:
                     for je in job_entries:
@@ -944,7 +955,7 @@ async def main() -> int:
             # stdout is device output only; the verdict belongs on stderr.
             print(f"Done. Failures: {failures}", file=sys.stderr)
 
-        if args.commit_confirmed and not args.dry_run and mode in ["edit-cmd", "edit-dir", "edit-broadcast"]:
+        if args.commit_confirmed and not args.dry_run and mode in ["edit-cmd", "edit-dir", "edit-broadcast", "rollback"]:
             print("")
             print("=" * 70)
             print(" " * 15 + "DON'T FORGET TO CONFIRM THE COMMIT!")
