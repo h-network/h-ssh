@@ -46,3 +46,6 @@ wheels/
 # =============================================================================
 # PROJECT-SPECIFIC: Protect sensitive network data
 # =============================================================================
+
+# Claude Code local state (agent worktrees, local settings)
+.claude/
