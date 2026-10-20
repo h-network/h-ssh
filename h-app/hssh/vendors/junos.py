@@ -401,3 +401,75 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
         return results
 
     return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
+
+
+def _is_cli_command(text: str) -> bool:
+    """"show chassis hardware" is a CLI command; "get-chassis-inventory" and
+    "get_chassis_inventory" are RPC names."""
+    return " " in text.strip() or not all(ch.isalnum() or ch in "-_" for ch in text.strip())
+
+
+def _rpc_element(dev, command: str, args: Optional[dict]):
+    """The RPC to send, as an lxml element: translated by the router from a
+    CLI command (what `| display xml rpc` does), or built from an RPC name
+    and its arguments."""
+    from lxml import etree
+
+    command = command.strip()
+    if _is_cli_command(command):
+        if args:
+            raise ValueError("args go with an RPC name; put them in the CLI command instead")
+        reply = dev.rpc.cli(command + " | display xml rpc", format="xml")
+        try:
+            return reply.getparent().find(".//rpc")[0]
+        except (AttributeError, IndexError, TypeError):
+            raise ValueError(f"no RPC equivalent for CLI command {command!r}") from None
+    element = etree.Element(command.replace("_", "-"))
+    for key, value in (args or {}).items():
+        child = etree.SubElement(element, key.replace("_", "-"))
+        if value is not True and value is not None:
+            child.text = str(value)
+    return element
+
+
+def rpc(host: str, user: str, passwd: str, command: str,
+        session_timeout: int, command_timeout: int,
+        port: int = None, vendor_hint: str = None,
+        args: Optional[dict] = None, fmt: str = "json"):
+    """Call a Junos RPC and return the reply as the router produces it: a
+    dict for fmt="json", the reply XML as a string for fmt="xml".
+
+    `command` is either the CLI command you already know — "show chassis
+    hardware", "show interfaces ge-0/0/0 terse" — in which case the router is
+    asked which RPC that is, or an RPC name — "get-chassis-inventory" — with
+    `args` as its arguments ({"interface-name": "ge-0/0/0", "terse": True}).
+
+    A get-* RPC (any "show ..." command) is a read and, on a dead reused
+    pooled session, is reopened and sent once more like show(). Anything else
+    (request-*, ...) is never re-sent: it fails, and the session is dropped.
+    """
+    _require()
+    fmt = (fmt or "json").lower()
+    if fmt not in ("json", "xml"):
+        raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
+    from lxml import etree
+
+    def run(lease):
+        element = _rpc_element(lease.dev, command, args)
+        if fmt == "json":
+            element.set("format", "json")
+            return lease.dev.execute(element)
+        reply = lease.dev.execute(element)
+        return etree.tostring(reply, pretty_print=True, encoding="unicode")
+
+    text = command.strip()
+    read_only = text.startswith("show ") or text.startswith("get")
+    if read_only:
+        return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
+    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+        try:
+            return run(lease)
+        except Exception as e:
+            if _session_lost(e) or _timed_out(e):
+                lease.discard()
+            raise
