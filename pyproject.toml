@@ -27,14 +27,19 @@ dev = [
 [project.scripts]
 h-ssh = "hssh.cli:main_sync"
 
+[tool.setuptools]
+package-dir = {"" = "h-app"}
+
 [tool.setuptools.dynamic]
 version = {attr = "hssh.__version__"}
 
 [tool.setuptools.packages.find]
+where = ["h-app"]
 include = ["hssh*"]
 
 [tool.setuptools.package-data]
 hssh = ["commands/*.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+pythonpath = ["h-app"]
+testpaths = ["h-app/tests"]
