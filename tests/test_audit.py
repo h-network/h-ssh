@@ -111,10 +111,12 @@ def test_write_audit_concurrent_locking():
         Path(tmp).unlink(missing_ok=True)
 
 
-def test_audit_graceful_failure():
-    # Attempting to write to an invalid path should return False without raising
+def test_audit_graceful_failure(tmp_path):
+    # Attempting to write to an invalid path should return False without raising.
+    # The parent is a regular file, so this fails for root too (CI runs as root).
+    (tmp_path / "not_a_dir").write_text("")
     ok = write_audit_entry(
-        path="/nonexistent/dir/cannot_write/audit.jsonl",
+        path=str(tmp_path / "not_a_dir" / "audit.jsonl"),
         device="R1",
         host="10.0.1.1",
         vendor="junos",
