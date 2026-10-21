@@ -23,15 +23,12 @@ from .core import (
 from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS
 from .safety import SafetyGate
 from .audit import write_audit_entry
-from .vendors import junos, arista, generic, openssh, telnet
+from .vendors import VENDORS
 
 
-# Supported vendor names for validation
-VENDOR_MODULES = {
-    "junos": junos, "arista": arista, "ssh": generic, "openssh": openssh,
-    "telnet": telnet, "telnet-ios": telnet, "telnet-junos": telnet,
-    "telnet-arista": telnet, "telnet-nxos": telnet,
-}
+# Supported vendor names for validation: the vendors registry itself, under
+# the name the CLI has always used, so one table cannot drift from the other.
+VENDOR_MODULES = VENDORS
 
 VENDOR_INSTALL = {
     "junos": "junos-eznc", "arista": "pyeapi", "ssh": "paramiko",

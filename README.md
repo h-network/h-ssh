@@ -114,7 +114,7 @@ export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 |---|---|---|
 | `-sC` | Show | Run a show/display command (or a template name) |
 | `-eC` | Edit command | Apply one config line to every target |
-| `-eD` | Edit directory | Per-device config from `<NAME>.set` files |
+| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written |
 | `-eB` | Edit broadcast | One config file applied to all targets |
 | `--batch` | Batch | Several show commands from a file, one connection per device |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |

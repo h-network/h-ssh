@@ -191,23 +191,21 @@ def load_jobs(path: str) -> List[JobEntry]:
 
 
 def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
+    """The -eD payload for one device: `<config_dir>/<dev_name>.set` with blank
+    and full-line '#' comment lines dropped, nothing else touched.
+
+    An inline '#' is part of the line (`set snmp community ab#12 ...`), the
+    same rule junos._strip_comments applies to every set payload: -eD sends
+    what the syntax guard validated, and what -eB sends from the same file.
+    """
     path = Path(config_dir) / f"{dev_name}.set"
     if not path.is_file():
         raise FileNotFoundError(f"Missing config file for {dev_name}: {path}")
-    data = path.read_text(encoding="utf-8").splitlines()
-
-    lines = []
-    for ln in data:
-        if _is_comment_or_empty(ln):
-            continue
-        ln = ln.split("#", 1)[0].rstrip()
-        if ln.strip():
-            lines.append(ln)
-
-    payload = "\n".join(lines).strip()
-    if not payload:
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+             if not _is_comment_or_empty(ln)]
+    if not lines:
         raise ValueError(f"Empty config after filtering: {path}")
-    return payload + "\n"
+    return "\n".join(lines) + "\n"
 
 
 def read_command_file_lines(path: Path) -> List[str]:
