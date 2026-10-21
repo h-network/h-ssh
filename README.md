@@ -51,7 +51,7 @@ and rollback that config changes need. Every edit passes a safety gate, prompts 
                     └──────────── every edit ──────────────────┴──▶ audit.jsonl
 ```
 
-On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first.
 
 ## Install
 
@@ -380,12 +380,21 @@ vendors.junos.commit_status(host, user, None, 30, 20)
 
 vendors.junos.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
                              check=lambda: checks_pass(), comment="C1 cutover")
-# commit confirmed → check() → confirm, or an immediate `rollback 1` commit; returns what happened
+# commit confirmed → check() → confirm, or an immediate `rollback 1` commit; returns what happened:
+# {'final': 'confirmed' | 'rolled back' | 'not confirmed' | 'not rolled back' | 'no changes', …}
 ```
 
 `edit()`, `rollback()` and `confirm()` take `comment=` too; the device's own "rollback in N min" is what
-`pending_rollback_minutes` reports. A session with an open transaction stays borrowed — other threads
-wait for it, the thread holding it may keep using it.
+`pending_rollback_minutes` reports, on the latest commit only: once confirmed, a commit keeps that note in
+the history (`note`) but is no longer waiting. `confirm()` commits under the configuration lock, so someone else's
+uncommitted edits refuse it (`NotAppliedError`, nothing sent) rather than going in with the confirmation.
+`guarded_commit()` reads `show system commit` after its commit and again before it confirms or rolls back:
+when the pending commit is no longer the one it made — another commit landed, which also confirmed it, or
+the checks outlasted the timer and the device rolled back by itself — it sends nothing and answers
+`not confirmed` / `not rolled back` with the reason, the history under `status` and, when the checks
+failed, their error under `check_error`, because a `rollback 1` at that point would re-apply the change
+that just failed its checks. A session with an open transaction stays borrowed —
+other threads wait for it, the thread holding it may keep using it.
 
 ### Structured output from a script
 

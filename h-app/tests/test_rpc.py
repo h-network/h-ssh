@@ -197,6 +197,22 @@ def test_commit_status_reads_the_history_as_data():
     assert sent().tag == "get-commit-information"
 
 
+def test_a_confirmed_commit_keeps_its_note_but_is_not_pending():
+    """Seen on a vMX: after the confirm, the history is the confirm at 0 and
+    the commit confirmed, note and all, at 1. Only seq 0 can be waiting."""
+    RpcDevice.json_reply = {"commit-information": [{"commit-history": [
+        {"sequence-number": [{"data": "0"}], "user": [{"data": "h-lab"}], "client": [{"data": "netconf"}],
+         "date-time": [{"data": "2026-10-21 02:48:02 UTC"}], "log": [{"data": "C1 (confirmed)"}]},
+        {"sequence-number": [{"data": "1"}], "user": [{"data": "h-lab"}], "client": [{"data": "netconf"}],
+         "date-time": [{"data": "2026-10-21 02:47:55 UTC"}],
+         "comment": [{"data": "commit confirmed, rollback in 3mins"}], "log": [{"data": "C1"}]},
+    ]}]}
+    entries = junos.commit_status("10.0.0.1", "u", None, 5, 30)
+    assert entries[1]["note"] == "commit confirmed, rollback in 3mins"
+    assert entries[1]["pending_rollback_minutes"] is None
+    assert junos.pending_commit(entries) is None
+
+
 # --- rpc_batch: several commands on one session --------------------------------
 
 def rpc_batch(cmds, **kw):

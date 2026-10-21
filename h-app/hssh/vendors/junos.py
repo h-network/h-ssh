@@ -264,6 +264,25 @@ def _strip_comments(payload: str) -> str:
                      if ln.strip() and not ln.strip().startswith("#"))
 
 
+def _lock(cu, lease) -> None:
+    """Take the configuration lock on the borrowed session. A refusal is a
+    NotAppliedError: nothing was sent, the caller may retry."""
+    try:
+        cu.lock()
+    except LockError as e:
+        # PyEZ wraps a timed-out or dead-session lock RPC in LockError
+        # too; the device may have granted that lock, so the session
+        # goes, which releases it, and the retry gets a fresh one.
+        if _session_lost(e) or _timed_out(e):
+            lease.discard()
+        raise NotAppliedError(f"Failed to lock config: {e}") from e
+    except Exception as e:
+        if _session_lost(e):
+            lease.discard()
+            raise NotAppliedError(f"NETCONF session lost before lock: {e}") from e
+        raise
+
+
 def _unlock_quietly(cu) -> Optional[str]:
     try:
         cu.unlock()
@@ -388,20 +407,7 @@ def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
     locked = False
     try:
         cu = JunosConfig(lease.dev)
-        try:
-            cu.lock()
-        except LockError as e:
-            # PyEZ wraps a timed-out or dead-session lock RPC in LockError
-            # too; the device may have granted that lock, so the session
-            # goes, which releases it, and the retry gets a fresh one.
-            if _session_lost(e) or _timed_out(e):
-                lease.discard()
-            raise NotAppliedError(f"Failed to lock config: {e}") from e
-        except Exception as e:
-            if _session_lost(e):
-                lease.discard()
-                raise NotAppliedError(f"NETCONF session lost before lock: {e}") from e
-            raise
+        _lock(cu, lease)
         locked = True
         try:
             stage(cu)
@@ -516,22 +522,34 @@ def confirm(host: str, user: str, passwd: str,
             session_timeout: int, command_timeout: int,
             port: int = None, vendor_hint: str = None,
             comment: Optional[str] = None) -> str:
-    """Confirm a pending commit-confirmed by issuing a plain commit."""
+    """Confirm a pending commit-confirmed with a plain commit, under the
+    configuration lock. The commit takes the whole shared candidate with
+    it, another user's uncommitted edits included; the lock is refused
+    while the candidate is modified, and that refusal is a NotAppliedError
+    (nothing sent, retried like any other) rather than their change going
+    in with the confirmation."""
     _require()
     with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
         cu = JunosConfig(lease.dev)
+        _lock(cu, lease)
         try:
             if comment:
                 cu.commit(timeout=command_timeout, comment=comment)
             else:
                 cu.commit(timeout=command_timeout)
         except CommitError as e:
+            if _unlock_quietly(cu) is not None:
+                lease.discard()
             raise RuntimeError(f"Commit failed: {e}") from e
         except Exception as e:
+            # The commit RPC was sent and the session is in doubt: it goes,
+            # and the lock with it.
             lease.discard()
             raise AmbiguousCommitError(
                 f"commit outcome unknown ({type(e).__name__}: {e}); "
                 "check the device before retrying") from e
+        if _unlock_quietly(cu) is not None:
+            lease.discard()
         return "COMMIT CONFIRMED OK"
 
 
@@ -700,9 +718,14 @@ def commit_status(host: str, user: str, passwd: str,
                   port: int = None, vendor_hint: str = None) -> List[dict]:
     """`show system commit` as data: one dict per entry, newest first —
     seq, user, client, time, epoch, comment (what was logged with the
-    commit) and pending_rollback_minutes, set on the entry whose commit
-    confirmed is still waiting ("commit confirmed, rollback in 5mins").
-    The device's own number is the authority on how long is left."""
+    commit), note (the device's own text, "commit confirmed, rollback in
+    5mins") and pending_rollback_minutes, set only on the latest entry
+    (seq 0) when it carries that note: a commit confirmed that was
+    confirmed by a later commit keeps its note in the history, but a
+    later commit is exactly what means it is no longer waiting. The
+    device's number is the authority on how long is left. (A confirm made
+    with `commit check` writes no entry, so seq 0 still reads as pending
+    after it; h-ssh confirms with a commit.)"""
     _require()
     doc = rpc(host, user, passwd, "get-commit-information", session_timeout, command_timeout, port=port)
 
@@ -720,15 +743,16 @@ def commit_status(host: str, user: str, passwd: str,
         note = text(entry, "comment") or ""
         pending = _PENDING.search(note)
         epoch = attr(entry, "date-time", "junos:seconds")
+        seq = int(text(entry, "sequence-number") or 0)
         out.append({
-            "seq": int(text(entry, "sequence-number") or 0),
+            "seq": seq,
             "user": text(entry, "user"),
             "client": text(entry, "client"),
             "time": text(entry, "date-time"),
             "epoch": float(epoch) if epoch else None,
             "comment": text(entry, "log"),
             "note": note or None,
-            "pending_rollback_minutes": int(pending.group(1)) if pending else None,
+            "pending_rollback_minutes": int(pending.group(1)) if pending and seq == 0 else None,
         })
     return out
 
@@ -741,6 +765,34 @@ def pending_commit(entries: List[dict]) -> Optional[dict]:
     return None
 
 
+def _same_commit(a: dict, b: dict) -> bool:
+    """Two commit_status() entries for one commit: what the device logged
+    about it, not the minutes left on its timer."""
+    return all(a.get(k) == b.get(k) for k in ("user", "client", "time", "epoch", "comment"))
+
+
+def _history_moved(ours: Optional[dict], entries: List[dict]) -> Optional[str]:
+    """Why the commit confirmed `ours` is no longer the one waiting on the
+    device, or None while it still is: it has to be the latest commit
+    (sequence 0) and the same entry the device logged after the edit."""
+    if ours is None:
+        return "no pending commit confirmed of ours found after the edit"
+    now = pending_commit(entries)
+    if now is None or now.get("seq") != 0 or not _same_commit(ours, now):
+        return "commit history changed since the edit (another commit landed, or the timer expired)"
+    return None
+
+
+def _ours(entry: Optional[dict], user: str, comment: Optional[str]) -> Optional[dict]:
+    """The pending entry when it is the commit this user just made (same
+    user, and the comment that was sent with it), else None."""
+    if entry is None or entry.get("seq") != 0 or entry.get("user") != user:
+        return None
+    if comment and entry.get("comment") != comment:
+        return None
+    return entry
+
+
 def guarded_commit(host: str, user: str, passwd: str, payload: str,
                    session_timeout: int, command_timeout: int, minutes: int, check,
                    port: int = None, comment: Optional[str] = None) -> dict:
@@ -751,19 +803,37 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     at once instead of waiting the timer out, so the device is back before
     the window closes. Returns {"final": "confirmed" | "rolled back" |
     "no changes", "commit": ..., "checks": ..., "confirm"/"rollback": ...}.
+
+    Before confirming or rolling back, `show system commit` is read again
+    and compared with the entry the commit confirmed made. When that is no
+    longer the pending one — another commit landed (which confirmed ours
+    too), or the checks outlasted the timer and the device rolled back by
+    itself — nothing is sent, since `rollback 1` would now re-apply the
+    change that just failed, and the result is "not confirmed" / "not
+    rolled back" with the reason and the history under "status" (for "not
+    rolled back" the check's own failure is under "check_error").
     """
     out = edit(host, user, passwd, payload, session_timeout, command_timeout,
                commit_confirmed=minutes, port=port, comment=comment)
     if out.startswith("NO CHANGES"):
         return {"final": "no changes", "commit": out, "checks": None}
+    ours = _ours(pending_commit(commit_status(host, user, passwd, session_timeout, command_timeout, port=port)),
+                 user, comment)
     try:
         ok, reason = bool(check()), None
     except Exception as e:
         ok, reason = False, f"{type(e).__name__}: {e}"
+    entries = commit_status(host, user, passwd, session_timeout, command_timeout, port=port)
+    moved = _history_moved(ours, entries)
     if ok:
+        if moved:
+            return {"final": "not confirmed", "commit": out, "checks": True, "reason": moved, "status": entries}
         done = confirm(host, user, passwd, session_timeout, command_timeout, port=port,
                        comment=f"{comment} (confirmed)" if comment else None)
         return {"final": "confirmed", "commit": out, "checks": True, "confirm": done}
+    if moved:
+        return {"final": "not rolled back", "commit": out, "checks": False, "reason": moved,
+                "check_error": reason, "status": entries}
     back = rollback(host, user, passwd, 1, session_timeout, command_timeout, port=port,
                     comment=f"{comment} (rolled back: checks failed)" if comment else "rolled back: checks failed")
     return {"final": "rolled back", "commit": out, "checks": False, "reason": reason, "rollback": back}

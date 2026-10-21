@@ -233,16 +233,33 @@ def test_the_word_commit_is_config_not_a_command():
     assert load[2]["format"] == "text"
 
 
-def test_confirm_issues_a_plain_commit():
+def test_confirm_commits_plain_under_the_lock():
     assert junos.confirm("10.0.0.1", "u", "p", 5, 30) == "COMMIT CONFIRMED OK"
-    assert cfg().names == ["commit"]
-    assert cfg().calls[0][2]["confirm"] is None
+    assert cfg().names == ["lock", "commit", "unlock"]
+    assert cfg().calls[1][2]["confirm"] is None
+
+
+def test_confirm_refused_lock_is_not_applied_and_sends_nothing():
+    """Another user's uncommitted edits refuse the lock; a commit would have
+    taken them along with the confirmation."""
+    FakeConfig.raise_on = {"lock": junos.LockError("configuration database modified")}
+    with pytest.raises(NotAppliedError, match="Failed to lock"):
+        junos.confirm("10.0.0.1", "u", "p", 5, 30)
+    assert cfg().names == ["lock"]
+
+
+def test_confirm_rejected_commit_unlocks():
+    FakeConfig.raise_on = {"commit": junos.CommitError("conflict")}
+    with pytest.raises(RuntimeError, match="Commit failed"):
+        junos.confirm("10.0.0.1", "u", "p", 5, 30)
+    assert cfg().names == ["lock", "commit", "unlock"]
 
 
 def test_confirm_timeout_is_ambiguous():
     FakeConfig.raise_on = {"commit": rpc_timeout()}
     with pytest.raises(AmbiguousCommitError):
         junos.confirm("10.0.0.1", "u", "p", 5, 30)
+    assert "unlock" not in cfg().names          # the session goes, and the lock with it
 
 
 # --- format detection -------------------------------------------------
@@ -401,18 +418,113 @@ def test_transaction_commit_verdicts_match_edit():
     assert "rollback" not in cfg().names and "unlock" not in cfg().names and not tx.open
 
 
-def test_guarded_commit_confirms_or_rolls_back():
+# commit_status() as guarded_commit() reads it: the entry its commit confirmed
+# made, the commit before it, and what another user's commit looks like
+OURS = {"seq": 0, "user": "u", "client": "netconf", "time": "2026-10-20 19:19:11 CEST", "epoch": 1792516751.0,
+        "comment": "C1", "note": "commit confirmed, rollback in 5mins", "pending_rollback_minutes": 5}
+PRE = {"seq": 1, "user": "u", "client": "cli", "time": "2026-10-19 02:33:16 CEST", "epoch": 1792369996.0,
+       "comment": None, "note": None, "pending_rollback_minutes": None}
+THEIRS = {"seq": 0, "user": "other", "client": "cli", "time": "2026-10-20 19:21:40 CEST", "epoch": 1792516900.0,
+          "comment": "theirs", "note": None, "pending_rollback_minutes": None}
+
+
+def history(monkeypatch, *reads):
+    """Canned commit_status() replies, one per read, the last one repeating;
+    returns the list that grows by one per read made."""
+    reads, made = list(reads), []
+
+    def commit_status(host, user, passwd, st, ct, port=None, vendor_hint=None):
+        made.append(host)
+        return reads.pop(0) if len(reads) > 1 else reads[0]
+
+    monkeypatch.setattr(junos, "commit_status", commit_status)
+    return made
+
+
+def guarded(check):
+    return junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5, check=check, comment="C1")
+
+
+def failing_check():
+    raise RuntimeError("bgp down")
+
+
+def all_names():
+    return [c[0] for i in FakeConfig.instances for c in i.calls]
+
+
+def test_guarded_commit_confirms_or_rolls_back(monkeypatch):
+    reads = history(monkeypatch, [OURS, PRE])
     calls = []
-    res = junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5,
-                               check=lambda: calls.append("checked") or True, comment="C1")
-    assert res["final"] == "confirmed" and calls == ["checked"]
+    res = guarded(lambda: calls.append("checked") or True)
+    assert res["final"] == "confirmed" and calls == ["checked"] and len(reads) == 2
     commits = [c[2] for i in FakeConfig.instances for c in i.calls if c[0] == "commit"]
     assert commits == [{"confirm": 5, "comment": "C1"}, {"confirm": None, "comment": "C1 (confirmed)"}]
     FakeConfig.instances.clear()
-    res = junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5,
-                               check=lambda: (_ for _ in ()).throw(RuntimeError("bgp down")), comment="C1")
+    res = guarded(failing_check)
     assert res["final"] == "rolled back" and "bgp down" in res["reason"]
-    names = [c[0] for i in FakeConfig.instances for c in i.calls]
-    assert names == ["lock", "load", "diff", "commit_check", "commit", "unlock",
-                     "lock", "rollback", "diff", "commit_check", "commit", "unlock"]
+    assert all_names() == ["lock", "load", "diff", "commit_check", "commit", "unlock",
+                           "lock", "rollback", "diff", "commit_check", "commit", "unlock"]
     assert FakeConfig.instances[1].calls[1][1] == (1,)       # rollback 1
+
+
+def test_guarded_commit_takes_the_timer_as_a_countdown_not_an_identity(monkeypatch):
+    later = dict(OURS, note="commit confirmed, rollback in 3mins", pending_rollback_minutes=3)
+    history(monkeypatch, [OURS, PRE], [later, PRE])
+    assert guarded(lambda: True)["final"] == "confirmed"
+
+
+def test_guarded_commit_sends_nothing_once_another_commit_landed(monkeypatch):
+    """Their commit confirmed ours and is rollback 0 now: `rollback 1` would
+    put back the change that just failed its checks."""
+    entries = [THEIRS, dict(OURS, seq=1, note=None, pending_rollback_minutes=None), PRE]
+    history(monkeypatch, [OURS, PRE], entries)
+    res = guarded(failing_check)
+    assert res["final"] == "not rolled back" and res["checks"] is False
+    assert "history changed" in res["reason"] and "bgp down" in res["check_error"]
+    assert res["status"] == entries
+    assert all_names() == ["lock", "load", "diff", "commit_check", "commit", "unlock"]   # the edit, nothing after
+    FakeConfig.instances.clear()
+    history(monkeypatch, [OURS, PRE], entries)
+    res = guarded(lambda: True)
+    assert res["final"] == "not confirmed" and res["checks"] is True and res["status"] == entries
+    assert [c[2] for c in cfg().calls if c[0] == "commit"] == [{"confirm": 5, "comment": "C1"}]
+    assert len(FakeConfig.instances) == 1
+
+
+def test_guarded_commit_does_not_roll_back_after_the_timer_ran_out(monkeypatch):
+    """Checks that outlast the timer: the device's own rollback is a commit of
+    its own and rollback 0 now, so there is nothing left to undo."""
+    expired = [{"seq": 0, "user": "u", "client": "other", "time": "2026-10-20 19:24:11 CEST",
+                "epoch": 1792517051.0, "comment": None, "note": None, "pending_rollback_minutes": None},
+               dict(OURS, seq=1, note=None, pending_rollback_minutes=None), PRE]
+    history(monkeypatch, [OURS, PRE], expired)
+    res = guarded(lambda: False)
+    assert res["final"] == "not rolled back" and res["check_error"] is None
+    assert res["status"] == expired and all_names() == ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+
+
+def test_guarded_commit_needs_its_own_commit_in_the_history(monkeypatch):
+    history(monkeypatch, [dict(OURS, note=None, pending_rollback_minutes=None), PRE])
+    res = guarded(lambda: True)
+    assert res["final"] == "not confirmed" and "no pending commit" in res["reason"]
+    assert len(FakeConfig.instances) == 1
+
+
+def test_guarded_commit_does_not_adopt_someone_elses_commit_confirmed(monkeypatch):
+    # Another user's commit confirmed is the pending one right after our edit:
+    # it is not ours, so neither their change nor ours is touched.
+    foreign = dict(THEIRS, note="commit confirmed, rollback in 10mins", pending_rollback_minutes=10)
+    history(monkeypatch, [foreign, dict(OURS, seq=1, note=None, pending_rollback_minutes=None), PRE])
+    res = guarded(failing_check)
+    assert res["final"] == "not rolled back" and "no pending commit" in res["reason"]
+    assert "bgp down" in res["check_error"] and len(FakeConfig.instances) == 1
+
+
+def test_guarded_commit_only_trusts_the_latest_commit(monkeypatch):
+    # Our entry still carries the device's "rollback in" note but a later
+    # commit sits at sequence 0: not ours to roll back any more.
+    history(monkeypatch, [OURS, PRE], [THEIRS, dict(OURS, seq=1), PRE])
+    res = guarded(failing_check)
+    assert res["final"] == "not rolled back" and "history changed" in res["reason"]
+    assert len(FakeConfig.instances) == 1
