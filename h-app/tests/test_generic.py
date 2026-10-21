@@ -294,3 +294,19 @@ def test_edit_refuses_a_rollback_timer_instead_of_dropping_it(monkeypatch):
     monkeypatch.setattr(generic, "paramiko", FakeParamiko(NoClient))
     with pytest.raises(ValueError, match="not supported by the 'ssh' transport; nothing was sent"):
         generic.edit("10.0.0.1", "u", "p", "hostname NEW\n", 5, 10, commit_confirmed=5)
+
+def test_a_failed_connect_closes_the_client(monkeypatch):
+    """A refused login left paramiko's Transport thread and socket behind (#43)."""
+    closes = []
+
+    class Refusing(paramiko.SSHClient):
+        def connect(self, **kw):
+            raise paramiko.AuthenticationException("Authentication failed.")
+
+        def close(self):
+            closes.append(1)
+            super().close()
+    monkeypatch.setattr(generic, "paramiko", FakeParamiko(Refusing))
+    with pytest.raises(paramiko.AuthenticationException):
+        generic.show("10.0.0.1", "u", "wrong", "show version", 5, 10)
+    assert closes == [1]

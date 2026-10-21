@@ -14,6 +14,9 @@ from hssh.errors import AmbiguousCommitError, NotAppliedError
 from hssh.vendors import junos
 from tests.test_junos import FakeConfig, FakeDevice, FakeHost, rpc_timeout
 
+# The driver's pool key: host, port, user and a digest of the password (#43).
+KEY = junos._pool_key("10.0.0.1", 830, "u", None)   # show() and edit() here use key auth
+
 
 @pytest.fixture(autouse=True)
 def fake_pyez(monkeypatch):
@@ -400,7 +403,7 @@ def test_reap_closes_idle_sessions_only(pooled):
 def test_reap_skips_a_busy_session(pooled):
     show()
     pooled.idle_timeout = 0
-    entry = pooled._get_or_create_entry(("10.0.0.1", 830, "u"))
+    entry = pooled._get_or_create_entry(KEY)
     held, release = threading.Event(), threading.Event()
 
     def borrower():                      # another thread holds the session
@@ -421,7 +424,7 @@ def test_same_thread_may_reuse_its_borrowed_session():
     """The lock is re-entrant: a show() inside an open borrow (a Transaction)
     rides the same session instead of deadlocking."""
     pool.enable()
-    key = ("10.0.0.1", 830, "u")
+    key = KEY
     with pool.POOL.get_connection(key, opener=lambda: FakeDevice(), closer=junos._close) as lease:
         show()
         assert len(devices()) == 1 and devices()[0] is lease.dev
@@ -451,11 +454,11 @@ def test_close_all_then_reopen(pooled):
 
 def test_close_all_during_a_borrow_closes_it_on_return(pooled):
     show()
-    entry = pooled._get_or_create_entry(("10.0.0.1", 830, "u"))
+    entry = pooled._get_or_create_entry(KEY)
     released = threading.Event()
 
     def hold():
-        with pooled.get_connection(("10.0.0.1", 830, "u"), opener=None, closer=junos._close):
+        with pooled.get_connection(KEY, opener=None, closer=junos._close):
             released.wait(2)
 
     t = threading.Thread(target=hold)
@@ -511,11 +514,11 @@ def test_idle_timeout_from_the_environment(monkeypatch):
 
 def test_close_all_waits_when_not_shutting_down(pooled):
     show()
-    entry = pooled._get_or_create_entry(("10.0.0.1", 830, "u"))
+    entry = pooled._get_or_create_entry(KEY)
     released = threading.Event()
 
     def hold():
-        with pooled.get_connection(("10.0.0.1", 830, "u"), opener=None, closer=junos._close):
+        with pooled.get_connection(KEY, opener=None, closer=junos._close):
             released.wait(2)
 
     t = threading.Thread(target=hold)
@@ -555,10 +558,79 @@ def test_nested_show_on_a_healthy_session_is_plain_reuse(pooled):
 
 
 def test_nested_discard_is_honoured_once_the_outer_borrow_returns(pooled):
-    key = ("10.0.0.1", 830, "u")
+    key = KEY
     with pooled.get_connection(key, opener=lambda: FakeDevice(), closer=junos._close) as outer:
         with pooled.get_connection(key, opener=None, closer=junos._close) as inner:
             inner.discard()
         assert not devices()[0].closed and outer.doomed
     assert devices()[0].closed and pooled.live() == 0
     assert pooled._get_or_create_entry(key)["doomed"] is False   # reset for the next borrow
+
+
+# --- #43: credentials, threads, exit -------------------------------------------
+
+def test_a_different_credential_gets_its_own_session(pooled):
+    """The key had no credential: a call with a wrong, different or absent
+    password rode the session the first password opened."""
+    junos.show("10.0.0.1", "u", "correct-horse", "show version", 5, 30)
+    junos.show("10.0.0.1", "u", "correct-horse", "show version", 5, 30)
+    junos.show("10.0.0.1", "u", "wrong", "show version", 5, 30)
+    junos.show("10.0.0.1", "u", None, "show version", 5, 30)
+    assert pooled.stats["opens"] == 3 and pooled.stats["reuses"] == 1
+    assert [d.params.get("passwd") for d in devices()] == ["correct-horse", "wrong", None]
+    assert not any("correct-horse" in str(k) for k in pooled._connections)   # a digest, never the password
+
+
+def test_a_transaction_finished_on_another_thread_sends_nothing_and_wedges_nothing(pooled):
+    """commit() from a thread other than begin()'s once landed the commit, then
+    raised from the RLock release and left the router's slot locked forever."""
+    tx = junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
+    outcome = {}
+
+    def elsewhere():
+        try:
+            tx.commit()
+        except Exception as e:
+            outcome["error"] = f"{type(e).__name__}: {e}"
+    t = threading.Thread(target=elsewhere); t.start(); t.join(5)
+    assert "thread that opened it" in outcome["error"]
+    assert [c[0] for c in FakeConfig.instances[0].calls] == ["lock", "load", "diff", "commit_check"]
+    assert tx.open
+    tx.abort()                                     # the owner can still finish it
+    done = threading.Event()
+
+    def other_borrower():                          # and the slot is free again
+        show()
+        done.set()
+    threading.Thread(target=other_borrower).start()
+    assert done.wait(5)
+
+
+def test_leaving_the_with_block_on_another_thread_does_not_abort_for_the_owner(pooled):
+    tx = junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
+
+    def elsewhere():
+        with tx:
+            pass
+    t = threading.Thread(target=elsewhere); t.start(); t.join(5)
+    assert tx.open and "rollback" not in [c[0] for c in FakeConfig.instances[0].calls]
+    tx.abort()
+
+
+def test_close_all_closes_sessions_side_by_side(monkeypatch):
+    """Serial closes with a slow router each cost one close timeout in a row;
+    a 350-router exit stalled for minutes."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    closed = []
+
+    def slow_closer(dev):
+        time.sleep(0.2)
+        closed.append(dev)
+    for i in range(20):
+        with p.get_connection(("r%d" % i, 830, "u"), opener=lambda: object(), closer=slow_closer):
+            pass
+    assert p.live() == 20
+    t0 = time.monotonic()
+    p.close_all(shutdown=False)
+    assert len(closed) == 20 and p.live() == 0 and time.monotonic() - t0 < 2.0
