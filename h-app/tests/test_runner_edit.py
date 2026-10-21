@@ -360,3 +360,20 @@ def test_save_output_cannot_be_aimed_outside_the_save_directory(monkeypatch, tmp
     with pytest.raises(ValueError):
         path_inside(str(save), "../victim.json")
     assert victim.read_text() == "keep me"
+
+def test_save_output_files_are_0600_and_raw(monkeypatch, tmp_path):
+    """--save-output wrote 0644 files under the umask; a fleet `show configuration`
+    left every root hash world-readable (#42). The content stays raw: a config
+    backup is the point."""
+    import os
+    os.umask(0o022)
+    v = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: 'encrypted-password "$6$HASH"; ## SECRET-DATA\n')
+    monkeypatch.setitem(vendors.VENDORS, "junos", v)
+    save = tmp_path / "out"
+    name, ok, out, _ = runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
+        show_cmd="show configuration", edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=str(save), quiet=True, max_attempts=1)
+    f = save / "R1.output"
+    assert ok and oct(f.stat().st_mode & 0o777) == "0o600" and "$6$HASH" in f.read_text()

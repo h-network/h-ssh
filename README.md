@@ -112,7 +112,9 @@ export HSSH_USER=admin HSSH_PASSWORD=secret               # or from the environm
 
 `--password secret` works too, but a command line is visible to every user on the host (`ps`,
 `/proc/<pid>/cmdline`) and ends up in the shell history. On a shared jump host, use the environment
-or the prompt.
+or the prompt. The same goes for the `openssh` transport's commands: each line runs as the `ssh`
+process's argument, so a config line is readable from `ps` for the life of that process; push
+secrets over NETCONF or paramiko, not over `openssh`.
 
 ## Modes
 

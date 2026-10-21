@@ -209,7 +209,10 @@ def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
         sock.close()
         if isinstance(e, TimeoutError):
             # Nothing was sent that the device acted on: permanent, no retry.
-            raise NotAppliedError(f"login failed: {e}") from e
+            # The message quotes the last line seen; a console that echoes
+            # what was typed would put the password there.
+            text = str(e).replace(passwd, "***") if passwd else str(e)
+            raise NotAppliedError(f"login failed: {text}") from e
         # A connection dropped during the login dialogue is the retried
         # kind of failure, like any reset after connecting.
         raise

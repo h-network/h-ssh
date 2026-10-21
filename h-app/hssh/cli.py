@@ -330,7 +330,7 @@ async def main() -> int:
                         help="Show output as the router's own JSON or XML reply, through its RPC "
                              "translation of the command (junos only; default: text)")
     parser.add_argument("--save-output", type=str,
-                        help="Create dir and save per-device output files inside it")
+                        help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted)")
     parser.add_argument("--log", type=str,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
     parser.add_argument("--audit-log", type=str,
@@ -537,7 +537,9 @@ async def main() -> int:
     save_dir = None
     if args.save_output:
         save_dir = args.save_output
-        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        # Raw device output (a config backup is the point), so the directory
+        # and its files are the operator's alone: 0700 / 0600, never redacted.
+        Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
 
     # Credentials. Flag beats environment beats config file; the password is
     # never read from the config file, so a shell alias cannot leak it to disk.
