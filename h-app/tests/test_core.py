@@ -99,6 +99,21 @@ def test_load_csv_default_vendor():
     assert targets[0].vendor == "ssh"
 
 
+def test_load_csv_default_vendor_is_the_callers(tmp_path):
+    """The CLI passes --transport as default_vendor; a declared vendor still wins."""
+    inv = tmp_path / "devices.csv"
+    inv.write_text("name,ip,vendor\nCR1,10.0.1.1\nSW1,10.0.2.1,arista\n")
+    targets = load_devices_csv(str(inv), default_vendor="junos")
+    assert [t.vendor for t in targets] == ["junos", "arista"]
+
+
+def test_load_csv_name_only_rows_get_the_default_vendor(tmp_path):
+    inv = tmp_path / "devices.csv"
+    inv.write_text("router1\nrouter2\n")
+    targets = load_devices_csv(str(inv), default_vendor="junos")
+    assert [t.vendor for t in targets] == ["junos", "junos"]
+
+
 def test_load_csv_file_not_found():
     """Test that FileNotFoundError is raised for missing file."""
     with pytest.raises(FileNotFoundError):

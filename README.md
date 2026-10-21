@@ -98,7 +98,7 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 
 Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`. A CSV inventory accepts `name,ip`, `name,ip,vendor`, headers or none, and `#` comments.
 
-**A target that doesn't declare a vendor is treated as plain `ssh`** — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` or `arista` explicitly to get NETCONF or eAPI. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
+**A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` or `arista` on the target to get NETCONF or eAPI, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
 ### Authentication
 
@@ -192,6 +192,10 @@ transport = openssh
 Precedence is flag → environment → config file → built-in default. A value given on the command
 line always wins, and `--user` additionally falls back to `HSSH_USER` then the prompt, which offers
 your system username so Enter accepts it.
+
+`transport` is the vendor for targets that don't declare one — `name,ip` inventory rows, a bare
+`--target R1:10.0.1.1`, or a job entry without a vendor. The example above runs those through the
+system `ssh` binary; a vendor on the target itself always wins.
 
 `session_timeout` is the one worth setting. It defaults to 30s, which is how long every unreachable
 device costs you; on a LAN a reachable device connects in well under a second.

@@ -1,6 +1,9 @@
 """~/.h-ssh/config defaults."""
+import asyncio
+import json
 import os
 import sys
+import types
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -154,3 +157,70 @@ def test_retries_zero_from_config_is_honoured():
     args = Args()
     apply_config_defaults(args, {"retries": "0"})
     assert args.retries == 0
+
+
+# --- the transport default reaches the targets --------------------------------
+
+def run_main(monkeypatch, *argv, config=os.devnull):
+    """h-ssh main() in this process, with the runner and the pre-flight check
+    replaced so nothing is contacted. Returns (rc, [(name, vendor, transport)])
+    as the runner was handed the targets."""
+    from hssh import cli
+
+    seen = []
+
+    async def fake_run(t, transport, mode, show_cmd, edit_cmd, **kw):
+        seen.append((t.name, t.vendor, transport))
+        return t.name, True, f"DEVICE: {t.name}\nHOST:   {t.host}\nMODE:   {mode}\nVENDOR: {t.vendor}\n\nok\n", 1
+
+    async def reachable(target, timeout=2):
+        return target.name, True, "reachable"
+
+    monkeypatch.setattr(cli, "run_for_target_async", fake_run)
+    monkeypatch.setattr(cli, "check_reachability", reachable)
+    for vendor in ("junos", "openssh"):
+        monkeypatch.setitem(cli.VENDOR_MODULES, vendor, types.SimpleNamespace(AVAILABLE=True))
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u",
+                                      "--password", "p", *argv])
+    rc = asyncio.run(cli.main())
+    return rc, sorted(seen)
+
+
+def test_transport_flag_is_the_vendor_of_an_undeclared_inline_target(monkeypatch):
+    rc, seen = run_main(monkeypatch, "--transport", "junos", "-sC", "show version",
+                        "--target", "R1:192.0.2.1")
+    assert rc == 0 and seen == [("R1", "junos", "junos")]
+
+
+def test_transport_flag_is_the_vendor_of_undeclared_inventory_rows(monkeypatch, tmp_path):
+    inv = tmp_path / "devices.csv"
+    inv.write_text("name,ip\nR1,192.0.2.1\n")
+    rc, seen = run_main(monkeypatch, "--transport", "junos", "-sC", "show version",
+                        "--devices", str(inv))
+    assert rc == 0 and seen == [("R1", "junos", "junos")]
+
+
+def test_transport_flag_is_the_vendor_of_undeclared_job_targets(monkeypatch, tmp_path):
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:192.0.2.1", "show": "show version"}]))
+    rc, seen = run_main(monkeypatch, "--transport", "junos", "--job", str(job))
+    assert rc == 0 and seen == [("R1", "junos", "junos")]
+
+
+@pytest.mark.parametrize("transport", ["junos", "openssh", "Junos "])
+def test_config_transport_is_the_vendor_of_an_undeclared_target(monkeypatch, tmp_path, transport):
+    """The README's 'transport = openssh' example has to do what it says;
+    the value is matched the way a target's vendor is, lowercase."""
+    cfg = write(tmp_path, f"transport = {transport}\n")
+    rc, seen = run_main(monkeypatch, "-sC", "show version", "--target", "R1:192.0.2.1", config=cfg)
+    assert rc == 0 and seen == [("R1", transport.strip().lower(), transport.strip().lower())]
+
+
+def test_a_declared_vendor_beats_the_transport_default(monkeypatch, tmp_path):
+    """Flag beats config file, and a vendor on the target beats both."""
+    cfg = write(tmp_path, "transport = openssh\n")
+    rc, seen = run_main(monkeypatch, "--transport", "junos", "-sC", "show version",
+                        "--target", "R1:192.0.2.1:telnet", "--target", "R2:192.0.2.2", config=cfg)
+    assert rc == 0 and seen == [("R1", "telnet", "telnet"), ("R2", "junos", "junos")]
