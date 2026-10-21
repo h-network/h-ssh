@@ -36,6 +36,7 @@ _PERMANENT = (
     "network is unreachable",
     "unable to connect to port",
     "authentication failed",
+    "login failed",  # telnet: the device asked for credentials again
     "permission denied",
     "host key verification",
     "cannot resolve",

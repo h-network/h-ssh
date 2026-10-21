@@ -150,9 +150,21 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 | `openssh` | OpenSSH client | built-in | `ssh host cmd` | `ssh host cmd` |
 | `telnet` | Raw socket | built-in | raw TCP | config mode |
 | `telnet-ios` | Raw socket, IOS prompts | built-in | raw TCP | `configure terminal` |
-| `telnet-junos` | Raw socket, Junos prompts | built-in | raw TCP | `configure` / `commit` |
+| `telnet-junos` | Raw socket, Junos prompts | built-in | raw TCP | `configure exclusive` / `commit` |
 
 Every transport reuses a single connection per device for batch work.
+
+Telnet is a prompt match on a raw socket, so it is strict about what it has not seen. A read that reaches
+its timeout or loses the connection is an error, never a partial reply passed off as the device's answer,
+and a `login:`/`Password:` prompt back after the password is a failed login, reported once — not the
+command typed in as a username. A port that prints nothing until Enter — a console-server line left at
+a prompt — gets one Enter once the session timeout is up, before silence counts as a failed login.
+`telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
+reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
+this session's candidate, never another user's pending changes. A commit whose reply never arrives is
+*outcome unknown* here too; one answered with `commit complete` that then takes the session with it — a
+management address, the telnet service — is still reported as committed, the closed session releasing
+the lock.
 
 ### `openssh` — for hosts where you cannot install anything
 
@@ -253,9 +265,9 @@ The split is whether a connection was established. A connect-phase failure has a
 full `ConnectTimeout`; spending it twice more is what lets one dead device dominate a fleet run.
 Unreachable means unreachable for the duration of the run. Once a session exists, a read failure may well
 be transient, so those still get retried. **Edits are different:** a config push is retried only when
-the driver reports that nothing reached the device (for Junos: a candidate-lock failure; a connect
-failure is unreachable like any other and stops at one). Any other failure — above all a timeout around
-a commit — is reported once and left for you to check.
+the driver reports that nothing reached the device (for Junos: a candidate-lock failure, over NETCONF
+or a refused `configure exclusive`; a connect failure is unreachable like any other and stops at one).
+Any other failure — above all a timeout around a commit — is reported once and left for you to check.
 
 Retrying an authentication failure cannot succeed either, and on a fleet it spends three real login
 attempts per device against accounts that may lock out. Those stop at one.
