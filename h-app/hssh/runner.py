@@ -109,6 +109,14 @@ def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
     return _retry_loop(fn, name, quiet, max_attempts, lambda e: True, *args, **kwargs)
 
 
+def is_read_command(command: str) -> bool:
+    """A `show …` command or a `get-*` RPC name reads; anything else
+    (`request …`, `clear …`, `restart …`, a request-* RPC) acts on the device
+    and is sent once, never re-sent by a retry."""
+    text = command.strip().lower()
+    return text.startswith("show ") or text.startswith("get") or text == "show"
+
+
 # Transports whose edit() can really validate a candidate and discard it, and
 # the ones that can really arm a commit-confirmed rollback timer. Everything
 # else must refuse rather than quietly do something weaker.
@@ -231,6 +239,7 @@ def _run_for_target_sync(
     comment: Optional[str] = None,
     fmt: str = "text",
     expected_diff: Optional[str] = None,
+    payload_text: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Execute task on a single target device (internal sync implementation).
@@ -266,9 +275,19 @@ def _run_for_target_sync(
         if mode == "show":
             if not show_cmd:
                 raise ValueError("No show command provided.")
+            # A show that is not a read (`request system reboot`, `clear bgp
+            # neighbor`) is sent once: a timeout after it must not mean two
+            # more reboots. --format turns the text into an RPC and sends it
+            # with no gate at all, so there it is refused outright.
+            read = is_read_command(show_cmd)
+            attempts = max_attempts if read else 1
             if dry_run:
                 result = f"DRY-RUN show: {show_cmd}"
             elif fmt != "text":
+                if not read:
+                    raise ValueError(
+                        f"--format {fmt} runs reads only (show …, get-*); {show_cmd!r} would act on "
+                        "the device with no confirmation. Nothing was sent.")
                 # The router's own JSON or XML for the command, through its
                 # RPC translation. Only the NETCONF driver can do that; a
                 # transport that cannot refuses here, before any device I/O.
@@ -280,14 +299,16 @@ def _run_for_target_sync(
                 # Absence of show_structured on a vendor module is the whole
                 # capability check — generic and telnet simply don't have one,
                 # so they fall through to the text path below.
-                data = _with_retry(vendor_mod.show_structured, name, quiet, max_attempts,
+                data = _with_retry(vendor_mod.show_structured, name, quiet, attempts,
                                    host, user, passwd, show_cmd,
                                    session_timeout, command_timeout,
                                    port=t.port, vendor_hint=vendor,
                                    binding=structured_binding)
                 result = json.dumps(data, indent=2, default=str)
             else:
-                result = _with_retry(vendor_mod.show, name, quiet, max_attempts,
+                if not read and not quiet:
+                    _say(f"{name:16s} NOTE {show_cmd!r} is not a read: sent once, never retried")
+                result = _with_retry(vendor_mod.show, name, quiet, attempts,
                                      host, user, passwd, show_cmd, session_timeout, command_timeout,
                                      port=t.port, vendor_hint=vendor)
             output.append(result.rstrip())
@@ -316,7 +337,9 @@ def _run_for_target_sync(
         elif mode == "edit-dir":
             if not config_dir:
                 raise ValueError("No config directory provided for -eD.")
-            payload = read_set_file_for_device(config_dir, name)
+            # The CLI hands over the text it validated; a file re-read here
+            # could differ from what the guard saw.
+            payload = payload_text if payload_text is not None else read_set_file_for_device(config_dir, name)
             result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
@@ -326,7 +349,7 @@ def _run_for_target_sync(
         elif mode == "edit-broadcast":
             if not broadcast_file:
                 raise ValueError("No broadcast file provided for -eB.")
-            payload = _read_broadcast_file(broadcast_file)
+            payload = payload_text if payload_text is not None else _read_broadcast_file(broadcast_file)
             result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
@@ -356,6 +379,8 @@ def _run_for_target_sync(
             output.append(result.rstrip())
 
         elif mode == "show-batch":
+            if batch_cmds and not all(is_read_command(c) for c in batch_cmds):
+                max_attempts = 1
             if not batch_cmds:
                 raise ValueError("No batch commands provided.")
             if dry_run:
@@ -432,6 +457,7 @@ def run_for_target(
     comment: Optional[str] = None,
     fmt: str = "text",
     expected_diff: Optional[str] = None,
+    payload_text: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Synchronous public API for library users. `expected_diff` is the diff a
@@ -454,6 +480,7 @@ def run_for_target(
         comment=comment,
         fmt=fmt,
         expected_diff=expected_diff,
+        payload_text=payload_text,
     )
 
 
@@ -482,6 +509,7 @@ async def run_for_target_async(
     comment: Optional[str] = None,
     fmt: str = "text",
     expected_diff: Optional[str] = None,
+    payload_text: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -503,6 +531,7 @@ async def run_for_target_async(
         comment=comment,
         fmt=fmt,
         expected_diff=expected_diff,
+        payload_text=payload_text,
     )
 
 

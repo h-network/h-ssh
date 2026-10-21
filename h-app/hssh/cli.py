@@ -202,6 +202,9 @@ def get_default_devices_path() -> str:
     return "devices.csv"
 
 
+SSH_VENDORS = ("junos", "ssh", "openssh")
+
+
 async def check_reachability(target, timeout: int = 2) -> tuple:
     """Quick reachability check for a target."""
     port = resolve_target_port(target)
@@ -210,12 +213,21 @@ async def check_reachability(target, timeout: int = 2) -> tuple:
     try:
         await loop.getaddrinfo(target.host, None)
         try:
-            _, writer = await asyncio.wait_for(
+            reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(target.host, port),
                 timeout=timeout,
             )
-            writer.close()
-            await writer.wait_closed()
+            try:
+                if target.vendor in SSH_VENDORS:
+                    # A port that accepts and closes (a NAT in front of a dead
+                    # container, sshd at its connection limit) is not a device:
+                    # the SSH banner is.
+                    banner = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                    if not banner.startswith(b"SSH-"):
+                        return (target.name, False, f"port {port} open but no SSH banner")
+            finally:
+                writer.close()
+                await writer.wait_closed()
             return (target.name, True, "reachable")
         except asyncio.TimeoutError:
             return (target.name, False, "connection timeout")
@@ -450,6 +462,8 @@ async def main() -> int:
 
         # Junos set-syntax check keys off the targets, not a global flag —
         # a mixed inventory can have some devices that care and some that don't.
+        broadcast_text = None
+        edit_payloads = {}
         has_junos = any(t.vendor in ("junos", "telnet-junos") for t in targets)
         if has_junos:
             if args.edit_command:
@@ -481,6 +495,24 @@ async def main() -> int:
                             if not valid:
                                 print(f"ERROR: Junos config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
                                 return 2
+
+        # The payloads, read once here and handed to the runner and the audit
+        # log as the same string: what the guard checked is what is sent.
+        if args.edit_broadcast:
+            try:
+                broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8")
+            except Exception as e:
+                print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
+                return 2
+        if args.edit_dir:
+            for t in targets:
+                set_file = path_inside(args.edit_dir, f"{t.name}.set")
+                if set_file.is_file():
+                    try:
+                        edit_payloads[t.name] = set_file.read_text(encoding="utf-8")
+                    except Exception as e:
+                        print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
+                        return 2
 
         # Mode label
         if args.show_command:
@@ -642,7 +674,10 @@ async def main() -> int:
             )
 
     # Pre-flight check and confirmation for edit operations
-    if has_edits and not args.dry_run:
+    # --show-diff previews every target before asking, which proves
+    # reachability the real way and spares the router a connection it counts
+    # against its ssh rate limit.
+    if has_edits and not args.dry_run and not args.show_diff:
         if not json_mode:
             print("\nPre-flight check: Validating device reachability...")
 
@@ -755,8 +790,9 @@ async def main() -> int:
                 if args.structured:
                     binding = resolve_structured(actual_show_cmd, t.vendor)
                 actual_show_cmd = resolve_command(actual_show_cmd, t.vendor)
-            if actual_edit_cmd:
-                actual_edit_cmd = resolve_command(actual_edit_cmd, t.vendor)
+            # Edit payloads are sent as typed: the template library is for
+            # show shortcuts, and a template could not pass the set-syntax
+            # guard that already approved the typed text.
             target_batch_cmds = (
                 [resolve_command(c, t.vendor) for c in batch_cmds]
                 if batch_cmds else None
@@ -775,6 +811,8 @@ async def main() -> int:
                 session_timeout=args.session_timeout,
                 command_timeout=args.command_timeout,
                 dry_run=dry_run,
+                payload_text=(broadcast_text if actual_mode == "edit-broadcast"
+                              else edit_payloads.get(t.name) if actual_mode == "edit-dir" else None),
                 commit_confirmed=args.commit_confirmed,
                 save_dir=save_dir,
                 quiet=not show_progress,
@@ -810,12 +848,21 @@ async def main() -> int:
         preview_failed = []
         for coro in asyncio.as_completed(previews):
             i, name, ok, out_text, _ = await coro
-            print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---")
-            print(out_text.rstrip())
+            # stdout stays the JSON array in --json mode; the previews go to stderr
+            print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=sys.stderr if json_mode else sys.stdout)
+            print(out_text.rstrip(), file=sys.stderr if json_mode else sys.stdout)
             if ok:
                 expected[i] = preview_diff(out_text)
             else:
                 preview_failed.append(name)
+            if args.audit_log:
+                ut, uje = units[i]
+                write_audit_entry(
+                    path=args.audit_log, device=ut.name, host=ut.host, vendor=ut.vendor,
+                    mode=uje.mode if uje else mode,
+                    payload=(uje.command if uje else edit_cmd or broadcast_text or edit_payloads.get(ut.name) or ""),
+                    ok=ok, diff=out_text if ok else None, error=None if ok else out_text.strip(),
+                    dry_run=True, comment=args.comment)
         if preview_failed:
             print(f"\nERROR: dry-run failed on {', '.join(preview_failed)}; nothing committed.", file=sys.stderr)
             return 1
@@ -927,26 +974,18 @@ async def main() -> int:
         if args.audit_log:
             audit_payload = ""
             if mode == "edit-cmd":
-                audit_payload = resolve_command(edit_cmd, t.vendor) if edit_cmd else ""
+                audit_payload = edit_cmd or ""
             elif mode == "edit-dir":
-                set_file = path_inside(args.edit_dir, f"{name}.set")
-                if set_file.is_file():
-                    try:
-                        audit_payload = set_file.read_text(encoding="utf-8")
-                    except Exception:
-                        audit_payload = f"<failed to read {set_file}>"
+                audit_payload = edit_payloads.get(name) or f"<no config file for {name}>"
             elif mode == "edit-broadcast":
-                if args.edit_broadcast and Path(args.edit_broadcast).is_file():
-                    try:
-                        audit_payload = Path(args.edit_broadcast).read_text(encoding="utf-8")
-                    except Exception:
-                        audit_payload = f"<failed to read {args.edit_broadcast}>"
+                audit_payload = broadcast_text or ""
             elif mode == "rollback":
                 audit_payload = f"rollback {args.rollback}"
             elif mode == "commit-status":
                 audit_payload = "show system commit"
             elif mode == "job":
-                audit_payload = resolve_command(je.command, t.vendor) if je.command else ""
+                audit_payload = ((resolve_command(je.command, t.vendor) if je.mode == "show" else je.command)
+                                 if je.command else "")
             elif mode == "show":
                 audit_payload = resolve_command(show_cmd, t.vendor) if show_cmd else ""
             elif mode == "show-batch":

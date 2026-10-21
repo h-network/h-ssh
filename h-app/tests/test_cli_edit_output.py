@@ -275,21 +275,23 @@ def test_show_diff_refuses_a_diff_that_changed_after_the_preview(monkeypatch, ca
     assert [c["dry_run"] for c in driver.calls] == [True, False]
 
 
-def test_show_diff_refuses_a_config_file_edited_after_the_preview(monkeypatch, capsys, tmp_path):
-    """-eD is read from disk again for the commit; the previewed diff is the guard."""
+def test_a_config_file_edited_after_the_preview_changes_nothing(monkeypatch, capsys, tmp_path):
+    """-eD/-eB are read once, after the guard, and that text is what the
+    preview, the commit and the audit log all see (#44): a rewrite while the
+    run waits at the prompt is ignored, not sent unchecked."""
     cfg = tmp_path / "cfg"
     cfg.mkdir()
     set_file = cfg / "R1.set"
     set_file.write_text("set system host-name PREVIEWED\n")
 
     def y():
-        set_file.write_text("set system host-name NOT-WHAT-WAS-SHOWN\n")
+        set_file.write_text("run request system reboot\n")
         return "y"
     answer(monkeypatch, y)
     driver = PreviewDriver()
     rc, out, _ = run_cli(monkeypatch, capsys, tmp_path, ["-eD", str(cfg), "--show-diff"], driver=driver)
-    assert rc == 1 and "nothing committed" in out
-    assert "PREVIEWED" in driver.calls[0]["payload"] and "NOT-WHAT-WAS-SHOWN" in driver.calls[1]["payload"]
+    assert rc == 0
+    assert [c["payload"] for c in driver.calls] == ["set system host-name PREVIEWED\n"] * 2
     assert driver.calls[1]["expected_diff"] == driver.diff_of("set system host-name PREVIEWED")
 
 
@@ -302,7 +304,8 @@ def test_show_diff_abort_paths(monkeypatch, capsys, tmp_path):
     rc, out, _ = run_cli(monkeypatch, capsys, tmp_path, argv, driver=driver)
     assert rc == 0 and "Aborted by user." in out
     assert [c["dry_run"] for c in driver.calls] == [True]
-    [record] = [json.loads(ln) for ln in audit.read_text().splitlines()]
+    preview, record = [json.loads(ln) for ln in audit.read_text().splitlines()]
+    assert preview["device"] == "R1" and preview["dry_run"] is True and preview["ok"] is True   # the preview is audited too (#44)
     assert record["device"] == "R1" and record["error"] == "aborted by user confirmation"
     # no terminal and no -y: refused before a dry run reaches any device
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
@@ -385,3 +388,54 @@ def test_commit_confirmed_outside_the_junos_range_is_refused_at_the_flag(monkeyp
                                                 "--commit-confirmed", minutes], driver=driver)
     err = capsys.readouterr().err
     assert exc.value.code == 2 and calls == [] and "1..65535 minutes" in err
+
+# --- #44: what the guard approved is what is sent ------------------------------
+
+def test_an_edit_payload_is_never_resolved_through_the_template_library(monkeypatch, capsys, tmp_path):
+    """A `commit` entry in ~/.h-ssh/commands/junos.json once turned -eC commit
+    into an arbitrary text-format load that skipped the guard and the confirm."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cmds = tmp_path / ".h-ssh" / "commands"
+    cmds.mkdir(parents=True)
+    (cmds / "junos.json").write_text(json.dumps({"commit": {"command": "run request system reboot"}}))
+    monkeypatch.setattr(cli, "check_reachability", _reachable)
+    calls = []
+    driver = types.SimpleNamespace(AVAILABLE=True,
+                                   confirm=lambda *a, **kw: calls.append(("confirm", a)) or "COMMIT CONFIRMED OK",
+                                   edit=lambda *a, **kw: calls.append(("edit", a[3])) or "COMMIT OK")
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", "commit", "-y"], driver=driver)
+    assert rc == 0 and [c[0] for c in calls] == ["confirm"]
+
+
+def test_a_broadcast_file_rewritten_after_the_check_is_not_what_is_sent(monkeypatch, capsys, tmp_path):
+    """-eB was syntax-checked, then re-read after the prompt (#44)."""
+    cfg = tmp_path / "all.set"
+    cfg.write_text("set system host-name CHECKED\n")
+
+    async def rewrite_then_reachable(target, timeout=2):
+        cfg.write_text("run request system reboot\n")
+        return (target.name, True, "reachable")
+    monkeypatch.setattr(cli, "check_reachability", rewrite_then_reachable)
+    seen = []
+    driver = types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: seen.append(a[3]) or "COMMIT OK")
+    audit = tmp_path / "audit.jsonl"
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eB", str(cfg), "-y", "--audit-log", str(audit)], driver=driver)
+    assert rc == 0 and seen == ["set system host-name CHECKED\n"]
+    assert json.loads(audit.read_text().splitlines()[-1])["payload"] == "set system host-name CHECKED\n"
+
+
+def test_show_diff_json_keeps_stdout_as_json_and_skips_the_preflight(monkeypatch, capsys, tmp_path):
+    """Previews landed on stdout in front of the JSON array; and the pre-flight
+    TCP connect is redundant once every target has been previewed (#44)."""
+    probes = []
+
+    async def counting(target, timeout=2):
+        probes.append(target.name)
+        return (target.name, True, "reachable")
+    monkeypatch.setattr(cli, "check_reachability", counting)
+    driver = PreviewDriver()
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path,
+                           ["-eC", "set system host-name R1-new", "--show-diff", "-y", "--json"], driver=driver)
+    assert rc == 0 and probes == []
+    data = json.loads(out)
+    assert len(data) == 1 and data[0]["ok"] and "R1-new" in err
