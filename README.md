@@ -458,7 +458,9 @@ the checks outlasted the timer and the device rolled back by itself — it sends
 `not confirmed` / `not rolled back` with the reason, the history under `status` and, when the checks
 failed, their error under `check_error`, because a `rollback 1` at that point would re-apply the change
 that just failed its checks. A session with an open transaction stays borrowed —
-other threads wait for it, the thread holding it may keep using it.
+other threads wait for it, the thread holding it may keep using it, and only that thread can commit or
+abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that landed elsewhere) is
+refused before anything is sent, because the session's lock belongs to the thread that opened it.
 
 ### Structured output from a script
 
@@ -496,8 +498,9 @@ print(pool.POOL.stats)            # {'opens': 1, 'reuses': 2, 'discards': 0, 're
 pool.close_all()                  # also runs at interpreter exit
 ```
 
-One session per `(host, port, user)`. Calls against the same router from several threads queue on
-that session; different routers run in parallel as before. A session is dropped, never handed to
+One session per `(host, port, user, credential)` — a digest of the password is part of the key, so a
+call with a different or wrong password never rides a session another credential opened. Calls against
+the same router from several threads queue on that session; different routers run in parallel as before. A session is dropped, never handed to
 the next caller, when something left it in doubt: a commit whose outcome is unknown, a rollback or
 unlock that failed, an RPC timeout, or the router closing it. A read (`show`, `show_structured`,
 `show_batch`, and `rpc`/`rpc_batch` for a `show …` command or `get-*` RPC) that finds its reused

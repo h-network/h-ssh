@@ -25,6 +25,7 @@ What a library needs on top, and only that:
 """
 
 import atexit
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import threading
@@ -226,7 +227,13 @@ class ConnectionPool:
             # last_used at 0.0, and the idle-cleanup loop (which requires
             # last_used > 0) would never reap it.
             entry["last_used"] = time.time()
-            entry["lock"].release()
+            try:
+                entry["lock"].release()
+            except RuntimeError:
+                # Released from a thread that does not own the RLock: the
+                # owner still holds it. Say so instead of hiding a sent
+                # commit behind a lock error.
+                log.error("Pool: borrow of %s returned from a thread that did not take it", key)
 
     # kept for callers written against the first h-ssh pool
     lease = get_connection
@@ -348,16 +355,29 @@ class ConnectionPool:
         with self._pool_lock:
             self._generation += 1
             entries = list(self._connections.items())
-        for key, entry in entries:
+
+        def close_one(item):
+            key, entry = item
             if shutdown:
                 if not entry["lock"].acquire(blocking=False):
-                    continue
+                    return
             else:
                 entry["lock"].acquire()
             try:
                 self._drop(entry, "discards")
             finally:
                 entry["lock"].release()
+
+        # Closes run side by side: one unresponsive router costs its own close
+        # timeout, not one per router in a row, so a 350-router exit does not
+        # stall for minutes.
+        live = [item for item in entries if item[1]["device"] is not None]
+        if len(live) > 1:
+            with ThreadPoolExecutor(max_workers=min(32, len(live)), thread_name_prefix="hssh-pool-close") as ex:
+                list(ex.map(close_one, live))
+        else:
+            for item in live:
+                close_one(item)
         log.info("Connection pool: all connections closed")
 
 

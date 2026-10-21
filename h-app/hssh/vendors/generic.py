@@ -114,10 +114,16 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
     try:
         client.connect(**conn_params)
     except paramiko.BadHostKeyException as exc:
+        client.close()
         raise RuntimeError(
             "Host key verification failed for %s: the key is not the one pinned. "
             "If the device was re-keyed, remove its line from %s (or ~/.ssh/known_hosts)."
             % (host, known_hosts)) from exc
+    except BaseException:
+        # A refused login or a dropped handshake leaves a Transport thread
+        # and a socket behind unless the client is closed.
+        client.close()
+        raise
     return client
 
 

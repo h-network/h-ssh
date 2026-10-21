@@ -12,7 +12,9 @@ session and gives it back. A session that fails underneath a call is
 discarded, never handed to the next caller.
 """
 
+import hashlib
 import re
+import threading
 from contextlib import contextmanager
 from typing import List, Optional
 
@@ -143,11 +145,20 @@ def _timed_out(exc: BaseException) -> bool:
     return any(isinstance(e, RpcTimeoutError) for e in _chain(exc))
 
 
+def _pool_key(host: str, port: Optional[int], user: str, passwd: Optional[str]) -> tuple:
+    """What identifies a pooled session: the router, the user and a digest of
+    the credential (never the password itself)."""
+    return (host, port or DEFAULT_PORT, user, hashlib.sha256((passwd or "").encode()).hexdigest()[:16])
+
+
 @contextmanager
 def _session(host: str, user: str, passwd: Optional[str], session_timeout: int,
              command_timeout: int, port: Optional[int]):
     """A session for this router: fresh, or borrowed from the pool."""
-    key = (host, port or DEFAULT_PORT, user)
+    # The credential is part of a session's identity: a later call with a
+    # different, wrong or absent password must not ride the session the
+    # first one opened. A digest of it, not the password, sits in the key.
+    key = _pool_key(host, port, user, passwd)
     with POOL.get_connection(
         key,
         opener=lambda: _open(host, user, passwd, session_timeout, command_timeout, port),
@@ -313,6 +324,9 @@ class Transaction:
         self.label = label
         self._timeout = command_timeout
         self.open = True
+        # The pool's per-router lock is re-entrant and owned by this thread;
+        # only this thread can hand the session back.
+        self._owner = threading.get_ident()
 
     @property
     def dev(self):
@@ -371,17 +385,26 @@ class Transaction:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self.open:
+        if self.open and threading.get_ident() == self._owner:
             self.abort()
         return False
 
     def _require_open(self) -> None:
         if not self.open:
             raise RuntimeError("transaction is no longer open")
+        if threading.get_ident() != self._owner:
+            # A commit from here would land on the device and then fail to
+            # release the owner's lock, with the slot wedged for every other
+            # caller. Refuse before any RPC: nothing is sent.
+            raise RuntimeError("transaction must be used and finished on the thread that opened it; "
+                               "nothing was sent to the device")
 
     def _finish(self, rollback: bool, unlock: bool) -> None:
         if not self.open:
             return
+        if threading.get_ident() != self._owner:
+            raise RuntimeError("transaction must be used and finished on the thread that opened it; "
+                               "nothing was sent to the device")
         self.open = False
         try:
             if rollback:
