@@ -287,3 +287,14 @@ def test_command_template_path_resolution(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_target_spec_round_trips_every_target_form():
+    """The confirm hint is built from target_spec(); an IPv6 host lost its
+    brackets and the hint could not be pasted back (#39)."""
+    from hssh.cli import target_spec
+    from hssh.core import Target, parse_inline_target
+    for t in (Target("R1", "10.0.0.1", "junos"), Target("R1", "10.0.0.1", "junos", 830),
+              Target("R1", "2001:db8::1", "junos"), Target("R1", "2001:db8::1", "junos", 830),
+              Target("sw", "::1", "telnet-ios", 5001)):
+        assert parse_inline_target(target_spec(t)) == t

@@ -137,6 +137,11 @@ def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
     name = parts[0]
     host = parts[1]
 
+    def port_of(text: str) -> int:
+        if not text.isdigit():
+            raise ValueError(f"Invalid target: {spec!r} (port {text!r} is not a number)")
+        return int(text)
+
     if len(parts) == 2:
         return Target(name=name, host=host, vendor=default_vendor)
     elif len(parts) == 3:
@@ -146,7 +151,7 @@ def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
     elif len(parts) == 4:
         if parts[2].isdigit():
             return Target(name=name, host=host, port=int(parts[2]), vendor=parts[3].lower())
-        return Target(name=name, host=host, vendor=parts[2].lower(), port=int(parts[3]))
+        return Target(name=name, host=host, vendor=parts[2].lower(), port=port_of(parts[3]))
     else:
         raise ValueError(f"Invalid target: {spec!r} (expected name:host[:vendor][:port]; "
                          "an IPv6 host goes in brackets)")
@@ -188,12 +193,21 @@ def load_jobs(path: str, default_vendor: str = "ssh") -> List[JobEntry]:
             raise ValueError(f"Job entry {i}: must be a JSON object")
         if "target" not in item:
             raise ValueError(f"Job entry {i}: missing 'target'")
+        for key in ("target", "show", "edit"):
+            if key in item and not isinstance(item[key], str):
+                raise ValueError(f"Job entry {i}: '{key}' must be a string")
 
-        target = parse_inline_target(item["target"], default_vendor)
+        try:
+            target = parse_inline_target(item["target"], default_vendor)
+        except ValueError as e:
+            raise ValueError(f"Job entry {i}: {e}") from e
 
         # Optional port override
         if "port" in item:
-            target.port = int(item["port"])
+            try:
+                target.port = int(item["port"])
+            except (TypeError, ValueError):
+                raise ValueError(f"Job entry {i}: 'port' must be a number")
 
         has_show = "show" in item
         has_edit = "edit" in item

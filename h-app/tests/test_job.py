@@ -129,3 +129,17 @@ def test_load_jobs_default_vendor_fills_undeclared_targets(tmp_path):
     entries = load_jobs(str(job_file), default_vendor="junos")
     assert entries[0].target.vendor == "junos"
     assert entries[1].target.vendor == "arista", "a declared vendor must win"
+
+
+@pytest.mark.parametrize("entry, text", [
+    ({"target": "R1:10.0.0.1:junos", "edit": ["set system host-name X"]}, "'edit' must be a string"),
+    ({"target": {"a": 1}, "show": "show version"}, "'target' must be a string"),
+    ({"target": "R1:10.0.0.1:junos", "show": "show version", "port": "eight"}, "'port' must be a number"),
+    ({"target": "R1:10.0.0.1:junos:notaport", "show": "show version"}, "Job entry 0: Invalid target"),
+])
+def test_load_jobs_rejects_wrongly_typed_entries_with_the_entry_number(tmp_path, entry, text):
+    """Wrongly typed job values ended in AttributeError/TypeError tracebacks (#39)."""
+    job_file = tmp_path / "bad.json"
+    job_file.write_text(json.dumps([entry]))
+    with pytest.raises(ValueError, match=text):
+        load_jobs(str(job_file))
