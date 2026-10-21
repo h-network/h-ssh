@@ -305,3 +305,41 @@ def test_commit_status_mode_returns_json(monkeypatch):
         user="u", passwd="p", session_timeout=5, command_timeout=30,
         dry_run=False, commit_confirmed=None, save_dir=None, quiet=True)
     assert not ok and "not supported" in out
+
+
+# --- #39 ------------------------------------------------------------------------
+
+def test_commit_with_a_semicolon_is_a_confirm_too(monkeypatch):
+    """The README lists `commit;` as a confirm form; it was loaded as config."""
+    v = FakeVendor(with_confirm=True)
+    _, ok, out, _ = run(monkeypatch, "junos", v, edit_cmd="commit;")
+    assert ok and v.confirm_calls == ["10.0.0.1"] and v.edit_calls == []
+
+
+def test_commit_status_dry_run_opens_no_session(monkeypatch):
+    class Mod:
+        AVAILABLE = True
+        calls = []
+
+        @staticmethod
+        def commit_status(*a, **kw):
+            Mod.calls.append(a)
+            return [{"seq": 0}]
+
+    monkeypatch.setitem(vendors.VENDORS, "junos", Mod)
+    name, ok, out, _ = runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="commit-status",
+        show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=True, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=1)
+    assert ok and Mod.calls == [] and "DRY-RUN" in out and out.strip().splitlines()[-1] == "[]"
+
+
+def test_progress_lines_are_written_in_one_piece(monkeypatch):
+    """print() writes the text and the newline separately, so two worker
+    threads interleave; _say writes the line once."""
+    writes = []
+    monkeypatch.setattr(runner.sys, "stdout", type("S", (), {"write": lambda self, t: writes.append(t),
+                                                               "flush": lambda self: None})())
+    runner._say("R1               STARTED")
+    assert len(writes) == 1 and writes[0].endswith("R1               STARTED\n") and writes[0].startswith("[")

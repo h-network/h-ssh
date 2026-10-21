@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import types
 import pytest
@@ -128,7 +129,9 @@ def test_built_in_defaults_apply_with_no_config():
         assert getattr(args, key) == expected
 
 
-def test_unparsable_numbers_fall_back_to_the_default():
+def test_unparsable_or_out_of_range_config_values_name_their_key():
+    """A config file is held to what the flag would accept (#39): no silent
+    fallback to the default, the error names the key."""
     from hssh.cli import apply_config_defaults
 
     class Args:
@@ -138,9 +141,22 @@ def test_unparsable_numbers_fall_back_to_the_default():
         retries = None
         transport = None
 
+    cases = [({"workers": "lots"}, "workers = 'lots' is not a number"),
+             ({"workers": "0"}, "workers = 0 is below 1"),
+             ({"session_timeout": "-3"}, "session_timeout = -3 is below 1"),
+             ({"transport": "../../etc"}, "transport = '../../etc' is not one of")]
+    for cfg, text in cases:
+        with pytest.raises(ValueError, match=re.escape(text)):
+            apply_config_defaults(Args(), cfg)
     args = Args()
-    apply_config_defaults(args, {"workers": "lots"})
-    assert args.workers == 8
+    apply_config_defaults(args, {"workers": "16", "transport": "Junos"})
+    assert args.workers == 16 and args.transport == "junos" and args.retries == 2
+
+
+def test_bad_config_file_value_is_a_usage_error(monkeypatch, tmp_path):
+    cfg = write(tmp_path, "transport = telnet-magic\n")
+    rc, seen = run_main(monkeypatch, "-sC", "show version", "--target", "R1:192.0.2.1", config=cfg)
+    assert rc == 2 and seen == []
 
 
 def test_retries_zero_from_config_is_honoured():

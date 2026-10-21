@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -70,6 +71,13 @@ def _is_local_error(exc) -> bool:
     return isinstance(exc, (ValueError, FileNotFoundError))
 
 
+def _say(text: str) -> None:
+    """One progress line from a worker thread, written in one piece: print()
+    writes the text and the newline separately, and two threads interleave."""
+    sys.stdout.write(f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
+    sys.stdout.flush()
+
+
 def _backoff(attempt: int) -> int:
     """Seconds before attempt+1. Falls back to the last step once the table runs out."""
     if attempt <= len(RETRY_BACKOFF):
@@ -90,8 +98,7 @@ def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, **kwargs):
             if attempt < attempts:
                 delay = _backoff(attempt)
                 if not quiet:
-                    timestamp = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{timestamp}] {name:16s} RETRY {attempt}/{attempts - 1} in {delay}s ({e})")
+                    _say(f"{name:16s} RETRY {attempt}/{attempts - 1} in {delay}s ({e})")
                 time.sleep(delay)
     raise last_err
 
@@ -240,8 +247,7 @@ def _run_for_target_sync(
             return name, False, err_out, duration_ms
 
     if not quiet:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"[{timestamp}] {name:16s} STARTED")
+        _say(f"{name:16s} STARTED")
 
     # Get vendor module
     vendor_mod = vendors.get(vendor)
@@ -287,7 +293,7 @@ def _run_for_target_sync(
             if not edit_cmd:
                 raise ValueError("No edit command provided.")
             payload = edit_cmd.strip() + "\n"
-            if payload.strip() == "commit" and hasattr(vendor_mod, "confirm"):
+            if payload.strip() in ("commit", "commit;") and hasattr(vendor_mod, "confirm"):
                 # Only a literal -eC "commit" confirms a pending commit-confirmed;
                 # the same word inside an -eD/-eB file is just (invalid) config.
                 if dry_run:
@@ -327,10 +333,15 @@ def _run_for_target_sync(
         elif mode == "commit-status":
             if not hasattr(vendor_mod, "commit_status"):
                 raise ValueError(f"--commit-status is not supported by the '{vendor}' transport")
-            entries = _with_retry(vendor_mod.commit_status, name, quiet, max_attempts,
-                                  host, user, passwd, session_timeout, command_timeout,
-                                  port=t.port, vendor_hint=vendor)
-            output.append(json.dumps(entries))
+            if dry_run:
+                # A dry run contacts no device, for a read too.
+                output.append("DRY-RUN commit-status (no session opened)")
+                output.append(json.dumps([]))
+            else:
+                entries = _with_retry(vendor_mod.commit_status, name, quiet, max_attempts,
+                                      host, user, passwd, session_timeout, command_timeout,
+                                      port=t.port, vendor_hint=vendor)
+                output.append(json.dumps(entries))
 
         elif mode == "rollback":
             if rollback is None:

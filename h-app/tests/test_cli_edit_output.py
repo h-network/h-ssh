@@ -338,3 +338,36 @@ def test_log_file_is_0600_and_redacted_like_the_audit_log(monkeypatch, capsys, t
     assert committed["command"] == "set snmp community [REDACTED] authorization read-only"
     assert "+   community [REDACTED] {" in committed["output"]
     assert failed["error"] == "Config error: community [REDACTED] rejected"
+
+
+# --- #39: the verdict and the exit code count what did not run -----------------
+
+def test_a_run_the_safety_gate_kept_from_every_device_is_not_all_ok(monkeypatch, capsys, tmp_path):
+    """A planted <safety-file>.corrupt blocks every device; the headline and
+    $? said 'All devices OK' / 0 for a change that touched nothing."""
+    monkeypatch.setattr(cli, "check_reachability", _reachable)
+    sf = tmp_path / "gate.json"
+    (tmp_path / "gate.json.corrupt").write_text("x")
+    calls = []
+    driver = types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: calls.append(a) or "COMMIT OK")
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path,
+                           ["-eC", "set system host-name X", "-y", "--safety-file", str(sf)], driver=driver)
+    assert rc == 3 and calls == []
+    assert "skipped by the safety gate: 1, nothing applied" in out and "All devices OK" not in out
+    assert "gate.json.corrupt" in out        # the reason names the sentinel to clear
+
+
+def test_commit_confirmed_with_a_confirm_is_refused(monkeypatch, capsys, tmp_path):
+    """A confirm is a plain commit: no new timer, so no banner promising one."""
+    calls = []
+    driver = types.SimpleNamespace(AVAILABLE=True, confirm=lambda *a, **kw: calls.append(a) or "OK",
+                                   edit=lambda *a, **kw: calls.append(a) or "OK")
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", "commit", "--commit-confirmed", "5", "-y"],
+                           driver=driver)
+    assert rc == 2 and calls == [] and "cannot arm a new timer" in err and "DON'T FORGET" not in out
+
+
+@pytest.mark.parametrize("spec", ["R1:1.2.3.4:junos:notaport", "R1:1.2.3.4:junos:830:extra", "R1"])
+def test_a_malformed_target_is_a_usage_error_not_a_traceback(monkeypatch, capsys, tmp_path, spec):
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-sC", "show version"], target=spec)
+    assert rc == 2 and err.startswith("ERROR:") and "Traceback" not in err

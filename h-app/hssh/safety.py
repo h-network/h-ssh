@@ -71,7 +71,8 @@ class SafetyGate:
             if self._safety_file:
                 self._load_cooldowns()
                 if self._corrupt:
-                    return False, "safety file corrupted (fail-closed)"
+                    return False, (f"safety file corrupted (fail-closed): check and remove "
+                                   f"{self._safety_file}.corrupt to clear it")
 
             # Tier 2: cooldown check
             now = time.time()

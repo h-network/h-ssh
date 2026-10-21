@@ -171,6 +171,7 @@ def test_fail_closed_on_corrupt_file():
         allowed, reason = gate.check_device("10.0.1.1")
         assert allowed is False
         assert "corrupt" in reason.lower()
+        assert f"{tmp}.corrupt" in reason      # names the sentinel to clear (#39)
     finally:
         Path(tmp).unlink(missing_ok=True)
         Path(f"{tmp}.lock").unlink(missing_ok=True)

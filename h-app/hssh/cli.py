@@ -99,23 +99,38 @@ CONFIG_DEFAULTS = {
 }
 
 
+TRANSPORT_CHOICES = ["junos", "arista", "ssh", "openssh", "telnet"]
+# The floor a config-file value must reach; a flag has argparse for this.
+CONFIG_FLOORS = {"workers": 1, "retries": 0, "session_timeout": 1, "command_timeout": 1}
+
+
 def apply_config_defaults(args, config: dict) -> None:
     """Fill unset options from the config file, then from the built-in default.
 
     Precedence is flag, then environment (handled per option), then config file,
-    then default. An option given on the command line is never overridden.
+    then default. An option given on the command line is never overridden. A
+    file value is held to what the flag would accept: a transport from the
+    list, numbers at or above their floor; anything else is a ValueError
+    naming the key, not a silent default.
     """
     for key, fallback in CONFIG_DEFAULTS.items():
         if getattr(args, key, None) is not None:
             continue
-        value = config.get(key, fallback)
+        if key not in config:
+            setattr(args, key, fallback)
+            continue
+        value = config[key]
         if isinstance(fallback, int):
             try:
                 value = int(value)
             except (TypeError, ValueError):
-                value = fallback
-        elif key == "transport" and isinstance(value, str):
-            value = value.strip().lower()   # vendors are matched lowercase, as for targets
+                raise ValueError(f"{key} = {value!r} is not a number")
+            if value < CONFIG_FLOORS.get(key, 0):
+                raise ValueError(f"{key} = {value} is below {CONFIG_FLOORS.get(key, 0)}")
+        elif key == "transport":
+            value = str(value).strip().lower()   # vendors are matched lowercase, as for targets
+            if value not in TRANSPORT_CHOICES:
+                raise ValueError(f"transport = {value!r} is not one of {', '.join(TRANSPORT_CHOICES)}")
         setattr(args, key, value)
 
 
@@ -142,8 +157,10 @@ def confirm_program() -> str:
 
 
 def target_spec(t: Target) -> str:
-    """A target as the inline --target spec that parses back to it."""
-    spec = f"{t.name}:{t.host}:{t.vendor}"
+    """A target as the inline --target spec that parses back to it; an IPv6
+    host goes back into its brackets."""
+    host = f"[{t.host}]" if ":" in t.host else t.host
+    spec = f"{t.name}:{host}:{t.vendor}"
     return f"{spec}:{t.port}" if t.port is not None else spec
 
 
@@ -209,13 +226,26 @@ async def check_reachability(target, timeout: int = 2) -> tuple:
         return (target.name, False, f"error: {e}")
 
 
+def is_confirm(payload: str) -> bool:
+    """A literal `commit` (or `commit;`) as the whole edit payload confirms a
+    pending commit-confirmed; the same word inside a config file is config."""
+    return payload.strip() in ("commit", "commit;")
+
+
 async def main() -> int:
     """Main CLI entry point."""
+    # Device output is whatever the device sent; a byte the terminal's
+    # encoding cannot show must not end the run with a traceback.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(description="Multi-vendor network automation tool.")
 
     parser.add_argument("--devices", default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
-    parser.add_argument("--transport", choices=["junos", "arista", "ssh", "openssh", "telnet"], default=None,
+    parser.add_argument("--transport", choices=TRANSPORT_CHOICES, default=None,
                         help="Transport for targets that don't declare one (default: ssh)")
     parser.add_argument("--structured", action="store_true",
                         help="Return structured data where the vendor supports it "
@@ -302,7 +332,11 @@ async def main() -> int:
     # Resolved before anything reads them, so --list-commands and the banner
     # see the same values the run will use.
     file_config = load_config(args.config)
-    apply_config_defaults(args, file_config)
+    try:
+        apply_config_defaults(args, file_config)
+    except ValueError as e:
+        print(f"ERROR: {get_config_path() if args.config is None else args.config}: {e}", file=sys.stderr)
+        return 2
 
     # Handle --list-commands
     if args.list_commands:
@@ -385,9 +419,11 @@ async def main() -> int:
         # Load targets. A target that doesn't declare a vendor gets
         # --transport (or the config file's), the same for every form.
         if args.target:
-            targets = []
-            for spec in args.target:
-                targets.append(parse_inline_target(spec, default_vendor=args.transport))
+            try:
+                targets = [parse_inline_target(spec, default_vendor=args.transport) for spec in args.target]
+            except ValueError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
         else:
             try:
                 targets = load_devices_csv(args.devices, default_vendor=args.transport)
@@ -453,6 +489,15 @@ async def main() -> int:
 
     if args.comment is not None and not has_edits:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
+        return 2
+    # A confirm is a plain commit: it cannot arm a new timer, so a run that
+    # asks for one would end with a banner promising a rollback that no
+    # device is counting down.
+    confirms = ([args.edit_command] if args.edit_command else
+                [je.command for je in (job_entries or []) if je.mode.startswith("edit")])
+    if args.commit_confirmed and confirms and all(is_confirm(c) for c in confirms):
+        print('ERROR: --commit-confirmed does not go with -eC "commit": a confirm cannot arm a new timer.',
+              file=sys.stderr)
         return 2
     if args.show_diff and (not has_edits or args.dry_run):
         print("ERROR: --show-diff goes with an edit that is not already a --dry-run.", file=sys.stderr)
@@ -1110,15 +1155,24 @@ async def main() -> int:
             print(f"Interrupted. Completed {len(json_results)} of {len(targets)} device(s).",
                   file=sys.stderr)
 
+        # The verdict counts what did not run as well as what failed: a run the
+        # safety gate kept away from every device must not read as a success.
+        if failures:
+            verdict = f"Done. Failures: {failures}" + (f", skipped by the safety gate: {skipped}" if skipped else "")
+        elif skipped:
+            applied = len(json_results) - skipped
+            verdict = f"Done. OK: {applied}, skipped by the safety gate: {skipped}"
+            if has_edits and not applied:
+                verdict += ", nothing applied"
+        else:
+            verdict = "Done. All devices OK."
         if not raw_mode:
             print("")
-            if failures:
-                print(f"Done. Failures: {failures}")
-            elif not interrupted:
-                print("Done. All devices OK.")
-        elif failures:
+            if failures or skipped or not interrupted:
+                print(verdict)
+        elif failures or skipped:
             # stdout is device output only; the verdict belongs on stderr.
-            print(f"Done. Failures: {failures}", file=sys.stderr)
+            print(verdict, file=sys.stderr)
 
         if args.commit_confirmed and not args.dry_run and has_edits:
             # A job's timers are armed on its edit entries' targets, not on
@@ -1156,7 +1210,9 @@ async def main() -> int:
 
     if interrupted:
         return 130  # 128 + SIGINT, the shell convention
-    return 1 if failures else 0
+    if failures:
+        return 1
+    return 3 if skipped else 0   # 3: nothing failed, but not everything ran
 
 
 def main_sync() -> None:
