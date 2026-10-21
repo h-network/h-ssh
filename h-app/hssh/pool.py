@@ -40,17 +40,28 @@ CLEANUP_INTERVAL = 60
 
 class Lease:
     """What a borrower gets: the session, whether it was reused, and a way to
-    say it is no good. A discarded session is closed on return instead of kept."""
+    say it is no good. A discarded session is closed when the outermost
+    borrow returns it — not before, so a call nested inside an open
+    transaction cannot pull the session out from under it."""
 
-    __slots__ = ("dev", "reused", "discarded")
+    __slots__ = ("dev", "reused", "discarded", "_entry")
 
-    def __init__(self, dev, reused: bool):
+    def __init__(self, dev, reused: bool, entry: Optional[dict] = None):
         self.dev = dev
         self.reused = reused
         self.discarded = False
+        self._entry = entry
 
     def discard(self) -> None:
         self.discarded = True
+
+    @property
+    def doomed(self) -> bool:
+        """True once any borrower of this session — this one or a nested
+        call — has discarded it; the outer holder must not send more work."""
+        if self.discarded:
+            return True
+        return bool(self._entry and self._entry.get("doomed"))
 
 
 class ConnectionPool:
@@ -165,11 +176,14 @@ class ConnectionPool:
 
         entry = self._get_or_create_entry(key)
         entry["lock"].acquire()
+        entry["depth"] += 1          # re-entrant: >1 means a call nested in an open borrow
+        nested = entry["depth"] > 1
         lease = None
         try:
             device = entry["device"]
             reused = device is not None
-            if device is not None and not self._usable(device, alive, time.time() - entry["last_used"]):
+            if device is not None and not nested and not self._usable(
+                    device, alive, time.time() - entry["last_used"]):
                 self._drop(entry, "discards")
                 device, reused = None, False
             if device is None:
@@ -182,9 +196,9 @@ class ConnectionPool:
                 self._count("reuses")
                 log.debug("Pool: reusing connection to %s", key)
 
-            if timeout is not None:
+            if timeout is not None and not nested:
                 device.timeout = timeout
-            lease = Lease(device, reused)
+            lease = Lease(device, reused, entry)
             yield lease
         except Exception:
             # Invalidate the pooled connection if the transport dropped; the
@@ -192,13 +206,21 @@ class ConnectionPool:
             # whose outcome is unknown) through lease.discard().
             dev = entry["device"]
             if dev is not None and not getattr(dev, "connected", True):
-                self._drop(entry, "discards")
+                entry["doomed"] = True
             raise
         finally:
-            if entry["device"] is not None and lease is not None and (
-                lease.discarded or not self._enabled or entry["generation"] != self._generation
-            ):
-                self._drop(entry, "discards")
+            if lease is not None and lease.discarded:
+                entry["doomed"] = True
+            entry["depth"] -= 1
+            # Only the outermost borrow closes: a nested call that found the
+            # session dead has marked it, and the holder of the outer borrow
+            # (a Transaction) still needs to finish on its own terms.
+            if entry["depth"] == 0:
+                if entry["device"] is not None and (
+                    entry["doomed"] or not self._enabled or entry["generation"] != self._generation
+                ):
+                    self._drop(entry, "discards")
+                entry["doomed"] = False
             # Refresh last_used on every borrow — success OR failure. Otherwise a
             # connection whose operation raised while still connected keeps
             # last_used at 0.0, and the idle-cleanup loop (which requires
@@ -218,6 +240,8 @@ class ConnectionPool:
                     "lock": threading.RLock(),
                     "last_used": 0.0,
                     "generation": 0,
+                    "depth": 0,
+                    "doomed": False,
                 }
             return self._connections[key]
 
