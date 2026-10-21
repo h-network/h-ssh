@@ -145,7 +145,7 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 | Vendor | Transport | Library | Show | Edit |
 |---|---|---|---|---|
 | `junos` | NETCONF | junos-eznc | PyEZ `Device.cli()` | PyEZ lock/load/diff/commit |
-| `arista` | eAPI (HTTPS) | pyeapi | eAPI enable | eAPI config |
+| `arista` | eAPI (HTTPS) | pyeapi | eAPI enable | eAPI `configure session` / diff / `commit` |
 | `ssh` | SSH | paramiko | `exec_command` | `exec_command` |
 | `openssh` | OpenSSH client | built-in | `ssh host cmd` | `ssh host cmd` |
 | `telnet` | Raw socket | built-in | raw TCP | config mode |
@@ -165,6 +165,18 @@ this session's candidate, never another user's pending changes. A commit whose r
 *outcome unknown* here too; one answered with `commit complete` that then takes the session with it — a
 management address, the telnet service — is still reported as committed, the closed session releasing
 the lock.
+
+### `ssh` — paramiko, for anything that speaks SSH
+
+The default transport runs each line as its own `exec_command`. A command that exits non-zero is a
+failure, not output: an edit stops at that line and reports it, a batch marks the entry `ok: false`
+with the first line the device said about it (stderr, or stdout where the device puts its errors).
+
+Host keys are pinned on first contact in `~/.h-ssh/known_hosts` (created 0600), and
+`~/.ssh/known_hosts` is honoured too. The policy is the same `HSSH_HOST_KEY_POLICY` the `openssh`
+transport reads: `accept-new` (default) pins an unknown host, `yes` refuses one, `no` only warns.
+A host whose key has changed is refused under every policy, before any credential is sent — after
+a re-image, remove its line from `~/.h-ssh/known_hosts`.
 
 ### `openssh` — for hosts where you cannot install anything
 
@@ -192,6 +204,17 @@ per-host identities work with no extra flags. Host key policy defaults to `accep
 Two limits, both deliberate: `--structured` has no bindings here, and `--commit-confirmed` is
 rejected rather than silently ignored — a confirmed commit needs the NETCONF `junos` transport, and
 dropping the rollback timer without saying so would be worse than refusing.
+
+### `arista` — eAPI over HTTPS
+
+The switch's certificate is verified against the system CAs. A lab CA goes in
+`HSSH_EAPI_CA=/path/ca.pem`; a self-signed switch needs `HSSH_EAPI_VERIFY=no`, an explicit choice
+where pyeapi's own default is to verify nothing. `session_timeout` covers the TCP and TLS handshake,
+`command_timeout` each request after it.
+
+Edits run in an EOS configure session: the lines load into the session, its diff comes back, and
+`commit` makes them live together. A rejected line aborts the session and leaves running-config as
+it was; `NO CHANGES` means the session diff was empty and nothing was committed.
 
 ## Defaults
 

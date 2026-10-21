@@ -1,6 +1,18 @@
-"""Arista EOS implementation using pyeapi."""
+"""Arista EOS implementation using pyeapi.
 
-from typing import List
+The switch's certificate is verified: against the system CAs, or against the
+one in HSSH_EAPI_CA for a lab-issued certificate. Left to itself pyeapi turns
+verification off; HSSH_EAPI_VERIFY=no is that choice made explicitly, for a
+self-signed switch, the way HSSH_HOST_KEY_POLICY=no is for the SSH transports.
+
+Edits go through an EOS configure session: the lines are loaded into the
+session, its diff is read back, and commit makes them live together. A line
+EOS rejects aborts the session, so running-config is left as it was.
+"""
+
+import os
+import ssl
+from typing import List, Optional
 
 try:
     import pyeapi
@@ -9,9 +21,26 @@ except ImportError:
     AVAILABLE = False
 
 
-def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
-         command_timeout: int, port: int = None, vendor_hint: str = None) -> str:
-    """Execute a show command on an Arista device."""
+def _tls_context() -> ssl.SSLContext:
+    """A verifying context, or a knowingly unverifying one when asked for."""
+    if os.environ.get("HSSH_EAPI_VERIFY", "yes").lower() == "no":
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    return ssl.create_default_context(cafile=os.environ.get("HSSH_EAPI_CA") or None)
+
+
+def _connect(host: str, user: str, passwd: str, port: Optional[int],
+             session_timeout: int, command_timeout: int):
+    """A pyeapi Node for the switch: verified TLS, both timeouts honoured.
+
+    pyeapi has one timeout, the socket's, covering connect and reads alike.
+    The connection's connect() is wrapped so the TCP and TLS handshake runs
+    under session_timeout and each request after it under command_timeout.
+    http.client reconnects before every request, so the wrapper applies to
+    all of them, not just the first.
+    """
     if not AVAILABLE:
         raise RuntimeError("pyeapi not available in this environment.")
 
@@ -21,8 +50,26 @@ def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
         port=port or 443,
         username=user,
         password=passwd,
-        timeout=session_timeout
+        timeout=session_timeout,
+        context=_tls_context(),
+        return_node=True,
     )
+
+    transport = node.connection.transport
+    handshake = transport.connect
+
+    def connect():
+        handshake()
+        transport.sock.settimeout(float(command_timeout))
+
+    transport.connect = connect
+    return node
+
+
+def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
+         command_timeout: int, port: int = None, vendor_hint: str = None) -> str:
+    """Execute a show command on an Arista device."""
+    node = _connect(host, user, passwd, port, session_timeout, command_timeout)
 
     result = node.enable([cmd])
 
@@ -47,17 +94,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str, session_timeout
     JSON raise pyeapi CommandError ("unconverted command"); that propagates
     to the caller rather than being silently downgraded to text.
     """
-    if not AVAILABLE:
-        raise RuntimeError("pyeapi not available in this environment.")
-
-    node = pyeapi.connect(
-        transport='https',
-        host=host,
-        port=port or 443,
-        username=user,
-        password=passwd,
-        timeout=session_timeout
-    )
+    node = _connect(host, user, passwd, port, session_timeout, command_timeout)
 
     result = node.enable([cmd])
 
@@ -69,40 +106,41 @@ def show_structured(host: str, user: str, passwd: str, cmd: str, session_timeout
 def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
          command_timeout: int, commit_confirmed: int = None, port: int = None,
          vendor_hint: str = None) -> str:
-    """Apply configuration commands to an Arista device."""
-    if not AVAILABLE:
-        raise RuntimeError("pyeapi not available in this environment.")
+    """Apply configuration to an Arista device through a configure session.
 
-    node = pyeapi.connect(
-        transport='https',
-        host=host,
-        port=port or 443,
-        username=user,
-        password=passwd,
-        timeout=session_timeout
-    )
+    COMMIT OK with the session's diff, or NO CHANGES when the lines changed
+    nothing. A rejected line raises pyeapi's CommandError with the session
+    aborted, nothing applied.
+    """
+    node = _connect(host, user, passwd, port, session_timeout, command_timeout)
 
     commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
-    node.config(commands)
+    node.configure_session()
+    try:
+        node.config(commands)
+        diff = node.diff()
+        if not diff.strip():
+            node.abort()
+            return "NO CHANGES"
+        node.commit()
+    except Exception:
+        # A session outlives the request on the switch, so leave none behind.
+        # The caller needs the original error, not an abort that may have
+        # failed for the same reason.
+        try:
+            node.abort()
+        except Exception:
+            pass
+        raise
 
-    return f"CONFIG OK\n\nCommands applied:\n" + "\n".join(f"  {c}" for c in commands)
+    return f"COMMIT OK\n\nDIFF:\n{diff}"
 
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
                port: int = None, vendor_hint: str = None) -> List[dict]:
     """Execute multiple show commands on a single Arista eAPI connection."""
-    if not AVAILABLE:
-        raise RuntimeError("pyeapi not available in this environment.")
-
-    node = pyeapi.connect(
-        transport='https',
-        host=host,
-        port=port or 443,
-        username=user,
-        password=passwd,
-        timeout=session_timeout,
-    )
+    node = _connect(host, user, passwd, port, session_timeout, command_timeout)
 
     results = []
     for cmd in cmds:
