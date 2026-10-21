@@ -4,30 +4,34 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 303/303 passed
+## Unit Tests — 419/419 passed
 
-`pip install -e '.[dev]' && pytest` from the checkout root (`develop`, 2026-10-21).
+`pip install -e '.[dev]' && pytest` from the checkout root (`develop` 9462f99, 2026-10-21). The
+standalone review of `develop` (18 items, issues #23–#29, PRs #30–#36) added 110 regression tests;
+every one was run against the code before its fix and failed there.
 
 | Suite | Tests | Covers |
 |-------|------:|--------|
-| test_audit.py | 6 | JSONL audit trail, 0600, redaction, graceful failure |
-| test_cli_edit_output.py | 13 | default-mode verdict + diff for edits, the commit-confirmed reminder |
-| test_cli_junos_safety.py | 10 | Junos set-syntax guard, show-batch error handling, `--rollback`/`--comment`/`--show-diff`/`--commit-status` usage errors |
-| test_config.py | 17 | `~/.h-ssh/config`, precedence flag → env → file → default |
-| test_core.py | 11 | targets, CSV inventory, template resolution, job parsing |
-| test_format.py | 20 | `--format json\|xml` through `rpc()`/`rpc_batch()`, refusal on other transports, `--json`/`--raw`/`-v`/`--diff` shapes |
-| test_job.py | 11 | `--job` files and stdin |
-| test_junos.py | 36 | PyEZ driver: show, batch, edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `guarded_commit()` |
-| test_openssh.py | 25 | the OpenSSH-binary transport, `SSH_ASKPASS`, ControlMaster |
+| test_arista.py | 11 | eAPI driver: `return_node`, TLS verified by default (`HSSH_EAPI_CA`, `HSSH_EAPI_VERIFY=no`), config session + commit, `command_timeout`, batch |
+| test_audit.py | 8 | JSONL audit trail, 0600, redaction (text and JSON values), `secure_append`, graceful failure |
+| test_cli_edit_output.py | 24 | default-mode verdict + diff for edits, the commit-confirmed reminder, `--show-diff` preview → prompt → commit and the abort paths, confirm hint from `sys.argv[0]` and job targets, `--log` 0600 + redacted |
+| test_cli_junos_safety.py | 12 | Junos set-syntax guard (also through `--transport junos`), show-batch error handling, `--rollback`/`--comment`/`--show-diff`/`--commit-status`/`--format` usage errors |
+| test_config.py | 24 | `~/.h-ssh/config`, precedence flag → env → file → default, `transport` reaching undeclared targets (flag, file, inline/CSV/job forms, declared vendor wins) |
+| test_core.py | 14 | targets (incl. `NAME:[v6]:vendor:port`), CSV inventory, the one set-file reader (inline `#` kept), template resolution, job parsing |
+| test_format.py | 21 | `--format json\|xml` through `rpc()`/`rpc_batch()`, refusal on other transports and on edits, `--json`/`--raw`/`-v`/`--diff` shapes |
+| test_generic.py | 15 | paramiko transport: host keys pinned in `~/.h-ssh/known_hosts` (0600), `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure |
+| test_job.py | 16 | `--job` files and stdin, `default_vendor`, same device twice (entries carried with their results) |
+| test_junos.py | 45 | PyEZ driver: show, batch, edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `confirm()` under the lock, `guarded_commit()` and its history check, `expected_diff` |
+| test_openssh.py | 26 | the OpenSSH-binary transport, `SSH_ASKPASS`, ControlMaster, `--` before the host |
 | test_packaging.py | 1 | wheel contents |
-| test_pool.py | 35 | session pool: reuse per `(host, port, user)`, stale detection and probe, discard rules on every edit failure, reopen-once for reads, threads never share a session, reaper, `close_all`, re-entrancy |
+| test_pool.py | 43 | session pool: reuse per `(host, port, user)`, stale detection and probe, discard rules on every edit failure, reopen-once for reads, threads never share a session, reaper, `close_all`, re-entrancy, a nested borrow never closes the session under an open transaction |
 | test_raw.py | 10 | `--raw` output contract |
-| test_retry.py | 34 | failure classification (incl. PyEZ connect-phase names), backoff, edits retried only on `NotAppliedError` |
-| test_rpc.py | 18 | `rpc()`: CLI-command translation, RPC name + args, JSON/XML, never re-sending non-reads, `rpc_batch()`, `commit_status()` |
-| test_runner_edit.py | 22 | runner policy: dry-run and commit-confirmed refusals, retry rule, confirm, rollback mode, comments, commit-status mode |
-| test_safety.py | 19 | SafetyGate rate limit, cooldown, flock, corrupt-file handling |
+| test_retry.py | 41 | failure classification (PyEZ connect phase by its prefix, `invalid` narrowed), backoff, edits retried only on `NotAppliedError` |
+| test_rpc.py | 19 | `rpc()`: CLI-command translation, RPC name + args, JSON/XML, never re-sending non-reads, `rpc_batch()`, `commit_status()` (pending only on the latest commit) |
+| test_runner_edit.py | 26 | runner policy: dry-run and commit-confirmed refusals, retry rule, confirm, rollback mode, comments, commit-status mode, `-eD`/`-eB` load the same lines, no resolver call |
+| test_safety.py | 21 | SafetyGate rate limit, cooldown, flock (one yield: an `OSError` in the body propagates), corrupt-file handling |
 | test_structured.py | 9 | `--structured` bindings and fallback |
-| test_telnet.py | 6 | raw-socket telnet prompts and config mode |
+| test_telnet.py | 33 | raw-socket telnet on a scripted fake server: readers raise on timeout/EOF, failed login detected, silent console gets one Enter, `configure exclusive`, anchored error match, commit outcome unknown, best-effort cleanup |
 
 ## Live checks on `develop` — lab AX4 + PE1, vMX 24.2R1-S2.5 (2026-10-20/21)
 
@@ -50,18 +54,56 @@ verified over 830, then `-eC commit`). Every item below was run on the pooled co
 | 11 | `--format json` on `-sC` (incl. a shortcut ending in `\| no-more`), `--format xml` on `--batch` (two documents) | Pass |
 | 12 | `h-app/` layout: installed `h-ssh` from another cwd resolves templates; `./h-app/h-ssh.py` from the root; `--batch` on both routers | Pass |
 | 13 | Functioning sweep, groups 1–2 (show/output modes, inventory forms, exit codes; `--batch`/`--job`/`--structured`/`--workers`): 42 + ~40 invocations on the code *before* the pool; findings not yet verified | Ran, unverified |
+| 14 | `confirm()` under the lock (PR #32): `commit confirmed 3` from one session; another session's uncommitted edit in the shared candidate → `confirm()` refused (`configuration database modified`, nothing sent); from a clean session the locked plain commit confirmed it; 187 s later the change was still there with no pending entry; undone with a plain commit. Found on the way: the router keeps the "commit confirmed, rollback in 3mins" note on the old entry after the confirm, so `pending_rollback_minutes` is now a sequence-0 fact | Pass |
+| 15 | Release gate on 9462f99, 29 checks (table below) | Pass |
 
 Observed on the way, not h-ssh defects: `\| match` is ignored over NETCONF (`\| display set` works; use
 `rpc()` for data); AX4 (a vMX) went down twice during the day — once while a `--dry-run` commit check
 was in flight, once during read-only polling — with no core dump and a clean reboot reason.
 
+### Release gate on `develop` 9462f99 (2026-10-21) — 29/29 passed
+
+`~/h-sshScripts/lab_release_gate.py`: AX4 takes the edits (always the lo0 description, always undone),
+PE1 is read only, CLI calls paced for the router's `ssh rate-limit 10`. First run: 26/29, the three
+misses were in the script (a `#` after a closing quote is not Junos syntax and the router says so;
+an operator's `n` exits 0 by design; a rollback transaction answers `ROLLBACK 1: COMMIT OK`); fixed and
+re-run clean.
+
+| # | Check | Result |
+|---|-------|--------|
+| 3.1–3.2 | Unreachable host, wrong port: exit 1, clean error, no traceback | Pass |
+| 3.3 | Unknown user: exit 1, one attempt (permanent), auth error named | Pass |
+| 3.4 | Invalid show command: exit 1, the router's `syntax error` | Pass |
+| 3.5 | Reachable + unreachable in one run: exit 1, AX4 ok, the other failed, in `--json` | Pass |
+| 3.6 | Invalid job file: exit 2 before any session | Pass |
+| 3.7 | `--transport junos` applies the set-syntax guard to an undeclared target (#24) | Pass |
+| 3.8 | `--format` with an edit refused, exit 2 (#26) | Pass |
+| 3.9 | `--show-diff` without a terminal refused before any preview (#26) | Pass |
+| 3.10 | `R1:[2001:db8::1]:junos` parses (#27) | Pass |
+| 4.1 | `--dry-run` edit: `DRY-RUN` + diff, candidate untouched | Pass |
+| 4.2 | `-eD` with `description "h-ssh-gate#2"`: the dry-run diff carries the value as written (#23) | Pass |
+| 4.3 | `--log` file is 0600 and the SNMP community in it is `[REDACTED]` (#26) | Pass |
+| 4.4 | `--commit-confirmed 1 --comment` → pending entry with the comment; `-eC commit --comment` → locked confirm, no pending entry, confirm at seq 0; the change survived the timer | Pass |
+| 4.5 | `--rollback 2 --comment`: lo0 back to before, the comment in `show system commit` | Pass |
+| 4.6 | `--show-diff` on a pty: `n` → diff shown, `Aborted by user`, nothing committed; `y` → the previewed diff committed with its comment | Pass |
+| 4.7 | Undo with a plain commit | Pass |
+| 5.1 | `begin()`: diff, `tx.show()` and a plain `show()` nested on the same pooled session (#22), `abort()` leaves nothing | Pass |
+| 5.2 | `Transaction.commit(comment=)`, then `begin(rollback=1)`: diff shows the removal, `ROLLBACK 1: COMMIT OK` | Pass |
+| 5.3 | `guarded_commit()` with a failing check: `rollback 1` at once, comment `… (rolled back: checks failed)`, no pending entry, lo0 as before | Pass |
+| 5.4 | `guarded_commit()` with a passing check: confirmed under the lock, comment `… (confirmed)`, no pending entry | Pass |
+| 5.5 | Undo through `edit()` | Pass |
+| 5.6 | `rpc()` JSON and XML, `rpc_batch()` on the pooled session | Pass |
+| 5.7 | One NETCONF session for the whole library section (`opens 1, reuses 24`) | Pass |
+| 5.8 | `--format json` on a `--job` with a show entry per router: both answer with JSON data | Pass |
+
 ## Before release 1
 
 | Item | State |
 |------|-------|
-| Functioning sweep, all 5 groups, on current `develop` (groups 3–5: failure handling, edit safety with `--dry-run`, library API) | pending, needs the lab |
-| Live, one real commit each: `--rollback N`, `begin()`/`Transaction` commit and abort, `--comment` visible in `--commit-status`, `guarded_commit()` on the rollback path, `--show-diff`, `--format` on a `--job` | pending, needs the lab |
-| `develop` → `main`, tag `v1.0.0` | after the two above |
+| Functioning sweep, all 5 groups, on current `develop` (groups 3–5: failure handling, edit safety with `--dry-run`, library API) | done, release gate above (groups 1–2 ran on the code before the pool) |
+| Live, one real commit each: `--rollback N`, `begin()`/`Transaction` commit and abort, `--comment` visible in `--commit-status`, `guarded_commit()` on the rollback path, `--show-diff`, `--format` on a `--job` | done, release gate 4.4–5.8 |
+| Standalone review of `develop`: 18 items verified, issues #23–#29, PRs #30–#36 merged | done |
+| `develop` → `main`, tag `v1.0.0` | ready |
 
 ## Earlier live run — 59/59 passed (3 × vMX 24.2R1-S2.5, code before the session pool)
 
