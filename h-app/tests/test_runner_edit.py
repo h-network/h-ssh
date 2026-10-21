@@ -377,3 +377,57 @@ def test_save_output_files_are_0600_and_raw(monkeypatch, tmp_path):
         dry_run=False, commit_confirmed=None, save_dir=str(save), quiet=True, max_attempts=1)
     f = save / "R1.output"
     assert ok and oct(f.stat().st_mode & 0o777) == "0o600" and "$6$HASH" in f.read_text()
+
+# --- #44: a show that acts on the device is sent once --------------------------
+
+def _show_mod(calls, fail_times=2):
+    class Mod:
+        AVAILABLE = True
+
+        @staticmethod
+        def show(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None):
+            calls.append(cmd)
+            if len(calls) <= fail_times:
+                raise RuntimeError("RpcTimeoutError: timed out")
+            return "ok"
+
+        @staticmethod
+        def rpc(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, fmt="json", args=None):
+            calls.append(("rpc", cmd))
+            return {"ok": True}
+    return Mod
+
+
+def _show(monkeypatch, mod, cmd, fmt="text"):
+    monkeypatch.setitem(vendors.VENDORS, "junos", mod)
+    return runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
+        show_cmd=cmd, edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3, fmt=fmt)
+
+
+def test_a_read_is_retried_but_a_request_is_sent_once(monkeypatch):
+    """`-sC "request system reboot"` was re-sent up to three times on a timeout."""
+    calls = []
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls), "show version")
+    assert ok and calls == ["show version"] * 3
+    calls = []
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls), "request system reboot")
+    assert not ok and calls == ["request system reboot"] and "timed out" in out
+
+
+def test_format_refuses_an_rpc_that_is_not_a_read(monkeypatch):
+    """--format json turned any token into an RPC and sent it with no gate."""
+    calls = []
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls, fail_times=0), "request-system-reboot", fmt="json")
+    assert not ok and calls == [] and "runs reads only" in out
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls, fail_times=0), "get-system-uptime-information", fmt="json")
+    assert ok and calls == [("rpc", "get-system-uptime-information")]
+
+
+def test_is_read_command():
+    for cmd in ("show version", "get-chassis-inventory", "get_system_information", "SHOW route", "show"):
+        assert runner.is_read_command(cmd)
+    for cmd in ("request system reboot", "clear bgp neighbor", "restart routing", "request-system-reboot", "file delete x"):
+        assert not runner.is_read_command(cmd)

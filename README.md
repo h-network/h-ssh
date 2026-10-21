@@ -120,7 +120,7 @@ secrets over NETCONF or paramiko, not over `openssh`.
 
 | Flag | Mode | What it does |
 |---|---|---|
-| `-sC` | Show | Run a show/display command (or a template name) |
+| `-sC` | Show | Run a show/display command (or a template name). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` |
 | `-eC` | Edit command | Apply one config line to every target |
 | `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written |
 | `-eB` | Edit broadcast | One config file applied to all targets |
@@ -330,7 +330,7 @@ ones (`--safety-file`, `--audit-log`, `--log`) apply to every mode once given.
 
 | Guard | Flag | Behaviour |
 |---|---|---|
-| Pre-flight check | *(automatic)* | Edits verify reachability before touching config |
+| Pre-flight check | *(automatic)* | Edits verify reachability before touching config: a TCP connect plus, for `junos`/`ssh`/`openssh`, the SSH banner, so a port that merely accepts and closes is not a device. Skipped under `--show-diff`, whose previews prove it |
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
 | Dry run | `--dry-run` | Junos over NETCONF: loads, diffs, runs `commit_check` (when there is a diff), then discards the candidate. `telnet-junos`: `configure exclusive`, loads, `show \| compare`, `rollback 0` — no commit check, so the diff is shown but not validated. Other transports **refuse** `--dry-run` for edits instead of pretending |
 | Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
