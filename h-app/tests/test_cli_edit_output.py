@@ -371,3 +371,17 @@ def test_commit_confirmed_with_a_confirm_is_refused(monkeypatch, capsys, tmp_pat
 def test_a_malformed_target_is_a_usage_error_not_a_traceback(monkeypatch, capsys, tmp_path, spec):
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-sC", "show version"], target=spec)
     assert rc == 2 and err.startswith("ERROR:") and "Traceback" not in err
+
+# --- #40: a rollback timer that cannot be armed is a usage error ----------------
+
+@pytest.mark.parametrize("minutes", ["0", "-5", "65536", "ten"])
+def test_commit_confirmed_outside_the_junos_range_is_refused_at_the_flag(monkeypatch, capsys, tmp_path, minutes):
+    """0 and negative values were committed permanently while the banner
+    promised a rollback; now argparse refuses them before anything runs."""
+    calls = []
+    driver = types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: calls.append(a) or "COMMIT OK")
+    with pytest.raises(SystemExit) as exc:
+        run_cli(monkeypatch, capsys, tmp_path, ["-eC", "set system host-name X", "-y",
+                                                "--commit-confirmed", minutes], driver=driver)
+    err = capsys.readouterr().err
+    assert exc.value.code == 2 and calls == [] and "1..65535 minutes" in err

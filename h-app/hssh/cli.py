@@ -20,6 +20,7 @@ from .core import (
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, resolve_target_port, validate_junos_set_syntax,
+    check_confirm_minutes,
 )
 from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS
 from .safety import SafetyGate
@@ -231,6 +232,16 @@ def is_confirm(payload: str) -> bool:
     pending commit-confirmed; the same word inside a config file is config."""
     return payload.strip() in ("commit", "commit;")
 
+def confirm_minutes_arg(text: str) -> int:
+    """--commit-confirmed N: Junos arms 1..65535 minutes; anything else is a
+    usage error here, not a permanent commit behind a rollback banner."""
+    try:
+        minutes = int(text)
+        check_confirm_minutes(minutes)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: --commit-confirmed takes 1..65535 minutes")
+    return minutes
+
 
 async def main() -> int:
     """Main CLI entry point."""
@@ -292,8 +303,8 @@ async def main() -> int:
                         help="Timeout for individual commands/operations (default: 20)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Do not push, only show what would happen")
-    parser.add_argument("--commit-confirmed", type=int, nargs="?", const=10, default=None,
-                        help="Use commit confirmed with auto-rollback timer in minutes (default: 10, Junos only)")
+    parser.add_argument("--commit-confirmed", type=confirm_minutes_arg, nargs="?", const=10, default=None,
+                        help="Use commit confirmed with auto-rollback timer in minutes, 1-65535 (default: 10, Junos only)")
     parser.add_argument("-y", "--yes", action="store_true",
                         help="Skip confirmation prompt for edit operations")
     parser.add_argument("-v", "--verbose", action="store_true",

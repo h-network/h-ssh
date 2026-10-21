@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .errors import NotAppliedError
-from .core import Target, read_set_file_for_device, read_command_file_lines
+from .core import Target, check_confirm_minutes, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
 from . import vendors
 
@@ -148,6 +148,7 @@ def _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts, host, user, p
     with `expected_diff` committed only if the device shows that diff again."""
     if not hasattr(vendor_mod, "rollback"):
         raise ValueError(f"--rollback is not supported by the '{vendor}' transport")
+    check_confirm_minutes(commit_confirmed)
     if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
         raise ValueError(
             f"--commit-confirmed is not supported by the '{vendor}' transport; "
@@ -172,6 +173,7 @@ def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passw
     failure, and above all a timeout around a commit, is reported, not repeated.
     `expected_diff` is the diff a dry run showed: the driver commits only if
     the candidate produces it again."""
+    check_confirm_minutes(commit_confirmed)
     if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
         raise ValueError(
             f"--commit-confirmed is not supported by the '{vendor}' transport; "

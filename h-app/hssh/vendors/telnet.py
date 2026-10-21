@@ -10,6 +10,7 @@ import socket
 import time
 from typing import List, Optional
 
+from ..core import check_confirm_minutes
 from ..errors import AmbiguousCommitError, NotAppliedError
 
 AVAILABLE = True  # Raw sockets, always available
@@ -232,8 +233,7 @@ def _send_command(sock: socket.socket, prompt_re: re.Pattern,
     return "\n".join(lines)
 
 
-def _edit_ios(sock: socket.socket, prompt_re: re.Pattern,
-              payload: str, dry_run: bool) -> str:
+def _edit_ios(sock: socket.socket, prompt_re: re.Pattern, payload: str) -> str:
     """IOS config mode: configure terminal -> commands -> end."""
     _send_command(sock, prompt_re, "configure terminal", 10)
 
@@ -362,14 +362,20 @@ def edit(host: str, user: str, passwd: str, payload: str,
          expected_diff: Optional[str] = None) -> str:
     """Send configuration commands via raw-socket telnet.
 
-    dry_run and expected_diff are honoured for Junos only (the candidate is
-    diffed, and rolled back or checked against the diff a dry run showed);
-    the runner rejects them for the other sub-vendors before getting here.
+    dry_run, commit_confirmed and expected_diff exist for Junos only (the
+    candidate is diffed and rolled back, armed with a timer, or checked
+    against the diff a dry run showed). An IOS-style flavour cannot honour
+    them, so asking is a ValueError before anything is sent, never a dry
+    run that lands or a commit with no timer.
     """
     effective_port = port if port is not None else 23
     sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint.startswith("telnet") else vendor_hint
     if sub_vendor == "telnet":
         sub_vendor = "ios"
+    if sub_vendor != "junos" and (dry_run or commit_confirmed is not None or expected_diff is not None):
+        raise ValueError(f"dry_run, commit_confirmed and expected_diff are not supported by "
+                         f"telnet-{sub_vendor}; nothing was sent to the device")
+    check_confirm_minutes(commit_confirmed)
 
     sock, prompt_re = _connect_and_login(host, user, passwd, effective_port,
                                          session_timeout, sub_vendor)
@@ -379,7 +385,7 @@ def edit(host: str, user: str, passwd: str, payload: str,
                                confirmed_minutes=commit_confirmed or 0,
                                expected_diff=expected_diff)
         else:
-            return _edit_ios(sock, prompt_re, payload, dry_run=False)
+            return _edit_ios(sock, prompt_re, payload)
     finally:
         try:
             sock.close()

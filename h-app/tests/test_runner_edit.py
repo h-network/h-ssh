@@ -343,3 +343,11 @@ def test_progress_lines_are_written_in_one_piece(monkeypatch):
                                                                "flush": lambda self: None})())
     runner._say("R1               STARTED")
     assert len(writes) == 1 and writes[0].endswith("R1               STARTED\n") and writes[0].startswith("[")
+
+def test_runner_refuses_a_timer_it_cannot_arm_before_the_driver(monkeypatch):
+    v = FakeVendor()
+    _, ok, out, _ = run(monkeypatch, "junos", v, commit_confirmed=0)
+    assert not ok and "commit_confirmed must be 1..65535" in out and v.edit_calls == []
+    r = RollbackVendor()
+    _, ok, out, _ = run_rollback(monkeypatch, "junos", r, n=1, commit_confirmed=-1)
+    assert not ok and "commit_confirmed must be 1..65535" in out and r.rollback_calls == []

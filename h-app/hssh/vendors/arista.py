@@ -112,6 +112,9 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
     nothing. A rejected line raises pyeapi's CommandError with the session
     aborted, nothing applied.
     """
+    if commit_confirmed is not None:
+        raise ValueError("commit_confirmed is not supported by the 'arista' transport; "
+                         "nothing was sent to the device")
     node = _connect(host, user, passwd, port, session_timeout, command_timeout)
 
     commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]

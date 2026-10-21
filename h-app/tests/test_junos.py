@@ -543,3 +543,31 @@ def test_guarded_commit_only_trusts_the_latest_commit(monkeypatch):
     res = guarded(failing_check)
     assert res["final"] == "not rolled back" and "history changed" in res["reason"]
     assert len(FakeConfig.instances) == 1
+
+
+# --- #40: no timer means no commit, never a plain one ---------------------------
+
+@pytest.mark.parametrize("minutes", [0, -5, 65536, True])
+def test_edit_and_rollback_refuse_a_timer_they_cannot_arm_before_any_session(minutes):
+    with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
+        edit(commit_confirmed=minutes)
+    with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
+        junos.rollback("10.0.0.1", "u", "p", 1, 5, 30, commit_confirmed=minutes)
+    with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
+        junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=minutes, check=lambda: True)
+    assert FakeDevice.instances == [] and FakeConfig.instances == []
+
+
+def test_transaction_commit_with_a_bad_timer_leaves_the_candidate_open():
+    tx = junos.begin("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30)
+    with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
+        tx.commit(confirmed=0)
+    assert [c[0] for c in cfg().calls] == ["lock", "load", "diff", "commit_check"]   # nothing committed
+    tx.abort()
+    assert [c[0] for c in cfg().calls][-2:] == ["rollback", "unlock"]
+
+
+def test_a_valid_timer_still_arms_the_commit():
+    out = edit(commit_confirmed=1)
+    assert out.startswith("COMMIT CONFIRMED (1 minutes)")
+    assert [c for c in cfg().calls if c[0] == "commit"][0][2]["confirm"] == 1

@@ -284,3 +284,13 @@ def test_runner_reports_a_failed_edit_as_fail(exits_with):
         dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=1)
     assert ok is False
     assert "exit 127" in out and "configure: not found" in out
+
+
+def test_edit_refuses_a_rollback_timer_instead_of_dropping_it(monkeypatch):
+    """commit_confirmed= was accepted and the change committed with no timer (#40)."""
+    class NoClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("connected although the timer cannot be armed over exec")
+    monkeypatch.setattr(generic, "paramiko", FakeParamiko(NoClient))
+    with pytest.raises(ValueError, match="not supported by the 'ssh' transport; nothing was sent"):
+        generic.edit("10.0.0.1", "u", "p", "hostname NEW\n", 5, 10, commit_confirmed=5)
