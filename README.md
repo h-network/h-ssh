@@ -134,6 +134,9 @@ export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
 cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json
 ```
 
+A device may appear in more than one entry. Its entries run one after another, in file order, so a
+show listed after an edit sees the edit, and each is audited with its own mode and payload.
+
 ## Transports
 
 | Vendor | Transport | Library | Show | Edit |
@@ -275,12 +278,13 @@ Layered, and every layer is off the critical path until you ask for a write.
 | Pre-flight check | *(automatic)* | Edits verify reachability before touching config |
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
 | Dry run | `--dry-run` | Junos (NETCONF and telnet-junos): loads, runs `commit_check`, diffs, then discards the candidate. Other transports **refuse** `--dry-run` for edits instead of pretending |
-| Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` before anything is committed |
+| Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` before anything is committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
 | Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box (Junos) |
-| Commit confirmed | `--commit-confirmed N` | Junos rolls back after N minutes unless confirmed (confirm with `-eC "commit"`). Transports that cannot do this (`ssh`, `arista`, telnet IOS/NX-OS/Arista, `openssh`) refuse it rather than commit with no timer |
+| Commit confirmed | `--commit-confirmed N` | Junos rolls back after N minutes unless confirmed (confirm with `-eC "commit"`; the run ends by printing that command for its own targets, a `--job`'s edit entries included). Transports that cannot do this (`ssh`, `arista`, telnet IOS/NX-OS/Arista, `openssh`) refuse it rather than commit with no timer |
 | Junos syntax guard | *(automatic)* | Enforces set-style syntax (`set`, `delete`, `activate`, `deactivate`, etc.) with `#`-only comments for `junos` and `telnet-junos`. `commit` is only valid as an exact command in `-eC` or `--job`, never inside `-eD`/`-eB` configuration files |
 | Safety gate | `--safety-file PATH` | Opt-in sliding-window rate limit (10 attempts / host / 60 s); 120 s cooldown after connection/auth failure, held in a `flock`'d 0600 JSON file so it persists safely across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
 | Audit trail | `--audit-log PATH` | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). Tracks edits, pre-flight aborts, and user cancellations; records diffs for edits and suppresses diffs on show operations. In edit modes, audit write failures fail the run |
+| Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, appended with the same 0600 mode and secret redaction as the audit trail |
 
 A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
 
@@ -330,10 +334,11 @@ Output is **vendor-shaped, not normalised** — `bgp` returns Junos field names 
 CLI command (what `| display xml rpc` does) and the reply comes back as the router produces it — the
 whole document, in Junos's own JSON or XML. It works for `-sC`, `--batch` (one session per device; per
 command a translation round trip plus the RPC) and the show entries of a `--job`, on the NETCONF
-`junos` transport; any other transport refuses it rather than handing back text. Edit modes, edit
-entries of a job and `--dry-run` ignore it and keep their text. `--structured` stays the fixed-fields
-path — the binding names the RPC and the few fields to keep — and the two cannot be combined. `--diff`
-with `--format json` compares the pretty-printed text.
+`junos` transport; any other transport refuses it rather than handing back text. With an edit,
+`--rollback`, `--commit-status` or a job without a show entry it is a usage error (exit 2); the edit
+entries of a job and `--dry-run` keep their text. `--structured` stays the fixed-fields path — the
+binding names the RPC and the few fields to keep — and the two cannot be combined. `--diff` with
+`--format json` compares the pretty-printed text.
 
 ```bash
 ./h-app/h-ssh.py --user admin -sC "show chassis hardware" --format json --json --target R1:10.0.1.1:junos

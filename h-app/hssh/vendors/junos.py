@@ -434,12 +434,19 @@ def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
 def _transaction(host: str, user: str, passwd: str, session_timeout: int,
                  command_timeout: int, port: Optional[int], stage, label: str,
                  dry_run: bool, commit_confirmed: Optional[int],
-                 comment: Optional[str] = None) -> str:
+                 comment: Optional[str] = None, expected_diff: Optional[str] = None) -> str:
     """begin() and finish in one go: commit (confirmed if asked), or for
-    dry_run show the diff the device produced and discard it. Only
-    NotAppliedError is safe to retry; AmbiguousCommitError means a commit was
-    sent and its outcome is unknown."""
+    dry_run show the diff the device produced and discard it. With
+    `expected_diff` (the diff a dry run showed) the commit goes ahead only
+    if the candidate produces that diff again. Only NotAppliedError is safe
+    to retry; AmbiguousCommitError means a commit was sent and its outcome
+    is unknown."""
     tx = _begin(host, user, passwd, session_timeout, command_timeout, port, stage, label)
+    if expected_diff is not None and tx.diff.strip() != expected_diff.strip():
+        # The device, or the file, changed between the preview and the y:
+        # what would be committed is not what was approved.
+        tx.abort()
+        raise RuntimeError("diff changed since preview; nothing committed")
     if not tx.diff.strip():
         tx.abort()
         return f"{label}NO CHANGES"
@@ -489,33 +496,38 @@ def edit(host: str, user: str, passwd: str, payload: str,
          session_timeout: int, command_timeout: int,
          commit_confirmed: int = None, port: int = None,
          vendor_hint: str = None, dry_run: bool = False,
-         comment: Optional[str] = None) -> str:
+         comment: Optional[str] = None, expected_diff: Optional[str] = None) -> str:
     """Apply configuration over NETCONF: load the payload into the candidate
     and run it through _transaction() (lock -> load -> diff -> commit_check
     -> commit, or rollback for dry_run -> unlock). `comment` is logged with
-    the commit and shows in `show system commit`."""
+    the commit and shows in `show system commit`; `expected_diff`, the diff
+    an earlier dry_run showed, is what the candidate must still produce or
+    nothing is committed."""
     _require()
     fmt = _config_format(payload)
     body = _strip_comments(payload) if fmt == "set" else payload
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
                         stage=lambda cu: cu.load(body, format=fmt), label="",
-                        dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment)
+                        dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment,
+                        expected_diff=expected_diff)
 
 
 def rollback(host: str, user: str, passwd: str, n: int,
              session_timeout: int, command_timeout: int,
              port: int = None, vendor_hint: str = None,
              dry_run: bool = False, commit_confirmed: int = None,
-             comment: Optional[str] = None) -> str:
+             comment: Optional[str] = None, expected_diff: Optional[str] = None) -> str:
     """Return to rollback `n` (0-49) over NETCONF, with the same gates as an
     edit: lock -> rollback n -> diff -> commit_check -> commit (confirmed if
-    asked), or show the diff and discard it for dry_run. "NO CHANGES" when
+    asked), or show the diff and discard it for dry_run, or refuse it when
+    it is not the `expected_diff` a dry run showed. "NO CHANGES" when
     rollback n equals the running configuration."""
     _require()
     n = _rollback_number(n)
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
                         stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ",
-                        dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment)
+                        dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment,
+                        expected_diff=expected_diff)
 
 
 def confirm(host: str, user: str, passwd: str,

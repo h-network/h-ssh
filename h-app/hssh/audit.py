@@ -34,6 +34,48 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
     return result
 
 
+# JSON keys whose whole value is a secret. A reply carried as data (--format
+# json) puts "encrypted-password" in the key and the hash in the value, out
+# of reach of the text patterns above.
+_SECRET_KEYS = frozenset({
+    "encrypted-password", "secret", "password", "passwd", "authentication-key",
+    "md5-key", "community", "pre-shared-key", "ascii-text", "hexadecimal",
+    "hex-key", "key-hex", "token", "api-key", "api_key",
+})
+
+
+def redact_values(data):
+    """redact_secrets() over a JSON-shaped value: every string in it, and the
+    whole value under a key that names a secret. Lists and dicts keep their
+    shape, so a --log record stays data."""
+    if isinstance(data, str):
+        return redact_secrets(data)
+    if isinstance(data, list):
+        return [redact_values(v) for v in data]
+    if isinstance(data, dict):
+        return {k: ("[REDACTED]" if str(k).lower() in _SECRET_KEYS else redact_values(v))
+                for k, v in data.items()}
+    return data
+
+
+def secure_append(path: str, text: str) -> None:
+    """Append `text` to a 0600 file under an exclusive flock, creating it
+    and its directory. The audit log and --log both go through here, so a
+    file that holds payloads, replies and diffs is never world-readable."""
+    log_path = Path(path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            os.chmod(str(log_path), 0o600)
+            os.write(fd, text.encode("utf-8"))
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 def write_audit_entry(
     path: str,
     device: str,
@@ -74,20 +116,7 @@ def write_audit_entry(
         if error:
             entry["error"] = redact_secrets(error)
 
-        log_path = Path(path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        line = json.dumps(entry) + "\n"
-        fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            try:
-                os.chmod(str(log_path), 0o600)
-                os.write(fd, line.encode("utf-8"))
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        secure_append(path, json.dumps(entry) + "\n")
         return True
     except Exception as e:
         logger.warning("Failed to write audit entry to %s: %s", path, e)
