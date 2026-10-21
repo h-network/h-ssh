@@ -1,9 +1,12 @@
 """Tests for CLI Junos syntax guard, show-batch crash prevention, and audit edge cases."""
 
+import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 import pytest
 
@@ -188,3 +191,44 @@ def test_cli_comment_show_diff_and_commit_status_usage(tmp_path):
     assert res.returncode == 2 and "--show-diff" in res.stderr
     res = _cli("--commit-status", "-sC", "show version", tmp_path=tmp_path)
     assert res.returncode == 2 and "exactly one of" in res.stderr
+
+
+def _main(monkeypatch, capsys, *argv):
+    """main() in-process with the runner and the pre-flight check replaced, so
+    a payload the guard lets through is recorded here and never sent anywhere."""
+    from hssh import cli
+
+    sent = []
+
+    async def fake_run(t, transport, mode, show_cmd, edit_cmd, **kw):
+        sent.append((t.name, t.vendor, edit_cmd))
+        return t.name, True, f"DEVICE: {t.name}\nHOST:   {t.host}\nMODE:   {mode}\nVENDOR: {t.vendor}\n\nok\n", 1
+
+    async def reachable(target, timeout=2):
+        return target.name, True, "reachable"
+
+    monkeypatch.setattr(cli, "run_for_target_async", fake_run)
+    monkeypatch.setattr(cli, "check_reachability", reachable)
+    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", types.SimpleNamespace(AVAILABLE=True))
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "test",
+                                      "--password", "test", "-y", *argv])
+    rc = asyncio.run(cli.main())
+    return rc, capsys.readouterr().err, sent
+
+
+def test_cli_junos_set_syntax_guard_applies_through_transport(monkeypatch, capsys):
+    """--transport junos makes an undeclared target a Junos one, guard included."""
+    rc, err, sent = _main(monkeypatch, capsys, "--transport", "junos", "-eC", "configure",
+                          "--target", "R1:192.0.2.1")
+    assert rc == 2 and "only accepts 'set ...' commands" in err
+    assert sent == [], "a non-set payload must be refused before any device I/O"
+
+
+def test_cli_junos_job_syntax_guard_applies_through_transport(monkeypatch, capsys, tmp_path):
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps([{"target": "R1:192.0.2.1", "edit": "reboot"}]))
+    rc, err, sent = _main(monkeypatch, capsys, "--transport", "junos", "--job", str(job_file))
+    assert rc == 2 and "only accepts set-style commands" in err
+    assert sent == []

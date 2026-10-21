@@ -21,13 +21,16 @@ def _is_comment_or_empty(line: str) -> bool:
     return not s or s.startswith("#")
 
 
-def load_devices_csv(path: str) -> List[Target]:
+def load_devices_csv(path: str, default_vendor: str = "ssh") -> List[Target]:
     """
     Accepts:
       - CSV with header name,ip or name,ip,vendor
       - CSV without header
       - Lines with just a name
       - Inline or full-line comments '#'
+
+    A row that doesn't declare a vendor gets default_vendor (the CLI passes
+    --transport); a declared one always wins.
     """
     p = Path(path)
     if not p.is_file():
@@ -43,7 +46,7 @@ def load_devices_csv(path: str) -> List[Target]:
         for ln in filtered:
             name = ln.split("#", 1)[0].strip()
             if name:
-                targets.append(Target(name=name, host=name))
+                targets.append(Target(name=name, host=name, vendor=default_vendor))
         return targets
 
     # Otherwise parse as CSV
@@ -67,7 +70,7 @@ def load_devices_csv(path: str) -> List[Target]:
             continue
         name = r[0].strip()
         ip = r[1].strip() if len(r) > 1 else ""
-        vendor = r[2].strip().lower() if len(r) > 2 else "ssh"
+        vendor = r[2].strip().lower() if len(r) > 2 else default_vendor
         port_str = r[3].strip() if len(r) > 3 else ""
         port = int(port_str) if port_str else None
         if not name:
@@ -107,11 +110,12 @@ def load_config(path: str = None) -> Dict[str, str]:
     return config
 
 
-def parse_inline_target(spec: str) -> Target:
+def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
     """Parse inline target string: NAME:HOST[:VENDOR][:PORT] or NAME:HOST[:PORT][:VENDOR].
 
     Handles port-style targets (e.g., SW1:10.0.0.1:5000:telnet-ios)
-    and vendor-style targets (e.g., R1:10.0.0.1:junos).
+    and vendor-style targets (e.g., R1:10.0.0.1:junos). A spec that names
+    no vendor gets default_vendor (the CLI passes --transport).
     """
     parts = spec.split(":")
     if len(parts) < 2:
@@ -121,10 +125,10 @@ def parse_inline_target(spec: str) -> Target:
     host = parts[1]
 
     if len(parts) == 2:
-        return Target(name=name, host=host)
+        return Target(name=name, host=host, vendor=default_vendor)
     elif len(parts) == 3:
         if parts[2].isdigit():
-            return Target(name=name, host=host, port=int(parts[2]))
+            return Target(name=name, host=host, port=int(parts[2]), vendor=default_vendor)
         return Target(name=name, host=host, vendor=parts[2].lower())
     elif len(parts) == 4:
         if parts[2].isdigit():
@@ -142,7 +146,7 @@ class JobEntry:
     command: str   # The command or config payload
 
 
-def load_jobs(path: str) -> List[JobEntry]:
+def load_jobs(path: str, default_vendor: str = "ssh") -> List[JobEntry]:
     """Load a JSON job file.
 
     Job file format — JSON array of objects:
@@ -152,7 +156,7 @@ def load_jobs(path: str) -> List[JobEntry]:
     ]
 
     Each entry must have:
-      - "target": "NAME:HOST[:PORT][:VENDOR]"
+      - "target": "NAME:HOST[:PORT][:VENDOR]" (no vendor: default_vendor)
       - Exactly one of: "show", "edit"
     """
     if path == "-":
@@ -171,7 +175,7 @@ def load_jobs(path: str) -> List[JobEntry]:
         if "target" not in item:
             raise ValueError(f"Job entry {i}: missing 'target'")
 
-        target = parse_inline_target(item["target"])
+        target = parse_inline_target(item["target"], default_vendor)
 
         # Optional port override
         if "port" in item:

@@ -113,6 +113,8 @@ def apply_config_defaults(args, config: dict) -> None:
                 value = int(value)
             except (TypeError, ValueError):
                 value = fallback
+        elif key == "transport" and isinstance(value, str):
+            value = value.strip().lower()   # vendors are matched lowercase, as for targets
         setattr(args, key, value)
 
 
@@ -250,7 +252,7 @@ async def main() -> int:
 
     # Inline targets
     parser.add_argument("--target", type=str, action="append",
-                        help="Inline target as name:host:vendor:port (repeatable, vendor defaults to junos)")
+                        help="Inline target as name:host:vendor:port (repeatable, vendor defaults to --transport)")
 
     # Output
     parser.add_argument("--json", action="store_true",
@@ -308,7 +310,7 @@ async def main() -> int:
             print("ERROR: --job cannot be combined with -sC, -eC, -eD, -eB, --batch, --rollback, or --commit-status.", file=sys.stderr)
             return 2
         try:
-            job_entries = load_jobs(args.job)
+            job_entries = load_jobs(args.job, default_vendor=args.transport)
         except (ValueError, json.JSONDecodeError) as e:
             print(f"ERROR: Invalid job file: {e}", file=sys.stderr)
             return 2
@@ -354,14 +356,15 @@ async def main() -> int:
                 print(f"ERROR: batch file not found: {args.batch}", file=sys.stderr)
                 return 2
 
-        # Load targets
+        # Load targets. A target that doesn't declare a vendor gets
+        # --transport (or the config file's), the same for every form.
         if args.target:
             targets = []
             for spec in args.target:
-                targets.append(parse_inline_target(spec))
+                targets.append(parse_inline_target(spec, default_vendor=args.transport))
         else:
             try:
-                targets = load_devices_csv(args.devices)
+                targets = load_devices_csv(args.devices, default_vendor=args.transport)
             except Exception as e:
                 print(f"ERROR loading devices: {e}", file=sys.stderr)
                 return 2

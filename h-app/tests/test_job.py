@@ -31,6 +31,19 @@ def test_parse_inline_target_invalid():
         parse_inline_target("invalid")
 
 
+def test_parse_inline_target_default_vendor_fills_an_undeclared_spec():
+    """The CLI passes --transport here; a spec that names no vendor gets it."""
+    t = parse_inline_target("R1:10.0.0.1", default_vendor="junos")
+    assert t.vendor == "junos" and t.port is None
+    t = parse_inline_target("R1:10.0.0.1:5000", default_vendor="junos")
+    assert t.vendor == "junos" and t.port == 5000
+
+
+def test_parse_inline_target_declared_vendor_beats_the_default():
+    for spec in ("R1:10.0.0.1:telnet", "R1:10.0.0.1:5000:telnet", "R1:10.0.0.1:telnet:5000"):
+        assert parse_inline_target(spec, default_vendor="junos").vendor == "telnet"
+
+
 def test_load_jobs_show(tmp_path):
     job_file = tmp_path / "test.json"
     job_file.write_text(json.dumps([
@@ -92,3 +105,14 @@ def test_load_jobs_port_override(tmp_path):
     ]))
     entries = load_jobs(str(job_file))
     assert entries[0].target.port == 5000
+
+
+def test_load_jobs_default_vendor_fills_undeclared_targets(tmp_path):
+    job_file = tmp_path / "test.json"
+    job_file.write_text(json.dumps([
+        {"target": "R1:10.0.0.1", "show": "show version"},
+        {"target": "SW1:10.0.0.2:arista", "show": "show version"},
+    ]))
+    entries = load_jobs(str(job_file), default_vendor="junos")
+    assert entries[0].target.vendor == "junos"
+    assert entries[1].target.vendor == "arista", "a declared vendor must win"
