@@ -309,8 +309,15 @@ class Transaction:
 
     def commit(self, confirmed: Optional[int] = None, comment: Optional[str] = None) -> str:
         """Commit the candidate: COMMIT OK, or COMMIT CONFIRMED (n minutes)
-        when `confirmed` is set, with the diff. NO CHANGES if there were none."""
+        when `confirmed` is set, with the diff. NO CHANGES if there were none.
+        If the session died while the transaction was open (a nested show()
+        hit a timeout or a dropped transport), nothing is sent: the lock and
+        candidate went with the session, and that is a NotAppliedError."""
         self._require_open()
+        if self._lease.doomed or not getattr(self.dev, "connected", True):
+            self._lease.discard()
+            self._finish(rollback=False, unlock=False)
+            raise NotAppliedError("NETCONF session lost during the transaction; nothing committed")
         if not self.diff.strip():
             self.abort()
             return f"{self.label}NO CHANGES"

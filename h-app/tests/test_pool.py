@@ -512,3 +512,40 @@ def test_close_all_waits_when_not_shutting_down(pooled):
     pool.close_all(shutdown=False)  # waits for the borrower, then closes
     t.join()
     assert devices()[0].closed and entry["device"] is None
+
+
+# --- a call nested inside an open transaction -----------------------------------
+
+def test_nested_call_that_dies_does_not_close_the_outer_session(pooled):
+    """show() inside an open Transaction hits a dead transport: the session is
+    marked, not closed, so the transaction finishes on its own terms — and
+    commit() refuses with NotAppliedError instead of sending into the void."""
+    tx = junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
+    dev = devices()[0]
+    FakeDevice.cli_outputs = {"show version": junos.TransportError("closed")}
+    with pytest.raises(junos.TransportError):
+        show()                                   # nested borrow, same thread, same session
+    assert not dev.closed and tx.open            # still the transaction's session
+    assert pooled.live() == 1
+    with pytest.raises(NotAppliedError, match="session lost during the transaction"):
+        tx.commit()
+    assert dev.closed and not tx.open and pooled.live() == 0
+    assert "commit" not in FakeConfig.instances[0].names
+
+
+def test_nested_show_on_a_healthy_session_is_plain_reuse(pooled):
+    with junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30) as tx:
+        assert show() == "output of show version"
+        assert tx.show("show version") == "output of show version"
+        assert len(devices()) == 1 and pooled.stats["opens"] == 1
+    assert pooled.live() == 1                    # abort on exit keeps the session
+
+
+def test_nested_discard_is_honoured_once_the_outer_borrow_returns(pooled):
+    key = ("10.0.0.1", 830, "u")
+    with pooled.get_connection(key, opener=lambda: FakeDevice(), closer=junos._close) as outer:
+        with pooled.get_connection(key, opener=None, closer=junos._close) as inner:
+            inner.discard()
+        assert not devices()[0].closed and outer.doomed
+    assert devices()[0].closed and pooled.live() == 0
+    assert pooled._get_or_create_entry(key)["doomed"] is False   # reset for the next borrow
