@@ -624,3 +624,116 @@ def test_a_console_that_echoes_the_password_does_not_put_it_in_the_error():
         show("127.0.0.1", "lab", "Pa55w0rd-FROM-PROMPT", "show version",
              session_timeout=1, command_timeout=1, port=srv.port, vendor_hint="telnet-junos")
     assert "Pa55w0rd-FROM-PROMPT" not in str(exc.value) and "***" in str(exc.value)
+
+# --- #46: the reader cannot be fooled by prompt-shaped text ----------------------
+
+REFUSED = "\r\nerror: configuration check-out failed: daemon file propagation failed"
+
+
+def junos_cli_slow(commit_reply=REFUSED):
+    """junos_cli with a tty's timing: the echo lands first, the reply a
+    moment later, in its own packet."""
+    def handler(srv):
+        srv.send("\r\n" + OP)
+        while True:
+            line = srv.readline()
+            time.sleep(0.05)
+            if line.startswith("configure"):
+                srv.send("\r\nEntering configuration mode" + CFG)
+            elif line.startswith("set "):
+                srv.send(CFG)
+            elif line == "show | compare":
+                srv.send("\r\n[edit interfaces xe-0/0/0]\r\n+   description noc@example.com>;" + CFG)
+            elif line.startswith("rollback"):
+                srv.send("\r\nload complete" + CFG)
+            elif line.startswith("commit"):
+                srv.send(commit_reply + CFG)
+            elif line == "exit":
+                srv.send("\r\nExiting configuration mode\r\n\r\n" + OP)
+                return
+            elif line == "show version":
+                srv.send("\r\nHostname: R1\r\nModel: mx204\r\n" + OP)
+            else:
+                srv.send("\r\nsyntax error, expecting <command>." + CFG)
+    return handler
+
+
+def test_a_set_line_ending_in_prompt_shaped_text_does_not_hide_a_refused_commit():
+    """The echo of `description noc@example.com>` satisfied the prompt match;
+    every later read was one reply behind and the refused commit came back
+    as COMMIT OK (#46)."""
+    from hssh.vendors.telnet import edit
+    srv = ScriptedTelnetServer(junos_cli_slow())
+    with pytest.raises(RuntimeError, match="Commit failed: error: configuration check-out failed"):
+        edit("127.0.0.1", "lab", "secret",
+             'set system host-name R1-NEW\nset interfaces xe-0/0/0 description noc@example.com>\n',
+             session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-junos")
+    assert _received(srv) == ["configure exclusive", "set system host-name R1-NEW",
+                              "set interfaces xe-0/0/0 description noc@example.com>",
+                              "show | compare", "commit", "rollback 0", "exit"]
+
+
+def test_the_learned_prompt_ignores_a_reply_line_that_looks_like_one():
+    from hssh.vendors.telnet import show
+
+    def handler(srv):
+        srv.send("\r\n" + OP)
+        srv.readline()
+        srv.send("\r\nnoc@example.com>")          # a line of output, ending like a prompt
+        time.sleep(0.1)
+        srv.send("\r\nmore output\r\n" + OP)
+        srv.readline()
+    srv = ScriptedTelnetServer(handler)
+    out = show("127.0.0.1", "lab", "secret", "show interfaces descriptions",
+               session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-junos")
+    assert "more output" in out and out.strip().endswith("more output")
+
+
+def test_more_keeps_what_followed_the_marker_in_the_same_chunk():
+    from hssh.vendors.telnet import show
+
+    def handler(srv):
+        srv.send("\r\n" + OP)
+        srv.readline()
+        srv.send("\r\npart one\r\n--More--part two\r\n" + OP)
+        srv.conn.recv(16)                          # the space the client sends
+    srv = ScriptedTelnetServer(handler)
+    out = show("127.0.0.1", "lab", "secret", "show log messages",
+               session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-junos")
+    assert "part one" in out and "part two" in out and "--More--" not in out
+
+
+def test_confirm_is_one_bare_commit_in_exclusive_mode():
+    """-eC commit on telnet-junos went through the edit path: configure
+    exclusive, commit as a config line, show | compare, commit again (#46)."""
+    from hssh.vendors import telnet
+    assert hasattr(telnet, "confirm")
+    srv = ScriptedTelnetServer(junos_cli(commit_reply="\r\ncommit complete"))
+    out = telnet.confirm("127.0.0.1", "lab", "secret", session_timeout=5, command_timeout=5,
+                         port=srv.port, vendor_hint="telnet-junos")
+    assert out == "COMMIT CONFIRMED OK"
+    assert _received(srv) == ["configure exclusive", "commit", "exit"]
+
+
+def test_confirm_refused_lock_is_not_applied():
+    from hssh.errors import NotAppliedError
+    from hssh.vendors import telnet
+    srv = ScriptedTelnetServer(junos_cli(lock_reply="\r\nerror: configuration database locked by: other"))
+    with pytest.raises(NotAppliedError, match="Failed to lock config"):
+        telnet.confirm("127.0.0.1", "lab", "secret", session_timeout=5, command_timeout=5,
+                       port=srv.port, vendor_hint="telnet-junos")
+    assert _received(srv) == ["configure exclusive"]
+
+
+def test_a_commit_line_inside_a_payload_is_refused_before_anything_is_sent(monkeypatch):
+    """A dry run of -eC commit sent the commit (#46); now the word is never
+    accepted as configuration, dry run or not."""
+    from hssh.vendors import telnet
+    sent = []
+    srv = ScriptedTelnetServer(junos_cli())
+    for payload in ("commit\n", "set system host-name x\ncommit confirmed 5\n"):
+        with pytest.raises(ValueError, match="'commit' is not configuration"):
+            telnet.edit("127.0.0.1", "lab", "secret", payload, 5, 5, port=srv.port,
+                        vendor_hint="telnet-junos", dry_run=True)
+    srv.stop()
+    assert srv.received == []

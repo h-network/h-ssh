@@ -127,11 +127,14 @@ def _read_until(sock: socket.socket, done, timeout: int, buffer: str = "") -> st
         buf += chunk
         clean = _strip_ansi(buf)
 
-        # Handle --More-- pagination
+        # Handle --More-- pagination: the marker goes, what followed it in
+        # the same chunk stays.
         for more_re in MORE_PATTERNS:
-            if more_re.search(clean):
+            m = more_re.search(clean)
+            if m:
                 _send(sock, " ")
-                buf = clean[:more_re.search(clean).start()]
+                buf = clean[:m.start()] + clean[m.end():]
+                clean = _strip_ansi(buf)
                 break
 
         if done(clean):
@@ -195,16 +198,19 @@ def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
             _send(sock, "\n")
             initial = _read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout)
 
+        last = initial
         if LOGIN_RE.search(initial):
             _send(sock, (user or "") + "\n")
-            resp = _read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout)
-            if PASSWORD_RE.search(resp):
+            last = _read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout)
+            if PASSWORD_RE.search(last):
                 _send(sock, (passwd or "") + "\n")
-                resp = _read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout)
-            _check_login(resp)
+                last = _read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout)
+            _check_login(last)
         elif PASSWORD_RE.search(initial):
             _send(sock, (passwd or "") + "\n")
-            _check_login(_read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout))
+            last = _read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout)
+            _check_login(last)
+        prompt_re = _learn_prompt(last, prompt_re, vendor_hint)
     except Exception as e:
         sock.close()
         if isinstance(e, TimeoutError):
@@ -220,20 +226,54 @@ def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
     return sock, prompt_re
 
 
+def _is_echo(line: str, cmd: str) -> bool:
+    """The device's echo of what was typed ends with the command itself; a
+    reply line that merely mentions the command is not it."""
+    return line.strip().endswith(cmd.strip())
+
+
 def _send_command(sock: socket.socket, prompt_re: re.Pattern,
                   cmd: str, command_timeout: int) -> str:
-    """Send a command and return output (stripped of echo and trailing prompt)."""
+    """Send a command and return output (stripped of echo and trailing prompt).
+
+    The prompt is looked for on the last line only, and never on the echo:
+    a config line that itself ends in prompt-shaped text (`description
+    noc@example.com>`) once satisfied the match on its echo, left the real
+    reply in the socket, and shifted every later read by one reply, so a
+    commit the device refused was reported as COMMIT OK."""
     _send(sock, cmd + "\n")
-    output = _read_until_prompt(sock, prompt_re, timeout=command_timeout)
+
+    def done(clean: str) -> bool:
+        lines = clean.splitlines()
+        if not lines:
+            return False
+        if len(lines) == 1 and _is_echo(lines[0], cmd):
+            return False                      # only the echo so far
+        return prompt_re.search(lines[-1]) is not None
+
+    output = _read_until(sock, done, timeout=command_timeout)
 
     lines = output.splitlines()
-    # Strip command echo
-    if lines and cmd.strip() in lines[0]:
+    if lines and _is_echo(lines[0], cmd):
         lines = lines[1:]
-    # Strip trailing prompt
     if lines and prompt_re.search(lines[-1]):
         lines = lines[:-1]
     return "\n".join(lines)
+
+
+def _learn_prompt(reply: str, prompt_re: re.Pattern, sub_vendor: str) -> re.Pattern:
+    """The device's own prompt, from the first one seen after login: from
+    then on only `user@host` (or `Router`, with its config-mode suffix) ends a
+    reply, not any line that happens to end in `>` or `#`."""
+    seen = [l.strip() for l in reply.splitlines() if l.strip()]
+    if not seen:
+        return prompt_re
+    last = seen[-1]
+    if sub_vendor == "junos":
+        m = re.search(r'([\w\-\.]+@[\w\-\.]+)[>%#]\s*$', last)
+        return re.compile(re.escape(m.group(1)) + r'[>%#]\s*$') if m else prompt_re
+    m = re.search(r'^([\w\-\.]+)(\([^\s()]+\))?[>#]\s*$', last)
+    return re.compile(re.escape(m.group(1)) + r'(\([^\s()]+\))?[>#]\s*$') if m else prompt_re
 
 
 def _edit_ios(sock: socket.socket, prompt_re: re.Pattern, payload: str) -> str:
@@ -272,6 +312,17 @@ def _leave_quietly(sock: socket.socket, prompt_re: re.Pattern, *cmds: str) -> No
         pass
 
 
+def _refuse_commit_lines(payload: str) -> None:
+    """`commit` typed inside configure mode would commit (and confirm any
+    pending timer) halfway through a payload. A confirm is `-eC "commit"`
+    on its own, which confirm() handles; here it is refused before the
+    device is contacted."""
+    for line in payload.strip().splitlines():
+        if line.strip().split(" ")[0] == "commit":
+            raise ValueError("'commit' is not configuration; a pending commit-confirmed is confirmed "
+                             "with -eC \"commit\" alone. Nothing was sent to the device")
+
+
 def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
                 payload: str, dry_run: bool, confirmed_minutes: int = 0,
                 expected_diff: Optional[str] = None) -> str:
@@ -284,6 +335,7 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
     (what a dry run showed) the candidate is committed only if
     `show | compare` says the same again.
     """
+    _refuse_commit_lines(payload)
     reply = _send_command(sock, prompt_re, "configure exclusive", 10)
     if _JUNOS_ERROR_RE.search(reply):
         raise NotAppliedError(f"Failed to lock config: {reply.strip()}")
@@ -334,6 +386,41 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
     return f"COMMIT OK\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
 
 
+def confirm(host: str, user: str, passwd: str,
+            session_timeout: int, command_timeout: int,
+            port: int = None, vendor_hint: str = "telnet-junos",
+            comment: Optional[str] = None) -> str:
+    """Confirm a pending commit-confirmed on a telnet-junos device: configure
+    exclusive, a bare `commit` (`commit comment "…"` with a comment), exit.
+    Without this the runner handed the word `commit` to the edit path, which
+    committed twice and reported someone else's diff."""
+    sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint and vendor_hint.startswith("telnet") else vendor_hint
+    if sub_vendor != "junos":
+        raise ValueError(f"confirm is only for telnet-junos, not telnet-{sub_vendor}; nothing was sent")
+    sock, prompt_re = _connect_and_login(host, user, passwd, port if port is not None else 23,
+                                         session_timeout, "junos")
+    try:
+        reply = _send_command(sock, prompt_re, "configure exclusive", 10)
+        if _JUNOS_ERROR_RE.search(reply):
+            raise NotAppliedError(f"Failed to lock config: {reply.strip()}")
+        commit_cmd = f'commit comment "{comment}"' if comment else "commit"
+        try:
+            out = _send_command(sock, prompt_re, commit_cmd, command_timeout)
+        except OSError as e:
+            raise AmbiguousCommitError(
+                f"commit outcome unknown ({type(e).__name__}: {e}); check the device before retrying") from e
+        if _JUNOS_ERROR_RE.search(out):
+            _leave_quietly(sock, prompt_re, "exit")
+            raise RuntimeError(f"Commit failed: {out.strip()}")
+        _leave_quietly(sock, prompt_re, "exit")
+        return "COMMIT CONFIRMED OK"
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Public functional API (matches vendor module interface)
 # ---------------------------------------------------------------------------
@@ -379,6 +466,8 @@ def edit(host: str, user: str, passwd: str, payload: str,
         raise ValueError(f"dry_run, commit_confirmed and expected_diff are not supported by "
                          f"telnet-{sub_vendor}; nothing was sent to the device")
     check_confirm_minutes(commit_confirmed)
+    if sub_vendor == "junos":
+        _refuse_commit_lines(payload)
 
     sock, prompt_re = _connect_and_login(host, user, passwd, effective_port,
                                          session_timeout, sub_vendor)

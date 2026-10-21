@@ -170,9 +170,14 @@ its timeout or loses the connection is an error, never a partial reply passed of
 and a `login:`/`Password:` prompt back after the password is a failed login, reported once — not the
 command typed in as a username. A port that prints nothing until Enter — a console-server line left at
 a prompt — gets one Enter once the session timeout is up, before silence counts as a failed login.
+The prompt is learned at login (`lab@R1` or `Router`, with its config-mode suffix) and looked for on
+the last line of a reply only, never on the echo of what was typed, so a description ending in `>` or
+a community ending in `#` cannot be taken for the prompt and shift every later reply.
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
-this session's candidate, never another user's pending changes. A commit whose reply never arrives is
+this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
+commit-confirmed with one bare `commit` in exclusive mode; a `commit` line inside a config payload is
+refused before the device is contacted. A commit whose reply never arrives is
 *outcome unknown* here too; one answered with `commit complete` that then takes the session with it — a
 management address, the telnet service — is still reported as committed, the closed session releasing
 the lock.
