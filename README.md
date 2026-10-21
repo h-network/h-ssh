@@ -516,11 +516,12 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (303 tests) needs no devices and runs on every push and pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (419 tests) needs no devices and runs on every push and pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
-edit paths, the RPC/JSON paths and a full commit-confirmed maintenance flow; the earlier 59-test run covered every CLI mode, both
-edit paths, concurrency, error handling, exit codes and the safety gate. What was run on which code, and what is still pending
-before a release, is in [TESTS.md](TESTS.md).
+edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
+gate (failure handling, edit safety, one real commit per write feature, the library API on one pooled session); the earlier
+59-test run covered every CLI mode, both edit paths, concurrency, error handling, exit codes and the safety gate. What was run
+on which code is in [TESTS.md](TESTS.md).
 
 ## Related global repos
 
