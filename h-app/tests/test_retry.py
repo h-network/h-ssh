@@ -19,6 +19,8 @@ from hssh.runner import _retry_loop, _with_retry, is_permanent_failure, _backoff
     "--commit-confirmed is not supported by the 'openssh' transport",
     "password authentication needs OpenSSH >= 8.4",
     "Junos rejected the operational command",
+    "login failed: Login incorrect",
+    "login failed: the device asked for credentials again",
 ])
 def test_permanent_failures_are_recognised(message):
     assert is_permanent_failure(Exception(message))
