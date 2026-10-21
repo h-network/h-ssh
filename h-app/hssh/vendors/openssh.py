@@ -30,8 +30,9 @@ from typing import List, Optional
 
 AVAILABLE = shutil.which("ssh") is not None
 
-# accept-new trusts a host the first time and pins it after, matching the
-# WarningPolicy the paramiko transport uses. Override for stricter sites.
+# accept-new trusts a host the first time and pins it after. The paramiko
+# transport reads the same variable and pins in ~/.h-ssh/known_hosts; this
+# one leaves pinning to ssh and ~/.ssh/known_hosts. Override for stricter sites.
 _HOST_KEY_POLICY = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
 
 # SSH_ASKPASS_REQUIRE=force is what lets askpass work with no TTY and no
