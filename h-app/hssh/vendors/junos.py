@@ -86,8 +86,16 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
     dev = JunosDevice(**params)
     try:
         dev.open()
-    except ConnectError as e:
-        raise NotAppliedError(f"NETCONF connect failed: {e}") from e
+    except Exception as e:
+        # open() may have partially established the transport before
+        # raising; close the local device so we don't leak it.
+        try:
+            dev.close()
+        except Exception:
+            pass
+        if isinstance(e, ConnectError):
+            raise NotAppliedError(f"NETCONF connect failed: {e}") from e
+        raise
     dev.timeout = command_timeout
     return dev
 
@@ -140,13 +148,13 @@ def _session(host: str, user: str, passwd: Optional[str], session_timeout: int,
              command_timeout: int, port: Optional[int]):
     """A session for this router: fresh, or borrowed from the pool."""
     key = (host, port or DEFAULT_PORT, user)
-    with POOL.lease(
+    with POOL.get_connection(
         key,
         opener=lambda: _open(host, user, passwd, session_timeout, command_timeout, port),
         closer=_close,
+        timeout=command_timeout,
         alive=_alive,
     ) as lease:
-        lease.dev.timeout = command_timeout
         yield lease
 
 
