@@ -8,8 +8,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hssh import runner, vendors
-from hssh.core import Target
+from hssh.core import Target, read_set_file_for_device
 from hssh.errors import AmbiguousCommitError, NotAppliedError
+from hssh.vendors import junos
 
 
 class FakeVendor:
@@ -41,11 +42,11 @@ def no_sleep(monkeypatch):
 
 
 def run(monkeypatch, vendor_name, mod, mode="edit-cmd", edit_cmd="set a b",
-        dry_run=False, commit_confirmed=None, config_dir=None, attempts=3):
+        dry_run=False, commit_confirmed=None, config_dir=None, broadcast_file=None, attempts=3):
     monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode=mode,
-        show_cmd=None, edit_cmd=edit_cmd, config_dir=config_dir, broadcast_file=None,
+        show_cmd=None, edit_cmd=edit_cmd, config_dir=config_dir, broadcast_file=broadcast_file,
         user="u", passwd="p", session_timeout=5, command_timeout=30,
         dry_run=dry_run, commit_confirmed=commit_confirmed, save_dir=None,
         quiet=True, max_attempts=attempts)
@@ -116,6 +117,33 @@ def test_commit_in_a_config_file_is_config(monkeypatch, tmp_path):
     v = FakeVendor(with_confirm=True)
     run(monkeypatch, "junos", v, mode="edit-dir", edit_cmd=None, config_dir=str(tmp_path))
     assert v.confirm_calls == [] and len(v.edit_calls) == 1
+
+
+# A '#' inside a set line is part of the value: the syntax guard passes the
+# file as written, so that is what the device must get (issue #23).
+SET_FILE = ("# full-line comment\n"
+            "set snmp community ab#12 authorization read-only\n"
+            'set interfaces ge-0/0/0 description "uplink #3"\n')
+SET_LINES = ("set snmp community ab#12 authorization read-only\n"
+             'set interfaces ge-0/0/0 description "uplink #3"\n')
+
+
+def test_dash_eD_keeps_an_inline_hash(monkeypatch, tmp_path):
+    (tmp_path / "R1.set").write_text(SET_FILE)
+    v = FakeVendor()
+    _, ok, _, _ = run(monkeypatch, "junos", v, mode="edit-dir", edit_cmd=None, config_dir=str(tmp_path))
+    assert ok and v.edit_calls[0]["payload"] == SET_LINES
+    assert v.edit_calls[0]["payload"] == read_set_file_for_device(str(tmp_path), "R1")
+
+
+def test_dash_eD_and_dash_eB_load_the_same_lines(monkeypatch, tmp_path):
+    (tmp_path / "R1.set").write_text(SET_FILE)
+    by_dir, by_file = FakeVendor(), FakeVendor()
+    run(monkeypatch, "junos", by_dir, mode="edit-dir", edit_cmd=None, config_dir=str(tmp_path))
+    run(monkeypatch, "junos", by_file, mode="edit-broadcast", edit_cmd=None,
+        broadcast_file=str(tmp_path / "R1.set"))
+    assert by_file.edit_calls[0]["payload"] == SET_FILE      # -eB hands the driver the file as is
+    assert junos._strip_comments(by_file.edit_calls[0]["payload"]) + "\n" == by_dir.edit_calls[0]["payload"]
 
 
 class FakeGate:

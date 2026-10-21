@@ -134,6 +134,7 @@ def test_registered_as_a_vendor():
     from hssh.cli import VENDOR_MODULES, VENDOR_INSTALL
     assert VENDORS["openssh"] is openssh
     assert VENDOR_MODULES["openssh"] is openssh
+    assert VENDOR_MODULES is VENDORS      # one registry; the CLI's name for it
     assert "openssh" in VENDOR_INSTALL
 
 

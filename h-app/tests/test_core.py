@@ -235,6 +235,29 @@ def test_validate_junos_set_syntax():
     assert "line 1" in err
 
 
+def test_read_set_file_for_device(tmp_path):
+    """The -eD reader drops blank and full-line '#' lines only; a '#' inside
+    a line is part of the value, as it is for -eB and the syntax guard."""
+    from hssh.core import read_set_file_for_device
+
+    (tmp_path / "R1.set").write_text(
+        "# full-line comment\n"
+        "\n"
+        "set snmp community ab#12 authorization read-only\n"
+        "   # indented comment\n"
+        'set interfaces ge-0/0/0 description "uplink #3"\n')
+    assert read_set_file_for_device(str(tmp_path), "R1") == (
+        "set snmp community ab#12 authorization read-only\n"
+        'set interfaces ge-0/0/0 description "uplink #3"\n')
+
+    with pytest.raises(FileNotFoundError):
+        read_set_file_for_device(str(tmp_path), "R2")
+
+    (tmp_path / "R3.set").write_text("# only comments\n\n")
+    with pytest.raises(ValueError):
+        read_set_file_for_device(str(tmp_path), "R3")
+
+
 def test_command_template_path_resolution(tmp_path, monkeypatch):
     """Template resolution should work even when CWD is outside the repo."""
     from hssh.core import resolve_command

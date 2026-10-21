@@ -292,7 +292,7 @@ def _run_for_target_sync(
         elif mode == "edit-dir":
             if not config_dir:
                 raise ValueError("No config directory provided for -eD.")
-            payload = _read_config_file(config_dir, name)
+            payload = read_set_file_for_device(config_dir, name)
             result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment)
@@ -469,25 +469,6 @@ async def run_for_target_async(
         comment=comment,
         fmt=fmt,
     )
-
-
-def _read_config_file(config_dir: str, dev_name: str) -> str:
-    """Read per-device config file, strip comments."""
-    path = Path(config_dir) / f"{dev_name}.set"
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing config file for {dev_name}: {path}")
-    lines = []
-    for ln in path.read_text(encoding="utf-8").splitlines():
-        stripped = ln.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        ln = ln.split("#", 1)[0].rstrip()
-        if ln.strip():
-            lines.append(ln)
-    payload = "\n".join(lines).strip()
-    if not payload:
-        raise ValueError(f"Empty config after filtering: {path}")
-    return payload + "\n"
 
 
 def _read_broadcast_file(broadcast_file: str) -> str:
