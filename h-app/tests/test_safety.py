@@ -402,3 +402,17 @@ def test_set_cooldown_survives_a_stat_failure(monkeypatch):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_lock_file_that_is_a_symlink_is_not_followed(tmp_path):
+    """The lock open once followed a planted symlink (#41); now the gate runs
+    unlocked and the link's target is left alone."""
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    os.chmod(victim, 0o644)
+    sf = tmp_path / "gate.json"
+    (tmp_path / "gate.json.lock").symlink_to(victim)
+    gate = SafetyGate(safety_file=str(sf))
+    with gate._file_lock():
+        pass
+    assert victim.read_text() == "keep" and oct(victim.stat().st_mode & 0o777) == "0o644"

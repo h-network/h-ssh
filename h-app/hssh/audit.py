@@ -4,6 +4,7 @@ import fcntl
 import json
 import logging
 import os
+import stat
 from pathlib import Path
 import re
 from datetime import datetime, timezone
@@ -59,17 +60,35 @@ def redact_values(data):
 
 
 def secure_append(path: str, text: str) -> None:
-    """Append `text` to a 0600 file under an exclusive flock, creating it
-    and its directory. The audit log and --log both go through here, so a
-    file that holds payloads, replies and diffs is never world-readable."""
+    """Append `text` to a 0600 regular file under an exclusive flock, creating
+    it and its directory. The audit log and --log both go through here, so a
+    file that holds payloads, replies and diffs is never world-readable.
+
+    The name is opened without following a symlink and must be a regular
+    file: a planted link once redirected the audit trail into (and chmod'ed)
+    whatever it pointed at, and a planted FIFO blocked a fleet run forever.
+    O_NONBLOCK makes a reader-less FIFO fail at open instead; a regular
+    file ignores it. The mode is set on the descriptor, and a short write
+    is finished or reported, never counted as done."""
     log_path = Path(path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     try:
+        fd = os.open(str(log_path), flags, 0o600)
+    except OSError as e:
+        raise OSError(f"{path}: not a plain file that can be appended to ({e.strerror})") from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path}: not a regular file; refusing to write the log there")
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
-            os.chmod(str(log_path), 0o600)
-            os.write(fd, text.encode("utf-8"))
+            os.fchmod(fd, 0o600)
+            data = text.encode("utf-8")
+            while data:
+                written = os.write(fd, data)
+                if written <= 0:
+                    raise OSError(f"{path}: short write, {len(data)} bytes not written")
+                data = data[written:]
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:

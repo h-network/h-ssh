@@ -21,6 +21,8 @@ from .core import (
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, resolve_target_port, validate_junos_set_syntax,
     check_confirm_minutes,
+
+    path_inside,
 )
 from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS
 from .safety import SafetyGate
@@ -468,7 +470,7 @@ async def main() -> int:
             elif args.edit_dir:
                 for t in targets:
                     if t.vendor in ("junos", "telnet-junos"):
-                        set_file = Path(args.edit_dir) / f"{t.name}.set"
+                        set_file = path_inside(args.edit_dir, f"{t.name}.set")
                         if set_file.is_file():
                             try:
                                 d_content = set_file.read_text(encoding="utf-8")
@@ -925,7 +927,7 @@ async def main() -> int:
             if mode == "edit-cmd":
                 audit_payload = resolve_command(edit_cmd, t.vendor) if edit_cmd else ""
             elif mode == "edit-dir":
-                set_file = Path(args.edit_dir) / f"{name}.set"
+                set_file = path_inside(args.edit_dir, f"{name}.set")
                 if set_file.is_file():
                     try:
                         audit_payload = set_file.read_text(encoding="utf-8")

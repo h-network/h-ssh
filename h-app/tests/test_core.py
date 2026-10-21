@@ -298,3 +298,50 @@ def test_target_spec_round_trips_every_target_form():
               Target("R1", "2001:db8::1", "junos"), Target("R1", "2001:db8::1", "junos", 830),
               Target("sw", "::1", "telnet-ios", 5001)):
         assert parse_inline_target(target_spec(t)) == t
+
+# --- #41: a device name is a file name --------------------------------------------
+
+@pytest.mark.parametrize("name", ["../outside", "/home/op/x", "a/b", ".", "..", "-oProxyCommand=x", "", ".hidden", "a b"])
+def test_a_target_name_that_could_leave_its_directory_is_refused(name):
+    """'../x' in an inventory row once chose which local file became the
+    pushed config, and where the device's output was written."""
+    from hssh.core import parse_inline_target, validate_device_name
+    with pytest.raises(ValueError, match="invalid device name"):
+        validate_device_name(name)
+    with pytest.raises(ValueError, match="invalid device name"):
+        Target(name, "10.0.0.1", "junos")
+    if ":" not in name:
+        with pytest.raises(ValueError, match="invalid device name"):
+            parse_inline_target(f"{name}:10.0.0.1:junos")
+
+
+@pytest.mark.parametrize("name", ["R1", "sw-1.lab", "10.0.0.1", "2001:db8::1", "ax4_ede0004", "C02"])
+def test_hostname_shaped_names_are_fine(name):
+    assert Target(name, "10.0.0.1", "junos").name == name
+
+
+def test_inventory_rows_and_job_entries_with_a_bad_name_are_refused(tmp_path):
+    from hssh.core import load_devices_csv, load_jobs
+    csv_file = tmp_path / "d.csv"
+    csv_file.write_text("name,ip,vendor\n../x,10.0.0.1,junos\n")
+    with pytest.raises(ValueError, match="invalid device name"):
+        load_devices_csv(str(csv_file))
+    job = tmp_path / "j.json"
+    job.write_text('[{"target": "../x:10.0.0.1:junos", "show": "show version"}]')
+    with pytest.raises(ValueError, match="invalid device name"):
+        load_jobs(str(job))
+
+
+def test_set_file_and_save_paths_stay_inside_their_directory(tmp_path):
+    """Belt and braces at the join: even a caller that skips Target cannot
+    read or write outside the directory."""
+    from hssh.core import path_inside, read_set_file_for_device
+    (tmp_path / "outside.set").write_text("set x y\n")
+    cfg = tmp_path / "configs"; cfg.mkdir()
+    with pytest.raises(ValueError):
+        read_set_file_for_device(str(cfg), "../outside")
+    with pytest.raises(ValueError, match="does not stay inside"):
+        path_inside(str(cfg), "../outside.output")
+    with pytest.raises(ValueError, match="does not stay inside"):
+        path_inside(str(cfg), "/etc/passwd")
+    assert path_inside(str(cfg), "R1.output") == cfg / "R1.output"
