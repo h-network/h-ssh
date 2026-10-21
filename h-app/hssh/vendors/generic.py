@@ -11,6 +11,8 @@ A command's exit status is checked the way the openssh transport checks the
 ssh binary's: a non-zero status is a failure, not output.
 """
 
+import socket
+import time
 import os
 import threading
 from pathlib import Path
@@ -127,15 +129,45 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
     return client
 
 
+def _drain(stream, deadline: float, cmd: str) -> str:
+    """Everything a stream sends before the deadline. A device that keeps
+    sending, or stops without closing, ends in a TimeoutError, not a worker
+    pinned for the rest of the run."""
+    chunks = []
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"'{cmd}': the device was still sending when the command timeout ran out")
+        try:
+            chunk = stream.read(65536)
+        except socket.timeout as e:
+            raise TimeoutError(f"'{cmd}': no output within the command timeout") from e
+        if not chunk:
+            return b"".join(chunks).decode(errors="replace")
+        chunks.append(chunk)
+
+
 def _exec(client, cmd: str, command_timeout: int):
-    """(exit status, stdout, stderr) of one command; -1 when the server sent no status."""
+    """(exit status, stdout, stderr) of one command; -1 when the server sent no status.
+
+    Every wait is bounded by command_timeout: the reads, and the exit status
+    after them. A device that sends EOF and then neither a status nor a
+    close once held a worker thread forever (and with it the whole run)."""
+    deadline = time.monotonic() + float(command_timeout)
     stdin, stdout, stderr = client.exec_command(cmd, timeout=float(command_timeout))
-    out = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace")
+    channel = stdout.channel
     # Both streams are drained first: the status only arrives once the
     # command has ended, and a chatty command cannot end while its output
     # has nowhere to go.
-    return stdout.channel.recv_exit_status(), out, err
+    out = _drain(stdout, deadline, cmd)
+    err = _drain(stderr, deadline, cmd)
+    status_event = getattr(channel, "status_event", None)
+    if status_event is not None and not status_event.wait(max(0.0, deadline - time.monotonic())):
+        try:
+            channel.close()
+        except Exception:
+            pass
+        raise TimeoutError(f"'{cmd}': the device sent no exit status within {command_timeout}s; channel closed")
+    return channel.recv_exit_status(), out, err
 
 
 def _describe_failure(cmd: str, rc: int, out: str, err: str) -> str:

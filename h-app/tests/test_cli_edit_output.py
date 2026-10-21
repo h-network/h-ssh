@@ -439,3 +439,69 @@ def test_show_diff_json_keeps_stdout_as_json_and_skips_the_preflight(monkeypatch
     assert rc == 0 and probes == []
     data = json.loads(out)
     assert len(data) == 1 and data[0]["ok"] and "R1-new" in err
+
+# --- #45: Ctrl-C keeps what is in flight; the run log is streamed -----------------
+
+def _main_cancelled_after(delay):
+    """cli.main() with the main task cancelled after `delay` s, as asyncio.run
+    does on SIGINT."""
+    async def go():
+        asyncio.get_running_loop().call_later(delay, asyncio.current_task().cancel)
+        return await cli.main()
+    return asyncio.run(go())
+
+
+def test_ctrl_c_reports_and_audits_the_commit_that_was_in_flight(monkeypatch, capsys, tmp_path):
+    """The interrupt cancelled every task; a commit already running in the
+    executor landed on the device and left no OK line, no audit entry and
+    no log line (#45). The unit that had not started must not start."""
+    import threading
+    import time
+    monkeypatch.setattr(cli, "check_reachability", _reachable)
+    seen = []
+
+    def edit(host, user, passwd, payload, st, ct, commit_confirmed=None, **kw):
+        seen.append(host)
+        time.sleep(0.8)                      # the commit is on its way
+        return "COMMIT OK\n\nDIFF:\n+ host-name X"
+    driver = types.SimpleNamespace(AVAILABLE=True, edit=edit)
+    monkeypatch.setitem(vendors.VENDORS, "junos", driver)
+    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", driver)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    audit, log = tmp_path / "audit.jsonl", tmp_path / "run.jsonl"
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", str(tmp_path / "none"), "--user", "u", "--password", "p",
+                                      "--target", "R1:10.0.0.1:junos", "--target", "R2:10.0.0.2:junos",
+                                      "--workers", "1", "-y", "-eC", "set system host-name X",
+                                      "--audit-log", str(audit), "--log", str(log)])
+    rc = _main_cancelled_after(0.3)
+    out, err = capsys.readouterr()
+    assert rc == 130 and seen == ["10.0.0.1"]
+    assert "R1" in out and "COMMIT OK" in out
+    assert "Interrupted. Completed 1 of 2" in err
+    assert [json.loads(l)["device"] for l in audit.read_text().splitlines()] == ["R1"]
+    assert [json.loads(l)["device"] for l in log.read_text().splitlines()] == ["R1"]
+
+
+def test_the_run_log_is_written_as_each_device_finishes(monkeypatch, capsys, tmp_path):
+    """--log was written once at the very end (#45): R2 finishes only once R1's
+    line is already in the file."""
+    import time
+    monkeypatch.setattr(cli, "check_reachability", _reachable)
+    log = tmp_path / "run.jsonl"
+
+    def edit(host, user, passwd, payload, st, ct, commit_confirmed=None, **kw):
+        if host == "10.0.0.2":
+            for _ in range(100):
+                if log.exists() and '"device": "R1"' in log.read_text():
+                    return "COMMIT OK"
+                time.sleep(0.05)
+            return "R1 never reached the log"
+        return "COMMIT OK"
+    driver = types.SimpleNamespace(AVAILABLE=True, edit=edit)
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path,
+                           ["--target", "R2:10.0.0.2:junos", "--workers", "2", "-y",
+                            "-eC", "set system host-name X", "--log", str(log)], driver=driver)
+    assert rc == 0
+    lines = [json.loads(l) for l in log.read_text().splitlines()]
+    assert [l["device"] for l in lines] == ["R1", "R2"] and all(l["ok"] for l in lines)

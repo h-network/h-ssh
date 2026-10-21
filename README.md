@@ -317,11 +317,12 @@ a thread; h-ssh sizes the executor to `--workers` rather than leaving it at asyn
 `min(32, cpu+4)`, which on a 2-vCPU jump host is **6 threads no matter what you asked for** — and a
 device stuck in a 30s connect timeout holds one of those six the whole time.
 
-Ctrl-C stops starting new devices, lets the calls already in flight run out, reports how many devices
-completed (`Interrupted. Completed 1 of 3 device(s).` on stderr) and exits `130`. Output already written
-to stdout stays valid; the notice goes to stderr, so a truncated `--raw` run cannot look like a complete
-one. With `--json` there is no notice: the array holds only the devices that completed, the summary's
-`targets` is that count, and the exit code is still `130`.
+Ctrl-C stops starting new devices and lets the calls already in flight run out: a commit that was on
+its way to a router is reported, logged and audited like any other, never dropped. The run then
+reports how many devices completed (`Interrupted. Completed 1 of 3 device(s).`, on stderr) and exits
+`130`. Output already written to stdout stays valid, so a truncated `--raw` run cannot look like a
+complete one. With `--json` there is no notice: the array holds only the devices that completed, the
+summary's `targets` is that count, and the exit code is still `130`.
 
 ## Safety
 
@@ -339,7 +340,7 @@ ones (`--safety-file`, `--audit-log`, `--log`) apply to every mode once given.
 | Junos syntax guard | *(automatic)* | Enforces set-style syntax — each line must start with `set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect` or `unprotect`, lowercase — with `#`-only comments, for `junos` and `telnet-junos` (checked when any target is one). `commit` (or `commit;`) is only valid as the single, exact command in `-eC` or a `--job` edit, never inside `-eD`/`-eB` configuration files |
 | Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
 | Audit trail | `--audit-log PATH` (or `HSSH_AUDIT_LOG`) | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`/`passwd`, `authentication-key`, `md5-key`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). One entry per device for every mode — shows included, without their output — plus pre-flight aborts and user cancellations; records diffs for edits. In edit modes, audit write failures fail the run |
-| Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, appended with the same 0600 mode and secret redaction as the audit trail |
+| Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, one line as each device finishes, appended with the same 0600 mode and secret redaction as the audit trail |
 
 A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
 

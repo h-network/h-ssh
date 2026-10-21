@@ -770,8 +770,11 @@ async def main() -> int:
             return contextlib.nullcontext()
         return host_locks.setdefault(host, asyncio.Lock())
 
-    async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None):
+    async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
+                           started=None):
         async with _host_lock(t.host), sem:
+            if started is not None:
+                started()        # from here on the device may be touched
             dry_run = args.dry_run if dry_run is None else dry_run
             # For job mode: each target has its own mode and command
             actual_mode = mode_override or mode
@@ -827,14 +830,18 @@ async def main() -> int:
                 expected_diff=expected_diff,
             )
 
+    started = set()      # unit indices whose device may already be in play
+
     async def _run_unit(i, dry_run=None, expected_diff=None):
         """units[i] on its device, in its own mode and command for a job
         entry; the index comes back with the result."""
         t, je = units[i]
+        mark = lambda: started.add(i)
         if je is not None:
-            result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff)
+            result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
+                                        started=mark)
         else:
-            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff)
+            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark)
         return (i, *result)
 
     # --show-diff: every target's diff first, one question, then the real
@@ -881,17 +888,32 @@ async def main() -> int:
     tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
 
     interrupted = False
-    for coro in asyncio.as_completed(tasks):
-        try:
-            i, name, ok, out_text, duration_ms = await coro
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            # Ctrl-C: stop starting work, let what is in flight go, and report
-            # the devices that did finish rather than losing the whole run.
-            interrupted = True
-            for task in tasks:
-                task.cancel()
-            break
+    log_cmd = (batch_cmds or show_cmd or edit_cmd or args.edit_broadcast
+               or (args.edit_dir and f"dir:{args.edit_dir}") or "job")
+    log_ts = datetime.now().isoformat()
+    log_warned = False
 
+    async def _completed():
+        """Results as they land. On Ctrl-C the units that have not started are
+        cancelled; the ones in flight are still awaited, so a commit that is
+        on its way to a device is reported, logged and audited, never dropped."""
+        nonlocal interrupted
+        pending = set(tasks)
+        while pending:
+            try:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                interrupted = True
+                for i, task in enumerate(tasks):
+                    if i not in started and task in pending:
+                        task.cancel()
+                        pending.discard(task)
+                continue
+            for task in done:
+                if not task.cancelled():
+                    yield task.result()
+
+    async for i, name, ok, out_text, duration_ms in _completed():
         t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
         dev_mode = je.mode if je else mode
@@ -1015,6 +1037,18 @@ async def main() -> int:
                 print(f"ERROR: Failed to write audit entry for {name}", file=sys.stderr)
                 failures += 1
 
+        # The run log is written as the results land: a SIGTERM, an exception
+        # later in the loop or an OOM loses nothing already reported.
+        if args.log:
+            try:
+                secure_append(args.log, json.dumps(redact_values({
+                    "timestamp": log_ts, "user": user, "mode": mode, "command": log_cmd,
+                    "dry_run": args.dry_run, **entry})) + "\n")
+            except Exception as e:
+                if not log_warned:
+                    print(f"WARNING: Could not write to log file: {e}", file=sys.stderr)
+                    log_warned = True
+
         if raw_mode:
             if mode == "show-batch":
                 cmd_results = None
@@ -1113,25 +1147,6 @@ async def main() -> int:
 
     # Write structured JSONL log. It holds the same payloads, replies and
     # diffs as the audit log, so it gets the same redaction and file mode.
-    if args.log:
-        try:
-            cmd = batch_cmds or show_cmd or edit_cmd or args.edit_broadcast or (args.edit_dir and f"dir:{args.edit_dir}") or "job"
-            ts = datetime.now().isoformat()
-            lines = []
-            for entry in json_results:
-                log_entry = {
-                    "timestamp": ts,
-                    "user": user,
-                    "mode": mode,
-                    "command": cmd,
-                    "dry_run": args.dry_run,
-                    **entry,
-                }
-                lines.append(json.dumps(redact_values(log_entry)) + "\n")
-            secure_append(args.log, "".join(lines))
-        except Exception as e:
-            print(f"WARNING: Could not write to log file: {e}", file=sys.stderr)
-
     # Cross-device diff (show modes only)
     if args.diff and mode in ["show", "show-batch"]:
         ok_results = [r for r in json_results if r["ok"]]
