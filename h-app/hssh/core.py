@@ -9,12 +9,41 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
+# A device name becomes a file name (<name>.set, <name>.output): hostname
+# characters only, nothing that pathlib would read as a directory, a parent
+# or an option.
+_DEVICE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*")
+
+
+def validate_device_name(name: str) -> str:
+    """The name of a target, as it may appear in a file path. Anything with a
+    separator, a leading '-' or '.', or empty, is a ValueError: a '../' in an
+    inventory row once chose which local file became the pushed config and
+    where the device's output was written."""
+    if not isinstance(name, str) or not _DEVICE_NAME.fullmatch(name):
+        raise ValueError(f"invalid device name {name!r}: letters, digits, '_', '.', ':' and '-' only, "
+                         "not starting with '-' or '.'")
+    return name
+
+
+def path_inside(base: str, filename: str) -> Path:
+    """`<base>/<filename>`, refused unless it stays inside `base` once resolved."""
+    root = Path(base).resolve()
+    target = (root / filename).resolve()
+    if target.parent != root:
+        raise ValueError(f"{filename!r} does not stay inside {base}")
+    return Path(base) / filename
+
+
 @dataclass
 class Target:
     name: str
     host: str  # IP or resolvable hostname
     vendor: str = "ssh"  # Default: plain SSH, the transport that assumes least
     port: Optional[int] = None  # None = vendor default (22/23/830)
+
+    def __post_init__(self):
+        validate_device_name(self.name)
 
 
 def _is_comment_or_empty(line: str) -> bool:
@@ -245,7 +274,7 @@ def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
     same rule junos._strip_comments applies to every set payload: -eD sends
     what the syntax guard validated, and what -eB sends from the same file.
     """
-    path = Path(config_dir) / f"{dev_name}.set"
+    path = path_inside(config_dir, f"{validate_device_name(dev_name)}.set")
     if not path.is_file():
         raise FileNotFoundError(f"Missing config file for {dev_name}: {path}")
     lines = [ln for ln in path.read_text(encoding="utf-8").splitlines()

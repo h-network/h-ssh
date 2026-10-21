@@ -351,3 +351,12 @@ def test_runner_refuses_a_timer_it_cannot_arm_before_the_driver(monkeypatch):
     r = RollbackVendor()
     _, ok, out, _ = run_rollback(monkeypatch, "junos", r, n=1, commit_confirmed=-1)
     assert not ok and "commit_confirmed must be 1..65535" in out and r.rollback_calls == []
+
+def test_save_output_cannot_be_aimed_outside_the_save_directory(monkeypatch, tmp_path):
+    """A --save-output name with '../' once overwrote ~/.h-ssh/commands/junos.json (#41)."""
+    from hssh.core import path_inside
+    victim = tmp_path / "victim.json"; victim.write_text("keep me")
+    save = tmp_path / "save"; save.mkdir()
+    with pytest.raises(ValueError):
+        path_inside(str(save), "../victim.json")
+    assert victim.read_text() == "keep me"

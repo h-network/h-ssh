@@ -11,6 +11,7 @@ import fcntl
 import json
 import logging
 import os
+import stat
 from pathlib import Path
 import tempfile
 import threading
@@ -145,7 +146,9 @@ class SafetyGate:
             lock_path = Path(f"{self._safety_file}.lock")
             try:
                 lock_path.parent.mkdir(parents=True, exist_ok=True)
-                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError(f"{lock_path} is not a regular file")
                 fcntl.flock(fd, fcntl.LOCK_EX)
             except OSError as e:
                 logger.warning("Could not lock safety file %s: %s (continuing without file lock)", lock_path, e)

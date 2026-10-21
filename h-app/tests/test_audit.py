@@ -4,7 +4,10 @@ import json
 import os
 import tempfile
 import threading
+import time
 from pathlib import Path
+
+import pytest
 
 from hssh.audit import write_audit_entry, redact_secrets, redact_values, secure_append
 
@@ -221,3 +224,42 @@ def test_audit_show_diff_suppressed():
     finally:
         Path(tmp).unlink(missing_ok=True)
 
+
+
+# --- #41: the log file must be a plain file of our own --------------------------
+
+def test_secure_append_refuses_a_planted_symlink(tmp_path):
+    """A symlink at the --audit-log/--log path once redirected the trail into,
+    and chmod'ed 0600, whatever it pointed at."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("victim content\n")
+    os.chmod(victim, 0o644)
+    link = tmp_path / "audit.jsonl"
+    link.symlink_to(victim)
+    with pytest.raises(OSError, match="not a plain file"):
+        secure_append(str(link), '{"written": "through the symlink"}\n')
+    assert victim.read_text() == "victim content\n"
+    assert oct(victim.stat().st_mode & 0o777) == "0o644"
+
+
+def test_secure_append_refuses_a_planted_fifo_without_blocking(tmp_path):
+    """A FIFO at the log path once blocked the whole fleet run at open()."""
+    fifo = tmp_path / "audit.jsonl"
+    os.mkfifo(fifo)
+    t0 = time.monotonic()
+    with pytest.raises(OSError):
+        secure_append(str(fifo), "x\n")
+    assert time.monotonic() - t0 < 2
+
+
+def test_secure_append_finishes_a_short_write(tmp_path, monkeypatch):
+    real_write = os.write
+    calls = []
+
+    def short_write(fd, data):
+        calls.append(len(data))
+        return real_write(fd, data[:5])     # the kernel wrote less than asked
+    monkeypatch.setattr(os, "write", short_write)
+    path = tmp_path / "run.jsonl"
+    secure_append(str(path), "0123456789abcdef\n")
+    assert path.read_text() == "0123456789abcdef\n" and len(calls) > 1
