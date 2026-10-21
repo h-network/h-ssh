@@ -238,6 +238,20 @@ def test_cli_job_show_entries_are_data_and_edit_entries_text(monkeypatch, capsys
     assert by_name["R2"]["output"].startswith("COMMIT OK")
 
 
+def test_cli_format_is_refused_where_nothing_is_shown(monkeypatch, capsys, tmp_path):
+    """An edit, --rollback or --commit-status has no reply for --format to
+    shape; so has a job without a show entry. Refused before any driver call."""
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "edit": "set system host-name r1"}]))
+    for argv in (["-eC", "set system host-name x", "-y", *R1],
+                 ["--rollback", "1", "-y", *R1],
+                 ["--commit-status", *R1],
+                 ["--job", str(job), "-y"]):
+        v = FakeVendor()
+        rc, _, err = run_cli(monkeypatch, capsys, v, "--format", "json", *argv)
+        assert rc == 2 and "--format goes with a show" in err and v.calls == []
+
+
 def test_structured_and_format_is_a_usage_error():
     hssh = os.path.join(os.path.dirname(__file__), "..", "h-ssh.py")
     proc = subprocess.run(

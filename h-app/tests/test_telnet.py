@@ -17,6 +17,7 @@ class MockTelnetServer:
 
     def __init__(self, vendor="ios"):
         self.vendor = vendor
+        self.received = []   # every command line a client sent, in order
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("127.0.0.1", 0))
@@ -56,6 +57,7 @@ class MockTelnetServer:
                     data = conn.recv(4096).decode("utf-8", errors="replace").strip()
                     if not data:
                         continue
+                    self.received.append(data)
 
                     if data == "show version":
                         response = f"Mock {self.vendor} device\nVersion: 1.0.0\nUptime: 1 day\r\n{prompt} "
@@ -166,6 +168,26 @@ def test_show_batch(ios_server):
     assert all(r["ok"] for r in results)
     assert "Mock ios device" in results[0]["output"]
     assert "10.0.0" in results[1]["output"]
+
+
+def _junos_edit(server, **kw):
+    from hssh.vendors.telnet import edit
+    return edit("127.0.0.1", "admin", "admin", "set system host-name test\n",
+                session_timeout=5, command_timeout=5, port=server.port,
+                vendor_hint="telnet-junos", **kw)
+
+
+def test_junos_edit_commits_only_the_diff_the_dry_run_showed(junos_server):
+    """--show-diff over telnet: `show | compare` must say what the preview
+    said, or the candidate is rolled back and nothing is committed."""
+    start = len(junos_server.received)
+    with pytest.raises(RuntimeError, match="diff changed since preview; nothing committed"):
+        _junos_edit(junos_server, expected_diff="[edit system]\n+  host-name OTHER;")
+    sent = junos_server.received[start:]
+    assert "rollback 0" in sent and "commit" not in sent
+    start = len(junos_server.received)
+    out = _junos_edit(junos_server, expected_diff="[edit system]\n+  host-name test;\n")
+    assert out.startswith("COMMIT OK") and "commit" in junos_server.received[start:]
 
 
 def test_telnet_always_available():

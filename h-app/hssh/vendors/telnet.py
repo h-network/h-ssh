@@ -227,8 +227,11 @@ def _edit_ios(sock: socket.socket, prompt_re: re.Pattern,
 
 
 def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
-                payload: str, dry_run: bool, confirmed_minutes: int = 0) -> str:
-    """Junos config mode: configure -> commands -> show|compare -> commit/rollback."""
+                payload: str, dry_run: bool, confirmed_minutes: int = 0,
+                expected_diff: Optional[str] = None) -> str:
+    """Junos config mode: configure -> commands -> show|compare -> commit/rollback.
+    With `expected_diff` (what a dry run showed) the candidate is committed
+    only if `show | compare` says the same again."""
     _send(sock, "configure\n")
     _read_until_prompt(sock, prompt_re, timeout=10)
 
@@ -251,14 +254,17 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
     if diff_lines and prompt_re.search(diff_lines[-1]):
         diff_lines = diff_lines[:-1]
     diff = "\n".join(diff_lines).strip()
+    changed = expected_diff is not None and diff != expected_diff.strip()
 
-    if dry_run or errors:
+    if dry_run or errors or changed:
         _send(sock, "rollback 0\n")
         _read_until_prompt(sock, prompt_re, timeout=10)
         _send(sock, "exit\n")
         _read_until_prompt(sock, prompt_re, timeout=10)
         if errors:
             raise RuntimeError("; ".join(errors))
+        if changed:
+            raise RuntimeError("diff changed since preview; nothing committed")
         return f"DRY-RUN\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
 
     if confirmed_minutes and confirmed_minutes > 0:
@@ -305,11 +311,13 @@ def show(host: str, user: str, passwd: str, cmd: str,
 def edit(host: str, user: str, passwd: str, payload: str,
          session_timeout: int, command_timeout: int,
          commit_confirmed: int = None, port: int = None,
-         vendor_hint: str = "telnet", dry_run: bool = False) -> str:
+         vendor_hint: str = "telnet", dry_run: bool = False,
+         expected_diff: Optional[str] = None) -> str:
     """Send configuration commands via raw-socket telnet.
 
-    dry_run is honoured for Junos only (the candidate is diffed and rolled back);
-    the runner rejects it for the other sub-vendors before getting here.
+    dry_run and expected_diff are honoured for Junos only (the candidate is
+    diffed, and rolled back or checked against the diff a dry run showed);
+    the runner rejects them for the other sub-vendors before getting here.
     """
     effective_port = port if port is not None else 23
     sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint.startswith("telnet") else vendor_hint
@@ -321,7 +329,8 @@ def edit(host: str, user: str, passwd: str, payload: str,
     try:
         if sub_vendor == "junos":
             return _edit_junos(sock, prompt_re, payload, dry_run=dry_run,
-                               confirmed_minutes=commit_confirmed or 0)
+                               confirmed_minutes=commit_confirmed or 0,
+                               expected_diff=expected_diff)
         else:
             return _edit_ios(sock, prompt_re, payload, dry_run=False)
     finally:

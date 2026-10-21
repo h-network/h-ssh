@@ -6,7 +6,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from hssh.audit import write_audit_entry, redact_secrets
+from hssh.audit import write_audit_entry, redact_secrets, redact_values, secure_append
 
 
 def test_write_audit_entry_basic():
@@ -165,6 +165,39 @@ def test_audit_extended_secret_redaction():
         assert "[REDACTED]" in record["error"]
     finally:
         Path(tmp).unlink(missing_ok=True)
+
+
+def test_redact_values_keeps_the_shape_and_loses_the_secrets():
+    """A --log record: strings get redact_secrets(), a reply carried as data
+    loses the whole value under a secret-named key, the rest is untouched."""
+    record = {
+        "command": "set snmp community public authorization read-only",
+        "output": {"configuration": {"system": {"root-authentication": {
+            "encrypted-password": [{"data": "$9$hash"}]}}}},
+        "commands": [{"ok": True, "output": 'pre-shared-key ascii-text "$9$psk"'},
+                     {"ok": False, "error": "password: hunter2 rejected"}],
+        "ok": True, "duration_ms": 3, "dry_run": False,
+    }
+    out = redact_values(record)
+    assert out["command"] == "set snmp community [REDACTED] authorization read-only"
+    assert out["output"]["configuration"]["system"]["root-authentication"]["encrypted-password"] == "[REDACTED]"
+    assert out["commands"][0]["output"] == "pre-shared-key ascii-text [REDACTED]"
+    assert out["commands"][1]["error"] == "password: [REDACTED] rejected"
+    assert (out["ok"], out["duration_ms"], out["dry_run"]) == (True, 3, False)
+    for secret in ("public", "$9$hash", "$9$psk", "hunter2"):
+        assert secret not in json.dumps(out)
+
+
+def test_secure_append_is_0600_whatever_the_umask(tmp_path):
+    old = os.umask(0o022)
+    try:
+        path = tmp_path / "logs" / "run.jsonl"
+        secure_append(str(path), '{"a": 1}\n')
+        secure_append(str(path), '{"b": 2}\n')
+    finally:
+        os.umask(old)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert path.read_text() == '{"a": 1}\n{"b": 2}\n'
 
 
 def test_audit_show_diff_suppressed():

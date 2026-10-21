@@ -118,11 +118,25 @@ def _comment_kwargs(vendor, comment):
     return {"comment": comment}
 
 
+def _expected_diff_kwargs(vendor, expected_diff):
+    """{"expected_diff": ...} for the drivers that diff a candidate before
+    committing it (the ones that can dry-run); refused elsewhere, since a
+    transport that cannot show a diff cannot check one either."""
+    if expected_diff is None:
+        return {}
+    if vendor not in DRY_RUN_EDIT_VENDORS:
+        raise ValueError(
+            f"expected_diff is not supported by the '{vendor}' transport; "
+            "nothing was sent to the device")
+    return {"expected_diff": expected_diff}
+
+
 def _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
                     n, session_timeout, command_timeout, commit_confirmed, port, dry_run=False,
-                    comment=None):
+                    comment=None, expected_diff=None):
     """Return to rollback n. Same rules as an edit: refused where the transport
-    cannot really do it, retried only when nothing reached the device."""
+    cannot really do it, retried only when nothing reached the device, and
+    with `expected_diff` committed only if the device shows that diff again."""
     if not hasattr(vendor_mod, "rollback"):
         raise ValueError(f"--rollback is not supported by the '{vendor}' transport")
     if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
@@ -138,20 +152,23 @@ def _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts, host, user, p
         lambda e: isinstance(e, NotAppliedError),
         host, user, passwd, n, session_timeout, command_timeout,
         port=port, vendor_hint=vendor, dry_run=dry_run, commit_confirmed=commit_confirmed,
-        **_comment_kwargs(vendor, comment))
+        **_comment_kwargs(vendor, comment), **_expected_diff_kwargs(vendor, expected_diff))
 
 
 def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
                 payload, session_timeout, command_timeout, commit_confirmed,
-                port, dry_run=False, comment=None):
+                port, dry_run=False, comment=None, expected_diff=None):
     """Push configuration. An edit is not idempotent, so it is only retried when
     the driver says nothing reached the device (NotAppliedError); any other
-    failure, and above all a timeout around a commit, is reported, not repeated."""
+    failure, and above all a timeout around a commit, is reported, not repeated.
+    `expected_diff` is the diff a dry run showed: the driver commits only if
+    the candidate produces it again."""
     if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
         raise ValueError(
             f"--commit-confirmed is not supported by the '{vendor}' transport; "
             "the change would be applied with no rollback timer")
-    kwargs = {"port": port, "vendor_hint": vendor, **_comment_kwargs(vendor, comment)}
+    kwargs = {"port": port, "vendor_hint": vendor, **_comment_kwargs(vendor, comment),
+              **_expected_diff_kwargs(vendor, expected_diff)}
     if dry_run:
         if vendor not in DRY_RUN_EDIT_VENDORS:
             raise ValueError(
@@ -201,6 +218,7 @@ def _run_for_target_sync(
     rollback: Optional[int] = None,
     comment: Optional[str] = None,
     fmt: str = "text",
+    expected_diff: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Execute task on a single target device (internal sync implementation).
@@ -286,7 +304,8 @@ def _run_for_target_sync(
             else:
                 result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout,
-                                     command_timeout, commit_confirmed, t.port, dry_run, comment)
+                                     command_timeout, commit_confirmed, t.port, dry_run, comment,
+                                     expected_diff)
             output.append(result.rstrip())
 
         elif mode == "edit-dir":
@@ -295,7 +314,8 @@ def _run_for_target_sync(
             payload = read_set_file_for_device(config_dir, name)
             result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
-                                 command_timeout, commit_confirmed, t.port, dry_run, comment)
+                                 command_timeout, commit_confirmed, t.port, dry_run, comment,
+                                 expected_diff)
             output.append(result.rstrip())
 
         elif mode == "edit-broadcast":
@@ -304,7 +324,8 @@ def _run_for_target_sync(
             payload = _read_broadcast_file(broadcast_file)
             result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
-                                 command_timeout, commit_confirmed, t.port, dry_run, comment)
+                                 command_timeout, commit_confirmed, t.port, dry_run, comment,
+                                 expected_diff)
             output.append(result.rstrip())
 
         elif mode == "commit-status":
@@ -320,7 +341,8 @@ def _run_for_target_sync(
                 raise ValueError("No rollback number provided for --rollback.")
             result = _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts,
                                      host, user, passwd, rollback, session_timeout,
-                                     command_timeout, commit_confirmed, t.port, dry_run, comment)
+                                     command_timeout, commit_confirmed, t.port, dry_run, comment,
+                                     expected_diff)
             output.append(result.rstrip())
 
         elif mode == "show-batch":
@@ -402,9 +424,12 @@ def run_for_target(
     rollback: Optional[int] = None,
     comment: Optional[str] = None,
     fmt: str = "text",
+    expected_diff: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
-    Synchronous public API for library users.
+    Synchronous public API for library users. `expected_diff` is the diff a
+    dry run showed; an edit or rollback is then committed only if the device
+    produces it again.
     Returns: (device_name, success, output_text, duration_ms)
     """
     return _run_for_target_sync(
@@ -421,6 +446,7 @@ def run_for_target(
         rollback=rollback,
         comment=comment,
         fmt=fmt,
+        expected_diff=expected_diff,
     )
 
 
@@ -448,6 +474,7 @@ async def run_for_target_async(
     rollback: Optional[int] = None,
     comment: Optional[str] = None,
     fmt: str = "text",
+    expected_diff: Optional[str] = None,
 ) -> Tuple[str, bool, str, int]:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -468,6 +495,7 @@ async def run_for_target_async(
         rollback=rollback,
         comment=comment,
         fmt=fmt,
+        expected_diff=expected_diff,
     )
 
 

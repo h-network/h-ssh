@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import concurrent.futures
+import contextlib
 import difflib
 import getpass
 import json
@@ -22,7 +23,7 @@ from .core import (
 )
 from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS
 from .safety import SafetyGate
-from .audit import write_audit_entry
+from .audit import write_audit_entry, redact_values, secure_append
 from .vendors import VENDORS
 
 
@@ -130,15 +131,31 @@ def format_edit_result(out_text: str) -> str:
     return "\n".join("  " + ln if ln.strip() else "" for ln in body.splitlines())
 
 
+def confirm_program() -> str:
+    """How this run was started, for the confirm hint: the script as typed
+    (./h-app/h-ssh.py, or its full path), or the console script's name for
+    a pip install, where no checkout path exists."""
+    prog = sys.argv[0] if sys.argv else ""
+    if prog.endswith(".py"):
+        return prog
+    return os.path.basename(prog) or "h-ssh"
+
+
+def target_spec(t: Target) -> str:
+    """A target as the inline --target spec that parses back to it."""
+    spec = f"{t.name}:{t.host}:{t.vendor}"
+    return f"{spec}:{t.port}" if t.port is not None else spec
+
+
 def build_confirm_command(user, target_specs, devices: str, transport: str) -> str:
     """The command that confirms this run's commit-confirmed.
 
     Rebuilt from the run's own arguments, so it reaches the same devices as
-    the same user: the inline --target specs as typed, or else the inventory
-    file. --transport is kept only when it names a transport that can
-    confirm a commit.
+    the same user, started the same way: the inline --target specs as typed
+    (a job's edit targets, rebuilt), or else the inventory file. --transport
+    is kept only when it names a transport that can confirm a commit.
     """
-    cmd = ['./h-app/h-ssh.py -eC "commit"']
+    cmd = [shlex.quote(confirm_program()) + ' -eC "commit"']
     if user:
         cmd.append("--user " + shlex.quote(user))
     if target_specs:
@@ -148,6 +165,13 @@ def build_confirm_command(user, target_specs, devices: str, transport: str) -> s
     if transport in COMMIT_CONFIRMED_VENDORS:
         cmd.append("--transport " + transport)
     return " ".join(cmd)
+
+
+def preview_diff(out_text: str) -> str:
+    """The diff a --show-diff dry run printed, as the commit must find it
+    again: the text under DIFF:, or "" when the preview said NO CHANGES."""
+    _, found, diff = strip_result_header(out_text).partition("DIFF:\n")
+    return diff if found else ""
 
 
 def get_default_devices_path() -> str:
@@ -223,7 +247,8 @@ async def main() -> int:
     parser.add_argument("--comment", type=str, metavar="TEXT",
                         help="Log this comment with the commit; it shows in 'show system commit' (Junos only)")
     parser.add_argument("--show-diff", action="store_true",
-                        help="Edits: run a dry-run on every target, print the diffs, then ask once before committing")
+                        help="Edits: run a dry-run on every target, print the diffs, then ask once before "
+                             "committing; a diff that changed by then is not committed")
 
     # Behavior
     parser.add_argument("--retries", type=int, default=None,
@@ -263,7 +288,7 @@ async def main() -> int:
     parser.add_argument("--save-output", type=str,
                         help="Create dir and save per-device output files inside it")
     parser.add_argument("--log", type=str,
-                        help="Append per-device JSONL results to file")
+                        help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
     parser.add_argument("--audit-log", type=str,
                         default=os.environ.get("HSSH_AUDIT_LOG"),
                         help="Edit audit log path for JSONL audit trail (or set HSSH_AUDIT_LOG env var)")
@@ -431,6 +456,13 @@ async def main() -> int:
     if args.show_diff and (not has_edits or args.dry_run):
         print("ERROR: --show-diff goes with an edit that is not already a --dry-run.", file=sys.stderr)
         return 2
+    # --format shapes a show's reply. An edit, --rollback or --commit-status
+    # has none to shape, so it is refused rather than quietly ignored; a job
+    # keeps it for its show entries.
+    has_shows = any(e.mode == "show" for e in job_entries) if job_entries else mode in ("show", "show-batch")
+    if args.format != "text" and not has_shows:
+        print("ERROR: --format goes with a show (-sC, --batch, or a --job's show entries).", file=sys.stderr)
+        return 2
 
     # Validate vendor libraries for all targets
     for v in set(t.vendor for t in targets):
@@ -527,7 +559,26 @@ async def main() -> int:
             print(f"Batch: {len(batch_cmds)} commands from {args.batch}")
         print(f"Targets: {len(targets)}")
 
-    target_map = {t.name: t for t in targets}
+    # One unit of work per job entry, or per target. The entry (None outside
+    # job mode) travels with its result, so a job that names one device in
+    # two entries never has the second read as the first.
+    units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
+
+    def _audit_aborted(error):
+        """One audit line per unit for a run the operator did not confirm."""
+        if not args.audit_log:
+            return
+        for t, je in units:
+            write_audit_entry(
+                path=args.audit_log,
+                device=t.name,
+                host=t.host,
+                vendor=t.vendor,
+                mode=je.mode if je else mode,
+                payload="",
+                ok=False,
+                error=error,
+            )
 
     # Pre-flight check and confirmation for edit operations
     if has_edits and not args.dry_run:
@@ -539,34 +590,32 @@ async def main() -> int:
         )
 
         unreachable = []
-        for name, reachable, msg in reachability_results:
+        for t, (name, reachable, msg) in zip(targets, reachability_results):
             if not json_mode:
                 status = "[PASS]" if reachable else "[FAIL]"
-                host_display = target_map[name].host
-                print(f"  {status} {name:16s} ({host_display}) - {msg}")
+                print(f"  {status} {name:16s} ({t.host}) - {msg}")
             if not reachable:
-                unreachable.append(name)
+                unreachable.append(t)
 
         if unreachable:
             if args.audit_log:
-                for unreach_name in unreachable:
-                    ut = target_map.get(unreach_name)
-                    if ut:
-                        write_audit_entry(
-                            path=args.audit_log,
-                            device=ut.name,
-                            host=ut.host,
-                            vendor=ut.vendor,
-                            mode=mode if 'mode' in locals() else "preflight",
-                            payload="",
-                            ok=False,
-                            error="preflight reachability check failed (aborted)",
-                        )
+                for ut in unreachable:
+                    write_audit_entry(
+                        path=args.audit_log,
+                        device=ut.name,
+                        host=ut.host,
+                        vendor=ut.vendor,
+                        mode=mode if 'mode' in locals() else "preflight",
+                        payload="",
+                        ok=False,
+                        error="preflight reachability check failed (aborted)",
+                    )
+            names = [ut.name for ut in unreachable]
             if json_mode:
-                err = {"error": f"{len(unreachable)} device(s) unreachable", "unreachable": unreachable}
+                err = {"error": f"{len(unreachable)} device(s) unreachable", "unreachable": names}
                 print(json.dumps(err))
             else:
-                print(f"\nERROR: {len(unreachable)} device(s) unreachable: {', '.join(unreachable)}")
+                print(f"\nERROR: {len(unreachable)} device(s) unreachable: {', '.join(names)}")
                 print("Aborting to prevent partial deployment.")
             return 2
 
@@ -582,33 +631,11 @@ async def main() -> int:
             try:
                 confirm = input("\nProceed with changes? [y/N]: ").strip().lower()
                 if confirm not in ['y', 'yes']:
-                    if args.audit_log:
-                        for target in targets:
-                            write_audit_entry(
-                                path=args.audit_log,
-                                device=target.name,
-                                host=target.host,
-                                vendor=target.vendor,
-                                mode=mode,
-                                payload="",
-                                ok=False,
-                                error="aborted by user confirmation",
-                            )
+                    _audit_aborted("aborted by user confirmation")
                     print("Aborted by user.")
                     return 0
             except (KeyboardInterrupt, EOFError):
-                if args.audit_log:
-                    for target in targets:
-                        write_audit_entry(
-                            path=args.audit_log,
-                            device=target.name,
-                            host=target.host,
-                            vendor=target.vendor,
-                            mode=mode,
-                            payload="",
-                            ok=False,
-                            error="aborted by user interrupt",
-                        )
+                _audit_aborted("aborted by user interrupt")
                 print("\nAborted by user.")
                 return 0
         elif not json_mode:
@@ -637,8 +664,18 @@ async def main() -> int:
 
     sem = asyncio.Semaphore(workers)
 
-    async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None):
-        async with sem:
+    # A job may list one device in several entries. Those run one at a time
+    # per host, in file order, so a show after an edit sees the edit and the
+    # safety gate never meets the second entry as an "active connection".
+    host_locks = {}
+
+    def _host_lock(host):
+        if not job_entries:
+            return contextlib.nullcontext()
+        return host_locks.setdefault(host, asyncio.Lock())
+
+    async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None):
+        async with _host_lock(t.host), sem:
             dry_run = args.dry_run if dry_run is None else dry_run
             # For job mode: each target has its own mode and command
             actual_mode = mode_override or mode
@@ -688,47 +725,57 @@ async def main() -> int:
                 comment=args.comment,
                 structured_binding=binding,
                 fmt=args.format,
+                expected_diff=expected_diff,
             )
 
-    # --show-diff: every target's diff first, one question, then the real run.
+    async def _run_unit(i, dry_run=None, expected_diff=None):
+        """units[i] on its device, in its own mode and command for a job
+        entry; the index comes back with the result."""
+        t, je = units[i]
+        if je is not None:
+            result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff)
+        else:
+            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff)
+        return (i, *result)
+
+    # --show-diff: every target's diff first, one question, then the real
+    # run, which commits each diff only if the device produces it again.
+    expected = {}
     if args.show_diff and has_edits and not args.dry_run:
-        previews = [asyncio.create_task(_bounded_run(e.target, e.mode, e.command, dry_run=True)) for e in job_entries] \
-            if job_entries else [asyncio.create_task(_bounded_run(t, dry_run=True)) for t in targets]
+        if not args.yes and not sys.stdin.isatty():
+            print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
+            return 2
+        previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units))]
         preview_failed = []
         for coro in asyncio.as_completed(previews):
-            name, ok, out_text, _ = await coro
+            i, name, ok, out_text, _ = await coro
             print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---")
             print(out_text.rstrip())
-            if not ok:
+            if ok:
+                expected[i] = preview_diff(out_text)
+            else:
                 preview_failed.append(name)
         if preview_failed:
             print(f"\nERROR: dry-run failed on {', '.join(preview_failed)}; nothing committed.", file=sys.stderr)
             return 1
         if not args.yes:
-            if not sys.stdin.isatty():
-                print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
-                return 2
             try:
                 answer = input("\nCommit these changes on all devices? [y/N]: ").strip().lower()
             except (KeyboardInterrupt, EOFError):
-                answer = ""
+                _audit_aborted("aborted by user interrupt")
+                print("\nAborted by user.")
+                return 0
             if answer not in ("y", "yes"):
+                _audit_aborted("aborted by user confirmation")
                 print("Aborted by user.")
                 return 0
 
-    # Create tasks - either job mode or normal mode
-    if job_entries:
-        tasks = [
-            asyncio.create_task(_bounded_run(entry.target, entry.mode, entry.command))
-            for entry in job_entries
-        ]
-    else:
-        tasks = [asyncio.create_task(_bounded_run(t)) for t in targets]
+    tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
 
     interrupted = False
     for coro in asyncio.as_completed(tasks):
         try:
-            name, ok, out_text, duration_ms = await coro
+            i, name, ok, out_text, duration_ms = await coro
         except (asyncio.CancelledError, KeyboardInterrupt):
             # Ctrl-C: stop starting work, let what is in flight go, and report
             # the devices that did finish rather than losing the whole run.
@@ -737,11 +784,9 @@ async def main() -> int:
                 task.cancel()
             break
 
-        t = target_map[name]
+        t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
-        dev_mode = mode
-        if job_entries:
-            dev_mode = next((je.mode for je in job_entries if je.target.name == name), mode)
+        dev_mode = je.mode if je else mode
         entry = {
             "device": name,
             "host": t.host,
@@ -840,11 +885,7 @@ async def main() -> int:
             elif mode == "commit-status":
                 audit_payload = "show system commit"
             elif mode == "job":
-                if job_entries:
-                    for je in job_entries:
-                        if je.target.name == name:
-                            audit_payload = resolve_command(je.command, t.vendor) if je.command else ""
-                            break
+                audit_payload = resolve_command(je.command, t.vendor) if je.command else ""
             elif mode == "show":
                 audit_payload = resolve_command(show_cmd, t.vendor) if show_cmd else ""
             elif mode == "show-batch":
@@ -970,24 +1011,24 @@ async def main() -> int:
             else:
                 failures += 1
 
-    # Write structured JSONL log
+    # Write structured JSONL log. It holds the same payloads, replies and
+    # diffs as the audit log, so it gets the same redaction and file mode.
     if args.log:
         try:
-            log_path = Path(args.log)
-            log_path.parent.mkdir(parents=True, exist_ok=True)
             cmd = batch_cmds or show_cmd or edit_cmd or args.edit_broadcast or (args.edit_dir and f"dir:{args.edit_dir}") or "job"
             ts = datetime.now().isoformat()
-            with open(log_path, "a") as f:
-                for entry in json_results:
-                    log_entry = {
-                        "timestamp": ts,
-                        "user": user,
-                        "mode": mode,
-                        "command": cmd,
-                        "dry_run": args.dry_run,
-                        **entry,
-                    }
-                    f.write(json.dumps(log_entry) + "\n")
+            lines = []
+            for entry in json_results:
+                log_entry = {
+                    "timestamp": ts,
+                    "user": user,
+                    "mode": mode,
+                    "command": cmd,
+                    "dry_run": args.dry_run,
+                    **entry,
+                }
+                lines.append(json.dumps(redact_values(log_entry)) + "\n")
+            secure_append(args.log, "".join(lines))
         except Exception as e:
             print(f"WARNING: Could not write to log file: {e}", file=sys.stderr)
 
@@ -1078,13 +1119,19 @@ async def main() -> int:
             # stdout is device output only; the verdict belongs on stderr.
             print(f"Done. Failures: {failures}", file=sys.stderr)
 
-        if args.commit_confirmed and not args.dry_run and mode in ["edit-cmd", "edit-dir", "edit-broadcast", "rollback"]:
+        if args.commit_confirmed and not args.dry_run and has_edits:
+            # A job's timers are armed on its edit entries' targets, not on
+            # the inventory file or any --target given alongside it.
+            specs = args.target
+            if job_entries:
+                specs = list(dict.fromkeys(target_spec(je.target) for je in job_entries
+                                           if je.mode.startswith("edit")))
             print("")
             print("=" * 70)
             print(" " * 15 + "DON'T FORGET TO CONFIRM THE COMMIT!")
             print("=" * 70)
             print(f"Run this command to confirm within {args.commit_confirmed} minutes:")
-            print("  " + build_confirm_command(user, args.target, args.devices, args.transport))
+            print("  " + build_confirm_command(user, specs, args.devices, args.transport))
             print("\nOr the changes will automatically rollback!")
             print("=" * 70)
             print("")

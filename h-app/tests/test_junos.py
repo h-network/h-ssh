@@ -333,6 +333,21 @@ def test_rollback_keeps_the_edit_verdicts():
     assert "unlock" not in cfg().names
 
 
+# --- expected_diff: --show-diff commits only what it showed -----------------
+
+def test_expected_diff_must_match_or_nothing_is_committed():
+    out = edit(expected_diff="\n[edit]\n+  system host-name r1;\n")      # the same, whitespace aside
+    assert out.startswith("COMMIT OK")
+    FakeConfig.instances.clear()
+    with pytest.raises(RuntimeError, match="diff changed since preview; nothing committed"):
+        edit(expected_diff="[edit]\n+  system host-name OTHER;")
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "rollback", "unlock"]
+    FakeConfig.instances.clear()
+    with pytest.raises(RuntimeError, match="diff changed since preview"):
+        rollback(1, expected_diff="")                                    # previewed NO CHANGES, now a diff
+    assert "commit" not in cfg().names and cfg().names[-2:] == ["rollback", "unlock"]
+
+
 # --- comments, transactions, guarded commit ---------------------------------
 
 def commit_call():

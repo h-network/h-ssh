@@ -42,14 +42,15 @@ def no_sleep(monkeypatch):
 
 
 def run(monkeypatch, vendor_name, mod, mode="edit-cmd", edit_cmd="set a b",
-        dry_run=False, commit_confirmed=None, config_dir=None, broadcast_file=None, attempts=3):
+        dry_run=False, commit_confirmed=None, config_dir=None, broadcast_file=None, attempts=3,
+        expected_diff=None):
     monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode=mode,
         show_cmd=None, edit_cmd=edit_cmd, config_dir=config_dir, broadcast_file=broadcast_file,
         user="u", passwd="p", session_timeout=5, command_timeout=30,
         dry_run=dry_run, commit_confirmed=commit_confirmed, save_dir=None,
-        quiet=True, max_attempts=attempts)
+        quiet=True, max_attempts=attempts, expected_diff=expected_diff)
 
 
 def test_junos_dry_run_reaches_the_driver(monkeypatch):
@@ -79,6 +80,20 @@ def test_junos_commit_confirmed_is_passed_through(monkeypatch):
     v = FakeVendor()
     run(monkeypatch, "junos", v, commit_confirmed=5)
     assert v.edit_calls[0]["cc"] == 5
+
+
+def test_expected_diff_reaches_the_driver_and_is_refused_elsewhere(monkeypatch):
+    """--show-diff's commit carries the previewed diff; a transport that
+    cannot diff a candidate cannot check one, and says so before any I/O."""
+    v = FakeVendor()
+    run(monkeypatch, "junos", v, expected_diff="+ x")
+    assert v.edit_calls[0]["expected_diff"] == "+ x"
+    v = FakeVendor()
+    run(monkeypatch, "junos", v)
+    assert "expected_diff" not in v.edit_calls[0]
+    v = FakeVendor()
+    _, ok, out, _ = run(monkeypatch, "ssh", v, expected_diff="+ x")
+    assert not ok and "not supported" in out and v.edit_calls == []
 
 
 def test_edit_failure_is_not_retried(monkeypatch):
@@ -194,8 +209,8 @@ class RollbackVendor(FakeVendor):
         self.rollback_calls = []
 
     def rollback(self, host, user, passwd, n, st, ct, port=None, vendor_hint=None,
-                 dry_run=False, commit_confirmed=None):
-        self.rollback_calls.append({"n": n, "dry_run": dry_run, "cc": commit_confirmed})
+                 dry_run=False, commit_confirmed=None, **kw):
+        self.rollback_calls.append({"n": n, "dry_run": dry_run, "cc": commit_confirmed, **kw})
         if self.effects:
             eff = self.effects.pop(0)
             if isinstance(eff, Exception):
@@ -204,14 +219,15 @@ class RollbackVendor(FakeVendor):
         return f"ROLLBACK {n}: COMMIT OK"
 
 
-def run_rollback(monkeypatch, vendor_name, mod, n=1, dry_run=False, commit_confirmed=None, attempts=3):
+def run_rollback(monkeypatch, vendor_name, mod, n=1, dry_run=False, commit_confirmed=None, attempts=3,
+                 expected_diff=None):
     monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode="rollback",
         show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
         user="u", passwd="p", session_timeout=5, command_timeout=30,
         dry_run=dry_run, commit_confirmed=commit_confirmed, save_dir=None,
-        quiet=True, max_attempts=attempts, rollback=n)
+        quiet=True, max_attempts=attempts, rollback=n, expected_diff=expected_diff)
 
 
 def test_rollback_reaches_the_driver_with_number_and_flags(monkeypatch):
@@ -219,6 +235,9 @@ def test_rollback_reaches_the_driver_with_number_and_flags(monkeypatch):
     _, ok, out, _ = run_rollback(monkeypatch, "junos", v, n=3, dry_run=True, commit_confirmed=None)
     assert ok and "ROLLBACK 3" in out
     assert v.rollback_calls == [{"n": 3, "dry_run": True, "cc": None}]
+    v = RollbackVendor()
+    run_rollback(monkeypatch, "junos", v, n=3, expected_diff="- x")
+    assert v.rollback_calls == [{"n": 3, "dry_run": False, "cc": None, "expected_diff": "- x"}]
 
 
 def test_rollback_is_refused_where_the_transport_cannot(monkeypatch):
