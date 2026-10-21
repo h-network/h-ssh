@@ -167,8 +167,8 @@ def _describe_failure(host: str, proc) -> str:
     if "Connection refused" in detail:
         return "Connection refused by %s." % host
     if "Host key verification failed" in detail:
-        return ("Host key verification failed for %s. Set HSSH_HOST_KEY_POLICY=no "
-                "to skip the check, or fix ~/.ssh/known_hosts." % host)
+        return ("Host key verification failed for %s: the key is not the one pinned. "
+                "If the device was re-keyed, remove its line from ~/.ssh/known_hosts." % host)
     if "Could not resolve" in detail or "Name or service not known" in detail:
         return "Cannot resolve %s." % host
     if first:

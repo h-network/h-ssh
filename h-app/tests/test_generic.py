@@ -370,3 +370,17 @@ def test_a_device_that_never_stops_sending_hits_the_deadline(monkeypatch):
     with pytest.raises(TimeoutError, match="still sending"):
         generic.show("10.0.0.1", "u", "p", "show version", 5, 1)
     assert _time.monotonic() - t0 < 3
+
+def test_pinning_takes_a_file_lock_so_two_processes_keep_each_others_pins(offline, home, monkeypatch):
+    """The pin file was rewritten whole under a per-process lock (#47)."""
+    import fcntl
+    locks = []
+    real = fcntl.flock
+
+    def recording(fd, op):
+        locks.append(op)
+        return real(fd, op)
+    monkeypatch.setattr(generic.fcntl, "flock", recording)
+    generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert fcntl.LOCK_EX in locks and fcntl.LOCK_UN in locks
+    assert pin_file(home).read_text().startswith("10.0.0.1 ")

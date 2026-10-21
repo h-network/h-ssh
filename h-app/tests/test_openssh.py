@@ -50,8 +50,9 @@ def test_show_maps_auth_failure(fake_ssh, monkeypatch):
 def test_show_maps_host_key_failure(fake_ssh, monkeypatch):
     monkeypatch.setenv("FAKE_SSH_RC", "255")
     monkeypatch.setenv("FAKE_SSH_STDERR", "Host key verification failed.")
-    with pytest.raises(RuntimeError, match="HSSH_HOST_KEY_POLICY"):
+    with pytest.raises(RuntimeError, match="not the one pinned") as exc:
         openssh.show("10.0.1.1", "admin", None, "show version", 5, 10)
+    assert "HSSH_HOST_KEY_POLICY=no" not in str(exc.value)      # no coaching to skip the check (#47)
 
 
 def test_show_reports_unmapped_stderr_verbatim(fake_ssh, monkeypatch):

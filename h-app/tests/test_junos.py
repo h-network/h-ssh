@@ -571,3 +571,21 @@ def test_a_valid_timer_still_arms_the_commit():
     out = edit(commit_confirmed=1)
     assert out.startswith("COMMIT CONFIRMED (1 minutes)")
     assert [c for c in cfg().calls if c[0] == "commit"][0][2]["confirm"] == 1
+
+# --- #47: how the NETCONF session is opened --------------------------------------
+
+def test_open_asks_for_huge_replies_and_no_host_key_check_unless_told(monkeypatch):
+    monkeypatch.delenv("HSSH_NETCONF_HOSTKEY", raising=False)
+    junos.show("10.0.0.1", "u", None, "show version", 5, 30)
+    params = FakeDevice.instances[0].params
+    assert params["huge_tree"] is True and params["hostkey_verify"] is False
+    assert "look_for_keys" not in params and "allow_agent" not in params     # key auth: keys and agent stay
+    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "yes")
+    junos.show("10.0.0.2", "u", None, "show version", 5, 30)
+    assert FakeDevice.instances[1].params["hostkey_verify"] is True
+
+
+def test_a_password_is_the_credential_no_key_is_tried_first():
+    junos.show("10.0.0.1", "u", "s3cret", "show version", 5, 30)
+    params = FakeDevice.instances[0].params
+    assert params["passwd"] == "s3cret" and params["look_for_keys"] is False and params["allow_agent"] is False
