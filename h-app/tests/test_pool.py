@@ -375,8 +375,8 @@ def test_reap_closes_idle_sessions_only(pooled):
     show()
     show(host="10.0.0.2")
     pooled.idle_timeout = 60
-    assert pooled.reap(now=time.monotonic()) == 0
-    assert pooled.reap(now=time.monotonic() + 61) == 2
+    assert pooled.reap(now=time.time()) == 0
+    assert pooled.reap(now=time.time() + 61) == 2
     assert all(d.closed for d in devices())
     assert pooled.live() == 0
     assert pooled.stats["reaped"] == 2
@@ -387,11 +387,11 @@ def test_reap_closes_idle_sessions_only(pooled):
 def test_reap_skips_a_busy_session(pooled):
     show()
     pooled.idle_timeout = 0
-    entry = pooled._entry(("10.0.0.1", 830, "u"))
+    entry = pooled._get_or_create_entry(("10.0.0.1", 830, "u"))
     held, release = threading.Event(), threading.Event()
 
     def borrower():                      # another thread holds the session
-        with entry.lock:
+        with entry["lock"]:
             held.set()
             release.wait(2)
 
@@ -409,16 +409,19 @@ def test_same_thread_may_reuse_its_borrowed_session():
     rides the same session instead of deadlocking."""
     pool.enable()
     key = ("10.0.0.1", 830, "u")
-    with pool.POOL.lease(key, opener=lambda: FakeDevice(), closer=junos._close) as lease:
+    with pool.POOL.get_connection(key, opener=lambda: FakeDevice(), closer=junos._close) as lease:
         show()
         assert len(devices()) == 1 and devices()[0] is lease.dev
 
 
-def test_reaper_thread_is_replaced_not_duplicated(pooled):
-    first = pooled._reaper
+def test_cleanup_thread_is_replaced_not_duplicated(pooled, monkeypatch):
+    monkeypatch.setattr(pool, "CLEANUP_INTERVAL", 0.05)
     pool.disable()
     pool.enable()
-    assert pooled._reaper is not first
+    first = pooled._cleanup_thread
+    pool.disable()
+    pool.enable()
+    assert pooled._cleanup_thread is not first
     first.join(timeout=2)
     assert not first.is_alive()
 
@@ -435,22 +438,22 @@ def test_close_all_then_reopen(pooled):
 
 def test_close_all_during_a_borrow_closes_it_on_return(pooled):
     show()
-    entry = pooled._entry(("10.0.0.1", 830, "u"))
+    entry = pooled._get_or_create_entry(("10.0.0.1", 830, "u"))
     released = threading.Event()
 
     def hold():
-        with pooled.lease(("10.0.0.1", 830, "u"), opener=None, closer=junos._close):
+        with pooled.get_connection(("10.0.0.1", 830, "u"), opener=None, closer=junos._close):
             released.wait(2)
 
     t = threading.Thread(target=hold)
     t.start()
     time.sleep(0.05)
-    pool.close_all(wait=0.05)       # busy: gives up waiting
+    pool.close_all()                # shutdown: busy entries are skipped, not waited on
     assert not devices()[0].closed  # still borrowed
     released.set()
     t.join()
     assert devices()[0].closed      # closed on return, not re-pooled
-    assert entry.dev is None
+    assert entry["device"] is None
 
 
 def test_disable_closes_and_returns_to_per_call(pooled):
@@ -469,3 +472,43 @@ def test_open_failure_leaves_the_slot_empty(pooled):
     FakeDevice.open_error = None
     show()
     assert pooled.stats["opens"] == 1
+
+
+# --- what came over from junos-mcp-server's ConnectionPool -------------------------
+
+def test_half_opened_device_is_closed_not_leaked():
+    class Half(FakeDevice):
+        def open(self):
+            self.opened = True
+            raise junos.ConnectError(FakeHost(), "auth failed after the transport came up")
+
+    junos.JunosDevice = Half
+    with pytest.raises(NotAppliedError):
+        show()
+    assert devices()[0].opened and devices()[0].closed
+
+
+def test_idle_timeout_from_the_environment(monkeypatch):
+    monkeypatch.setenv("HSSH_POOL_IDLE_TIMEOUT", "42")
+    assert pool.ConnectionPool().idle_timeout == 42
+    monkeypatch.setenv("HSSH_POOL_IDLE_TIMEOUT", "soon")
+    assert pool.ConnectionPool().idle_timeout == pool.DEFAULT_IDLE_TIMEOUT   # warns, keeps the default
+    assert pool.ConnectionPool(idle_timeout=7).idle_timeout == 7
+
+
+def test_close_all_waits_when_not_shutting_down(pooled):
+    show()
+    entry = pooled._get_or_create_entry(("10.0.0.1", 830, "u"))
+    released = threading.Event()
+
+    def hold():
+        with pooled.get_connection(("10.0.0.1", 830, "u"), opener=None, closer=junos._close):
+            released.wait(2)
+
+    t = threading.Thread(target=hold)
+    t.start()
+    time.sleep(0.05)
+    threading.Timer(0.1, released.set).start()
+    pool.close_all(shutdown=False)  # waits for the borrower, then closes
+    t.join()
+    assert devices()[0].closed and entry["device"] is None

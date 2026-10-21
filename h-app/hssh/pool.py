@@ -1,32 +1,41 @@
 """Session pool — keep a device session open between calls.
 
-Off by default. The CLI never enables it, so a one-shot run still opens and
-closes one session per operation, exactly as before. Library code that makes
-many calls against the same router enables it once:
+This is the thread-safe ConnectionPool that h-network contributed to
+Juniper/junos-mcp-server (PR #27), carried over into h-ssh: one entry per
+router with its own lock, a global lock for the table, idle connections
+closed by a cleanup thread after a configurable timeout (default 300 s,
+HSSH_POOL_IDLE_TIMEOUT), close_all() that never waits on an in-flight
+operation at shutdown, and a half-opened device closed rather than leaked.
+
+What a library needs on top, and only that:
+- off by default — the CLI never enables it, so a one-shot run still opens
+  and closes one session per operation; library code calls pool.enable()
+- the borrower gets a Lease and may call lease.discard() when the driver
+  knows the session is in doubt (ambiguous commit, failed unlock, ...)
+- an optional liveness check before a reused session is handed out
+- a re-entrant per-router lock, so a thread holding an open transaction
+  can keep using the same session through the pool
+- entries are keyed by whatever the driver passes (host, port, user), the
+  driver supplies the opener/closer, so the pool knows no vendor
 
     from hssh import pool
     pool.enable()                 # sessions idle for 300 s are closed
     ... vendors.junos.show(...)   # every call now reuses the router's session
     pool.close_all()              # or leave it to atexit
-
-One session per (host, port, user). A per-key lock means a session is never
-used by two threads at once — same-router calls queue, different routers run
-in parallel. The driver decides when a session is no good (`lease.discard()`),
-a daemon thread reaps sessions nobody has used for `idle_timeout` seconds,
-and `close_all` runs at interpreter exit.
-
-Modelled on the pool in Juniper/junos-mcp-server (PR #27), cut down to what a
-script needs.
 """
 
 import atexit
+import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
 from typing import Callable, Dict, Hashable, Optional
 
+log = logging.getLogger("hssh.pool")
+
 DEFAULT_IDLE_TIMEOUT = 300
-REAP_INTERVAL = 60
+CLEANUP_INTERVAL = 60
 
 
 class Lease:
@@ -44,182 +53,293 @@ class Lease:
         self.discarded = True
 
 
-class _Entry:
-    __slots__ = ("lock", "dev", "closer", "last_used", "generation")
+class ConnectionPool:
+    """Thread-safe session pool for network devices.
 
-    def __init__(self):
-        # Re-entrant: a thread holding an open Transaction on this session may
-        # still show()/rpc() through the pool; other threads wait as before.
-        self.lock = threading.RLock()
-        self.dev = None
-        self.closer: Optional[Callable] = None
-        self.last_used = 0.0
-        self.generation = 0
+    Reuses sessions across calls instead of opening a new connection for
+    every command. Idle connections are closed after a configurable timeout
+    (default 300s, configurable via the HSSH_POOL_IDLE_TIMEOUT env var).
+    """
 
-
-class SessionPool:
-    def __init__(self, idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
-                 reap_interval: float = REAP_INTERVAL):
-        self.idle_timeout = idle_timeout
-        self.reap_interval = reap_interval
+    def __init__(self, idle_timeout: Optional[float] = None):
+        self._connections: Dict[Hashable, dict] = {}
+        self._pool_lock = threading.Lock()
+        if idle_timeout is None:
+            self._idle_timeout = DEFAULT_IDLE_TIMEOUT
+            env_val = os.getenv("HSSH_POOL_IDLE_TIMEOUT")
+            if env_val is not None:
+                try:
+                    self._idle_timeout = int(env_val)
+                except ValueError:
+                    log.warning(
+                        "Invalid HSSH_POOL_IDLE_TIMEOUT environment variable "
+                        "value: %s. Using default idle timeout.",
+                        env_val,
+                    )
+        else:
+            self._idle_timeout = idle_timeout
         self._enabled = False
-        self._entries: Dict[Hashable, _Entry] = {}
-        self._lock = threading.Lock()  # guards _entries, stats and the reaper
-        self._reaper: Optional[threading.Thread] = None
-        self._stop: Optional[threading.Event] = None
+        self._cleanup_thread: Optional[threading.Thread] = None
+        # The running cleanup thread holds the token it was started with; a
+        # later enable() hands out a new one, so a thread still finishing a
+        # pass when disable() -> enable() happens exits instead of living on
+        # beside its successor.
+        self._cleanup_token = None
         # Bumped by close_all(): a session borrowed before the bump is closed
         # on return instead of going back into the pool.
         self._generation = 0
         self.stats = {"opens": 0, "reuses": 0, "discards": 0, "reaped": 0}
         atexit.register(self.close_all)
 
+    # -- lifecycle -------------------------------------------------------------
+
     @property
     def enabled(self) -> bool:
         return self._enabled
 
+    @property
+    def idle_timeout(self) -> float:
+        return self._idle_timeout
+
+    @idle_timeout.setter
+    def idle_timeout(self, value: float) -> None:
+        self._idle_timeout = value
+
     def enable(self, idle_timeout: Optional[float] = None) -> None:
         """Start reusing sessions. Idempotent."""
-        with self._lock:
+        with self._pool_lock:
             if idle_timeout is not None:
-                self.idle_timeout = idle_timeout
+                self._idle_timeout = idle_timeout
             if self._enabled:
                 return
             self._enabled = True
-            # Each reaper owns its stop event, so a reaper still finishing a
-            # pass when disable() -> enable() happens cannot pick up the new
-            # one's flag and live on beside it.
-            stop = threading.Event()
-            self._stop = stop
-            self._reaper = threading.Thread(
-                target=self._reap_loop, args=(stop,), name="hssh-pool-reaper", daemon=True)
-            self._reaper.start()
+            token = object()
+            self._cleanup_token = token
+            self._cleanup_thread = threading.Thread(
+                target=self._cleanup_loop, args=(token,), daemon=True, name="hssh-pool-cleanup"
+            )
+            self._cleanup_thread.start()
+            log.info("Connection pool enabled (idle_timeout=%ds)", self._idle_timeout)
 
     def disable(self) -> None:
         """Close every session and go back to one session per call."""
-        with self._lock:
+        with self._pool_lock:
             self._enabled = False
-            if self._stop is not None:
-                self._stop.set()
-        self.close_all()
+            self._cleanup_token = None
+        self.close_all(shutdown=True)
+
+    # -- borrowing -------------------------------------------------------------
 
     @contextmanager
-    def lease(self, key: Hashable, opener: Callable, closer: Callable,
-              alive: Optional[Callable] = None):
-        """Borrow the session for `key`, opening it with `opener()` if needed.
+    def get_connection(self, key: Hashable, opener: Callable, closer: Callable,
+                       timeout: Optional[float] = None, alive: Optional[Callable] = None):
+        """Get a pooled device session. Creates or reuses as needed.
 
-        Holds the key's lock for the duration, so same-key borrowers queue.
-        `alive(dev, idle_seconds)` is asked before a session is reused; False
-        or an exception means it is closed and a new one opened. Whatever
-        `opener()` raises propagates untouched and leaves the slot empty.
-        With the pool disabled this is plain open -> yield -> close.
+        Args:
+            key: What identifies the router to this pool (the junos driver
+                uses (host, port, user))
+            opener: Opens and returns a session; whatever it raises propagates
+                untouched and leaves the slot empty
+            closer: Closes a session this pool is done with
+            timeout: Command timeout to set on the device for this borrow
+            alive: alive(dev, idle_seconds) asked before a session is reused;
+                False or an exception means it is closed and a new one opened
+
+        Yields:
+            A Lease: .dev is the open session, .reused says whether it came
+            from the pool, .discard() closes it on return instead of keeping it
+
+        Note:
+            The per-router lock serializes same-router work: other threads
+            wanting this router wait, the thread holding it may re-enter.
         """
         if not self._enabled:
             dev = opener()
             try:
+                if timeout is not None:
+                    dev.timeout = timeout
                 yield Lease(dev, reused=False)
             finally:
                 closer(dev)
             return
 
-        entry = self._entry(key)
-        with entry.lock:
-            dev = entry.dev
-            reused = dev is not None
-            if reused and alive is not None:
-                try:
-                    ok = alive(dev, time.monotonic() - entry.last_used)
-                except Exception:
-                    ok = False
-                if not ok:
-                    self._drop(entry, "discards")
-                    dev, reused = None, False
-            if dev is None:
-                dev = opener()
-                entry.dev, entry.closer = dev, closer
-                entry.generation = self._generation
+        entry = self._get_or_create_entry(key)
+        entry["lock"].acquire()
+        lease = None
+        try:
+            device = entry["device"]
+            reused = device is not None
+            if device is not None and not self._usable(device, alive, time.time() - entry["last_used"]):
+                self._drop(entry, "discards")
+                device, reused = None, False
+            if device is None:
+                device = opener()
+                entry["device"], entry["closer"] = device, closer
+                entry["generation"] = self._generation
                 self._count("opens")
+                log.info("Pool: opened new connection to %s", key)
             else:
                 self._count("reuses")
-            lease = Lease(dev, reused)
-            try:
-                yield lease
-            finally:
-                entry.last_used = time.monotonic()
-                if (lease.discarded or not self._enabled
-                        or entry.generation != self._generation):
-                    self._drop(entry, "discards")
+                log.debug("Pool: reusing connection to %s", key)
 
-    def close_all(self, wait: float = 5.0) -> None:
-        """Close every pooled session. Waits up to `wait` seconds for a busy
-        one; a session still busy after that is closed when its borrower
-        returns it. Safe to call twice."""
-        with self._lock:
-            self._generation += 1
-            entries = list(self._entries.values())
-        for entry in entries:
-            if not entry.lock.acquire(timeout=wait):
-                continue
-            try:
+            if timeout is not None:
+                device.timeout = timeout
+            lease = Lease(device, reused)
+            yield lease
+        except Exception:
+            # Invalidate the pooled connection if the transport dropped; the
+            # driver signals the other cases (an RPC that timed out, a commit
+            # whose outcome is unknown) through lease.discard().
+            dev = entry["device"]
+            if dev is not None and not getattr(dev, "connected", True):
                 self._drop(entry, "discards")
-            finally:
-                entry.lock.release()
+            raise
+        finally:
+            if entry["device"] is not None and lease is not None and (
+                lease.discarded or not self._enabled or entry["generation"] != self._generation
+            ):
+                self._drop(entry, "discards")
+            # Refresh last_used on every borrow — success OR failure. Otherwise a
+            # connection whose operation raised while still connected keeps
+            # last_used at 0.0, and the idle-cleanup loop (which requires
+            # last_used > 0) would never reap it.
+            entry["last_used"] = time.time()
+            entry["lock"].release()
 
-    def reap(self, now: Optional[float] = None) -> int:
-        """Close sessions idle for longer than idle_timeout. Never waits on a
-        busy one. Returns how many were closed."""
-        now = time.monotonic() if now is None else now
-        with self._lock:
-            entries = list(self._entries.values())
-        closed = 0
-        for entry in entries:
-            if not entry.lock.acquire(blocking=False):
-                continue
-            try:
-                if entry.dev is not None and now - entry.last_used >= self.idle_timeout:
-                    self._drop(entry, "reaped")
-                    closed += 1
-            finally:
-                entry.lock.release()
-        return closed
+    # kept for callers written against the first h-ssh pool
+    lease = get_connection
 
-    def live(self) -> int:
-        """How many sessions are open right now."""
-        with self._lock:
-            return sum(1 for e in self._entries.values() if e.dev is not None)
+    def _get_or_create_entry(self, key: Hashable) -> dict:
+        with self._pool_lock:
+            if key not in self._connections:
+                self._connections[key] = {
+                    "device": None,
+                    "closer": None,
+                    "lock": threading.RLock(),
+                    "last_used": 0.0,
+                    "generation": 0,
+                }
+            return self._connections[key]
 
-    # -- internals --------------------------------------------------------
+    @staticmethod
+    def _usable(device, alive: Optional[Callable], idle: float) -> bool:
+        if not getattr(device, "connected", True):
+            return False
+        if alive is None:
+            return True
+        try:
+            return bool(alive(device, idle))
+        except Exception:
+            return False
 
-    def _entry(self, key: Hashable) -> _Entry:
-        with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                entry = self._entries[key] = _Entry()
-            return entry
-
-    def _drop(self, entry: _Entry, counter: str) -> None:
-        """Close and forget the entry's session. Caller holds entry.lock."""
-        dev, entry.dev = entry.dev, None
-        if dev is None:
+    def _drop(self, entry: dict, counter: str) -> None:
+        """Close and forget the entry's session. Caller holds entry["lock"]."""
+        device, entry["device"] = entry["device"], None
+        if device is None:
             return
         self._count(counter)
         try:
-            entry.closer(dev)
-        except Exception:
-            pass
+            entry["closer"](device)
+        except Exception as e:
+            log.debug("Pool: error closing connection: %s", e)
 
     def _count(self, name: str) -> None:
-        with self._lock:
+        with self._pool_lock:
             self.stats[name] += 1
 
-    def _reap_loop(self, stop: threading.Event) -> None:
-        while not stop.wait(self.reap_interval):
+    def live(self) -> int:
+        """How many sessions are open right now."""
+        with self._pool_lock:
+            return sum(1 for e in self._connections.values() if e["device"] is not None)
+
+    # -- idle cleanup -----------------------------------------------------------
+
+    def _cleanup_loop(self, token) -> None:
+        while self._cleanup_token is token:
+            time.sleep(CLEANUP_INTERVAL)
+            if self._cleanup_token is not token:
+                break
             try:
-                self.reap()
-            except Exception:
-                pass
+                self._cleanup_idle()
+            except Exception as e:
+                log.debug("Pool: cleanup pass failed: %s", e)
+
+    def _cleanup_idle(self, now: Optional[float] = None) -> int:
+        """Close sessions idle for longer than idle_timeout; returns how many."""
+        now = time.time() if now is None else now
+        # Collect idle candidates under the global lock, then close OUTSIDE it.
+        # Holding _pool_lock across a blocking device.close() (a black-holed
+        # device can stall on TCP/SSH timeout) would freeze every router's
+        # borrow, since get_connection() needs the same lock. Mirrors close_all.
+        candidates = []
+        with self._pool_lock:
+            for key, entry in self._connections.items():
+                if (
+                    entry["device"] is not None
+                    and entry["last_used"] > 0
+                    and (now - entry["last_used"]) >= self._idle_timeout
+                ):
+                    candidates.append((key, entry))
+        closed = 0
+        for key, entry in candidates:
+            # Non-blocking: skip entries currently in use this cycle.
+            if not entry["lock"].acquire(blocking=False):
+                continue
+            try:
+                # Re-check under the lock: the entry may have been used or closed
+                # between collection and acquiring the lock.
+                if (
+                    entry["device"] is not None
+                    and entry["last_used"] > 0
+                    and (now - entry["last_used"]) >= self._idle_timeout
+                ):
+                    idle = now - entry["last_used"]
+                    self._drop(entry, "reaped")
+                    closed += 1
+                    log.info("Pool: closed idle connection to %s (idle %.0fs)", key, idle)
+            finally:
+                entry["lock"].release()
+        return closed
+
+    reap = _cleanup_idle
+
+    def close_all(self, shutdown: bool = True) -> None:
+        """Close all pooled connections.
+
+        Args:
+            shutdown: If True (default), don't wait on an in-flight operation —
+                skip busy entries; they are closed when their borrower returns
+                them. Use at exit, so a SIGTERM during a long command doesn't
+                hang teardown. If False, wait for in-flight operations so a
+                live RPC is not severed — use when a run is over and the next
+                one must start from fresh sessions.
+        """
+        # Snapshot entries under the global lock, then close each under its own
+        # per-router lock (outside the global lock, so a slow close can't block
+        # unrelated routers). Do NOT clear _connections: clearing would detach an
+        # entry that an in-flight get_connection() borrow already holds, leaving
+        # the connection it is about to open untracked and never reaped. Leaving
+        # device=None entries behind is cheap and keeps every connection
+        # reapable.
+        with self._pool_lock:
+            self._generation += 1
+            entries = list(self._connections.items())
+        for key, entry in entries:
+            if shutdown:
+                if not entry["lock"].acquire(blocking=False):
+                    continue
+            else:
+                entry["lock"].acquire()
+            try:
+                self._drop(entry, "discards")
+            finally:
+                entry["lock"].release()
+        log.info("Connection pool: all connections closed")
 
 
-POOL = SessionPool()
+SessionPool = ConnectionPool   # the name the first h-ssh pool had
+
+POOL = ConnectionPool()
 
 enable = POOL.enable
 disable = POOL.disable
