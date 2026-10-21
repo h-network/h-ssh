@@ -310,3 +310,63 @@ def test_a_failed_connect_closes_the_client(monkeypatch):
     with pytest.raises(paramiko.AuthenticationException):
         generic.show("10.0.0.1", "u", "wrong", "show version", 5, 10)
     assert closes == [1]
+
+# --- #45: every wait in exec is bounded ----------------------------------------
+
+import threading
+import time as _time
+
+
+class StuckChannel(FakeChannel):
+    """A device that sends EOF and then neither a status nor a close."""
+    def __init__(self, rc, status_set):
+        super().__init__(rc)
+        self.status_event = threading.Event()
+        if status_set:
+            self.status_event.set()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _stuck_client(status_set):
+    class Client(ExitClient):
+        def exec_command(self, cmd, timeout=None):
+            out = FakeStream(b"partial output", 0)
+            out.channel = StuckChannel(0, status_set)
+            return FakeStream(b"", 0), out, FakeStream(b"", 0)
+    return Client
+
+
+def test_eof_without_an_exit_status_ends_in_a_timeout_not_a_pinned_worker(monkeypatch):
+    """generic.show(command_timeout=3) was still blocked after 20 s in
+    recv_exit_status; Ctrl-C could not end the run."""
+    monkeypatch.setattr(generic, "paramiko", FakeParamiko(_stuck_client(status_set=False)))
+    t0 = _time.monotonic()
+    with pytest.raises(TimeoutError, match="no exit status within 1s"):
+        generic.show("10.0.0.1", "u", "p", "show version", 5, 1)
+    assert _time.monotonic() - t0 < 3
+
+
+def test_a_status_that_does_arrive_is_read_as_before(monkeypatch):
+    monkeypatch.setattr(generic, "paramiko", FakeParamiko(_stuck_client(status_set=True)))
+    assert "partial output" in generic.show("10.0.0.1", "u", "p", "show version", 5, 1)
+
+
+def test_a_device_that_never_stops_sending_hits_the_deadline(monkeypatch):
+    class Endless(io.RawIOBase):
+        channel = FakeChannel(0)
+
+        def read(self, n=-1):
+            _time.sleep(0.05)
+            return b"x" * 1024
+
+    class Client(ExitClient):
+        def exec_command(self, cmd, timeout=None):
+            return FakeStream(b"", 0), Endless(), FakeStream(b"", 0)
+    monkeypatch.setattr(generic, "paramiko", FakeParamiko(Client))
+    t0 = _time.monotonic()
+    with pytest.raises(TimeoutError, match="still sending"):
+        generic.show("10.0.0.1", "u", "p", "show version", 5, 1)
+    assert _time.monotonic() - t0 < 3
