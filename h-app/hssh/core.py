@@ -157,6 +157,21 @@ def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
                          "an IPv6 host goes in brackets)")
 
 
+CONFIRM_MINUTES = (1, 65535)   # what Junos accepts for `commit confirmed`
+
+
+def check_confirm_minutes(minutes) -> None:
+    """A rollback timer that cannot be armed is a ValueError, never a plain
+    commit: 0 and negative values once committed permanently behind a banner
+    promising a rollback."""
+    if minutes is None:
+        return
+    lo, hi = CONFIRM_MINUTES
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or not lo <= minutes <= hi:
+        raise ValueError(f"commit_confirmed must be {lo}..{hi} minutes, got {minutes!r}; "
+                         "nothing was sent to the device")
+
+
 @dataclass
 class JobEntry:
     """A single entry from a job file."""

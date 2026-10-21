@@ -581,3 +581,29 @@ def test_junos_refused_commit_keeps_its_words_when_the_rollback_drops():
         _edit(srv)
     assert "check-out failed" in str(exc.value)
     assert _received(srv)[-2:] == ["commit", "rollback 0"]
+
+
+# --- #40: the library edit() on an IOS flavour cannot fake a dry run ------------
+
+@pytest.mark.parametrize("kw", [{"dry_run": True}, {"commit_confirmed": 5}, {"expected_diff": "+ x"}])
+def test_ios_flavour_refuses_dry_run_timer_and_diff_check_before_connecting(monkeypatch, kw):
+    """dry_run=True once applied the config and returned '(config applied)'."""
+    from hssh.vendors import telnet
+
+    def never(*a, **k):
+        raise AssertionError("connected although the request could not be honoured")
+    monkeypatch.setattr(telnet, "_connect_and_login", never)
+    with pytest.raises(ValueError, match="not supported by telnet-ios; nothing was sent"):
+        telnet.edit("127.0.0.1", "admin", "admin", "interface Et1\n", 5, 5, port=2323, vendor_hint="telnet-ios", **kw)
+
+
+@pytest.mark.parametrize("minutes", [0, -3])
+def test_junos_flavour_refuses_a_timer_it_cannot_arm(monkeypatch, minutes):
+    from hssh.vendors import telnet
+
+    def never(*a, **k):
+        raise AssertionError("connected although the timer could not be armed")
+    monkeypatch.setattr(telnet, "_connect_and_login", never)
+    with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
+        telnet.edit("127.0.0.1", "lab", "secret", "set system host-name x\n", 5, 5, port=2323,
+                    vendor_hint="telnet-junos", commit_confirmed=minutes)

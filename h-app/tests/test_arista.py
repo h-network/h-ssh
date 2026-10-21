@@ -221,3 +221,10 @@ def test_no_changes_aborts_rather_than_commits(session):
     assert arista.edit("192.0.2.1", "admin", "pw", "hostname SW1\n", 5, 10) == "NO CHANGES"
     assert "commit" not in flat(eapi)
     assert eapi.requests[-1][2:] == ["abort"]
+
+
+def test_edit_refuses_a_rollback_timer_instead_of_dropping_it(recorder):
+    """commit_confirmed= was accepted and the session committed with no timer (#40)."""
+    with pytest.raises(ValueError, match="not supported by the 'arista' transport; nothing was sent"):
+        arista.edit("10.0.0.1", "u", "p", "hostname NEW\n", 5, 10, commit_confirmed=5)
+    assert recorder == {}

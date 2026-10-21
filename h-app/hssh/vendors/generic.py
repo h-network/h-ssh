@@ -160,7 +160,11 @@ def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
 def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
          command_timeout: int, commit_confirmed: int = None, port: int = None,
          vendor_hint: str = None) -> str:
-    """Execute configuration commands via SSH."""
+    """Execute configuration commands via SSH. A rollback timer has no
+    equivalent over an exec channel: asking for one is refused, not dropped."""
+    if commit_confirmed is not None:
+        raise ValueError("commit_confirmed is not supported by the 'ssh' transport; "
+                         "nothing was sent to the device")
     commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
     return _run_commands(host, user, passwd, commands, session_timeout, command_timeout, port=port)
 

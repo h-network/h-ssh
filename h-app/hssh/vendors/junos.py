@@ -16,7 +16,7 @@ import re
 from contextlib import contextmanager
 from typing import List, Optional
 
-from ..core import JUNOS_SET_PREFIX_VERBS
+from ..core import JUNOS_SET_PREFIX_VERBS, check_confirm_minutes
 from ..errors import AmbiguousCommitError, NotAppliedError
 from ..pool import POOL
 
@@ -333,6 +333,7 @@ class Transaction:
         hit a timeout or a dropped transport), nothing is sent: the lock and
         candidate went with the session, and that is a NotAppliedError."""
         self._require_open()
+        check_confirm_minutes(confirmed)   # before anything else: the candidate stays open
         if self._lease.doomed or not getattr(self.dev, "connected", True):
             self._lease.discard()
             self._finish(rollback=False, unlock=False)
@@ -341,7 +342,7 @@ class Transaction:
             self.abort()
             return f"{self.label}NO CHANGES"
         kwargs = {"timeout": self._timeout}
-        if confirmed and confirmed > 0:
+        if confirmed is not None:
             kwargs["confirm"] = confirmed
         if comment:
             kwargs["comment"] = comment
@@ -359,7 +360,7 @@ class Transaction:
                 f"commit outcome unknown ({type(e).__name__}: {e}); "
                 "check the device before retrying") from e
         self._finish(rollback=False, unlock=True)
-        head = f"COMMIT CONFIRMED ({confirmed} minutes)" if confirmed and confirmed > 0 else "COMMIT OK"
+        head = f"COMMIT CONFIRMED ({confirmed} minutes)" if confirmed is not None else "COMMIT OK"
         return f"{self.label}{head}\n\nDIFF:\n{self.diff}"
 
     def abort(self) -> None:
@@ -504,6 +505,7 @@ def edit(host: str, user: str, passwd: str, payload: str,
     an earlier dry_run showed, is what the candidate must still produce or
     nothing is committed."""
     _require()
+    check_confirm_minutes(commit_confirmed)
     fmt = _config_format(payload)
     body = _strip_comments(payload) if fmt == "set" else payload
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
@@ -523,6 +525,7 @@ def rollback(host: str, user: str, passwd: str, n: int,
     it is not the `expected_diff` a dry run showed. "NO CHANGES" when
     rollback n equals the running configuration."""
     _require()
+    check_confirm_minutes(commit_confirmed)
     n = _rollback_number(n)
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
                         stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ",
@@ -825,6 +828,7 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     rolled back" with the reason and the history under "status" (for "not
     rolled back" the check's own failure is under "check_error").
     """
+    check_confirm_minutes(minutes)
     out = edit(host, user, passwd, payload, session_timeout, command_timeout,
                commit_confirmed=minutes, port=port, comment=comment)
     if out.startswith("NO CHANGES"):
