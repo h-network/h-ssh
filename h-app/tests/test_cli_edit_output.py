@@ -505,3 +505,18 @@ def test_the_run_log_is_written_as_each_device_finishes(monkeypatch, capsys, tmp
     assert rc == 0
     lines = [json.loads(l) for l in log.read_text().splitlines()]
     assert [l["device"] for l in lines] == ["R1", "R2"] and all(l["ok"] for l in lines)
+
+# --- #47: device output cannot drive the operator's terminal -------------------
+
+def test_terminal_safe_strips_what_a_terminal_would_act_on():
+    from hssh.cli import terminal_safe
+    raw = "line one\x1b[2J\x1b[H\x1b]0;owned\x07\ttab\nline two\x9b31m\x07\x7f\n"
+    assert terminal_safe(raw) == "line one\ttab\nline two\n"
+    assert terminal_safe("") == "" and terminal_safe("plain") == "plain"
+
+
+def test_output_shown_on_a_terminal_has_its_escape_sequences_removed(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    driver = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "Hostname: R1\x1b[2J\x1b]0;owned\x07\nModel: vmx\n")
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-sC", "show version", "--raw"], driver=driver)
+    assert rc == 0 and "\x1b" not in out and "Hostname: R1" in out and "Model: vmx" in out

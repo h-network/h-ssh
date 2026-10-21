@@ -13,6 +13,7 @@ discarded, never handed to the next caller.
 """
 
 import hashlib
+import os
 import re
 import threading
 from contextlib import contextmanager
@@ -82,9 +83,21 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         "port": port or DEFAULT_PORT,
         "gather_facts": False,
         "conn_open_timeout": session_timeout,
+        # A reply with a text node over 10 MB (a big configuration, a log
+        # file) is rejected by lxml unless the parser is told to expect it.
+        "huge_tree": True,
+        # Off by default, deliberately: the lab and the management network
+        # are trusted paths. HSSH_NETCONF_HOSTKEY=yes verifies the router's
+        # key against ~/.ssh/known_hosts (an unknown or changed key refuses
+        # the session), for a jump host on a path that is not.
+        "hostkey_verify": os.environ.get("HSSH_NETCONF_HOSTKEY", "no").strip().lower() in ("yes", "1", "true"),
     }
     if passwd:
         params["passwd"] = passwd
+        # The password is the credential: no ~/.ssh/id_* is tried first (and
+        # never with the device password as its passphrase), no agent asked.
+        params["look_for_keys"] = False
+        params["allow_agent"] = False
     dev = JunosDevice(**params)
     try:
         dev.open()

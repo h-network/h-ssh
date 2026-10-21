@@ -8,6 +8,7 @@ import difflib
 import getpass
 import json
 import os
+import re
 import shlex
 import socket
 import sys
@@ -45,6 +46,24 @@ VENDOR_INSTALL = {
 
 
 _RESULT_HEADER_KEYS = ("DEVICE:", "HOST:", "MODE:", "VENDOR:")
+
+
+# What a terminal would act on rather than show: C0 controls other than tab
+# and newline, DEL, C1 controls, and every ESC sequence (CSI, OSC, the rest).
+_TERMINAL_CONTROLS = re.compile(
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"   # CSI (7- or 8-bit) … final byte
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC … BEL or ST
+    r"|\x1b[@-Z\\-_]"                    # two-byte ESC sequences
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
+
+
+def terminal_safe(text: str) -> str:
+    """Device output as it may be shown on the operator's terminal: a device
+    (or a description field) cannot repaint, hide or retitle anything.
+    Files keep the raw bytes; this is for the screen only."""
+    if not text:
+        return text
+    return _TERMINAL_CONTROLS.sub("", text)
 
 
 def strip_result_header(out_text: str, command: str = None) -> str:
@@ -855,6 +874,8 @@ async def main() -> int:
         preview_failed = []
         for coro in asyncio.as_completed(previews):
             i, name, ok, out_text, _ = await coro
+            if sys.stdout.isatty():
+                out_text = terminal_safe(out_text)
             # stdout stays the JSON array in --json mode; the previews go to stderr
             print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=sys.stderr if json_mode else sys.stdout)
             print(out_text.rstrip(), file=sys.stderr if json_mode else sys.stdout)
@@ -886,6 +907,7 @@ async def main() -> int:
                 return 0
 
     tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
+    screen = sys.stdout.isatty()     # control sequences are stripped for a terminal, kept for a pipe
 
     interrupted = False
     log_cmd = (batch_cmds or show_cmd or edit_cmd or args.edit_broadcast
@@ -914,6 +936,8 @@ async def main() -> int:
                     yield task.result()
 
     async for i, name, ok, out_text, duration_ms in _completed():
+        if screen:
+            out_text = terminal_safe(out_text)
         t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
         dev_mode = je.mode if je else mode

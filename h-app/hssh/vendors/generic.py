@@ -11,6 +11,7 @@ A command's exit status is checked the way the openssh transport checks the
 ssh binary's: a non-zero status is a failure, not output.
 """
 
+import fcntl
 import socket
 import time
 import os
@@ -48,11 +49,20 @@ class _PinPolicy:
         self.path = path
 
     def missing_host_key(self, client, hostname, key):
+        # The thread lock serialises this process's workers; the file lock
+        # serialises processes, so two h-ssh runs pinning at once cannot
+        # rewrite the file over each other's pins.
         with _PIN_LOCK:
-            keys = client.get_host_keys()
-            keys.load(self.path)  # merge what other workers pinned meanwhile
-            keys.add(hostname, key.get_name(), key)
-            keys.save(self.path)
+            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                keys = client.get_host_keys()
+                keys.load(self.path)  # merge what other workers pinned meanwhile
+                keys.add(hostname, key.get_name(), key)
+                keys.save(self.path)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
 
 class _RejectPolicy:
