@@ -362,5 +362,42 @@ def test_safety_file_zero_byte():
         Path(f"{tmp}.lock").unlink(missing_ok=True)
 
 
+def test_file_lock_passes_a_body_error_through():
+    """An OSError raised inside the locked body is the caller's error, not a
+    lock failure: it must come back as itself, not as contextlib's RuntimeError
+    for a generator that yielded twice."""
+    with tempfile.TemporaryDirectory() as d:
+        gate = SafetyGate(safety_file=os.path.join(d, "safety.json"))
+        with pytest.raises(PermissionError):
+            with gate._file_lock():
+                raise PermissionError(13, "simulated EACCES inside the locked body")
+
+
+def test_set_cooldown_survives_a_stat_failure(monkeypatch):
+    """set_cooldown runs from the runner's except handler. A safety file that
+    cannot be stat'ed must log and keep the cooldown, not abort the whole run."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "safety.json")
+        gate = SafetyGate(safety_file=tmp, cooldown_seconds=120)
+        real_stat = Path.stat
+
+        def stat(self, *args, **kwargs):
+            if str(self) == tmp:
+                raise PermissionError(13, "simulated EACCES", tmp)
+            return real_stat(self, *args, **kwargs)
+
+        # The file has to exist and be non-empty first, or exists() short-
+        # circuits the stat (on 3.13+ it is os.path.exists and never calls
+        # Path.stat at all) and the patched stat is never reached.
+        gate.set_cooldown("10.0.1.2")
+        monkeypatch.setattr(Path, "stat", stat)
+        gate.set_cooldown("10.0.1.1")
+        monkeypatch.undo()
+
+        assert "10.0.1.1" in gate._cooldowns
+        with open(tmp) as f:
+            assert "10.0.1.1" in json.load(f)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

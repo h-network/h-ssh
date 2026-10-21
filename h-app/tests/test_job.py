@@ -44,6 +44,19 @@ def test_parse_inline_target_declared_vendor_beats_the_default():
         assert parse_inline_target(spec, default_vendor="junos").vendor == "telnet"
 
 
+def test_parse_inline_target_ipv6_in_brackets():
+    """An IPv6 literal has colons of its own, so it goes in brackets."""
+    assert parse_inline_target("R1:[2001:db8::1]:830:junos") == Target("R1", "2001:db8::1", "junos", 830)
+    assert parse_inline_target("R1:[2001:db8::1]:junos:830") == Target("R1", "2001:db8::1", "junos", 830)
+    assert parse_inline_target("R1:[2001:db8::1]:junos") == Target("R1", "2001:db8::1", "junos")
+    assert parse_inline_target("R1:[::1]") == Target("R1", "::1")
+
+
+def test_parse_inline_target_bare_ipv6_says_to_bracket_it():
+    with pytest.raises(ValueError, match="brackets"):
+        parse_inline_target("R1:2001:db8::1:junos")
+
+
 def test_load_jobs_show(tmp_path):
     job_file = tmp_path / "test.json"
     job_file.write_text(json.dumps([

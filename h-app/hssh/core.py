@@ -2,6 +2,7 @@
 
 import csv
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,14 +111,26 @@ def load_config(path: str = None) -> Dict[str, str]:
     return config
 
 
+# NAME:[v6]... — an IPv6 literal has colons of its own, so it goes in brackets.
+_BRACKETED_HOST = re.compile(r"^([^:]+):\[([^\]]+)\](?::(.*))?$")
+
+
 def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
     """Parse inline target string: NAME:HOST[:VENDOR][:PORT] or NAME:HOST[:PORT][:VENDOR].
 
     Handles port-style targets (e.g., SW1:10.0.0.1:5000:telnet-ios)
     and vendor-style targets (e.g., R1:10.0.0.1:junos). A spec that names
-    no vendor gets default_vendor (the CLI passes --transport).
+    no vendor gets default_vendor (the CLI passes --transport). An IPv6
+    host goes in brackets, since its own colons would read as separators
+    (e.g., R1:[2001:db8::1]:830:junos); the brackets are stripped.
     """
-    parts = spec.split(":")
+    m = _BRACKETED_HOST.match(spec)
+    if m:
+        parts = [m.group(1), m.group(2)]
+        if m.group(3) is not None:
+            parts += m.group(3).split(":")
+    else:
+        parts = spec.split(":")
     if len(parts) < 2:
         raise ValueError(f"Invalid target: {spec!r} (expected name:host[:vendor][:port])")
 
@@ -135,7 +148,8 @@ def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
             return Target(name=name, host=host, port=int(parts[2]), vendor=parts[3].lower())
         return Target(name=name, host=host, vendor=parts[2].lower(), port=int(parts[3]))
     else:
-        raise ValueError(f"Invalid target: {spec!r}")
+        raise ValueError(f"Invalid target: {spec!r} (expected name:host[:vendor][:port]; "
+                         "an IPv6 host goes in brackets)")
 
 
 @dataclass

@@ -161,6 +161,16 @@ def test_dash_eD_and_dash_eB_load_the_same_lines(monkeypatch, tmp_path):
     assert junos._strip_comments(by_file.edit_calls[0]["payload"]) + "\n" == by_dir.edit_calls[0]["payload"]
 
 
+def test_runner_leaves_name_resolution_to_the_transport(monkeypatch):
+    """The runner once called gethostbyname before every attempt: result
+    unused, errors swallowed, one blocking resolver round-trip per device."""
+    import socket
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda host: calls.append(host))
+    _, ok, _, _ = run(monkeypatch, "junos", FakeVendor())
+    assert ok and calls == []
+
+
 class FakeGate:
     def __init__(self):
         self.events = []

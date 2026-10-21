@@ -142,9 +142,11 @@ def _base_opts(session_timeout: int, port: Optional[int],
 def _exec(host: str, user: str, askpass, cmd: str,
           session_timeout: int, command_timeout: int, port: Optional[int],
           control_path: Optional[str]):
+    # "--" ends the options: a host that starts with "-" is still the host,
+    # which matters for a library caller that passes no user.
     argv = (["ssh", "-n"]
             + _base_opts(session_timeout, port, control_path, askpass.passwd is not None)
-            + ["%s@%s" % (user, host) if user else host, cmd])
+            + ["--", "%s@%s" % (user, host) if user else host, cmd])
     timeout = float(session_timeout + command_timeout)
     return subprocess.run(argv, capture_output=True, text=True,
                           timeout=timeout, env=askpass.env,
@@ -221,7 +223,7 @@ def _close_master(host: str, user: str, control_path: Optional[str],
             subprocess.run(
                 ["ssh", "-O", "exit", "-o", "ControlPath=%s" % control_path]
                 + (["-p", str(port)] if port else [])
-                + ["%s@%s" % (user, host) if user else host],
+                + ["--", "%s@%s" % (user, host) if user else host],
                 capture_output=True, text=True, timeout=float(session_timeout))
     except (OSError, subprocess.SubprocessError):
         pass
@@ -287,5 +289,5 @@ def ssh_command_line(host: str, user: str, cmd: str, session_timeout: int = 8,
                      port: int = None) -> str:
     """The exact command line this module would run, for logs and bug reports."""
     argv = (["ssh", "-n"] + _base_opts(session_timeout, port, None, False)
-            + ["%s@%s" % (user, host) if user else host, cmd])
+            + ["--", "%s@%s" % (user, host) if user else host, cmd])
     return " ".join(shlex.quote(part) for part in argv)

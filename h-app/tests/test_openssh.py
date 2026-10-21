@@ -130,6 +130,32 @@ def test_ssh_never_inherits_local_stdin(fake_ssh):
     assert seen["stdin"] == subprocess.DEVNULL
 
 
+def test_host_follows_an_end_of_options_marker(fake_ssh, tmp_path):
+    """A host like -oProxyCommand=... must reach ssh as the host, never as an
+    option. The CLI always sends user@host; a library caller may send no user."""
+    import subprocess
+    seen = []
+    real = subprocess.run
+
+    def spy(argv, **kwargs):
+        seen.append(argv)
+        return real(argv, **kwargs)
+
+    mux = tmp_path / "mux"
+    mux.mkdir()
+    (mux / "cm").write_text("")
+    subprocess.run = spy
+    try:
+        openssh.show("-oProxyCommand=x", None, None, "uptime", 5, 10)
+        openssh._close_master("-oProxyCommand=x", None, str(mux / "cm"), str(mux), 5, None)
+    finally:
+        subprocess.run = real
+    assert seen[0][-3:] == ["--", "-oProxyCommand=x", "uptime"]
+    assert seen[1][-2:] == ["--", "-oProxyCommand=x"]
+    line = openssh.ssh_command_line("-oProxyCommand=x", None, "uptime")
+    assert line.endswith(" -- -oProxyCommand=x uptime")
+
+
 def test_registered_as_a_vendor():
     from hssh.cli import VENDOR_MODULES, VENDOR_INSTALL
     assert VENDORS["openssh"] is openssh

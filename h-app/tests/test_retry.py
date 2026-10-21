@@ -182,6 +182,27 @@ def test_pyez_session_failures_are_retried(message):
     assert not is_permanent_failure(RuntimeError(message))
 
 
+@pytest.mark.parametrize("message", [
+    "Invalid SSH banner",
+    "Invalid packet blocking",
+    "[Errno 22] Invalid argument",
+])
+def test_transport_level_invalid_is_retried(message):
+    """paramiko and the OS say 'Invalid ...' about a mangled transport, which
+    is nothing like a device rejecting the command: the next attempt may succeed."""
+    assert not is_permanent_failure(Exception(message))
+
+
+@pytest.mark.parametrize("message", [
+    "Error [1002]: CLI command 1 of 1 'show foo' failed: invalid command "
+    "[Invalid input (at token 1: 'foo')]",
+    "% Invalid input detected at '^' marker.",
+])
+def test_rejected_command_is_permanent(message):
+    """A device that rejected the command will reject it again."""
+    assert is_permanent_failure(Exception(message))
+
+
 def test_dead_router_edit_is_attempted_once(monkeypatch):
     """NotAppliedError is the one failure an edit may retry, but a connect
     timeout inside it is still a dead router: one timeout, not three plus backoff."""

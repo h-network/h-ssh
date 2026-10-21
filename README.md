@@ -96,17 +96,20 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 ./h-app/h-ssh.py --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
 ```
 
-Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`. A CSV inventory accepts `name,ip`, `name,ip,vendor`, headers or none, and `#` comments.
+Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`; an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor`, headers or none, and `#` comments.
 
 **A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` or `arista` on the target to get NETCONF or eAPI, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
 ### Authentication
 
 ```bash
-./h-app/h-ssh.py --user admin -sC bgp                     # SSH agent / key, no password
-./h-app/h-ssh.py --user admin --password secret -sC bgp   # explicit
-export HSSH_USER=admin HSSH_PASSWORD=secret         # or from the environment
+./h-app/h-ssh.py --user admin -sC bgp                     # SSH agent / key, or type it at the prompt
+export HSSH_USER=admin HSSH_PASSWORD=secret               # or from the environment, nothing to type
 ```
+
+`--password secret` works too, but a command line is visible to every user on the host (`ps`,
+`/proc/<pid>/cmdline`) and ends up in the shell history. On a shared jump host, use the environment
+or the prompt.
 
 ## Modes
 
@@ -204,8 +207,8 @@ system `ssh` binary; a vendor on the target itself always wins.
 device costs you; on a LAN a reachable device connects in well under a second.
 
 **Passwords are never read from this file.** A config file on a shared jump host is the wrong place
-for a secret; use `HSSH_PASSWORD`, `--password`, the prompt, or keys. `--config PATH` points at a
-different file.
+for a secret; use `HSSH_PASSWORD`, the prompt, or keys (`--password` works, but shows in `ps`).
+`--config PATH` points at a different file.
 
 ## Output
 

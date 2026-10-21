@@ -225,7 +225,7 @@ async def main() -> int:
     parser.add_argument("--config", type=str,
                         help="Config file with defaults (default: ~/.h-ssh/config)")
     parser.add_argument("--password", type=str,
-                        help="Password (or set HSSH_PASSWORD env var)")
+                        help="Password (visible in the process list; prefer HSSH_PASSWORD or the prompt)")
 
     # Modes
     parser.add_argument("-sC", "--show-command", type=str,
@@ -277,7 +277,8 @@ async def main() -> int:
 
     # Inline targets
     parser.add_argument("--target", type=str, action="append",
-                        help="Inline target as name:host:vendor:port (repeatable, vendor defaults to --transport)")
+                        help="Inline target as name:host:vendor:port, an IPv6 host in brackets "
+                             "(repeatable, vendor defaults to --transport)")
 
     # Output
     parser.add_argument("--json", action="store_true",
