@@ -12,10 +12,37 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Patterns for redaction of sensitive credentials/tokens
+# Patterns for redaction of sensitive credentials/tokens. Order matters: the
+# Junos "## SECRET-DATA" rule goes first, it knows the value is the last token
+# whatever the keyword.
 _REDACT_PATTERNS = [
-    (re.compile(r'((?:encrypted-password|secret|password|authentication-key|md5-key)\s+(?:\d+\s+)?)(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+    # Junos marks every secret line in text/display-set output: the last token
+    # before the marker is the secret, whatever stanza it sits in.
+    (re.compile(r'^([^\n]*?)("[^"\n]*"|[^\s\n;]+)(;?\s*## SECRET-DATA)', re.MULTILINE),
+     r'\1[REDACTED]\3'),
+    # keyword [type words] value — Junos set/text, EOS and IOS alike:
+    # `plain-text-password-value hunter2`, `authentication md5 1 key X`,
+    # `ntp authentication-key 1 value "$9$.."`, `secret sha512 $6$..`,
+    # `tacacs-server key 7 X`, `key-string 7 X`, `privacy-key "$9$.."`.
+    (re.compile(r'((?:encrypted-password|plain-text-password(?:-value)?|password(?:-value)?|secret|'
+                r'authentication-key|message-digest-key|md5-key|privacy-key|key-string)\s+'
+                r'(?:(?:\d+|md5|sha512|sha256|sha1|sha|value|type\s+\S+|hmac-\S+)\s+)*)'
+                r'(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
      r'\1[REDACTED]'),
+    # A bare `key` only where a protocol puts a secret after it, so a
+    # description with the word "key" in it is left alone: `md5 1 key X`
+    # (OSPF/IS-IS/BGP), `key 7 X` (IOS type 7), `tacacs-server … key X`,
+    # `radius-server … key X`, `crypto isakmp key X`.
+    (re.compile(r'((?:(?<![\w-])(?:md5|sha\d*|hmac-\S+)\s+\d+\s+key\s+|(?<![\w-])key\s+\d+\s+|\bisakmp\s+key\s+|'
+                r'\b(?:tacacs-server|radius-server)\b[^\n]*?\bkey\s+(?:\d+\s+)?))'
+                r'(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+     r'\1[REDACTED]'),
+    # XML, as --format xml returns it: <encrypted-password>$6$..</encrypted-password>
+    (re.compile(r'(<(?:[\w.-]+:)?(?:encrypted-password|plain-text-password-value|secret|password|passwd|'
+                r'authentication-key|md5-key|key|key-string|privacy-key|pre-shared-key|ascii-text|'
+                r'hexadecimal|hex-key|key-hex|token|api-key)>)[^<]*(?=</)', re.IGNORECASE),
+     r'\1[REDACTED]'),
+    (re.compile(r'(<community>\s*<name>)[^<]*(?=</name>)', re.IGNORECASE), r'\1[REDACTED]'),
     (re.compile(r'((?:password|secret|token|api[_-]?key|passwd)\s*[:=]\s*)(?:("[^"]*"|\'[^\']*\'|[^\s,;]+))', re.IGNORECASE),
      r'\1[REDACTED]'),
     (re.compile(r'(\bcommunity\s+)(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
@@ -39,9 +66,10 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
 # json) puts "encrypted-password" in the key and the hash in the value, out
 # of reach of the text patterns above.
 _SECRET_KEYS = frozenset({
-    "encrypted-password", "secret", "password", "passwd", "authentication-key",
-    "md5-key", "community", "pre-shared-key", "ascii-text", "hexadecimal",
-    "hex-key", "key-hex", "token", "api-key", "api_key",
+    "encrypted-password", "plain-text-password-value", "secret", "password", "passwd",
+    "authentication-key", "md5-key", "key", "key-string", "privacy-key", "community",
+    "pre-shared-key", "ascii-text", "hexadecimal", "hex-key", "key-hex", "token",
+    "api-key", "api_key",
 })
 
 
@@ -91,6 +119,30 @@ def secure_append(path: str, text: str) -> None:
                 data = data[written:]
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def secure_write(path: str, text: str) -> None:
+    """Replace a 0600 regular file of our own with `text` (--save-output):
+    the same open rules as secure_append, truncating instead of appending."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(out), flags, 0o600)
+    except OSError as e:
+        raise OSError(f"{path}: not a plain file that can be written ({e.strerror})") from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path}: not a regular file; refusing to write there")
+        os.fchmod(fd, 0o600)
+        data = text.encode("utf-8")
+        while data:
+            written = os.write(fd, data)
+            if written <= 0:
+                raise OSError(f"{path}: short write, {len(data)} bytes not written")
+            data = data[written:]
     finally:
         os.close(fd)
 

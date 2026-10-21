@@ -92,6 +92,10 @@ class _AskPass:
     @property
     def env(self) -> dict:
         env = os.environ.copy()
+        # The password reaches ssh through the askpass channel only; the
+        # variable the operator set is not for ssh, the ControlMaster daemon
+        # (which outlives the run) or any ProxyCommand helper to inherit.
+        env.pop("HSSH_PASSWORD", None)
         if not self.passwd:
             return env
         env["SSH_ASKPASS"] = self.path

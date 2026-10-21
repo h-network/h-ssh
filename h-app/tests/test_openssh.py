@@ -288,3 +288,15 @@ def test_command_line_is_reproducible():
     assert line.startswith("ssh -n ")
     assert "admin@10.0.1.1" in line
     assert "'show version | match Junos'" in line
+
+
+def test_the_child_environment_does_not_carry_hssh_password(monkeypatch):
+    """HSSH_PASSWORD was inherited by ssh, the ControlMaster daemon and any
+    ProxyCommand helper (#42); the askpass channel is the only carrier."""
+    from hssh.vendors.openssh import _AskPass
+    monkeypatch.setenv("HSSH_PASSWORD", "Pa55w0rd-FROM-ENV")
+    with _AskPass("Pa55w0rd-FROM-ENV") as ap:
+        env = ap.env
+        assert "HSSH_PASSWORD" not in env and env["HSSH_ASKPASS_SECRET"] == "Pa55w0rd-FROM-ENV"
+    with _AskPass(None) as ap:
+        assert "HSSH_PASSWORD" not in ap.env

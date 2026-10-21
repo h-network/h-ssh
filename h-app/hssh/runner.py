@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .errors import NotAppliedError
+from .audit import secure_write
 from .core import Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
 from . import vendors
@@ -371,8 +372,7 @@ def _run_for_target_sync(
             result_json = json.dumps(cmd_results)
             duration_ms = int((time.time() - start_time) * 1000)
             if save_dir:
-                out_path = path_inside(save_dir, f"{name}.json")
-                out_path.write_text(result_json, encoding="utf-8")
+                secure_write(str(path_inside(save_dir, f"{name}.json")), result_json)
             if safety_gate is not None:
                 safety_gate.release_device(host)
             return name, all_ok, result_json, duration_ms
@@ -384,8 +384,7 @@ def _run_for_target_sync(
         duration_ms = int((time.time() - start_time) * 1000)
 
         if save_dir:
-            out_path = path_inside(save_dir, f"{name}.output")
-            out_path.write_text(final_out, encoding="utf-8")
+            secure_write(str(path_inside(save_dir, f"{name}.output")), final_out)
 
         if safety_gate is not None:
             safety_gate.release_device(host)
@@ -404,8 +403,7 @@ def _run_for_target_sync(
         final_out = "\n".join(output).strip() + "\n"
         duration_ms = int((time.time() - start_time) * 1000)
         if save_dir:
-            out_path = path_inside(save_dir, f"{name}.output")
-            out_path.write_text(final_out, encoding="utf-8")
+            secure_write(str(path_inside(save_dir, f"{name}.output")), final_out)
         return name, False, final_out, duration_ms
 
 

@@ -607,3 +607,20 @@ def test_junos_flavour_refuses_a_timer_it_cannot_arm(monkeypatch, minutes):
     with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
         telnet.edit("127.0.0.1", "lab", "secret", "set system host-name x\n", 5, 5, port=2323,
                     vendor_hint="telnet-junos", commit_confirmed=minutes)
+
+def test_a_console_that_echoes_the_password_does_not_put_it_in_the_error():
+    """The timeout message quoted the last line seen; an echoing console
+    line after 'Password:' made that the operator's password (#42)."""
+    from hssh.errors import NotAppliedError
+    from hssh.vendors.telnet import show
+
+    def echoing_console(srv):
+        srv.send("Password: ")
+        typed = srv.readline()
+        srv.send(typed + "\r\n")          # echoed back, then silence
+        srv.readline()
+    srv = ScriptedTelnetServer(echoing_console, echo=False)
+    with pytest.raises(NotAppliedError) as exc:
+        show("127.0.0.1", "lab", "Pa55w0rd-FROM-PROMPT", "show version",
+             session_timeout=1, command_timeout=1, port=srv.port, vendor_hint="telnet-junos")
+    assert "Pa55w0rd-FROM-PROMPT" not in str(exc.value) and "***" in str(exc.value)

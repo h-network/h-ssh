@@ -263,3 +263,85 @@ def test_secure_append_finishes_a_short_write(tmp_path, monkeypatch):
     path = tmp_path / "run.jsonl"
     secure_append(str(path), "0123456789abcdef\n")
     assert path.read_text() == "0123456789abcdef\n" and len(calls) > 1
+
+# --- #42: the forms that leaked -------------------------------------------------
+
+LEAKED_FORMS = [
+    'set system login user bob authentication plain-text-password-value hunter2',
+    'set protocols ospf area 0.0.0.0 interface ge-0/0/0 authentication md5 1 key mykey',
+    'set system ntp authentication-key 1 value "$9$NTPKEY"',
+    '    authentication-key 1 type md5 value "$9$NTPKEY"; ## SECRET-DATA',
+    '    md5 1 key "$9$OSPFKEY"; ## SECRET-DATA',
+    '+   authentication-key "$9$DIFFKEY"; ## SECRET-DATA',
+    'set snmp v3 usm local-engine user u privacy-aes128 privacy-key "$9$V3PRIV"',
+    'username admin secret sha512 $6$EOSHASH',
+    'enable password sha512 $6$ENHASH',
+    'tacacs-server key 7 0F1A2B',
+    'tacacs-server host 1.1.1.1 key MYKEY',
+    'radius-server host 1.1.1.1 key 7 ABCD',
+    'ntp authentication-key 1 md5 7 DEAD',
+    'ip ospf message-digest-key 1 md5 7 BEEF',
+    'key-string 7 CAFE',
+    'crypto isakmp key MYPSK address 1.2.3.4',
+]
+SECRETS = ["hunter2", "mykey", "$9$NTPKEY", "$9$OSPFKEY", "$9$DIFFKEY", "$9$V3PRIV", "$6$EOSHASH", "$6$ENHASH",
+           "0F1A2B", "MYKEY", "ABCD", "DEAD", "BEEF", "CAFE", "MYPSK"]
+
+
+@pytest.mark.parametrize("line", LEAKED_FORMS)
+def test_every_form_that_leaked_is_redacted(line):
+    out = redact_secrets(line)
+    assert "[REDACTED]" in out and not any(s in out for s in SECRETS), out
+
+
+def test_the_type_words_stay_and_only_the_value_goes():
+    assert redact_secrets('ntp authentication-key 1 md5 7 DEAD') == 'ntp authentication-key 1 md5 7 [REDACTED]'
+    assert redact_secrets('ip ospf message-digest-key 1 md5 7 BEEF') == 'ip ospf message-digest-key 1 md5 7 [REDACTED]'
+    assert redact_secrets('    md5 1 key "$9$X"; ## SECRET-DATA') == '    md5 1 key [REDACTED]; ## SECRET-DATA'
+
+
+def test_descriptions_with_the_word_key_are_left_alone():
+    line = 'set interfaces ge-0/0/0 description "key customer uplink"'
+    assert redact_secrets(line) == line
+    assert redact_secrets("set system host-name R1") == "set system host-name R1"
+
+
+def test_format_xml_replies_are_redacted_element_by_element():
+    xml = ("<rpc-reply><configuration><system><root-authentication><encrypted-password>$6$ROOTHASH"
+           "</encrypted-password></root-authentication><tacplus-server><secret>$9$TACSEC</secret></tacplus-server>"
+           "<login><user><authentication><plain-text-password-value>hunter2</plain-text-password-value>"
+           "</authentication></user></login></system><snmp><community><name>public</name><authorization>read-only"
+           "</authorization></community></snmp><protocols><ospf><md5><name>1</name><key>$9$K</key></md5></ospf>"
+           "</protocols></configuration></rpc-reply>")
+    out = redact_secrets(xml)
+    assert out.count("[REDACTED]") == 5
+    for secret in ("$6$ROOTHASH", "$9$TACSEC", "hunter2", "public", "$9$K"):
+        assert secret not in out
+    assert "<authorization>read-only</authorization>" in out and "<name>1</name>" in out
+
+
+def test_json_replies_lose_the_keys_that_carry_secrets():
+    data = {"configuration": {"protocols": {"ospf": {"md5": [{"name": 1, "key": "$9$X"}]}},
+                              "snmp": {"v3": {"privacy-key": "$9$Y"}},
+                              "login": {"plain-text-password-value": "hunter2"},
+                              "interfaces": {"description": "key customer uplink"}}}
+    out = redact_values(data)
+    assert out["configuration"]["protocols"]["ospf"]["md5"][0] == {"name": 1, "key": "[REDACTED]"}
+    assert out["configuration"]["snmp"]["v3"]["privacy-key"] == "[REDACTED]"
+    assert out["configuration"]["login"]["plain-text-password-value"] == "[REDACTED]"
+    assert out["configuration"]["interfaces"]["description"] == "key customer uplink"
+
+
+def test_secure_write_is_0600_and_refuses_a_symlink(tmp_path):
+    from hssh.audit import secure_write
+    os.umask(0o022)
+    path = tmp_path / "R1.output"
+    secure_write(str(path), "show configuration\n")
+    assert oct(path.stat().st_mode & 0o777) == "0o600" and path.read_text() == "show configuration\n"
+    secure_write(str(path), "again\n")
+    assert path.read_text() == "again\n"
+    victim = tmp_path / "victim"; victim.write_text("keep")
+    link = tmp_path / "R2.output"; link.symlink_to(victim)
+    with pytest.raises(OSError):
+        secure_write(str(link), "x")
+    assert victim.read_text() == "keep"
