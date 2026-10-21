@@ -14,21 +14,24 @@
 # h-ssh
 
 `h-ssh` runs commands across a fleet of network devices: one device or three hundred, Juniper, Arista, any SSH host, or a console
-still speaking telnet. Devices are worked in parallel, results are collected per device, and one dead box does not sink the run.
+still speaking telnet. Devices are worked in parallel, results are collected per device, and one dead box does not sink a show
+run; an edit run checks every target is reachable first and refuses to start a partial deployment.
 
 The per-device session is a solved problem; what is left is everything around it: the thread pool, per-device result collection, a rate
-limiter so a router that already failed is not hammered, and a record of what changed. That is the part h-ssh provides.
+limiter (`--safety-file`) so a router that already failed is not hammered, and a record of what changed (`--audit-log`). That is
+the part h-ssh provides.
 
 On Junos, everything goes through PyEZ over NETCONF, reads and writes alike, which gives one session, real RPC errors, and the lock, diff
-and rollback that config changes need. Every edit passes a safety gate, prompts before it commits, and lands in a JSONL audit trail.
+and rollback that config changes need. Every edit is checked for reachability and prompts before it commits; with `--audit-log` it
+lands in a JSONL audit trail.
 `--commit-confirmed` puts the device back the way it was if you never confirm.
 
 ## Features
 
-- **Four transports, one interface.** Juniper (PyEZ over NETCONF), Arista (eAPI), any generic SSH device, and raw-socket telnet — including IOS- and Junos-flavoured prompt handling. Same flags whichever you point it at.
+- **Five transports, one interface.** Juniper (PyEZ over NETCONF), Arista (eAPI), any SSH host through paramiko or the system `ssh` binary, and raw-socket telnet with IOS-, Junos-, Arista- and NX-OS-flavoured prompt handling. Same flags whichever you point it at; the ones only a Junos transport can honour (`--dry-run` on an edit, `--show-diff`, `--commit-confirmed`, and over NETCONF `--comment`, `--format`, `--rollback`, `--commit-status`) are refused on the others before anything is sent, never faked.
 - **Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
 - **One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
-- **Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing, per-device rate limit and cooldown, and `--commit-confirmed N` for changes that undo themselves if you lose the session.
+- **Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing and `--commit-confirmed N` for changes that undo themselves unless you confirm within N minutes (both Junos), and an opt-in per-device rate limit and cooldown (`--safety-file`).
 - **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
 - **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely.
 - **Built for a maintenance, not just a run.** A session pool keeps one NETCONF session per router open for a whole script; `rpc()` and `--format json|xml` return the router's own data instead of CLI text; `begin()` holds a diffed candidate open until a gate decides; `--rollback N`, commit comments, `--commit-status` and `guarded_commit()` cover the commit-confirmed lifecycle without a `| match` in sight.
@@ -42,13 +45,13 @@ and rollback that config changes need. Every edit passes a safety gate, prompts 
                     │                          ┌─ junos    PyEZ over NETCONF (830)
                     ▼                          │           show/edit → PyEZ NETCONF
         ┌───────────────────────┐              │                  lock → load → diff
-        │ safety gate           │              │                  → commit → unlock
+        │ safety gate (opt-in)  │              │                  → commit → unlock
         │ rate limit 10/device  │──▶ workers ──┼─ arista   eAPI over HTTPS
         │ cooldown 120s on fail │              ├─ ssh      exec_command
-        │ flock'd, cross-process│              ├─ openssh  the ssh binary, no deps
+        │ --safety-file, flock'd│              ├─ openssh  the ssh binary, no deps
         └───────────────────────┘              └─ telnet   raw TCP + prompt match
                     │                                          │
-                    └──────────── every edit ──────────────────┴──▶ audit.jsonl
+                    └──────────── every edit ──────────────────┴──▶ --audit-log (JSONL)
 ```
 
 On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first.
@@ -76,13 +79,13 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 # show command across two routers, inline targets
 ./h-app/h-ssh.py --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
-# ... or from a CSV inventory, as JSON
+# ... or from a CSV inventory, as JSON (the sample inventory has junos, arista and ssh rows: needs `.[all]` and a password)
 ./h-app/h-ssh.py --user admin --json -sC "show version" --devices h-app/devices.csv
 
 # compare one command's output across the fleet
 ./h-app/h-ssh.py --user admin -sC bgp --diff --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
-# config change — look before you leap
+# config change — look before you leap (no --target/--devices: the inventory is ~/.h-ssh/devices.csv, or ./devices.csv)
 ./h-app/h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" --dry-run
 ./h-app/h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" -y
 
@@ -96,7 +99,7 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 ./h-app/h-ssh.py --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
 ```
 
-Targets are `NAME:HOST:VENDOR` or `NAME:HOST:PORT:VENDOR`; an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor`, headers or none, and `#` comments.
+Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints); an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing.
 
 **A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` or `arista` on the target to get NETCONF or eAPI, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
@@ -133,9 +136,12 @@ or the prompt.
 ```
 
 ```bash
-./h-app/h-ssh.py --user admin --job jobs.json --json
-cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json
+./h-app/h-ssh.py --user admin --job jobs.json --json -y
+cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json -y   # the job is on stdin, so an edit cannot be confirmed there
 ```
+
+An entry may also carry `"port": 830` to override the target's port. A job with an edit entry asks the usual
+`y/N` unless `-y` is given, and the question goes to stdout, so a `--json` run wants `-y`.
 
 A device may appear in more than one entry. Its entries run one after another, in file order, so a
 show listed after an edit sees the edit, and each is audited with its own mode and payload.
@@ -151,8 +157,11 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 | `telnet` | Raw socket | built-in | raw TCP | config mode |
 | `telnet-ios` | Raw socket, IOS prompts | built-in | raw TCP | `configure terminal` |
 | `telnet-junos` | Raw socket, Junos prompts | built-in | raw TCP | `configure exclusive` / `commit` |
+| `telnet-arista` | Raw socket, EOS prompts | built-in | raw TCP | `configure terminal` |
+| `telnet-nxos` | Raw socket, NX-OS prompts | built-in | raw TCP | `configure terminal` |
 
-Every transport reuses a single connection per device for batch work.
+Every transport runs a batch on one session per device; eAPI is HTTP, so there each command is its own
+request on the same node.
 
 Telnet is a prompt match on a raw socket, so it is strict about what it has not seen. A read that reaches
 its timeout or loses the connection is an error, never a partial reply passed off as the device's answer,
@@ -202,8 +211,8 @@ per-host identities work with no extra flags. Host key policy defaults to `accep
 `HSSH_HOST_KEY_POLICY=yes` (strict) or `no` (skip).
 
 Two limits, both deliberate: `--structured` has no bindings here, and `--commit-confirmed` is
-rejected rather than silently ignored — a confirmed commit needs the NETCONF `junos` transport, and
-dropping the rollback timer without saying so would be worse than refusing.
+rejected rather than silently ignored — as it is on every transport but `junos` and `telnet-junos`,
+the two that can arm a rollback timer; dropping the timer without saying so would be worse than refusing.
 
 ### `arista` — eAPI over HTTPS
 
@@ -230,9 +239,10 @@ command_timeout = 15
 transport = openssh
 ```
 
-Precedence is flag → environment → config file → built-in default. A value given on the command
-line always wins, and `--user` additionally falls back to `HSSH_USER` then the prompt, which offers
-your system username so Enter accepts it.
+Precedence is flag → config file → built-in default. A value given on the command line always wins;
+only the credentials have an environment step: `--user` falls back to `HSSH_USER`, then the file's
+`user`, then the prompt, which offers your system username so Enter accepts it; the password to
+`HSSH_PASSWORD`, then the prompt.
 
 `transport` is the vendor for targets that don't declare one — `name,ip` inventory rows, a bare
 `--target R1:10.0.1.1`, or a job entry without a vendor. The example above runs those through the
@@ -251,13 +261,14 @@ for a secret; use `HSSH_PASSWORD`, the prompt, or keys (`--password` works, but 
 |---|---|
 | *(none)* | one status line per device, plus the verdict and diff under it for edits |
 | `-v` | status plus a framed block per device |
-| `--raw` | device output only, nothing else on stdout |
-| `--json` | one object per device, with `command` and `output` fields |
-| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string |
+| `--raw` | device output only: no banner, progress lines or summary on stdout |
+| `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure |
+| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string |
 
 `--raw` is the pipe-friendly one: no banner, no progress lines, no summary. Each device gets a
-`name:` line and its output, and that is all stdout carries — failures and the verdict go to stderr,
-so `--raw > out.txt` keeps the file clean even on a partial run.
+`name:` line and its output; failures and the verdict go to stderr, so for a show `--raw > out.txt`
+keeps the file clean even on a partial run. Two things still print to stdout: the `Resolved 'ver' ->
+'show version'` line a shortcut produces, and an edit's pre-flight check and confirmation.
 
 ```console
 $ h-ssh -sC "show version | match Junos:" --raw
@@ -268,8 +279,8 @@ cr2:
 Junos: 24.2R1-S2.5
 ```
 
-`--raw`, `-v` and `--json` are mutually exclusive; asking for two is an error rather than a silent
-preference. The command echo (`$ show version`) belongs to the framed view — `--raw` and `--json`
+`--raw` is exclusive with `-v` and with `--json`; asking for either pair is an error rather than a
+silent preference (`--json -v` is accepted: the JSON is printed and `-v` does nothing). The command echo (`$ show version`) belongs to the framed view — `--raw` and `--json`
 both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
 `output`.
 
@@ -280,14 +291,15 @@ classified before anything is retried:
 
 | Failure | Behaviour |
 |---|---|
-| Unreachable — timed out, refused, no route, network unreachable | fail immediately |
-| Authentication, host key, unresolvable name, rejected command | fail immediately |
+| Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh`, `telnet*` and `arista` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker) |
+| Authentication, host key, rejected command (and an unresolvable name on `junos`/`openssh`) | fail immediately |
 | Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2) |
 
 The split is whether a connection was established. A connect-phase failure has already spent the
 full `ConnectTimeout`; spending it twice more is what lets one dead device dominate a fleet run.
-Unreachable means unreachable for the duration of the run. Once a session exists, a read failure may well
-be transient, so those still get retried. **Edits are different:** a config push is retried only when
+Unreachable means unreachable for the duration of the run on the transports that report it as such
+(`junos`, `openssh`); `ssh`, `telnet*` and `arista` still spend `--retries` extra connect timeouts on a dead
+or unresolvable host. Once a session exists, a read failure may well be transient, so those still get retried. **Edits are different:** a config push is retried only when
 the driver reports that nothing reached the device (for Junos: a candidate-lock failure, over NETCONF
 or a refused `configure exclusive`; a connect failure is unreachable like any other and stops at one).
 Any other failure — above all a timeout around a commit — is reported once and left for you to check.
@@ -303,40 +315,46 @@ a thread; h-ssh sizes the executor to `--workers` rather than leaving it at asyn
 `min(32, cpu+4)`, which on a 2-vCPU jump host is **6 threads no matter what you asked for** — and a
 device stuck in a 30s connect timeout holds one of those six the whole time.
 
-Ctrl-C stops the run, reports which devices finished, and exits `130`. Output already written to
-stdout stays valid; the interrupted notice goes to stderr, so a truncated `--raw` run cannot look
-like a complete one.
+Ctrl-C stops starting new devices, lets the calls already in flight run out, reports how many devices
+completed (`Interrupted. Completed 1 of 3 device(s).` on stderr) and exits `130`. Output already written
+to stdout stays valid; the notice goes to stderr, so a truncated `--raw` run cannot look like a complete
+one. With `--json` there is no notice: the array holds only the devices that completed, the summary's
+`targets` is that count, and the exit code is still `130`.
 
 ## Safety
 
-Layered, and every layer is off the critical path until you ask for a write.
+Layered. The automatic layers — pre-flight, confirmation, syntax guard — only run for a write; the opt-in
+ones (`--safety-file`, `--audit-log`, `--log`) apply to every mode once given.
 
 | Guard | Flag | Behaviour |
 |---|---|---|
 | Pre-flight check | *(automatic)* | Edits verify reachability before touching config |
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
-| Dry run | `--dry-run` | Junos (NETCONF and telnet-junos): loads, runs `commit_check`, diffs, then discards the candidate. Other transports **refuse** `--dry-run` for edits instead of pretending |
-| Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` before anything is committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
-| Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box (Junos) |
-| Commit confirmed | `--commit-confirmed N` | Junos rolls back after N minutes unless confirmed (confirm with `-eC "commit"`; the run ends by printing that command for its own targets, a `--job`'s edit entries included). Transports that cannot do this (`ssh`, `arista`, telnet IOS/NX-OS/Arista, `openssh`) refuse it rather than commit with no timer |
-| Junos syntax guard | *(automatic)* | Enforces set-style syntax (`set`, `delete`, `activate`, `deactivate`, etc.) with `#`-only comments for `junos` and `telnet-junos`. `commit` is only valid as an exact command in `-eC` or `--job`, never inside `-eD`/`-eB` configuration files |
-| Safety gate | `--safety-file PATH` | Opt-in sliding-window rate limit (10 attempts / host / 60 s); 120 s cooldown after connection/auth failure, held in a `flock`'d 0600 JSON file so it persists safely across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
-| Audit trail | `--audit-log PATH` | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). Tracks edits, pre-flight aborts, and user cancellations; records diffs for edits and suppresses diffs on show operations. In edit modes, audit write failures fail the run |
+| Dry run | `--dry-run` | Junos over NETCONF: loads, diffs, runs `commit_check` (when there is a diff), then discards the candidate. `telnet-junos`: `configure exclusive`, loads, `show \| compare`, `rollback 0` — no commit check, so the diff is shown but not validated. Other transports **refuse** `--dry-run` for edits instead of pretending |
+| Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
+| Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box. NETCONF `junos` only: `telnet-junos` and every other transport refuse it rather than drop it, and it needs an edit (`-eC`, `-eD`, `-eB`, `--rollback`, or a job with edits) |
+| Commit confirmed | `--commit-confirmed [N]` | Junos rolls back after N minutes (10 when N is omitted) unless confirmed (confirm with `-eC "commit"`; a run without `--json` ends by printing that command for its own targets, a `--job`'s edit entries included). Transports that cannot do this (`ssh`, `arista`, telnet IOS/NX-OS/Arista, `openssh`) refuse it rather than commit with no timer |
+| Junos syntax guard | *(automatic)* | Enforces set-style syntax — each line must start with `set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect` or `unprotect`, lowercase — with `#`-only comments, for `junos` and `telnet-junos` (checked when any target is one). `commit` (or `commit;`) is only valid as the single, exact command in `-eC` or a `--job` edit, never inside `-eD`/`-eB` configuration files |
+| Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite |
+| Audit trail | `--audit-log PATH` (or `HSSH_AUDIT_LOG`) | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`/`passwd`, `authentication-key`, `md5-key`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). One entry per device for every mode — shows included, without their output — plus pre-flight aborts and user cancellations; records diffs for edits. In edit modes, audit write failures fail the run |
 | Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, appended with the same 0600 mode and secret redaction as the audit trail |
 
 A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
 
-The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a crash mid-run leaves it blocked rather than open.
+The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a second attempt on the same host while one is in flight is refused rather than doubled up, and a failure cools it before anything else can try. The mark lives in memory; only cooldowns reach the file, so a crashed process blocks nothing in the next run.
 
-Exit codes: `0` success · `1` a device failed · `2` usage error. Every run also prints a structured summary to stderr:
+Exit codes: `0` success (also when the operator answers N, or when every failure was a safety-gate block — those count as skipped, not failed) · `1` a device failed (also a failed `--show-diff` preview, or an audit write failure in an edit mode) · `2` usage error, a transport that cannot honour the request, or a pre-flight that found a device unreachable · `130` interrupted. A run that reaches its devices also prints a structured summary to stderr (a usage error, a failed pre-flight or an N at the prompt exit before it):
 
 ```
-[h-ssh] {"targets":3,"ok":2,"fail":1,...}
+[h-ssh] {"targets": 3, "ok": 2, "fail": 1, "skipped": 0, "elapsed_ms": 812, "mode": "show"}
 ```
+
+`targets` is the number of devices that completed, `skipped` the safety-gate blocks, `mode` one of `show`,
+`edit`, `rollback`, `commit`, `batch`, `job`.
 
 ## Structured output
 
-`--structured` returns parsed data instead of text where the vendor can provide it, and falls back to the normal text path where it can't. There is no capability list to maintain — a vendor module either implements `show_structured` or it doesn't, and that absence *is* the fallback signal.
+`--structured` returns parsed data instead of text where the vendor can provide it. The fallback is per transport, not per command: `ssh`, `openssh` and `telnet*` have no `show_structured`, so they return text as usual; on `junos` a shortcut without a `structured` binding (or a typed command) fails for that device, and on `arista` every command is asked as JSON, so one eAPI cannot render fails. There is no capability list to maintain — a vendor module either implements `show_structured` or it doesn't, and that absence *is* the fallback signal.
 
 ```bash
 ./h-app/h-ssh.py --user admin -sC bgp --structured --json --target R1:10.0.1.1:junos
@@ -366,7 +384,7 @@ Bindings live in the same `h-app/commands/{vendor}.json` entry as the command, u
 }
 ```
 
-Output is **vendor-shaped, not normalised** — `bgp` returns Junos field names on a router and eAPI's own JSON on a switch. Nothing here promises the two match, which is why there's no cross-vendor schema to keep in sync. Add bindings one command at a time; commands without one keep working exactly as before.
+Output is **vendor-shaped, not normalised** — `bgp` returns the binding's fields (`remote_as`, `is_up`, …) keyed by peer address on a router and eAPI's own JSON on a switch. Nothing here promises the two match, which is why there's no cross-vendor schema to keep in sync. Add bindings one command at a time; without `--structured`, commands without one keep working exactly as before — with it, a junos command without a binding is an error, not text.
 
 `--format json` (or `xml`) needs no binding at all: the router is asked for its RPC translation of the
 CLI command (what `| display xml rpc` does) and the reply comes back as the router produces it — the
@@ -385,22 +403,23 @@ binding names the RPC and the few fields to keep — and the two cannot be combi
 ## Library usage
 
 ```python
-from hssh import Target, vendors
+from hssh import SafetyGate, Target, vendors
 from hssh.runner import run_for_target
 
 # straight at a vendor
 output = vendors.junos.show("10.0.1.1", "admin", None, "show version", 30, 20)
 
-# or through the runner, with the safety gate in place
+# or through the runner, with the safety gate in place — none is applied unless you pass one
 target = Target(name="R1", host="10.0.1.1", vendor="junos")
 name, ok, output, ms = run_for_target(
-    t=target, transport="junos", mode="show",
+    t=target, transport="junos", mode="show",      # the driver comes from Target.vendor
     show_cmd="show version", edit_cmd=None,
     config_dir=None, broadcast_file=None,
     user="admin", passwd=None,
     session_timeout=30, command_timeout=20,
     dry_run=False, commit_confirmed=None, save_dir=None,
-)
+    safety_gate=SafetyGate(),   # in memory: 10 attempts per device per 60 s, 120 s cooldown after a failure;
+)                               # SafetyGate(safety_file="...") shares the cooldowns across processes
 ```
 
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
@@ -466,7 +485,7 @@ Junos call reuses the router's open session:
 
 ```python
 from hssh import pool
-pool.enable()                     # idle sessions close after 300 s; pool.enable(idle_timeout=60) to change
+pool.enable()                     # sessions idle 300 s are closed (reaper runs once a minute); pool.enable(idle_timeout=60) or HSSH_POOL_IDLE_TIMEOUT=60 to change
 
 for cmd in ("show version", "show bgp summary", "show route summary"):
     vendors.junos.show("10.0.1.1", "admin", None, cmd, 30, 20)   # one NETCONF session, three RPCs
@@ -479,9 +498,9 @@ One session per `(host, port, user)`. Calls against the same router from several
 that session; different routers run in parallel as before. A session is dropped, never handed to
 the next caller, when something left it in doubt: a commit whose outcome is unknown, a rollback or
 unlock that failed, an RPC timeout, or the router closing it. A read (`show`, `show_structured`,
-`show_batch`) that finds its reused session dead opens a new one and runs once more; an edit never
-does — it reports `NotAppliedError` if the session died before the lock, and the usual verdicts
-after. The CLI never enables the pool, so `h-ssh` runs behave exactly as before.
+`show_batch`, and `rpc`/`rpc_batch` for a `show …` command or `get-*` RPC) that finds its reused
+session dead opens a new one and runs once more; any other RPC (`request-*`, …) and an edit never do —
+an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI never enables the pool, so `h-ssh` runs behave exactly as before.
 
 ## Package structure
 
@@ -489,23 +508,31 @@ after. The CLI never enables the pool, so `h-ssh` runs behave exactly as before.
 h-ssh/
 ├── h-app/
 │   ├── hssh/
+│   │   ├── __init__.py      # public API: Target, run_for_target, SafetyGate, pool, vendors; __version__
 │   │   ├── core.py          # Target, CSV loader, template resolver, job parser
 │   │   ├── cli.py           # argument parsing + orchestration
 │   │   ├── runner.py        # concurrent execution engine
 │   │   ├── pool.py          # opt-in session pool for library use
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
+│   │   ├── errors.py        # NotAppliedError, AmbiguousCommitError — what the retry logic keys on
+│   │   ├── commands/        # per-vendor template library: arista.json, junos.json, ssh.json (shipped with the package)
 │   │   └── vendors/
-│   │       ├── junos.py     # PyEZ NETCONF: show, structured, config
+│   │       ├── __init__.py  # VENDORS: transport name → module
+│   │       ├── junos.py     # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
 │   │       ├── arista.py    # eAPI
 │   │       ├── generic.py   # paramiko SSH
 │   │       ├── openssh.py   # the OpenSSH binary — zero dependencies
 │   │       └── telnet.py    # raw socket, per-flavour prompt handling
-│   ├── commands/            # per-vendor template library (JSON)
+│   ├── commands -> hssh/commands
 │   ├── tests/
 │   ├── h-ssh.py             # CLI entry point
-│   └── devices.csv          # example inventory
+│   ├── devices.csv          # example inventory
+│   ├── example_library_usage.py       # library walkthrough
+│   └── custom_automation_example.py   # build on hssh: CSV loader + junos driver
+├── .github/workflows/tests.yml   # unit suite, Python 3.10–3.13
 ├── assets/                  # banner, badges
+├── TESTS.md                 # what was run on which code
 └── pyproject.toml           # installs the `h-ssh` entry point from h-app/
 ```
 
@@ -516,7 +543,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (419 tests) needs no devices and runs on every push and pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (419 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
 gate (failure handling, edit safety, one real commit per write feature, the library API on one pooled session); the earlier
@@ -525,7 +552,7 @@ on which code is in [TESTS.md](TESTS.md).
 
 ## Related global repos
 
-- [`h-network/junos-mcp-server`](https://github.com/h-network/junos-mcp-server): the same device access exposed to an LLM over MCP
+- [`Juniper/junos-mcp-server`](https://github.com/Juniper/junos-mcp-server): the same device access exposed to an LLM over MCP; h-ssh's session pool is the `ConnectionPool` h-network contributed there
 - [`h-network/h-cli`](https://github.com/h-network/h-cli): AI-driven infrastructure management this feeds into
 - [`h-network/h-agent`](https://github.com/h-network/h-agent): unattended launcher for claude, codex and agy
 - [`h-network/h-mesh`](https://github.com/h-network/h-mesh): agentic office framework
