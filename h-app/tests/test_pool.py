@@ -332,6 +332,19 @@ def test_confirm_timeout_discards_the_session(pooled):
     assert devices()[0].closed
 
 
+def test_confirm_lock_held_elsewhere_keeps_the_session(pooled):
+    FakeConfig.raise_on = {"lock": junos.LockError("held")}
+    with pytest.raises(NotAppliedError):
+        junos.confirm("10.0.0.1", "u", None, 5, 30)
+    assert cfg().names == ["lock"] and not devices()[0].closed
+
+
+def test_confirm_unlock_failure_discards_the_session(pooled):
+    FakeConfig.raise_on = {"unlock": RuntimeError("session gone")}
+    assert junos.confirm("10.0.0.1", "u", None, 5, 30) == "COMMIT CONFIRMED OK"
+    assert devices()[0].closed
+
+
 # --- concurrency --------------------------------------------------------
 
 def test_same_router_calls_never_overlap(pooled):
