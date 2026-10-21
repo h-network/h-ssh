@@ -132,26 +132,33 @@ class SafetyGate:
 
     @contextmanager
     def _file_lock(self) -> Generator[None, None, None]:
-        """Acquire an exclusive advisory flock on the safety lockfile."""
-        if not self._safety_file:
-            yield
-            return
+        """Acquire an exclusive advisory flock on the safety lockfile.
 
-        lock_path = Path(f"{self._safety_file}.lock")
-        try:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        Exactly one yield, outside any except: an error raised in the locked
+        body must come back as itself (a second yield would turn it into
+        contextlib's RuntimeError). A lock that cannot be taken is logged and
+        the body runs without it.
+        """
+        fd = None
+        if self._safety_file:
+            lock_path = Path(f"{self._safety_file}.lock")
             try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
                 fcntl.flock(fd, fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
-        except OSError as e:
-            logger.warning("Could not lock safety file %s: %s (continuing without file lock)", lock_path, e)
+            except OSError as e:
+                logger.warning("Could not lock safety file %s: %s (continuing without file lock)", lock_path, e)
+                if fd is not None:
+                    os.close(fd)
+                    fd = None
+        try:
             yield
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
 
     def _mark_corrupt(self, path: Path) -> None:
         """Mark as corrupt and move corrupt file aside to .corrupt."""
@@ -233,10 +240,12 @@ class SafetyGate:
 
         with self._file_lock():
             now = time.time()
-            # Read current on-disk entries to merge
+            # Read current on-disk entries to merge. The stat is in the try
+            # too: a file that cannot be stat'ed is a read failure like any
+            # other, logged and worked around, not an error out of the lock.
             merged: dict[str, float] = {}
-            if path.exists() and path.stat().st_size > 0:
-                try:
+            try:
+                if path.exists() and path.stat().st_size > 0:
                     with open(path, "r", encoding="utf-8") as f:
                         disk_data = json.load(f)
                         if isinstance(disk_data, dict):
@@ -248,8 +257,8 @@ class SafetyGate:
                                             merged[str(h)] = exp_val
                                     except (TypeError, ValueError):
                                         pass
-                except Exception:
-                    pass
+            except Exception as e:
+                logger.warning("Could not read safety file %s: %s (writing in-memory cooldowns only)", self._safety_file, e)
 
             # Merge with in-memory cooldowns
             for h, exp in self._cooldowns.items():

@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import socket
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,15 +24,12 @@ _PERMANENT = (
     # is what makes one dead device dominate a fleet run.
     "connect to host",
     # PyEZ reports the connect phase by exception class, and the junos driver
-    # wraps it: "NETCONF connect failed: ConnectTimeoutError(host)". The same
-    # dead-router and bad-login cases as above, in a different coat.
-    # ConnectClosedError and RpcTimeoutError are deliberately absent: they
-    # come after the session was up, so the next attempt may succeed.
+    # wraps every one of them: "NETCONF connect failed: ConnectTimeoutError(host)".
+    # The prefix covers the whole connect phase, so the class names need no
+    # entry of their own. ConnectClosedError and RpcTimeoutError only ever
+    # arrive bare, after the session was up, so they fall through and are
+    # retried: the next attempt may succeed.
     "netconf connect failed",
-    "connecttimeouterror",
-    "connectrefusederror",
-    "connectunknownhosterror",
-    "connectautherror",
     "connection timed out",
     "connection refused",
     "no route to host",
@@ -52,7 +48,12 @@ _PERMANENT = (
     "rejected the operational command",
     "no rpc equivalent",
     "no 'ssh' binary",
-    "invalid",
+    # A device that rejected the command will reject it again: eAPI says
+    # "invalid command [Invalid input (at token ...)]", IOS "% Invalid input".
+    # A bare "invalid" also caught paramiko's "Invalid SSH banner" and the
+    # OS's "Invalid argument", which are transport trouble, not a verdict.
+    "invalid command",
+    "invalid input",
     "syntax error",
 )
 
@@ -240,12 +241,6 @@ def _run_for_target_sync(
     if not quiet:
         timestamp = datetime.now().strftime("%H:%M:%S")
         print(f"[{timestamp}] {name:16s} STARTED")
-
-    # Resolve host if it's a name
-    try:
-        socket.gethostbyname(host)
-    except Exception:
-        pass
 
     # Get vendor module
     vendor_mod = vendors.get(vendor)
