@@ -45,7 +45,7 @@ def run(monkeypatch, capsys, tmp_path, argv, driver=None):
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", str(tmp_path / "no-config"),
+    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull,
                                       "--password", "p", *argv])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
@@ -286,8 +286,34 @@ def test_the_password_still_comes_from_the_prompt_or_the_environment(monkeypatch
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
-    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", str(tmp_path / "no-config"), "--run", f])
+    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull, "--run", f])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
     assert rc == 0, err
     assert seen["passwd"] is None
+
+
+# --- the run file meets #62's ceilings and port checks, and #64's --allow-missing ----
+
+def test_run_file_values_are_held_to_the_flags_ceilings(tmp_path):
+    from hssh.runfile import validate_run
+    from hssh.cli import CONFIG_FLOORS, CONFIG_CEILINGS, TRANSPORT_CHOICES
+    with pytest.raises(ValueError, match="'workers' must be at most 256, not 300"):
+        validate_run({"workers": 300}, str(tmp_path / "r.yaml"), TRANSPORT_CHOICES, CONFIG_FLOORS, CONFIG_CEILINGS)
+    with pytest.raises(ValueError, match="'session_timeout' must be at most 86400"):
+        validate_run({"session_timeout": 10 ** 6}, str(tmp_path / "r.yaml"), TRANSPORT_CHOICES, CONFIG_FLOORS, CONFIG_CEILINGS)
+    assert validate_run({"workers": 256}, str(tmp_path / "r.yaml"), TRANSPORT_CHOICES, CONFIG_FLOORS, CONFIG_CEILINGS)["workers"] == 256
+
+
+def test_a_device_port_in_a_run_file_is_checked_like_everywhere_else(tmp_path):
+    from hssh.runfile import target_spec
+    assert target_spec({"name": "R1", "host": "10.0.0.1", "port": 22}, "r.yaml", 0) == "R1:10.0.0.1:22"
+    with pytest.raises(ValueError, match=r"devices\[0\]: port 70000 is outside 1..65535"):
+        target_spec({"name": "R1", "host": "10.0.0.1", "port": 70000}, "r.yaml", 0)
+    with pytest.raises(ValueError, match=r"devices\[0\]: 'port' must be a number, not 'x'"):
+        target_spec({"name": "R1", "host": "10.0.0.1", "port": "x"}, "r.yaml", 0)
+
+
+def test_allow_missing_is_a_run_file_key(tmp_path, monkeypatch, capsys):
+    from hssh.runfile import RUN_KEYS
+    assert RUN_KEYS["allow_missing"] == ("allow_missing", bool)

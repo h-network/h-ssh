@@ -461,7 +461,8 @@ async def main() -> int:
     # checks below see what the run will use.
     if args.run:
         try:
-            run_data = validate_run(load_run_file(args.run), args.run, TRANSPORT_CHOICES, CONFIG_FLOORS)
+            run_data = validate_run(load_run_file(args.run), args.run, TRANSPORT_CHOICES, CONFIG_FLOORS,
+                                    CONFIG_CEILINGS)
             apply_run(args, run_data, parser)
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)

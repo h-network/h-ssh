@@ -18,6 +18,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .core import check_port
+
 try:  # PyYAML comes with the junos extra; a JSON run file needs nothing
     import yaml
 except ImportError:  # pragma: no cover - exercised through monkeypatching
@@ -58,6 +60,7 @@ RUN_KEYS: Dict[str, tuple] = {
     "log": ("log", str),
     "audit_log": ("audit_log", str),
     "safety_file": ("safety_file", str),
+    "allow_missing": ("allow_missing", bool),
 }
 
 # A file on a shared jumphost or in a git repository is the wrong home for a
@@ -155,15 +158,14 @@ def target_spec(item: Any, path: str, index: int) -> str:
                 raise ValueError(f"run file '{path}': devices[{index}] 'vendor' must be a string")
             spec += f":{fields['vendor'].strip()}"
         if "port" in fields:
-            if isinstance(fields["port"], bool) or not isinstance(fields["port"], int):
-                raise ValueError(f"run file '{path}': devices[{index}] 'port' must be a number")
-            spec += f":{fields['port']}"
+            spec += f":{check_port(fields['port'], f'run file {path!r}: devices[{index}]')}"
         return spec
     raise ValueError(f"run file '{path}': devices[{index}] must be a 'name:host:vendor' "
                      f"string or a mapping, not {type(item).__name__}")
 
 
-def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, int]) -> Dict[str, Any]:
+def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, int],
+                 ceilings: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """Type-check every value and resolve the file's relative paths. Returns a
     new dict ready for apply_run(); raises ValueError naming the key."""
     base = Path(path).resolve().parent
@@ -173,6 +175,8 @@ def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, 
         _check_type(path, key, value, expected)
         if key in floors and value < floors[key]:
             raise ValueError(f"run file '{path}': '{key}' must be at least {floors[key]}, not {value}")
+        if ceilings and key in ceilings and value > ceilings[key]:
+            raise ValueError(f"run file '{path}': '{key}' must be at most {ceilings[key]}, not {value}")
         if key == "transport" and value not in transports:
             raise ValueError(f"run file '{path}': 'transport' must be one of "
                              f"{', '.join(transports)}, not '{value}'")
