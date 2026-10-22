@@ -123,6 +123,31 @@ def secure_append(path: str, text: str) -> None:
         os.close(fd)
 
 
+def probe_append(path: str) -> None:
+    """Prove that secure_append() will be able to write `path` before a run
+    depends on it: the directory is created, the file is opened the way
+    secure_append opens it (created 0600, no symlink, a regular file, not a
+    FIFO) and nothing is written. Raises OSError naming the reason. An
+    audit log that cannot be written is found out here, not after the
+    commits it was supposed to record."""
+    log_path = Path(path)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise OSError(f"{path}: cannot create its directory ({e.strerror})") from e
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(log_path), flags, 0o600)
+    except OSError as e:
+        raise OSError(f"{path}: not a plain file that can be appended to ({e.strerror})") from e
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path}: not a regular file; refusing to write the log there")
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+
+
 def secure_write(path: str, text: str) -> None:
     """Replace a 0600 regular file of our own with `text` (--save-output):
     the same open rules as secure_append, truncating instead of appending."""

@@ -117,19 +117,17 @@ def test_cross_invocation_persist():
         Path(tmp).unlink(missing_ok=True)
 
 
-# T8: Graceful degradation
-def test_graceful_degradation_unwritable():
-    gate = SafetyGate(safety_file="/nonexistent/dir/safety.json")
-    # Should still work in-memory
+# T8: a gate that cannot keep its file refuses to exist (#64); the
+# in-memory gate is still the one without a file.
+def test_an_unwritable_safety_file_refuses_the_gate():
+    with pytest.raises(OSError, match="safety file /nonexistent/dir/safety.json: cannot create its directory"):
+        SafetyGate(safety_file="/nonexistent/dir/safety.json")
+    gate = SafetyGate(safety_file=None)
     allowed, reason = gate.check_device("10.0.1.1")
-    assert allowed is True
-    assert reason == "ok"
-
-    # set_cooldown should not crash even if file is unwritable
+    assert allowed is True and reason == "ok"
     gate.set_cooldown("10.0.1.1")
     allowed, reason = gate.check_device("10.0.1.1")
-    assert allowed is False
-    assert "cooldown active" in reason
+    assert allowed is False and "cooldown active" in reason
 
 
 # T9: Concurrent invocations (fcntl.flock prevents corruption)
@@ -412,7 +410,6 @@ def test_lock_file_that_is_a_symlink_is_not_followed(tmp_path):
     os.chmod(victim, 0o644)
     sf = tmp_path / "gate.json"
     (tmp_path / "gate.json.lock").symlink_to(victim)
-    gate = SafetyGate(safety_file=str(sf))
-    with gate._file_lock():
-        pass
+    with pytest.raises(OSError, match="gate.json.lock: cannot be created or opened"):
+        SafetyGate(safety_file=str(sf))             # #64: refused outright, not run unlocked
     assert victim.read_text() == "keep" and oct(victim.stat().st_mode & 0o777) == "0o644"

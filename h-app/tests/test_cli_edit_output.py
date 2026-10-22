@@ -193,7 +193,7 @@ def test_job_entries_for_one_device_keep_their_own_mode_and_payload(monkeypatch,
 def test_job_results_carry_their_own_entrys_host(monkeypatch, capsys, tmp_path):
     rc, out, _, driver = run_job(monkeypatch, capsys, tmp_path, [
         {"target": "R1:10.0.0.1:junos", "show": "show version"},
-        {"target": "R1:10.0.0.2:junos", "show": "show version"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"},
     ], "--json")
     assert rc == 0
     assert sorted(c[1] for c in driver.calls) == ["10.0.0.1", "10.0.0.2"]

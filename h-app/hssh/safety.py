@@ -55,6 +55,7 @@ class SafetyGate:
         self._corrupt = False
 
         if self._safety_file:
+            self._probe()
             self._load_cooldowns()
 
     # ------------------------------------------------------------------
@@ -131,6 +132,35 @@ class SafetyGate:
     # ------------------------------------------------------------------
     # File persistence (Tier 2)
     # ------------------------------------------------------------------
+
+    def _probe(self) -> None:
+        """A gate that was asked for must exist: the directory creatable, the
+        lock file and the state file creatable as regular files (0600) and
+        the lock takeable. Raises OSError naming the reason, so the run
+        refuses to start instead of continuing unguarded on a warning."""
+        path = Path(self._safety_file)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise OSError(f"safety file {self._safety_file}: cannot create its directory ({e.strerror})") from e
+        for p in (Path(f"{self._safety_file}.lock"), path):
+            try:
+                fd = os.open(str(p), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            except OSError as e:
+                raise OSError(f"safety file {p}: cannot be created or opened ({e.strerror})") from e
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError(f"safety file {p}: not a regular file")
+                if p.suffix == ".lock":
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except BlockingIOError:
+                        pass            # another run holds it: the lock works
+                    except OSError as e:
+                        raise OSError(f"safety file {p}: cannot be locked ({e.strerror})") from e
+            finally:
+                os.close(fd)
 
     @contextmanager
     def _file_lock(self) -> Generator[None, None, None]:

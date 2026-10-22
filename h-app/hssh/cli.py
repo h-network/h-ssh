@@ -22,14 +22,14 @@ from .core import (
     Target, load_devices_csv, load_config, get_config_path,
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
-    load_jobs, resolve_target_port, validate_junos_set_syntax,
+    load_jobs, resolve_target_port, validate_junos_set_syntax, check_unique,
     check_confirm_minutes,
 
     path_inside,
 )
 from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS
 from .safety import SafetyGate
-from .audit import write_audit_entry, redact_values, secure_append
+from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .vendors import VENDORS
 
 
@@ -350,6 +350,9 @@ async def main() -> int:
                         help="Directory containing <NAME>.set files")
     parser.add_argument("-eB", "--edit-broadcast", type=str,
                         help="Multi-line config file for all devices (e.g., configs/all.set)")
+    parser.add_argument("--allow-missing", action="store_true",
+                        help="-eD: skip devices that have no <NAME>.set instead of refusing the run "
+                             "(they count as skipped: exit 3)")
     parser.add_argument("--batch", type=str,
                         help="File containing show commands to run in batch (one per line, # comments)")
     parser.add_argument("--job", type=str,
@@ -472,6 +475,11 @@ async def main() -> int:
             return 2
 
         targets = [entry.target for entry in job_entries]
+        try:
+            check_unique(targets, allow_repeats=True)
+        except ValueError as e:
+            print(f"ERROR: job file: {e}", file=sys.stderr)
+            return 2
         has_edits = any(e.mode.startswith("edit") for e in job_entries)
         mode = "job"
         for je in job_entries:
@@ -530,6 +538,11 @@ async def main() -> int:
         if not targets:
             print("ERROR: no devices found in inventory.", file=sys.stderr)
             return 2
+        try:
+            check_unique(targets)
+        except ValueError as e:
+            print(f"ERROR: {'inline targets' if args.target else args.devices}: {e}", file=sys.stderr)
+            return 2
 
         # Junos set-syntax check keys off the targets, not a global flag —
         # a mixed inventory can have some devices that care and some that don't.
@@ -575,6 +588,7 @@ async def main() -> int:
             except Exception as e:
                 print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
                 return 2
+        skipped_missing = 0
         if args.edit_dir:
             for t in targets:
                 set_file = path_inside(args.edit_dir, f"{t.name}.set")
@@ -584,6 +598,23 @@ async def main() -> int:
                     except Exception as e:
                         print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
                         return 2
+            # A device without a set file is known before the first lock. The
+            # run is refused rather than deployed to everyone else, unless the
+            # operator said those devices may be left out; then they are
+            # reported as skipped, never silently.
+            missing = [t.name for t in targets if t.name not in edit_payloads]
+            if missing:
+                shown = ", ".join(missing[:20]) + (" …" if len(missing) > 20 else "")
+                if not args.allow_missing:
+                    print(f"ERROR: -eD {args.edit_dir}: no <NAME>.set for {len(missing)} of {len(targets)} device(s): "
+                          f"{shown}. Nothing was sent; --allow-missing skips them.", file=sys.stderr)
+                    return 2
+                print(f"Skipping {len(missing)} device(s) without a set file: {shown}", file=sys.stderr)
+                targets = [t for t in targets if t.name in edit_payloads]
+                skipped_missing = len(missing)
+                if not targets:
+                    print("ERROR: no device has a set file; nothing to do.", file=sys.stderr)
+                    return 2
 
         # Mode label
         if args.show_command:
@@ -636,6 +667,24 @@ async def main() -> int:
             install = VENDOR_INSTALL.get(v, v)
             print(f"ERROR: {install} not installed (required for vendor '{v}').", file=sys.stderr)
             return 2
+
+    # Everything the run will write is proven writable before the first
+    # device is touched: an audit log found unwritable after the commits
+    # landed records nothing, and a safety gate that cannot keep its file
+    # must refuse, not warn and run unguarded.
+    for label, path in (("--audit-log", args.audit_log), ("--log", args.log)):
+        if path:
+            try:
+                probe_append(path)
+            except OSError as e:
+                print(f"ERROR: {label} {e}; refusing to start.", file=sys.stderr)
+                return 2
+    safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
+    try:
+        safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
+    except OSError as e:
+        print(f"ERROR: --safety-file requested but unusable: {e}; refusing to start.", file=sys.stderr)
+        return 2
 
     save_dir = None
     if args.save_output:
@@ -819,12 +868,9 @@ async def main() -> int:
         print()
 
     failures = 0
-    skipped = 0
+    skipped = skipped_missing if not job_entries else 0
     json_results = []
     run_start = time.time()
-
-    safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
-    safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
 
     # asyncio.to_thread runs on the loop's default executor, which sizes itself
     # min(32, cpu+4) — 6 threads on a 2-vCPU jump host. Without this, --workers
