@@ -64,6 +64,7 @@ _PERMANENT = (
     "no authentication methods available",   # paramiko: no password, no key, no agent
     "contains invalid characters",           # OpenSSH refuses the user or host name
     "malformed known_hosts line",            # the pin file cannot be parsed
+    "no ssh session",                        # openssh: the session never opened within --session-timeout
 )
 
 # Failures that happen before any session exists: nothing reached the device.
@@ -76,6 +77,7 @@ _CONNECT_PHASE = (
     "unable to connect to port",
     "ssh protocol banner",
     "connection timed out",
+    "no ssh session",
 )
 
 

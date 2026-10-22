@@ -800,17 +800,40 @@ async def main() -> int:
                 error=error,
             )
 
+    # asyncio.to_thread runs on the loop's default executor, which sizes itself
+    # min(32, cpu+4) — 6 threads on a 2-vCPU jump host. Without this, --workers
+    # silently caps at that number and the semaphore below is the smaller lie:
+    # devices queue behind threads, and blocked ones (a 30s connect timeout)
+    # hold a thread the whole time, stalling everything behind them.
+    workers = resolve_workers(args.workers)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="hssh"))
+
+    sem = asyncio.Semaphore(workers)
+
     # Pre-flight check and confirmation for edit operations
     # --show-diff previews every target before asking, which proves
     # reachability the real way and spares the router a connection it counts
     # against its ssh rate limit.
     if has_edits and not args.dry_run and not args.show_diff:
-        if not json_mode:
-            print("\nPre-flight check: Validating device reachability...")
+        # Probed --workers at a time with --session-timeout, like the run
+        # itself: 250 probes at once trip sshd's MaxStartups and a router's
+        # ssh rate-limit, and called devices unreachable that the real
+        # 32-worker edit then reached (H1). A probe that fails is tried once
+        # more before the device is called unreachable, for the same reason.
+        async def _probe(t):
+            async with sem:
+                result = await check_reachability(t, timeout=args.session_timeout)
+                if not result[1]:
+                    result = await check_reachability(t, timeout=args.session_timeout)
+                return result
 
-        reachability_results = await asyncio.gather(
-            *[check_reachability(t, timeout=5) for t in targets]
-        )
+        if not json_mode:
+            print(f"\nPre-flight check: Validating device reachability "
+                  f"({min(workers, len(targets))} at a time, {args.session_timeout}s each)...")
+
+        reachability_results = await asyncio.gather(*[_probe(t) for t in targets])
 
         unreachable = []
         for t, (name, reachable, msg) in zip(targets, reachability_results):
@@ -873,17 +896,6 @@ async def main() -> int:
     json_results = []
     run_start = time.time()
 
-    # asyncio.to_thread runs on the loop's default executor, which sizes itself
-    # min(32, cpu+4) — 6 threads on a 2-vCPU jump host. Without this, --workers
-    # silently caps at that number and the semaphore below is the smaller lie:
-    # devices queue behind threads, and blocked ones (a 30s connect timeout)
-    # hold a thread the whole time, stalling everything behind them.
-    workers = resolve_workers(args.workers)
-    loop = asyncio.get_running_loop()
-    loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="hssh"))
-
-    sem = asyncio.Semaphore(workers)
 
     # A job may list one device in several entries. Those run one at a time
     # per host, in file order, so a show after an edit sees the edit and the
