@@ -29,6 +29,8 @@ import tempfile
 import time
 from typing import List, Optional
 
+from ..core import refusal_line
+
 AVAILABLE = shutil.which("ssh") is not None
 
 # accept-new trusts a host the first time and pins it after. The paramiko
@@ -131,7 +133,12 @@ def _base_opts(session_timeout: int, port: Optional[int],
         "-o", "ConnectTimeout=%d" % int(session_timeout),
         "-o", "NumberOfPasswordPrompts=1",
     ]
-    if not have_password:
+    if have_password:
+        # The password is the credential, as on the junos and ssh transports:
+        # no ~/.ssh/id_* and no agent key is offered first, so a wrong
+        # password is a failed login and not an OK by way of a key (M5).
+        opts += ["-o", "PubkeyAuthentication=no", "-o", "IdentitiesOnly=yes"]
+    else:
         # No secret to offer, so never let OpenSSH sit on an interactive prompt.
         opts += ["-o", "BatchMode=yes"]
     if port:
@@ -276,7 +283,7 @@ def _format(cmd: str, proc) -> str:
 
 def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[str],
                   session_timeout: int, command_timeout: int,
-                  port: Optional[int] = None) -> str:
+                  port: Optional[int] = None, edit: bool = False) -> str:
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
@@ -294,6 +301,12 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
                     raise RuntimeError("SSH transport failed: %s" % exc)
                 if proc.returncode != 0:
                     raise RuntimeError(_describe_failure(host, proc))
+                # For an edit the reply counts as well as the exit status: a
+                # CLI that answers "error: ..." or "% ..." and exits 0 has
+                # refused the line (M6).
+                refused = refusal_line(proc.stderr, proc.stdout) if edit else None
+                if refused:
+                    raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
                 outputs.append(_format(cmd, proc))
             return "\n\n".join(outputs).strip() + "\n"
     finally:
@@ -341,7 +354,7 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
             "use the 'junos' transport for confirmed commits")
     commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
     return _run_commands(host, user, passwd, commands, session_timeout,
-                         command_timeout, port=port)
+                         command_timeout, port=port, edit=True)
 
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],

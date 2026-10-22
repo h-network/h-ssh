@@ -102,6 +102,37 @@ def document_text(output) -> str:
 MAX_WORKERS = 256
 
 
+# Descriptors one in-flight device costs: measured at ~6 for a NETCONF
+# session (socket, ncclient's selector, paramiko's pipe), the heaviest case.
+FDS_PER_WORKER = 6
+FDS_BASE = 32
+
+
+def fit_workers_to_open_files(workers: int):
+    """(workers the open-file limit can carry, a note when that is fewer).
+    The soft limit is raised towards the hard one first, which needs no
+    privilege; only what is still short lowers the workers (L10)."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, ValueError, OSError):
+        return workers, None
+    need = workers * FDS_PER_WORKER + FDS_BASE
+    if soft != resource.RLIM_INFINITY and soft < need:
+        wanted = need if hard == resource.RLIM_INFINITY else min(need, hard)
+        if wanted > soft:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+                soft = wanted
+            except (ValueError, OSError):
+                pass
+    if soft == resource.RLIM_INFINITY or soft >= need:
+        return workers, None
+    fit = max(1, (soft - FDS_BASE) // FDS_PER_WORKER)
+    return fit, (f"the open-file limit of {soft} (ulimit -n) carries {fit} workers at "
+                 f"~{FDS_PER_WORKER} descriptors each, not {workers}; running {fit}")
+
+
 def resolve_workers(requested: int) -> int:
     """Clamp --workers to something a thread pool can honour."""
     try:
@@ -763,6 +794,10 @@ async def main() -> int:
                     resolved = resolve_command(raw, vendor)
                     if resolved != raw:
                         print(f"Resolved '{raw}' -> '{resolved}' ({vendor})")
+
+    args.workers, fd_note = fit_workers_to_open_files(resolve_workers(args.workers))
+    if fd_note:
+        print(f"WARNING: {fd_note}", file=sys.stderr)
 
     if show_progress:
         if job_entries:

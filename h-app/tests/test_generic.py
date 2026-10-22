@@ -384,3 +384,19 @@ def test_pinning_takes_a_file_lock_so_two_processes_keep_each_others_pins(offlin
     generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert fcntl.LOCK_EX in locks and fcntl.LOCK_UN in locks
     assert pin_file(home).read_text().startswith("10.0.0.1 ")
+
+
+# --- #67 (M6): the reply is the verdict too ---------------------------------------
+
+def test_edit_is_failed_when_the_cli_refuses_a_line_and_exits_zero(exits_with):
+    exits_with(0, stdout=b"error: syntax error, expecting <statement> for %s\n")
+    with pytest.raises(RuntimeError, match="'set system host-name x' was refused by the device: error: syntax error"):
+        generic.edit("10.0.0.1", "u", "p", "set system host-name x\n", 5, 10)
+    exits_with(0, stdout=b"%% Invalid input detected at '^' marker. (%s)\n")
+    with pytest.raises(RuntimeError, match="was refused by the device: % Invalid input"):
+        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10)
+
+
+def test_a_show_that_prints_error_is_still_output(exits_with):
+    exits_with(0, stdout=b"log: error: link down on ge-0/0/0 (%s)\n")
+    assert "link down" in generic.show("10.0.0.1", "u", "p", "show log", 5, 10)
