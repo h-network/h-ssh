@@ -22,12 +22,13 @@ from .core import (
     Target, load_devices_csv, load_config, get_config_path,
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
-    load_jobs, resolve_target_port, validate_junos_set_syntax, check_unique,
+    load_jobs, parse_jobs, resolve_target_port, validate_junos_set_syntax, check_unique,
     check_confirm_minutes,
 
     path_inside,
 )
 from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS, is_connect_failure
+from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .vendors import VENDORS
@@ -388,6 +389,9 @@ async def main() -> int:
                         help="File containing show commands to run in batch (one per line, # comments)")
     parser.add_argument("--job", type=str,
                         help="JSON job file with per-device commands (use - for stdin)")
+    parser.add_argument("--run", type=str, metavar="FILE",
+                        help="YAML or JSON run file: every key is a flag name (devices, show, commands, "
+                             "edit, jobs, workers, ...); a flag on the command line wins over the file")
     parser.add_argument("--rollback", type=_ranged_int(0, 49, "--rollback"), metavar="N",
                         help="Return every target to rollback N (0-49), with the same gates as an edit (Junos only)")
     parser.add_argument("--commit-status", action="store_true",
@@ -448,6 +452,20 @@ async def main() -> int:
     args = parser.parse_args()
     if not args.verbose:
         _quiet_transport_logs()
+    args.batch_commands = None   # an inline batch, only a run file sets it
+    args.jobs_data = None        # job entries from a run file
+
+    # A run file sits between the command line and the config file: a flag
+    # typed on the command line wins, the file wins over the environment and
+    # ~/.h-ssh/config. It is read before anything else so the banner and the
+    # checks below see what the run will use.
+    if args.run:
+        try:
+            run_data = validate_run(load_run_file(args.run), args.run, TRANSPORT_CHOICES, CONFIG_FLOORS)
+            apply_run(args, run_data, parser)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
 
     # Resolved before anything reads them, so --list-commands and the banner
     # see the same values the run will use. A --config named on the command
@@ -495,12 +513,19 @@ async def main() -> int:
 
     # ------ JOB MODE ------
     job_entries = None
-    if args.job:
-        if any([args.show_command, args.edit_command, args.edit_dir, args.edit_broadcast, args.batch, args.rollback is not None, args.commit_status]):
+    if args.job or args.jobs_data:
+        if any([args.show_command, args.edit_command, args.edit_dir, args.edit_broadcast, args.batch,
+                args.batch_commands, args.rollback is not None, args.commit_status]):
             print("ERROR: --job cannot be combined with -sC, -eC, -eD, -eB, --batch, --rollback, or --commit-status.", file=sys.stderr)
             return 2
+        if args.job and args.jobs_data:
+            print("ERROR: --job and a run file's 'jobs' are two job lists; use one.", file=sys.stderr)
+            return 2
         try:
-            job_entries = load_jobs(args.job, default_vendor=args.transport)
+            if args.job:
+                job_entries = load_jobs(args.job, default_vendor=args.transport)
+            else:
+                job_entries = parse_jobs(args.jobs_data, default_vendor=args.transport)
         except (ValueError, json.JSONDecodeError) as e:
             print(f"ERROR: Invalid job file: {e}", file=sys.stderr)
             return 2
@@ -526,10 +551,13 @@ async def main() -> int:
             bool(args.edit_command),
             bool(args.edit_dir),
             bool(args.edit_broadcast),
-            bool(args.batch),
+            bool(args.batch) or bool(args.batch_commands),
             args.rollback is not None,
             bool(args.commit_status),
         ]
+        if args.batch and args.batch_commands:
+            print("ERROR: --batch and a run file's 'commands' are two command lists; use one.", file=sys.stderr)
+            return 2
         if sum(modes) != 1:
             print("ERROR: choose exactly one of -sC, -eC, -eD, -eB, --batch, --rollback, --commit-status, or --job.", file=sys.stderr)
             return 2
@@ -654,7 +682,7 @@ async def main() -> int:
             mode = "edit-cmd"
         elif args.edit_broadcast:
             mode = "edit-broadcast"
-        elif args.batch:
+        elif args.batch or args.batch_commands:
             mode = "show-batch"
         elif args.rollback is not None:
             mode = "rollback"
@@ -667,6 +695,12 @@ async def main() -> int:
 
     if args.comment is not None and not has_edits:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
+        return 2
+    # Nobody watches a pipeline: a run file that commits must arm a timer, or
+    # say it is a dry run. A flag on the command line may supply either.
+    if args.run and has_edits and edit_needs_timer(args, is_confirm):
+        print(f"ERROR: run file '{args.run}' makes changes without a rollback timer: set commit_confirmed "
+              "(minutes) in the file or pass --commit-confirmed, or set dry_run.", file=sys.stderr)
         return 2
     # A confirm is a plain commit: it cannot arm a new timer, so a run that
     # asks for one would end with a banner promising a rollback that no
@@ -781,7 +815,9 @@ async def main() -> int:
     if not job_entries:
         show_cmd = args.show_command
         edit_cmd = args.edit_command
-        if args.batch:
+        if args.batch_commands:
+            batch_cmds = list(args.batch_commands)
+        elif args.batch:
             batch_cmds = read_command_file_lines(Path(args.batch))
             if not batch_cmds:
                 print("ERROR: batch file is empty after filtering.", file=sys.stderr)
@@ -808,10 +844,14 @@ async def main() -> int:
                 print(f"Targets: {len(targets)} (inline)")
             else:
                 print(f"Inventory: {args.devices}")
+        if args.run:
+            timer = (f", commit confirmed {args.commit_confirmed} min" if has_edits and args.commit_confirmed
+                     else ", dry run" if has_edits and args.dry_run else "")
+            print(f"Run file: {args.run} ({'edit' if has_edits else 'read'} on {len(targets)} device(s){timer})")
         if save_dir:
             print(f"Save output dir: {save_dir}")
         if batch_cmds:
-            print(f"Batch: {len(batch_cmds)} commands from {args.batch}")
+            print(f"Batch: {len(batch_cmds)} commands from {args.batch or 'the run file'}")
         print(f"Targets: {len(targets)}")
 
     # One unit of work per job entry, or per target. The entry (None outside
