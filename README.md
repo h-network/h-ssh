@@ -54,7 +54,7 @@ lands in a JSONL audit trail.
                     └──────────── every edit ──────────────────┴──▶ --audit-log (JSONL)
 ```
 
-On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted. With a password, no `~/.ssh/id_*` key and no agent is tried first.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted. With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT`, `connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns (sshd busy, or filtered)`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
 
 ## Install
 
@@ -309,6 +309,7 @@ classified before anything is retried:
 |---|---|
 | Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh`, `telnet*` and `arista` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker) |
 | Authentication, host key, rejected command (and an unresolvable name on `junos`/`openssh`) | fail immediately |
+| The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
 | Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2) |
 
 The split is whether a connection was established. A connect-phase failure has already spent the
@@ -335,7 +336,11 @@ Ctrl-C stops starting new devices and lets the calls already in flight run out: 
 its way to a router is reported, logged and audited like any other, never dropped. The run then
 reports how many devices completed (`Interrupted. Completed 1 of 3 device(s).`, on stderr) and exits
 `130`. Output already written to stdout stays valid, so a truncated `--raw` run cannot look like a
-complete one. With `--json` there is no notice: the array holds only the devices that completed, the
+complete one. A device that was still being connected to when Ctrl-C came, and whose connect then
+ran out on its own, is reported as `INTERRUPTED` rather than `FAIL`: nothing reached it and the
+operator stopped the run. Its entry carries `interrupted: true`, its error starts with `interrupted
+while connecting:`, the notice says `; N interrupted while connecting`, and the summary gains an
+`interrupted` count. With `--json` there is no notice: the array holds only the devices that completed, the
 summary's `targets` is that count, and the exit code is still `130`.
 
 ## Safety
