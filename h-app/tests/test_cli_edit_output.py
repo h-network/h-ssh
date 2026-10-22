@@ -51,7 +51,7 @@ def run_cli(monkeypatch, capsys, tmp_path, argv, result=None, driver=None,
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys, "argv", [
-        prog, "--config", str(tmp_path / "no-config"), "--user", "u", "--password", "p",
+        prog, "--config", os.devnull, "--user", "u", "--password", "p",
         *(["--target", target] if target else []), *argv])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
@@ -470,7 +470,7 @@ def test_ctrl_c_reports_and_audits_the_commit_that_was_in_flight(monkeypatch, ca
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
     audit, log = tmp_path / "audit.jsonl", tmp_path / "run.jsonl"
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", str(tmp_path / "none"), "--user", "u", "--password", "p",
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
                                       "--target", "R1:10.0.0.1:junos", "--target", "R2:10.0.0.2:junos",
                                       "--workers", "1", "-y", "-eC", "set system host-name X",
                                       "--audit-log", str(audit), "--log", str(log)])

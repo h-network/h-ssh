@@ -15,6 +15,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from .core import (
     Target, load_devices_csv, load_config, get_config_path,
@@ -109,6 +110,41 @@ def resolve_workers(requested: int) -> int:
     return max(1, min(n, MAX_WORKERS))
 
 
+MAX_SECONDS = 86400
+
+
+def _ranged_int(low: int, high: Optional[int], what: str):
+    """An argparse type: an integer within [low, high], or one line naming the
+    range. The value a flag accepts is the value a config file accepts, so
+    the same ranges live in CONFIG_FLOORS / CONFIG_CEILINGS."""
+    def convert(text: str) -> int:
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(f"{what} takes a whole number, not {text!r}")
+        if value < low or (high is not None and value > high):
+            span = f"a number from {low} to {high}" if high is not None else f"a number of {low} or more"
+            raise argparse.ArgumentTypeError(f"{what} takes {span}, not {value}")
+        return value
+    return convert
+
+
+def _tty(stream) -> bool:
+    """Is this a terminal? False for a closed or absent stream (`>&-` leaves
+    sys.stdout as None) instead of a traceback."""
+    try:
+        return bool(stream is not None and stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse's error() prints the whole usage block before the one line
+    that matters; on a 30-flag tool that buries it. One line, exit 2."""
+    def error(self, message):
+        self.exit(2, f"{self.prog}: error: {message} (see --help)\n")
+
+
 
 # Everything here may be set in ~/.h-ssh/config. The password may not: a config
 # file on a shared host is the wrong home for a secret.
@@ -124,6 +160,7 @@ CONFIG_DEFAULTS = {
 TRANSPORT_CHOICES = ["junos", "arista", "ssh", "openssh", "telnet"]
 # The floor a config-file value must reach; a flag has argparse for this.
 CONFIG_FLOORS = {"workers": 1, "retries": 0, "session_timeout": 1, "command_timeout": 1}
+CONFIG_CEILINGS = {"workers": MAX_WORKERS, "session_timeout": MAX_SECONDS, "command_timeout": MAX_SECONDS}
 
 
 def apply_config_defaults(args, config: dict) -> None:
@@ -149,6 +186,8 @@ def apply_config_defaults(args, config: dict) -> None:
                 raise ValueError(f"{key} = {value!r} is not a number")
             if value < CONFIG_FLOORS.get(key, 0):
                 raise ValueError(f"{key} = {value} is below {CONFIG_FLOORS.get(key, 0)}")
+            if key in CONFIG_CEILINGS and value > CONFIG_CEILINGS[key]:
+                raise ValueError(f"{key} = {value} is above {CONFIG_CEILINGS[key]}")
         elif key == "transport":
             value = str(value).strip().lower()   # vendors are matched lowercase, as for targets
             if value not in TRANSPORT_CHOICES:
@@ -285,7 +324,7 @@ async def main() -> int:
             stream.reconfigure(errors="replace")
         except (AttributeError, ValueError):
             pass
-    parser = argparse.ArgumentParser(description="Multi-vendor network automation tool.")
+    parser = _Parser(description="Multi-vendor network automation tool.")
 
     parser.add_argument("--devices", default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
@@ -314,7 +353,7 @@ async def main() -> int:
                         help="File containing show commands to run in batch (one per line, # comments)")
     parser.add_argument("--job", type=str,
                         help="JSON job file with per-device commands (use - for stdin)")
-    parser.add_argument("--rollback", type=int, metavar="N",
+    parser.add_argument("--rollback", type=_ranged_int(0, 49, "--rollback"), metavar="N",
                         help="Return every target to rollback N (0-49), with the same gates as an edit (Junos only)")
     parser.add_argument("--commit-status", action="store_true",
                         help="Show the commit history as data: sequence, time, user, comment, pending commit-confirmed timer (Junos only)")
@@ -325,14 +364,14 @@ async def main() -> int:
                              "committing; a diff that changed by then is not committed")
 
     # Behavior
-    parser.add_argument("--retries", type=int, default=None,
+    parser.add_argument("--retries", type=_ranged_int(0, None, "--retries"), default=None,
                         help="Retries per device after the first attempt (default: 2). "
                              "Permanent failures never retry.")
-    parser.add_argument("--workers", type=int, default=None,
+    parser.add_argument("--workers", type=_ranged_int(1, MAX_WORKERS, "--workers"), default=None,
                         help="Parallel workers (default: 8)")
-    parser.add_argument("--session-timeout", type=int, default=None,
+    parser.add_argument("--session-timeout", type=_ranged_int(1, MAX_SECONDS, "--session-timeout"), default=None,
                         help="Timeout for establishing connection/session (default: 30)")
-    parser.add_argument("--command-timeout", type=int, default=None,
+    parser.add_argument("--command-timeout", type=_ranged_int(1, MAX_SECONDS, "--command-timeout"), default=None,
                         help="Timeout for individual commands/operations (default: 20)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Do not push, only show what would happen")
@@ -374,13 +413,23 @@ async def main() -> int:
     args = parser.parse_args()
 
     # Resolved before anything reads them, so --list-commands and the banner
-    # see the same values the run will use.
-    file_config = load_config(args.config)
+    # see the same values the run will use. A --config named on the command
+    # line that is not there is said so; the implicit default stays silent.
+    if args.config and not Path(args.config).exists():
+        print(f"ERROR: config file not found: {args.config}", file=sys.stderr)
+        return 2
     try:
+        file_config = load_config(args.config)
         apply_config_defaults(args, file_config)
     except ValueError as e:
         print(f"ERROR: {get_config_path() if args.config is None else args.config}: {e}", file=sys.stderr)
         return 2
+
+    # A command made of whitespace is a typo, not a request.
+    for flag, value in (("-sC", args.show_command), ("-eC", args.edit_command)):
+        if value is not None and not value.strip():
+            print(f"ERROR: {flag} is empty.", file=sys.stderr)
+            return 2
 
     # Handle --list-commands
     if args.list_commands:
@@ -492,7 +541,7 @@ async def main() -> int:
                     return 2
             elif args.edit_broadcast:
                 try:
-                    b_content = Path(args.edit_broadcast).read_text(encoding="utf-8")
+                    b_content = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
                 except Exception as e:
                     print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
                     return 2
@@ -506,7 +555,7 @@ async def main() -> int:
                         set_file = path_inside(args.edit_dir, f"{t.name}.set")
                         if set_file.is_file():
                             try:
-                                d_content = set_file.read_text(encoding="utf-8")
+                                d_content = set_file.read_text(encoding="utf-8-sig")
                             except Exception as e:
                                 print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
                                 return 2
@@ -519,7 +568,7 @@ async def main() -> int:
         # log as the same string: what the guard checked is what is sent.
         if args.edit_broadcast:
             try:
-                broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8")
+                broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
             except Exception as e:
                 print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
                 return 2
@@ -528,7 +577,7 @@ async def main() -> int:
                 set_file = path_inside(args.edit_dir, f"{t.name}.set")
                 if set_file.is_file():
                     try:
-                        edit_payloads[t.name] = set_file.read_text(encoding="utf-8")
+                        edit_payloads[t.name] = set_file.read_text(encoding="utf-8-sig")
                     except Exception as e:
                         print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
                         return 2
@@ -590,7 +639,14 @@ async def main() -> int:
         save_dir = args.save_output
         # Raw device output (a config backup is the point), so the directory
         # and its files are the operator's alone: 0700 / 0600, never redacted.
-        Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        if Path(save_dir).exists() and not Path(save_dir).is_dir():
+            print(f"ERROR: --save-output {save_dir} exists and is not a directory.", file=sys.stderr)
+            return 2
+        try:
+            Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as e:
+            print(f"ERROR: --save-output {save_dir}: {e.strerror or e}", file=sys.stderr)
+            return 2
 
     # Credentials. Flag beats environment beats config file; the password is
     # never read from the config file, so a shell alias cannot leak it to disk.
@@ -610,7 +666,7 @@ async def main() -> int:
     show_progress = not (json_mode or raw_mode)
 
     if not user:
-        if not sys.stdin.isatty():
+        if not _tty(sys.stdin):
             print("ERROR: No username provided and stdin is not a TTY. "
                   "Use --user, HSSH_USER, or set 'user' in %s." % get_config_path(),
                   file=sys.stderr)
@@ -621,11 +677,11 @@ async def main() -> int:
     if not passwd:
         needs_password = any(t.vendor in ("arista",) for t in targets)
         if needs_password:
-            if not sys.stdin.isatty():
+            if not _tty(sys.stdin):
                 print("ERROR: Arista requires a password but stdin is not a TTY.", file=sys.stderr)
                 return 2
             passwd = getpass.getpass("Password: ")
-        elif sys.stdin.isatty():
+        elif _tty(sys.stdin):
             passwd = getpass.getpass("Password (press Enter to skip): ")
             if not passwd:
                 passwd = None
@@ -740,7 +796,7 @@ async def main() -> int:
         if args.show_diff:
             pass  # the diffs are shown first, the question comes after them
         elif not args.yes:
-            if not sys.stdin.isatty():
+            if not _tty(sys.stdin):
                 print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
                 return 2
             try:
@@ -867,14 +923,14 @@ async def main() -> int:
     # run, which commits each diff only if the device produces it again.
     expected = {}
     if args.show_diff and has_edits and not args.dry_run:
-        if not args.yes and not sys.stdin.isatty():
+        if not args.yes and not _tty(sys.stdin):
             print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
             return 2
         previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units))]
         preview_failed = []
         for coro in asyncio.as_completed(previews):
             i, name, ok, out_text, _ = await coro
-            if sys.stdout.isatty():
+            if _tty(sys.stdout):
                 out_text = terminal_safe(out_text)
             # stdout stays the JSON array in --json mode; the previews go to stderr
             print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=sys.stderr if json_mode else sys.stdout)
@@ -907,7 +963,7 @@ async def main() -> int:
                 return 0
 
     tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
-    screen = sys.stdout.isatty()     # control sequences are stripped for a terminal, kept for a pipe
+    screen = _tty(sys.stdout)     # control sequences are stripped for a terminal, kept for a pipe
 
     interrupted = False
     log_cmd = (batch_cmds or show_cmd or edit_cmd or args.edit_broadcast

@@ -51,6 +51,21 @@ def _is_comment_or_empty(line: str) -> bool:
     return not s or s.startswith("#")
 
 
+def check_port(value, where: str) -> int:
+    """A TCP port as a number in 1..65535; anything else names where it came from."""
+    if isinstance(value, bool):
+        raise ValueError(f"{where}: 'port' must be a number, not a boolean")
+    if isinstance(value, str):
+        if not value.strip().isdigit():
+            raise ValueError(f"{where}: 'port' must be a number, not {value!r}")
+        value = int(value.strip())
+    if not isinstance(value, int):
+        raise ValueError(f"{where}: 'port' must be a number, not {type(value).__name__}")
+    if not 1 <= value <= 65535:
+        raise ValueError(f"{where}: port {value} is outside 1..65535")
+    return value
+
+
 def load_devices_csv(path: str, default_vendor: str = "ssh") -> List[Target]:
     """
     Accepts:
@@ -67,7 +82,9 @@ def load_devices_csv(path: str, default_vendor: str = "ssh") -> List[Target]:
         raise FileNotFoundError(f"Devices file not found: {path}")
 
     targets: List[Target] = []
-    raw_lines = p.read_text(encoding="utf-8").splitlines()
+    # utf-8-sig: an inventory saved by Excel or Notepad starts with a BOM,
+    # which is not part of the first device's name.
+    raw_lines = p.read_text(encoding="utf-8-sig").splitlines()
 
     filtered = [ln for ln in raw_lines if not _is_comment_or_empty(ln)]
 
@@ -95,14 +112,16 @@ def load_devices_csv(path: str, default_vendor: str = "ssh") -> List[Target]:
     has_header = len(first) >= 1 and first[0] == "name"
     start_idx = 1 if has_header else 0
 
-    for r in rows[start_idx:]:
+    for i, r in enumerate(rows[start_idx:], start=start_idx + 1):
         if not r:
             continue
+        if len(r) > 4:
+            raise ValueError(f"{path} row {i}: {len(r)} columns; expected name,ip[,vendor[,port]]")
         name = r[0].strip()
         ip = r[1].strip() if len(r) > 1 else ""
         vendor = r[2].strip().lower() if len(r) > 2 else default_vendor
         port_str = r[3].strip() if len(r) > 3 else ""
-        port = int(port_str) if port_str else None
+        port = check_port(port_str, f"{path} row {i} ({name or '?'})") if port_str else None
         if not name:
             continue
         host = ip if ip else name
@@ -124,14 +143,22 @@ def load_config(path: str = None) -> Dict[str, str]:
     the same '#' comment handling the devices file already has.
     """
     p = Path(path) if path else get_config_path()
+    if p.is_dir():
+        raise ValueError("is a directory, not a config file")
     if not p.is_file():
         return {}
 
     config = {}
-    for line in p.read_text(encoding="utf-8").splitlines():
+    try:
+        text = p.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        raise ValueError("is not UTF-8 text")
+    for n, line in enumerate(text.splitlines(), start=1):
         line = line.split("#", 1)[0].strip()
-        if not line or "=" not in line:
+        if not line:
             continue
+        if "=" not in line:
+            raise ValueError(f"line {n}: expected 'key = value', got {line!r}")
         key, value = line.split("=", 1)
         key = key.strip().lower().replace("-", "_")
         value = value.strip().strip('"').strip("'")
@@ -169,17 +196,17 @@ def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
     def port_of(text: str) -> int:
         if not text.isdigit():
             raise ValueError(f"Invalid target: {spec!r} (port {text!r} is not a number)")
-        return int(text)
+        return check_port(text, f"Invalid target {spec!r}")
 
     if len(parts) == 2:
         return Target(name=name, host=host, vendor=default_vendor)
     elif len(parts) == 3:
         if parts[2].isdigit():
-            return Target(name=name, host=host, port=int(parts[2]), vendor=default_vendor)
+            return Target(name=name, host=host, port=port_of(parts[2]), vendor=default_vendor)
         return Target(name=name, host=host, vendor=parts[2].lower())
     elif len(parts) == 4:
         if parts[2].isdigit():
-            return Target(name=name, host=host, port=int(parts[2]), vendor=parts[3].lower())
+            return Target(name=name, host=host, port=port_of(parts[2]), vendor=parts[3].lower())
         return Target(name=name, host=host, vendor=parts[2].lower(), port=port_of(parts[3]))
     else:
         raise ValueError(f"Invalid target: {spec!r} (expected name:host[:vendor][:port]; "
@@ -237,6 +264,9 @@ def load_jobs(path: str, default_vendor: str = "ssh") -> List[JobEntry]:
             raise ValueError(f"Job entry {i}: must be a JSON object")
         if "target" not in item:
             raise ValueError(f"Job entry {i}: missing 'target'")
+        unknown = sorted(set(item) - {"target", "show", "edit", "port"})
+        if unknown:
+            raise ValueError(f"Job entry {i}: unknown key(s) {', '.join(unknown)} (target, show, edit, port)")
         for key in ("target", "show", "edit"):
             if key in item and not isinstance(item[key], str):
                 raise ValueError(f"Job entry {i}: '{key}' must be a string")
@@ -248,10 +278,7 @@ def load_jobs(path: str, default_vendor: str = "ssh") -> List[JobEntry]:
 
         # Optional port override
         if "port" in item:
-            try:
-                target.port = int(item["port"])
-            except (TypeError, ValueError):
-                raise ValueError(f"Job entry {i}: 'port' must be a number")
+            target.port = check_port(item["port"], f"Job entry {i}")
 
         has_show = "show" in item
         has_edit = "edit" in item
@@ -277,7 +304,7 @@ def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
     path = path_inside(config_dir, f"{validate_device_name(dev_name)}.set")
     if not path.is_file():
         raise FileNotFoundError(f"Missing config file for {dev_name}: {path}")
-    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+    lines = [ln for ln in path.read_text(encoding="utf-8-sig").splitlines()
              if not _is_comment_or_empty(ln)]
     if not lines:
         raise ValueError(f"Empty config after filtering: {path}")
@@ -285,7 +312,7 @@ def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
 
 
 def read_command_file_lines(path: Path) -> List[str]:
-    data = path.read_text(encoding="utf-8").splitlines()
+    data = path.read_text(encoding="utf-8-sig").splitlines()
     out = []
     for ln in data:
         if _is_comment_or_empty(ln):

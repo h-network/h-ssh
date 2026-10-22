@@ -99,7 +99,7 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 ./h-app/h-ssh.py --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
 ```
 
-Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints); an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing.
+Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints); an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device.
 
 **A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` or `arista` on the target to get NETCONF or eAPI, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
@@ -260,7 +260,11 @@ device costs you; on a LAN a reachable device connects in well under a second.
 
 **Passwords are never read from this file.** A config file on a shared jump host is the wrong place
 for a secret; use `HSSH_PASSWORD`, the prompt, or keys (`--password` works, but shows in `ps`).
-`--config PATH` points at a different file.
+`--config PATH` points at a different file, and that path must exist: a typo is exit 2, only the
+default path may be absent. Every line is `key = value`; a line that is not is exit 2 naming it, as
+is a value outside the flag's range (`workers` 1..256, `session_timeout` and `command_timeout`
+1..86400, `retries` 0 or more). The flags are held to the same ranges, and a usage error prints one
+line, not the usage block.
 
 ## Output
 
