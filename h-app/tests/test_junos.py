@@ -108,6 +108,8 @@ def fake_pyez(monkeypatch):
     monkeypatch.setattr(junos, "AVAILABLE", True)
     monkeypatch.setattr(junos, "JunosDevice", FakeDevice)
     monkeypatch.setattr(junos, "JunosConfig", FakeConfig)
+    # A confirm first asks the device whether anything is waiting (#63).
+    monkeypatch.setattr(junos, "_pending_on", lambda dev, t: {"seq": 0, "pending_rollback_minutes": 5})
 
 
 def edit(payload="set system host-name r1\n", **kw):

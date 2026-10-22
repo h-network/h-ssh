@@ -11,7 +11,7 @@ import time
 from typing import List, Optional
 
 from ..core import check_confirm_minutes
-from ..errors import AmbiguousCommitError, NotAppliedError
+from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
 
 AVAILABLE = True  # Raw sockets, always available
 
@@ -386,6 +386,11 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
     return f"COMMIT OK\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
 
 
+# The latest entry of `show system commit` while a commit confirmed waits:
+# "0   2026-10-22 08:00:00 UTC by lab via cli commit confirmed, rollback in 5mins"
+_PENDING_LINE = re.compile(r"^\s*0\s+.*rollback in \d+\s*min", re.I | re.M)
+
+
 def confirm(host: str, user: str, passwd: str,
             session_timeout: int, command_timeout: int,
             port: int = None, vendor_hint: str = "telnet-junos",
@@ -400,6 +405,13 @@ def confirm(host: str, user: str, passwd: str,
     sock, prompt_re = _connect_and_login(host, user, passwd, port if port is not None else 23,
                                          session_timeout, "junos")
     try:
+        # Nothing waiting means the timer expired or it was confirmed
+        # already; a commit now would hide that from the operator.
+        history = _send_command(sock, prompt_re, "show system commit", command_timeout)
+        if not _PENDING_LINE.search(history):
+            raise NothingToConfirmError(
+                "nothing to confirm: no commit-confirmed is pending on the device "
+                "(the timer expired, or it was confirmed already); nothing was sent")
         reply = _send_command(sock, prompt_re, "configure exclusive", 10)
         if _JUNOS_ERROR_RE.search(reply):
             raise NotAppliedError(f"Failed to lock config: {reply.strip()}")

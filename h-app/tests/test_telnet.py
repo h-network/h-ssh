@@ -263,8 +263,13 @@ OP = "lab@R1> "
 CFG = "\r\n[edit]\r\nlab@R1# "
 
 
+HISTORY_PENDING = ("\r\n0   2026-10-22 08:00:00 UTC by lab via cli commit confirmed, rollback in 5mins"
+                   "\r\n1   2026-10-21 17:10:03 UTC by lab via cli\r\n")
+HISTORY_CLEAN = "\r\n0   2026-10-22 08:00:00 UTC by lab via cli\r\n1   2026-10-21 17:10:03 UTC by lab via cli\r\n"
+
+
 def junos_cli(login=False, lock_reply=None, commit_reply="\r\ncommit complete",
-              hang_on=None, hang_up_on=None):
+              hang_on=None, hang_up_on=None, history=HISTORY_PENDING):
     """A Junos-looking CLI: a login step when asked, then the operational
     prompt. lock_reply answers `configure exclusive` in place of entering
     configuration mode; hang_on names a command (`commit`, `exit`, ...) left
@@ -293,6 +298,8 @@ def junos_cli(login=False, lock_reply=None, commit_reply="\r\ncommit complete",
                 srv.send(CFG)
             elif line == "show version":
                 srv.send("\r\nHostname: R1\r\nModel: mx204\r\n" + OP)
+            elif line == "show system commit":
+                srv.send(history + OP)
             elif line == "show | compare":
                 srv.send("\r\n[edit system]\r\n+  host-name test;" + CFG)
             elif line.startswith("rollback"):
@@ -712,7 +719,7 @@ def test_confirm_is_one_bare_commit_in_exclusive_mode():
     out = telnet.confirm("127.0.0.1", "lab", "secret", session_timeout=5, command_timeout=5,
                          port=srv.port, vendor_hint="telnet-junos")
     assert out == "COMMIT CONFIRMED OK"
-    assert _received(srv) == ["configure exclusive", "commit", "exit"]
+    assert _received(srv) == ["show system commit", "configure exclusive", "commit", "exit"]
 
 
 def test_confirm_refused_lock_is_not_applied():
@@ -722,7 +729,7 @@ def test_confirm_refused_lock_is_not_applied():
     with pytest.raises(NotAppliedError, match="Failed to lock config"):
         telnet.confirm("127.0.0.1", "lab", "secret", session_timeout=5, command_timeout=5,
                        port=srv.port, vendor_hint="telnet-junos")
-    assert _received(srv) == ["configure exclusive"]
+    assert _received(srv) == ["show system commit", "configure exclusive"]
 
 
 def test_a_commit_line_inside_a_payload_is_refused_before_anything_is_sent(monkeypatch):

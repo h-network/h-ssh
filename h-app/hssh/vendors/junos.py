@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from typing import List, Optional
 
 from ..core import JUNOS_SET_PREFIX_VERBS, check_confirm_minutes
-from ..errors import AmbiguousCommitError, NotAppliedError
+from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
 from ..pool import POOL
 
 try:
@@ -581,6 +581,13 @@ def confirm(host: str, user: str, passwd: str,
     in with the confirmation."""
     _require()
     with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+        # A plain commit with nothing waiting is not a confirmation: the
+        # timer expired (the change is gone) or someone confirmed before.
+        # Either way the operator must know; a commit would only hide it.
+        if _pending_on(lease.dev, command_timeout) is None:
+            raise NothingToConfirmError(
+                "nothing to confirm: no commit-confirmed is pending on the device "
+                "(the timer expired, or it was confirmed already); nothing was sent")
         cu = JunosConfig(lease.dev)
         _lock(cu, lease)
         try:
@@ -779,7 +786,11 @@ def commit_status(host: str, user: str, passwd: str,
     after it; h-ssh confirms with a commit.)"""
     _require()
     doc = rpc(host, user, passwd, "get-commit-information", session_timeout, command_timeout, port=port)
+    return _commit_entries(doc)
 
+
+def _commit_entries(doc: dict) -> List[dict]:
+    """commit_status()'s entries from the router's get-commit-information reply."""
     def text(d, key):
         v = d.get(key)
         return v[0].get("data") if isinstance(v, list) and v and isinstance(v[0], dict) else None
@@ -806,6 +817,12 @@ def commit_status(host: str, user: str, passwd: str,
             "pending_rollback_minutes": int(pending.group(1)) if pending and seq == 0 else None,
         })
     return out
+
+
+def _pending_on(dev, command_timeout: int) -> Optional[dict]:
+    """The commit-confirmed still waiting on an open session's router, if any."""
+    doc = _rpc_reply(dev, "get-commit-information", None, "json")
+    return pending_commit(_commit_entries(doc))
 
 
 def pending_commit(entries: List[dict]) -> Optional[dict]:

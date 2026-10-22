@@ -6,6 +6,12 @@ class NotAppliedError(RuntimeError):
     was sent (connect/auth/lock). Safe to retry even for an edit."""
 
 
+class NothingToConfirmError(RuntimeError):
+    """A confirm was asked of a device with no commit-confirmed waiting: the
+    timer expired (the change is already gone) or it was confirmed before.
+    Nothing was sent; not retried, since the next attempt finds the same."""
+
+
 class AmbiguousCommitError(RuntimeError):
     """The commit was sent but its outcome is unknown (timeout, dropped session).
 
