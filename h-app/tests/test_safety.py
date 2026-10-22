@@ -119,9 +119,11 @@ def test_cross_invocation_persist():
 
 # T8: a gate that cannot keep its file refuses to exist (#64); the
 # in-memory gate is still the one without a file.
-def test_an_unwritable_safety_file_refuses_the_gate():
-    with pytest.raises(OSError, match="safety file /nonexistent/dir/safety.json: cannot create its directory"):
-        SafetyGate(safety_file="/nonexistent/dir/safety.json")
+def test_an_unwritable_safety_file_refuses_the_gate(tmp_path):
+    (tmp_path / "afile").write_text("x")          # a directory cannot be made inside a file, root or not
+    bad = tmp_path / "afile" / "dir" / "safety.json"
+    with pytest.raises(OSError, match=f"safety file {bad}: cannot create its directory"):
+        SafetyGate(safety_file=str(bad))
     gate = SafetyGate(safety_file=None)
     allowed, reason = gate.check_device("10.0.1.1")
     assert allowed is True and reason == "ok"
