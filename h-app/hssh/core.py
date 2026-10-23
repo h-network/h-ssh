@@ -279,7 +279,12 @@ def load_jobs(path: str, default_vendor: str = "ssh") -> List[JobEntry]:
     else:
         with open(path) as f:
             data = json.load(f)
+    return parse_jobs(data, default_vendor)
 
+
+def parse_jobs(data, default_vendor: str = "ssh") -> List[JobEntry]:
+    """The job entries from already-parsed data (a --job file, or the `jobs:`
+    list of a run file), checked the same way."""
     if not isinstance(data, list) or len(data) == 0:
         raise ValueError("Job file must be a non-empty JSON array")
 

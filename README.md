@@ -33,7 +33,7 @@ lands in a JSONL audit trail.
 - **One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
 - **Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing and `--commit-confirmed N` for changes that undo themselves unless you confirm within N minutes (both Junos), and an opt-in per-device rate limit and cooldown (`--safety-file`).
 - **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
-- **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely.
+- **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely. A whole fleet run fits in one YAML file (`--run fleet.yaml`) that a pipeline step or a jump-host session runs as it is.
 - **Built for a maintenance, not just a run.** A session pool keeps one NETCONF session per router open for a whole script; `rpc()` and `--format json|xml` return the router's own data instead of CLI text; `begin()` holds a diffed candidate open until a gate decides; `--rollback N`, commit comments, `--commit-status` and `guarded_commit()` cover the commit-confirmed lifecycle without a `| match` in sight.
 - **One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
 
@@ -130,6 +130,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
+| `--run FILE` | Run file | Any of the above described in one YAML or JSON file: devices, commands, options, outputs. See [Run files](#run-files) |
 
 ```json
 [
@@ -267,6 +268,72 @@ default path may be absent. Every line is `key = value`; a line that is not is e
 is a value outside the flag's range (`workers` 1..256, `session_timeout` and `command_timeout`
 1..86400, `retries` 0 or more). The flags are held to the same ranges, and a usage error prints one
 line, not the usage block.
+
+## Run files
+
+A pipeline step does not want fifteen flags, and neither does a jump host at three in the morning.
+A run file is the whole run in one YAML (or JSON) file:
+
+```yaml
+# fleet-bgp.yaml
+devices: inventories/ax.csv        # a CSV path, or an inline list (below)
+transport: junos
+user: h-lab                        # never a password: see below
+workers: 64
+retries: 1
+session-timeout: 15
+format: xml
+commands:                          # a batch, one session per device
+  - show bgp summary
+  - show route summary
+log: runs/bgp.jsonl
+audit-log: audit.jsonl
+```
+
+```bash
+h-ssh --run fleet-bgp.yaml                 # on the jump host: asks for the password once
+HSSH_PASSWORD=... h-ssh --run fleet-bgp.yaml --json > out.json   # in a pipeline: no terminal needed
+h-ssh --run fleet-bgp.yaml --dry-run       # a flag on the command line wins over the file
+```
+
+Every key is a flag name, written with `-` or `_`, and gets the flag's validation: a transport outside
+the list, `workers: 0`, `format: csv` or an unknown key is exit 2 naming the key. Precedence is
+command line → run file → environment → `~/.h-ssh/config` → built-in default, so a `--dry-run` from a
+pipeline variable overrides whatever the file says. Relative paths in the file (`devices`, `batch`,
+`edit-dir`, `edit-broadcast`, `log`, `audit-log`, `save-output`, `safety-file`) resolve against the
+file's own directory, so a run directory with its inventory and set files moves as one.
+
+Three keys have no flag of their own:
+
+```yaml
+devices:                           # inline targets instead of a CSV
+  - R1:10.0.1.1:junos
+  - {name: R2, host: 10.0.1.2, vendor: junos, port: 830}
+commands: [show version, show route summary]      # an inline --batch
+jobs:                              # the entries a --job file holds
+  - {target: "R1:10.0.1.1:junos", show: show bgp summary}
+  - {target: "R3:10.0.1.3:junos", edit: set system host-name R3-new}
+```
+
+The rest are the flags: `show`, `edit`, `edit-dir`, `edit-broadcast`, `batch`, `rollback`,
+`commit-status`, `comment`, `show-diff`, `dry-run`, `commit-confirmed`, `yes` (or `assume-yes`:
+YAML reads a bare `yes:` as a boolean, both spellings work), `structured`, `format`, `json`, `raw`,
+`diff`, `verbose`, `save-output`, `log`, `audit-log`, `safety-file`, `retries`, `workers`,
+`session-timeout`, `command-timeout`, `transport`, `user`.
+
+Two rules the file cannot bend:
+
+- **No credential, ever.** `password`, `passwd`, `secret` and `token` keys are refused before anything
+  runs. The password comes from `HSSH_PASSWORD`, `--password`, or the prompt when stdin is a terminal,
+  exactly as without a file, so a run file can live in git or on a shared jump host.
+- **Changes need a timer.** A run file that commits (`edit`, `edit-dir`, `edit-broadcast`, `rollback`,
+  or a job with an edit) must set `commit-confirmed` in the file or on the command line, or be a
+  `dry-run`; otherwise exit 2. Nobody watches a pipeline, and an unattended commit without a rollback
+  timer is the one thing it must not be able to do by accident. The `y/N` question and `-y` work as
+  they do for flags, and the banner names the file, the device count and the timer.
+
+The file is declarative: no variables, loops or templating. A pipeline that needs them generates the
+file. YAML needs PyYAML, which the `junos` extra already installs; a JSON run file needs nothing.
 
 ## Output
 
