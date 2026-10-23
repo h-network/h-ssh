@@ -58,6 +58,24 @@ _PERMANENT = (
     "invalid command",
     "invalid input",
     "syntax error",
+    # The request itself is wrong: the same call cannot come out differently,
+    # and each retry costs a full session timeout per device on a fleet.
+    "no structured binding",                 # --structured on a command without one (junos)
+    "no authentication methods available",   # paramiko: no password, no key, no agent
+    "contains invalid characters",           # OpenSSH refuses the user or host name
+    "malformed known_hosts line",            # the pin file cannot be parsed
+)
+
+# Failures that happen before any session exists: nothing reached the device.
+_CONNECT_PHASE = (
+    "netconf connect failed",
+    "connect to host",
+    "connection refused",
+    "no route to host",
+    "network is unreachable",
+    "unable to connect to port",
+    "ssh protocol banner",
+    "connection timed out",
 )
 
 
@@ -65,6 +83,14 @@ def is_permanent_failure(exc) -> bool:
     """True when another identical attempt cannot plausibly succeed."""
     text = str(exc).lower()
     return any(marker in text for marker in _PERMANENT)
+
+
+def is_connect_failure(exc_or_text) -> bool:
+    """True when the failure happened while connecting, before any session
+    existed: nothing reached the device. paramiko's bare socket timeout is
+    the whole message 'timed out'; a command timeout always says more."""
+    text = str(exc_or_text).strip().lower()
+    return text == "timed out" or any(marker in text for marker in _CONNECT_PHASE)
 
 
 def _is_local_error(exc) -> bool:

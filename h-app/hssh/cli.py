@@ -27,7 +27,7 @@ from .core import (
 
     path_inside,
 )
-from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS
+from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS, is_connect_failure
 from .safety import SafetyGate
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .vendors import VENDORS
@@ -868,6 +868,7 @@ async def main() -> int:
         print()
 
     failures = 0
+    interrupted_connects = 0
     skipped = skipped_missing if not job_entries else 0
     json_results = []
     run_start = time.time()
@@ -955,6 +956,7 @@ async def main() -> int:
             )
 
     started = set()      # unit indices whose device may already be in play
+    inflight = set()     # of those, the ones still running when Ctrl-C came
 
     async def _run_unit(i, dry_run=None, expected_diff=None):
         """units[i] on its device, in its own mode and command for a job
@@ -1035,6 +1037,8 @@ async def main() -> int:
                     if i not in started and task in pending:
                         task.cancel()
                         pending.discard(task)
+                    elif task in pending and not task.done():
+                        inflight.add(i)
                 continue
             for task in done:
                 if not task.cancelled():
@@ -1119,6 +1123,13 @@ async def main() -> int:
                     break
             else:
                 entry["error"] = "unknown error"
+        if i in inflight and not ok and is_connect_failure(entry.get("error", "")):
+            # Ctrl-C came while this device was still being connected to; the
+            # connect ran out on its own afterwards. Nothing reached the
+            # device, and the operator stopped the run: that is interrupted,
+            # not a device that failed.
+            entry["interrupted"] = True
+            entry["error"] = f"interrupted while connecting: {entry['error']}"
         json_results.append(entry)
 
         # Audit logging for operations
@@ -1226,7 +1237,7 @@ async def main() -> int:
                     elif ok_count > 0:
                         status = f"PARTIAL ({ok_count}/{total} commands)"
                     else:
-                        status = "FAIL"
+                        status = "INTERRUPTED" if entry.get("interrupted") else "FAIL"
                     print(f"[{timestamp}] {name:16s} {status}")
                     if args.verbose:
                         for cr in cmd_results:
@@ -1241,7 +1252,7 @@ async def main() -> int:
                             if not cr.get("ok"):
                                 print(f"  ERROR: {cr.get('command')}: {cr.get('error')}")
                 else:
-                    status = "FAIL"
+                    status = "INTERRUPTED" if entry.get("interrupted") else "FAIL"
                     print(f"[{timestamp}] {name:16s} {status}")
                     if args.verbose:
                         print(f"\n--- Output from {name} ---")
@@ -1253,7 +1264,7 @@ async def main() -> int:
                                 print(f"  {ln}")
                                 break
             else:
-                status = "OK" if ok else "FAIL"
+                status = "OK" if ok else ("INTERRUPTED" if entry.get("interrupted") else "FAIL")
                 print(f"[{timestamp}] {name:16s} {status}")
 
                 if args.verbose:
@@ -1271,6 +1282,8 @@ async def main() -> int:
         if not ok:
             if entry.get("error", "").startswith("safety gate blocked"):
                 skipped += 1
+            elif entry.get("interrupted"):
+                interrupted_connects += 1
             else:
                 failures += 1
 
@@ -1350,8 +1363,10 @@ async def main() -> int:
         if interrupted:
             # Always reported, and always on stderr, so --raw stdout stays
             # device output and a truncated run can never look complete.
-            print(f"Interrupted. Completed {len(json_results)} of {len(targets)} device(s).",
-                  file=sys.stderr)
+            note = (f"; {interrupted_connects} interrupted while connecting"
+                    if interrupted_connects else "")
+            print(f"Interrupted. Completed {len(json_results) - interrupted_connects} of "
+                  f"{len(targets)} device(s){note}.", file=sys.stderr)
 
         # The verdict counts what did not run as well as what failed: a run the
         # safety gate kept away from every device must not read as a success.
@@ -1395,13 +1410,14 @@ async def main() -> int:
 
     # Structured stderr summary
     elapsed_ms = int((time.time() - run_start) * 1000)
-    ok_count = len(json_results) - failures - skipped
+    ok_count = len(json_results) - failures - skipped - interrupted_connects
     stderr_mode = "batch" if mode == "show-batch" else ("job" if mode == "job" else mode.split("-")[0])
     summary = json.dumps({
         "targets": len(json_results),
         "ok": ok_count,
         "fail": failures,
         "skipped": skipped,
+        **({"interrupted": interrupted_connects} if interrupted else {}),
         "elapsed_ms": elapsed_ms,
         "mode": stderr_mode,
     })

@@ -74,6 +74,25 @@ class _RejectPolicy:
             "HSSH_HOST_KEY_POLICY=yes." % hostname)
 
 
+def _load_pins(client, known_hosts: str) -> None:
+    """~/.ssh/known_hosts (read only) and h-ssh's own pin file. A line that
+    cannot be parsed is a refusal, not a skip: the pin it was meant to hold
+    is unknown, and retrying the file cannot change it."""
+    system = str(Path.home() / ".ssh" / "known_hosts")
+    for path, load in ((system, client.load_system_host_keys),
+                       (known_hosts, lambda: client.load_host_keys(known_hosts))):
+        try:
+            if path == known_hosts:
+                with _PIN_LOCK:
+                    load()
+            else:
+                load()
+        except (paramiko.hostkeys.InvalidHostKey, paramiko.SSHException, ValueError) as exc:
+            line = getattr(exc, "line", None)
+            shown = f": {line.strip()!r}" if isinstance(line, str) and line.strip() else ""
+            raise ValueError(f"{path}: malformed known_hosts line{shown}; fix or remove it") from exc
+
+
 def _host_key_policy(known_hosts: str):
     """The missing-host-key policy HSSH_HOST_KEY_POLICY asks for.
 
@@ -99,9 +118,7 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
 
     known_hosts = _known_hosts()
     client = paramiko.SSHClient()
-    client.load_system_host_keys()
-    with _PIN_LOCK:
-        client.load_host_keys(known_hosts)
+    _load_pins(client, known_hosts)
     client.set_missing_host_key_policy(_host_key_policy(known_hosts))
 
     session_timeout_float = float(session_timeout)
@@ -131,6 +148,14 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
             "Host key verification failed for %s: the key is not the one pinned. "
             "If the device was re-keyed, remove its line from %s (or ~/.ssh/known_hosts)."
             % (host, known_hosts)) from exc
+    except paramiko.SSHException as exc:
+        client.close()
+        if "no authentication methods available" in str(exc).lower():
+            # paramiko found nothing to offer: no password, no ~/.ssh/id_*, no agent key.
+            raise RuntimeError(
+                "No authentication methods available for %s@%s: no password was given and "
+                "no key was found in ~/.ssh or from an agent." % (user, host)) from exc
+        raise
     except BaseException:
         # A refused login or a dropped handshake leaves a Transport thread
         # and a socket behind unless the client is closed.

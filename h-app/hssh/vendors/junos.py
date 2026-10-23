@@ -15,7 +15,9 @@ discarded, never handed to the next caller.
 import hashlib
 import os
 import re
+import socket
 import threading
+import time
 from contextlib import contextmanager
 from typing import List, Optional
 
@@ -98,7 +100,13 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         # never with the device password as its passphrase), no agent asked.
         params["look_for_keys"] = False
         params["allow_agent"] = False
-    dev = JunosDevice(**params)
+    try:
+        dev = JunosDevice(**params)
+    except ValueError as e:
+        # PyEZ validates the host itself: "only alphanumerics, dots,
+        # underscores, hyphens, or bracketed IPv6 literals are permitted".
+        raise NotAppliedError(f"NETCONF connect failed: PyEZ does not accept host {host!r}: {e}") from e
+    started = time.monotonic()
     try:
         dev.open()
     except Exception as e:
@@ -109,10 +117,56 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         except Exception:
             pass
         if isinstance(e, ConnectError):
-            raise NotAppliedError(f"NETCONF connect failed: {e}") from e
+            reason = _connect_reason(e, host, user, params["port"], session_timeout,
+                                     time.monotonic() - started)
+            raise NotAppliedError(f"NETCONF connect failed: {reason}") from e
         raise
     dev.timeout = command_timeout
     return dev
+
+
+def _connect_reason(exc: BaseException, host: str, user: str, port: int,
+                    timeout: float, elapsed: float) -> str:
+    """Why the session did not open, in words. PyEZ names a connect failure
+    by its class and picks the class by the clock: anything that fails
+    within 3 s is ConnectRefusedError, whether the port was closed, the
+    banner was garbage, sshd dropped the session or the host key was
+    refused. The reason is in the exception PyEZ was handling, so read that."""
+    where = f"{host}:{port}"
+    kind = type(exc).__name__
+    cause = getattr(exc, "_orig", None) or exc.__context__ or exc.__cause__
+    cause_kind = type(cause).__name__ if cause is not None else ""
+    text = str(cause) if cause is not None else ""
+    low = text.lower()
+    if kind == "ConnectAuthError" or cause_kind == "AuthenticationError":
+        return f"authentication failed for {user} at {where}"
+    if kind == "ConnectUnknownHostError" or isinstance(cause, socket.gaierror):
+        why = f"cannot resolve {host}"
+        if ":" in host:
+            why += " (an IPv6 literal is not accepted by this PyEZ/ncclient; use a name)"
+        return why
+    if cause_kind == "SSHUnknownHostError" or "unknown host key" in low:
+        return (f"host key verification failed for {where}: not in ~/.ssh/known_hosts, or changed "
+                "(HSSH_NETCONF_HOSTKEY=yes); nothing was sent")
+    if "could not open socket" in low:
+        if elapsed >= timeout - 0.5:
+            return f"connect to {where} timed out after {timeout}s (filtered, or down)"
+        return f"connection refused by {where} (nothing listening, or no route)"
+    if "ssh protocol banner" in low:
+        detail = text.split("banner", 1)[1].strip()
+        if "codec" in detail or "decode" in detail:
+            return f"{where} is not an SSH server: the banner is not text"
+        if detail and "timed out" not in detail:
+            return (f"{where} dropped the session before login after {elapsed:.1f}s "
+                    f"({detail}; sshd connection limit?)")
+        if elapsed < min(timeout, 15) - 1:
+            return f"{where} dropped the session before login after {elapsed:.1f}s (sshd connection limit?)"
+        return f"no SSH banner from {where} within {elapsed:.0f}s (sshd busy, or filtered)"
+    if "negotiation failed" in low:
+        return f"SSH negotiation with {where} failed: {text.split(':', 1)[1].strip()}"
+    if kind == "ConnectTimeoutError":
+        return f"connect to {where} timed out after {timeout}s"
+    return f"{kind} for {where}" + (f": {text}" if text else "")
 
 
 def _close(dev) -> None:
