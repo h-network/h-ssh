@@ -518,5 +518,5 @@ def refusal_line(*texts: str):
     for text in texts:
         m = _REFUSAL.search(text or "")
         if m:
-            return (text[m.start():].splitlines() or [""])[0].strip()
+            return (text[m.start(1):].splitlines() or [""])[0].strip()
     return None

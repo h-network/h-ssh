@@ -30,6 +30,9 @@ def test_refusal_line_reads_junos_and_ios_refusals():
     assert refusal_line("% Invalid input detected at '^' marker.\n", "") == "% Invalid input detected at '^' marker."
     assert refusal_line("ok\n  error: unknown command\n") == "error: unknown command"
     assert refusal_line("no error: here\n", "100% done\n", None) is None
+    # the Junos CLI over an exec channel answers with a leading blank line
+    assert refusal_line("", "\nerror: syntax error, expecting <command>: bad-line\n") == \
+        "error: syntax error, expecting <command>: bad-line"
 
 
 @pytest.fixture
@@ -51,6 +54,17 @@ def test_openssh_edit_stops_at_the_refused_line(fake_ssh):
     with pytest.raises(RuntimeError, match="'set bad line' was refused by the device: error: syntax error"):
         openssh.edit("h", "u", None, "set good line\nset bad line\nset never sent\n", 5, 5)
     assert "error: syntax error" in openssh.show("h", "u", None, "show bad", 5, 5)   # a show is output
+
+
+def test_a_server_that_closes_after_the_password_is_a_failed_login():
+    proc = openssh._Result(["ssh"], 255, "", "", "Connection closed by 10.0.0.1 port 22",
+                           "debug1: read_passphrase: requested to askpass\nConnection closed by 10.0.0.1 port 22\n")
+    assert openssh._describe_failure("10.0.0.1", proc) == (
+        "Authentication failed: 10.0.0.1 closed the connection after the password was offered "
+        "(wrong password, or password login is off on the server).")
+    before_auth = openssh._Result(["ssh"], 255, "", "", "Connection closed by 10.0.0.1 port 22",
+                                  "debug1: Connecting to 10.0.0.1 port 22.\nConnection closed by 10.0.0.1 port 22\n")
+    assert openssh._describe_failure("10.0.0.1", before_auth) == "ssh exit 255: Connection closed by 10.0.0.1 port 22"
 
 
 # --- L10: the open-file limit --------------------------------------------------

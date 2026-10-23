@@ -166,8 +166,9 @@ class _Result:
     """What _exec hands back: the command's own stdout and stderr, and ssh's
     diagnostics (its non-debug log lines) apart from them."""
 
-    def __init__(self, args, returncode, stdout, stderr, diag):
+    def __init__(self, args, returncode, stdout, stderr, diag, log=""):
         self.args, self.returncode, self.stdout, self.stderr, self.diag = args, returncode, stdout, stderr, diag
+        self.log = log      # ssh's whole -v log, for the phase a failure happened in
 
 
 def _own_lines(log: str) -> str:
@@ -217,10 +218,11 @@ def _exec(host: str, user: str, askpass, cmd: str,
                 raise
             outf.seek(0)
             errf.seek(0)
+            log = _read(log_path)
             return _Result(argv, proc.returncode,
                            outf.read().decode("utf-8", "replace"),
                            errf.read().decode("utf-8", "replace"),
-                           _own_lines(_read(log_path)))
+                           _own_lines(log), log)
     finally:
         try:
             os.unlink(log_path)
@@ -257,6 +259,11 @@ def _describe_failure(host: str, proc) -> str:
     first = detail.splitlines()[0] if detail else ""
     if "Permission denied" in detail or "Authentication failed" in detail:
         return "Authentication failed."
+    if "Connection closed by" in detail and _password_offered(getattr(proc, "log", "")):
+        # Junos sshd (cRPD too) drops the connection after a refused password
+        # instead of answering "Permission denied".
+        return ("Authentication failed: %s closed the connection after the password was offered "
+                "(wrong password, or password login is off on the server)." % host)
     if "Connection refused" in detail:
         return "Connection refused by %s." % host
     if "Host key verification failed" in detail:
@@ -267,6 +274,13 @@ def _describe_failure(host: str, proc) -> str:
     if first:
         return "ssh exit %d: %s" % (proc.returncode, first)
     return "ssh exit %d with no diagnostic output." % proc.returncode
+
+
+def _password_offered(log: str) -> bool:
+    """ssh's -v log says when a password went out: the askpass helper was
+    asked, or password was the authentication method being tried."""
+    return ("requested to askpass" in log or "Next authentication method: password" in log
+            or "Next authentication method: keyboard-interactive" in log)
 
 
 def _format(cmd: str, proc) -> str:

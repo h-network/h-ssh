@@ -927,7 +927,8 @@ async def main() -> int:
 
     failures = 0
     interrupted_connects = 0
-    skipped = skipped_missing if not job_entries else 0
+    skipped = 0                                              # held back by the safety gate (in the results)
+    not_run = skipped_missing if not job_entries else 0      # no set file (--allow-missing): not in the results
     json_results = []
     run_start = time.time()
 
@@ -1417,20 +1418,22 @@ async def main() -> int:
 
         # The verdict counts what did not run as well as what failed: a run the
         # safety gate kept away from every device must not read as a success.
+        notes = ([f"skipped by the safety gate: {skipped}"] if skipped else []) + \
+                ([f"skipped for want of a set file: {not_run}"] if not_run else [])
         if failures:
-            verdict = f"Done. Failures: {failures}" + (f", skipped by the safety gate: {skipped}" if skipped else "")
-        elif skipped:
+            verdict = f"Done. Failures: {failures}" + (", " + ", ".join(notes) if notes else "")
+        elif notes:
             applied = len(json_results) - skipped
-            verdict = f"Done. OK: {applied}, skipped by the safety gate: {skipped}"
+            verdict = f"Done. OK: {applied}, " + ", ".join(notes)
             if has_edits and not applied:
                 verdict += ", nothing applied"
         else:
             verdict = "Done. All devices OK."
         if not raw_mode:
             print("")
-            if failures or skipped or not interrupted:
+            if failures or skipped or not_run or not interrupted:
                 print(verdict)
-        elif failures or skipped:
+        elif failures or skipped or not_run:
             # stdout is device output only; the verdict belongs on stderr.
             print(verdict, file=sys.stderr)
 
@@ -1460,10 +1463,10 @@ async def main() -> int:
     ok_count = len(json_results) - failures - skipped - interrupted_connects
     stderr_mode = "batch" if mode == "show-batch" else ("job" if mode == "job" else mode.split("-")[0])
     summary = json.dumps({
-        "targets": len(json_results),
+        "targets": len(json_results) + not_run,
         "ok": ok_count,
         "fail": failures,
-        "skipped": skipped,
+        "skipped": skipped + not_run,
         **({"interrupted": interrupted_connects} if interrupted else {}),
         "elapsed_ms": elapsed_ms,
         "mode": stderr_mode,
@@ -1477,7 +1480,7 @@ async def main() -> int:
         return 130  # 128 + SIGINT, the shell convention
     if failures:
         return 1
-    return 3 if skipped else 0   # 3: nothing failed, but not everything ran
+    return 3 if skipped or not_run else 0   # 3: nothing failed, but not everything ran
 
 
 def _quiet_transport_logs() -> None:

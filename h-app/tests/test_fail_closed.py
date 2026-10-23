@@ -124,7 +124,9 @@ def test_allow_missing_skips_them_and_says_so(monkeypatch, capsys, tmp_path):
     assert rc == 3, err
     assert drv.calls == [("edit", "10.0.0.1", "set system host-name R1")]
     assert "Skipping 1 device(s) without a set file: R2" in err
-    assert "skipped" in out
+    assert "Done. OK: 1, skipped for want of a set file: 1" in out
+    summary = json.loads(err.split("[h-ssh] ", 1)[1].splitlines()[0])
+    assert summary == {**summary, "targets": 2, "ok": 1, "fail": 0, "skipped": 1}
 
 
 def test_allow_missing_with_no_set_file_at_all_is_nothing_to_do(monkeypatch, capsys, tmp_path):
