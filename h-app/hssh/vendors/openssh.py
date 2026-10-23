@@ -26,6 +26,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from typing import List, Optional
 
 AVAILABLE = shutil.which("ssh") is not None
@@ -144,23 +145,108 @@ def _base_opts(session_timeout: int, port: Optional[int],
     return opts
 
 
+# ssh's own log, written with -v to the -E file, says when the session is up:
+# the first connection prints "Authenticated to HOST" and "Entering interactive
+# session", a command riding the ControlMaster prints "master session id".
+_SESSION_UP = ("Authenticated to ", "Entering interactive session", "master session id")
+# Lines of that log that are chatter, not a diagnostic.
+_CHATTER = ("debug", "OpenSSH_", "Authenticated to ", "Transferred: ", "Bytes per second: ",
+            "Warning: Permanently added ")
+_POLL = 0.2
+
+
+class _Result:
+    """What _exec hands back: the command's own stdout and stderr, and ssh's
+    diagnostics (its non-debug log lines) apart from them."""
+
+    def __init__(self, args, returncode, stdout, stderr, diag):
+        self.args, self.returncode, self.stdout, self.stderr, self.diag = args, returncode, stdout, stderr, diag
+
+
+def _own_lines(log: str) -> str:
+    return "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith(_CHATTER))
+
+
+def _phase(log: str) -> str:
+    """How far the session got, from ssh's log."""
+    if "Connection established" not in log:
+        return "no TCP connection"
+    if "Remote protocol version" not in log:
+        return "connected, but no SSH banner came"
+    return "the banner came, but key exchange or authentication did not finish"
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
 def _exec(host: str, user: str, askpass, cmd: str,
           session_timeout: int, command_timeout: int, port: Optional[int],
-          control_path: Optional[str]):
+          control_path: Optional[str]) -> _Result:
+    """Run one command through ssh. ConnectTimeout bounds the TCP connect and
+    the banner, nothing in OpenSSH bounds the key exchange after it (L9), so
+    the session has --session-timeout from the start to be up, judged by ssh's
+    own -v log, and the command has --command-timeout from that moment."""
     # "--" ends the options: a host that starts with "-" is still the host,
     # which matters for a library caller that passes no user.
-    argv = (["ssh", "-n"]
+    fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
+    os.close(fd)
+    argv = (["ssh", "-n", "-v", "-E", log_path]
             + _base_opts(session_timeout, port, control_path, askpass.passwd is not None)
             + ["--", "%s@%s" % (user, host) if user else host, cmd])
-    timeout = float(session_timeout + command_timeout)
-    return subprocess.run(argv, capture_output=True, text=True,
-                          timeout=timeout, env=askpass.env,
-                          stdin=subprocess.DEVNULL)
+    try:
+        with tempfile.TemporaryFile() as outf, tempfile.TemporaryFile() as errf:
+            proc = subprocess.Popen(argv, stdout=outf, stderr=errf, env=askpass.env,
+                                    stdin=subprocess.DEVNULL)
+            try:
+                _wait(proc, host, cmd, log_path, session_timeout, command_timeout)
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+            outf.seek(0)
+            errf.seek(0)
+            return _Result(argv, proc.returncode,
+                           outf.read().decode("utf-8", "replace"),
+                           errf.read().decode("utf-8", "replace"),
+                           _own_lines(_read(log_path)))
+    finally:
+        try:
+            os.unlink(log_path)
+        except OSError:
+            pass
+
+
+def _wait(proc, host: str, cmd: str, log_path: str, session_timeout: int, command_timeout: int) -> None:
+    deadline = time.monotonic() + session_timeout
+    session_up = False
+    while True:
+        try:
+            proc.wait(timeout=min(_POLL, max(0.0, deadline - time.monotonic())))
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if not session_up:
+            log = _read(log_path)
+            if any(marker in log for marker in _SESSION_UP):
+                session_up = True
+                deadline = time.monotonic() + command_timeout
+                continue
+        if time.monotonic() >= deadline:
+            if not session_up:
+                raise RuntimeError("no SSH session to %s within %ds: %s"
+                                   % (host, session_timeout, _phase(_read(log_path))))
+            raise RuntimeError("Command timed out after %ds: %s" % (command_timeout, cmd))
 
 
 def _describe_failure(host: str, proc) -> str:
-    """OpenSSH reports the real reason on stderr; surface it instead of an exit code."""
-    detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+    """OpenSSH reports the real reason in its own log; surface it instead of an exit code."""
+    detail = ((getattr(proc, "diag", "") or "").strip() or (proc.stderr or "").strip()
+              or (proc.stdout or "").strip())
     first = detail.splitlines()[0] if detail else ""
     if "Permission denied" in detail or "Authentication failed" in detail:
         return "Authentication failed."
@@ -204,9 +290,6 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
                 try:
                     proc = _exec(host, user, askpass, cmd, session_timeout,
                                  command_timeout, port, control_path)
-                except subprocess.TimeoutExpired:
-                    raise RuntimeError("Command timed out after %ds: %s"
-                                       % (session_timeout + command_timeout, cmd))
                 except OSError as exc:
                     raise RuntimeError("SSH transport failed: %s" % exc)
                 if proc.returncode != 0:

@@ -61,6 +61,64 @@ except ImportError:
     class TransportError(Exception):
         pass
 
+try:
+    import paramiko as _paramiko
+    import ncclient.transport.ssh as _ncclient_ssh
+except ImportError:
+    _paramiko = _ncclient_ssh = None
+
+# The session timeout of the _open() running on this thread, as a monotonic
+# deadline; paramiko's Transport reads it while the session is being set up.
+_DEADLINE = threading.local()
+
+
+if _paramiko is not None:
+    class _DeadlineTransport(_paramiko.Transport):
+        """paramiko waits 15 s for the SSH banner, 15 s for the key exchange
+        and 30 s for authentication. Those are set in Transport.__init__ and
+        neither ncclient nor PyEZ passes anything else, so a router that
+        accepts TCP and then says nothing cost 15 s whatever --session-timeout
+        said (H3). Each timeout now answers with what is left of this thread's
+        session timeout, read when paramiko asks: one deadline for the whole
+        session set-up. Without a deadline (another ncclient user in the same
+        process) the defaults stay."""
+
+        def __init__(self, *args, **kwargs):
+            # Captured here, on the thread that runs _open(); the timeouts
+            # are read on the Transport's own thread, where the local is unset.
+            self._hssh_deadline = getattr(_DEADLINE, "at", None)
+            super().__init__(*args, **kwargs)
+
+        def _timeout(name, default):
+            def get(self):
+                at = self.__dict__.get("_hssh_deadline")
+                own = self.__dict__.get(name, default)
+                return own if at is None else max(0.1, at - time.monotonic())
+
+            def set(self, value):
+                self.__dict__[name] = value
+            return property(get, set)
+
+        banner_timeout = _timeout("_hssh_banner", 15)
+        handshake_timeout = _timeout("_hssh_handshake", 15)
+        auth_timeout = _timeout("_hssh_auth", 30)
+
+    class _ParamikoForNcclient:
+        """ncclient's view of the paramiko module: as it is, except that
+        Transport is the deadline-aware one. Only ncclient sees this; paramiko
+        itself and the ssh transport's SSHClient are untouched."""
+
+        Transport = _DeadlineTransport
+
+        def __init__(self, module):
+            self._module = module
+
+        def __getattr__(self, name):
+            return getattr(self._module, name)
+
+    if _ncclient_ssh is not None and not isinstance(_ncclient_ssh.paramiko, _ParamikoForNcclient):
+        _ncclient_ssh.paramiko = _ParamikoForNcclient(_ncclient_ssh.paramiko)
+
 DEFAULT_PORT = 830
 
 # A pooled session idle this long is probed with a cheap RPC before reuse, so
@@ -107,6 +165,9 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         # underscores, hyphens, or bracketed IPv6 literals are permitted".
         raise NotAppliedError(f"NETCONF connect failed: PyEZ does not accept host {host!r}: {e}") from e
     started = time.monotonic()
+    # The TCP connect gets conn_open_timeout from PyEZ; the banner, key
+    # exchange and authentication get what is left of the same budget.
+    _DEADLINE.at = started + session_timeout
     try:
         dev.open()
     except Exception as e:
@@ -121,6 +182,8 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
                                      time.monotonic() - started)
             raise NotAppliedError(f"NETCONF connect failed: {reason}") from e
         raise
+    finally:
+        _DEADLINE.at = None
     dev.timeout = command_timeout
     return dev
 
@@ -159,7 +222,7 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
         if detail and "timed out" not in detail:
             return (f"{where} dropped the session before login after {elapsed:.1f}s "
                     f"({detail}; sshd connection limit?)")
-        if elapsed < min(timeout, 15) - 1:
+        if elapsed < timeout / 2:
             return f"{where} dropped the session before login after {elapsed:.1f}s (sshd connection limit?)"
         return f"no SSH banner from {where} within {elapsed:.0f}s (sshd busy, or filtered)"
     if "negotiation failed" in low:

@@ -115,18 +115,18 @@ def test_ssh_never_inherits_local_stdin(fake_ssh):
     """-n plus DEVNULL stdin: nothing local can reach the remote command."""
     import subprocess
     seen = {}
-    real = subprocess.run
+    real = subprocess.Popen
 
     def spy(argv, **kwargs):
         seen["argv"] = argv
         seen["stdin"] = kwargs.get("stdin")
         return real(argv, **kwargs)
 
-    subprocess.run = spy
+    subprocess.Popen = spy
     try:
         openssh.show("10.0.1.1", "admin", None, "show version", 5, 10)
     finally:
-        subprocess.run = real
+        subprocess.Popen = real
     assert "-n" in seen["argv"]
     assert seen["stdin"] == subprocess.DEVNULL
 
@@ -136,21 +136,25 @@ def test_host_follows_an_end_of_options_marker(fake_ssh, tmp_path):
     option. The CLI always sends user@host; a library caller may send no user."""
     import subprocess
     seen = []
-    real = subprocess.run
+    real_run, real_popen = subprocess.run, subprocess.Popen
 
-    def spy(argv, **kwargs):
+    def spy_run(argv, **kwargs):
         seen.append(argv)
-        return real(argv, **kwargs)
+        return real_run(argv, **kwargs)
+
+    def spy_popen(argv, **kwargs):
+        seen.append(argv)
+        return real_popen(argv, **kwargs)
 
     mux = tmp_path / "mux"
     mux.mkdir()
     (mux / "cm").write_text("")
-    subprocess.run = spy
+    subprocess.run, subprocess.Popen = spy_run, spy_popen
     try:
-        openssh.show("-oProxyCommand=x", None, None, "uptime", 5, 10)
-        openssh._close_master("-oProxyCommand=x", None, str(mux / "cm"), str(mux), 5, None)
+        openssh.show("-oProxyCommand=x", None, None, "uptime", 5, 10)     # Popen
+        openssh._close_master("-oProxyCommand=x", None, str(mux / "cm"), str(mux), 5, None)   # run
     finally:
-        subprocess.run = real
+        subprocess.run, subprocess.Popen = real_run, real_popen
     assert seen[0][-3:] == ["--", "-oProxyCommand=x", "uptime"]
     assert seen[1][-2:] == ["--", "-oProxyCommand=x"]
     line = openssh.ssh_command_line("-oProxyCommand=x", None, "uptime")
