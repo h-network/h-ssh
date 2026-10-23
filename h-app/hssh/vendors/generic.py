@@ -19,6 +19,8 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
+from ..core import refusal_line
+
 try:
     import paramiko
     AVAILABLE = True
@@ -239,12 +241,16 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
         raise ValueError("commit_confirmed is not supported by the 'ssh' transport; "
                          "nothing was sent to the device")
     commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
-    return _run_commands(host, user, passwd, commands, session_timeout, command_timeout, port=port)
+    return _run_commands(host, user, passwd, commands, session_timeout, command_timeout, port=port,
+                         edit=True)
 
 
 def _run_commands(host: str, user: str, passwd: str, commands: List[str],
-                  session_timeout: int, command_timeout: int, port: int = None) -> str:
-    """Execute commands via SSH on any device."""
+                  session_timeout: int, command_timeout: int, port: int = None,
+                  edit: bool = False) -> str:
+    """Execute commands via SSH on any device. For an edit the reply is read
+    as well as the exit status: a CLI that answers "error: ..." or "% ..."
+    and exits 0 has refused the line, and the edit stops there."""
     client = _connect(host, user, passwd, session_timeout, port)
 
     try:
@@ -255,6 +261,9 @@ def _run_commands(host: str, user: str, passwd: str, commands: List[str],
             # a failure; some network OSes never send one.
             if rc > 0:
                 raise RuntimeError(_describe_failure(cmd, rc, out, err))
+            refused = refusal_line(err, out) if edit else None
+            if refused:
+                raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
             outputs.append(_format(cmd, out, err))
         return "\n\n".join(outputs).strip() + "\n"
     finally:

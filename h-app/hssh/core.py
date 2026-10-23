@@ -506,3 +506,17 @@ def get_available_commands(vendor: str) -> Dict[str, str]:
         else:
             result[name] = ""
     return result
+
+
+# A CLI that exits 0 after refusing a line still said so: Junos answers
+# "error: syntax error", IOS and Arista "% Invalid input ...".
+_REFUSAL = re.compile(r"^\s*(error:|% )", re.M)
+
+
+def refusal_line(*texts: str):
+    """The first line in which the device refused the command, or None."""
+    for text in texts:
+        m = _REFUSAL.search(text or "")
+        if m:
+            return (text[m.start(1):].splitlines() or [""])[0].strip()
+    return None

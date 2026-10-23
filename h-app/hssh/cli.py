@@ -102,6 +102,37 @@ def document_text(output) -> str:
 MAX_WORKERS = 256
 
 
+# Descriptors one in-flight device costs: measured at ~6 for a NETCONF
+# session (socket, ncclient's selector, paramiko's pipe), the heaviest case.
+FDS_PER_WORKER = 6
+FDS_BASE = 32
+
+
+def fit_workers_to_open_files(workers: int):
+    """(workers the open-file limit can carry, a note when that is fewer).
+    The soft limit is raised towards the hard one first, which needs no
+    privilege; only what is still short lowers the workers (L10)."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, ValueError, OSError):
+        return workers, None
+    need = workers * FDS_PER_WORKER + FDS_BASE
+    if soft != resource.RLIM_INFINITY and soft < need:
+        wanted = need if hard == resource.RLIM_INFINITY else min(need, hard)
+        if wanted > soft:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+                soft = wanted
+            except (ValueError, OSError):
+                pass
+    if soft == resource.RLIM_INFINITY or soft >= need:
+        return workers, None
+    fit = max(1, (soft - FDS_BASE) // FDS_PER_WORKER)
+    return fit, (f"the open-file limit of {soft} (ulimit -n) carries {fit} workers at "
+                 f"~{FDS_PER_WORKER} descriptors each, not {workers}; running {fit}")
+
+
 def resolve_workers(requested: int) -> int:
     """Clamp --workers to something a thread pool can honour."""
     try:
@@ -764,6 +795,10 @@ async def main() -> int:
                     if resolved != raw:
                         print(f"Resolved '{raw}' -> '{resolved}' ({vendor})")
 
+    args.workers, fd_note = fit_workers_to_open_files(resolve_workers(args.workers))
+    if fd_note:
+        print(f"WARNING: {fd_note}", file=sys.stderr)
+
     if show_progress:
         if job_entries:
             print(f"\nMode: job | Targets: {len(targets)} | Workers: {args.workers}")
@@ -892,7 +927,8 @@ async def main() -> int:
 
     failures = 0
     interrupted_connects = 0
-    skipped = skipped_missing if not job_entries else 0
+    skipped = 0                                              # held back by the safety gate (in the results)
+    not_run = skipped_missing if not job_entries else 0      # no set file (--allow-missing): not in the results
     json_results = []
     run_start = time.time()
 
@@ -1382,20 +1418,22 @@ async def main() -> int:
 
         # The verdict counts what did not run as well as what failed: a run the
         # safety gate kept away from every device must not read as a success.
+        notes = ([f"skipped by the safety gate: {skipped}"] if skipped else []) + \
+                ([f"skipped for want of a set file: {not_run}"] if not_run else [])
         if failures:
-            verdict = f"Done. Failures: {failures}" + (f", skipped by the safety gate: {skipped}" if skipped else "")
-        elif skipped:
+            verdict = f"Done. Failures: {failures}" + (", " + ", ".join(notes) if notes else "")
+        elif notes:
             applied = len(json_results) - skipped
-            verdict = f"Done. OK: {applied}, skipped by the safety gate: {skipped}"
+            verdict = f"Done. OK: {applied}, " + ", ".join(notes)
             if has_edits and not applied:
                 verdict += ", nothing applied"
         else:
             verdict = "Done. All devices OK."
         if not raw_mode:
             print("")
-            if failures or skipped or not interrupted:
+            if failures or skipped or not_run or not interrupted:
                 print(verdict)
-        elif failures or skipped:
+        elif failures or skipped or not_run:
             # stdout is device output only; the verdict belongs on stderr.
             print(verdict, file=sys.stderr)
 
@@ -1425,10 +1463,10 @@ async def main() -> int:
     ok_count = len(json_results) - failures - skipped - interrupted_connects
     stderr_mode = "batch" if mode == "show-batch" else ("job" if mode == "job" else mode.split("-")[0])
     summary = json.dumps({
-        "targets": len(json_results),
+        "targets": len(json_results) + not_run,
         "ok": ok_count,
         "fail": failures,
-        "skipped": skipped,
+        "skipped": skipped + not_run,
         **({"interrupted": interrupted_connects} if interrupted else {}),
         "elapsed_ms": elapsed_ms,
         "mode": stderr_mode,
@@ -1442,7 +1480,7 @@ async def main() -> int:
         return 130  # 128 + SIGINT, the shell convention
     if failures:
         return 1
-    return 3 if skipped else 0   # 3: nothing failed, but not everything ran
+    return 3 if skipped or not_run else 0   # 3: nothing failed, but not everything ran
 
 
 def _quiet_transport_logs() -> None:

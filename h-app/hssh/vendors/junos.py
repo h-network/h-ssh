@@ -633,7 +633,14 @@ def begin(host: str, user: str, passwd: str, payload: Optional[str],
     fmt = _config_format(payload)
     body = _strip_comments(payload) if fmt == "set" else payload
     return _begin(host, user, passwd, session_timeout, command_timeout, port,
-                  stage=lambda cu: cu.load(body, format=fmt), label="")
+                  stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="")
+
+
+# Load warnings that do not fail the device. A delete of a statement the
+# device does not have is "warning: statement not found": the intended state
+# is already there, so a broadcast of deletes stays idempotent (M2). Every
+# other warning is still an error.
+IGNORED_LOAD_WARNINGS = "statement not found"
 
 
 def _rollback_number(n) -> int:
@@ -662,7 +669,7 @@ def edit(host: str, user: str, passwd: str, payload: str,
     fmt = _config_format(payload)
     body = _strip_comments(payload) if fmt == "set" else payload
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
-                        stage=lambda cu: cu.load(body, format=fmt), label="",
+                        stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="",
                         dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment,
                         expected_diff=expected_diff)
 

@@ -76,8 +76,8 @@ class FakeConfig:
     def unlock(self):
         self._do("unlock")
 
-    def load(self, body, format=None):
-        self._do("load", body, format=format)
+    def load(self, body, format=None, ignore_warning=False):
+        self._do("load", body, format=format, ignore_warning=ignore_warning)
 
     def diff(self):
         self._do("diff")
@@ -591,3 +591,12 @@ def test_a_password_is_the_credential_no_key_is_tried_first():
     junos.show("10.0.0.1", "u", "s3cret", "show version", 5, 30)
     params = FakeDevice.instances[0].params
     assert params["passwd"] == "s3cret" and params["look_for_keys"] is False and params["allow_agent"] is False
+
+
+# --- #67 (M2): a delete of what is not there is a no-op, not a failure ----------
+
+def test_load_ignores_statement_not_found_and_nothing_else():
+    edit("delete system services telnet\n")
+    load = [c for c in cfg().calls if c[0] == "load"][0]
+    assert load[2]["ignore_warning"] == "statement not found"
+    assert junos.IGNORED_LOAD_WARNINGS == "statement not found"
