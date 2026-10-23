@@ -75,8 +75,13 @@ def _is_local_error(exc) -> bool:
 def _say(text: str) -> None:
     """One progress line from a worker thread, written in one piece: print()
     writes the text and the newline separately, and two threads interleave."""
-    sys.stdout.write(f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError, AttributeError):
+        # The reader went away (`| head`) or stdout is closed: the device's
+        # result is not an error because nobody is watching the progress.
+        pass
 
 
 def _backoff(attempt: int) -> int:

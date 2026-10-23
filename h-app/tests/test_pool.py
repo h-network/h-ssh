@@ -36,8 +36,10 @@ def fake_pyez(monkeypatch):
 
 
 @pytest.fixture
-def pooled():
+def pooled(monkeypatch):
     pool.enable(idle_timeout=300)
+    # A confirm first asks the device whether anything is waiting (#63).
+    monkeypatch.setattr(junos, "_pending_on", lambda dev, t: {"seq": 0, "pending_rollback_minutes": 5})
     yield pool.POOL
 
 

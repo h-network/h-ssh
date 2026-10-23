@@ -54,7 +54,7 @@ lands in a JSONL audit trail.
                     └──────────── every edit ──────────────────┴──▶ --audit-log (JSONL)
 ```
 
-On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted. With a password, no `~/.ssh/id_*` key and no agent is tried first.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted. With a password, no `~/.ssh/id_*` key and no agent is tried first.
 
 ## Install
 
@@ -275,6 +275,11 @@ line, not the usage block.
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
 | `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure |
 | `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string |
+
+A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
+no traceback, and whatever had landed stands. paramiko's transport thread logs a full traceback when
+a device closes the connection mid-handshake; the CLI keeps that off the screen (the one FAIL line
+already says so) unless `-v` is given. A library caller configures logging as it likes.
 
 `--raw` is the pipe-friendly one: no banner, no progress lines, no summary. Each device gets a
 `name:` line and its output; failures and the verdict go to stderr, so for a show `--raw > out.txt`

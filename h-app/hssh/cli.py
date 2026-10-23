@@ -7,6 +7,7 @@ import contextlib
 import difflib
 import getpass
 import json
+import logging
 import os
 import re
 import shlex
@@ -411,6 +412,8 @@ async def main() -> int:
                         help="Safety gate JSON file for per-device rate limiting and cooldown")
 
     args = parser.parse_args()
+    if not args.verbose:
+        _quiet_transport_logs()
 
     # Resolved before anything reads them, so --list-commands and the banner
     # see the same values the run will use. A --config named on the command
@@ -1323,7 +1326,11 @@ async def main() -> int:
             # stdout is device output only; the verdict belongs on stderr.
             print(verdict, file=sys.stderr)
 
-        if args.commit_confirmed and not args.dry_run and has_edits:
+        # The reminder is for timers that are actually running: a device
+        # that was refused, failed, or had no changes armed nothing.
+        armed = [e for e in json_results
+                 if e.get("ok") and re.search(r"COMMIT (OK|CONFIRMED \()", str(e.get("output") or ""))]
+        if args.commit_confirmed and not args.dry_run and has_edits and armed:
             # A job's timers are armed on its edit entries' targets, not on
             # the inventory file or any --target given alongside it.
             specs = args.target
@@ -1364,10 +1371,45 @@ async def main() -> int:
     return 3 if skipped else 0   # 3: nothing failed, but not everything ran
 
 
-def main_sync() -> None:
-    """Synchronous entry point for console_scripts."""
+def _quiet_transport_logs() -> None:
+    """paramiko logs a full traceback at ERROR from its transport thread when
+    a device closes the connection mid-handshake; with no logging configured
+    Python's last-resort handler prints it to stderr next to the one FAIL
+    line that already says so. Silenced unless -v; a library caller
+    configures logging as it likes and is not touched here."""
+    for name in ("paramiko", "ncclient"):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.CRITICAL)
+        if not lg.handlers:
+            lg.addHandler(logging.NullHandler())
+
+
+def _stdout_gone() -> None:
+    """The reader of our output closed it (`| head`, also `2>&1 | head`).
+    Point both fds at /dev/null so the interpreter's final flush does not
+    fail a second time."""
     try:
-        sys.exit(asyncio.run(main()))
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        for stream in (sys.stdout, sys.stderr):
+            os.dup2(devnull, stream.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def main_sync() -> None:
+    """Synchronous entry point for console_scripts and h-ssh.py."""
+    rc = 0
+    try:
+        rc = asyncio.run(main())
+        sys.stdout.flush()          # a reader that left shows up here, not at interpreter exit
     except KeyboardInterrupt:
+        # Ctrl-C is a normal way to stop a fleet run; a stack trace is not a
+        # useful thing to print at someone who already knows what they did.
         print("\nInterrupted.", file=sys.stderr)
-        sys.exit(130)
+        rc = 130
+    except BrokenPipeError:
+        # `h-ssh ... | head`: the reader has what it wanted. Not an error of
+        # ours, and not a traceback; the run's own verdict, if it got that
+        # far, stands.
+        _stdout_gone()
+    sys.exit(rc)
