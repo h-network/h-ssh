@@ -66,6 +66,31 @@ def check_port(value, where: str) -> int:
     return value
 
 
+def check_unique(targets: List["Target"], allow_repeats: bool = False) -> None:
+    """One name is one device and one device is one name. A name under two
+    hosts, or one host under two names, is a mistake that would commit to
+    the wrong box or twice; the same row twice (allow_repeats=False) runs a
+    device twice and writes both results to one file. A job may repeat a
+    device on purpose (its entries run in order), so it allows repeats but
+    not contradictions. Raises ValueError naming the duplicate."""
+    by_name: dict = {}
+    by_host: dict = {}
+    for t in targets:
+        where = (t.host, t.port)
+        if t.name in by_name and by_name[t.name] != where:
+            other = by_name[t.name]
+            raise ValueError(f"device name {t.name!r} is used for two hosts: "
+                             f"{other[0]}{':' + str(other[1]) if other[1] else ''} and "
+                             f"{t.host}{':' + str(t.port) if t.port else ''}")
+        if where in by_host and by_host[where] != t.name:
+            raise ValueError(f"host {t.host}{':' + str(t.port) if t.port else ''} is listed under two names: "
+                             f"{by_host[where]!r} and {t.name!r}")
+        if not allow_repeats and t.name in by_name:
+            raise ValueError(f"device {t.name!r} ({t.host}) is listed twice")
+        by_name[t.name] = where
+        by_host[where] = t.name
+
+
 def load_devices_csv(path: str, default_vendor: str = "ssh") -> List[Target]:
     """
     Accepts:
