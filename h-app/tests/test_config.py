@@ -50,8 +50,10 @@ def test_values_keep_their_case_and_inner_spacing(tmp_path):
     assert load_config(write(tmp_path, "user = Ef-Ops"))["user"] == "Ef-Ops"
 
 
-def test_lines_without_a_separator_are_skipped(tmp_path):
-    assert load_config(write(tmp_path, "nonsense\nuser = EF\n")) == {"user": "EF"}
+def test_lines_without_a_separator_are_named(tmp_path):
+    """A line that is not `key = value` is a typo, not a comment (#62)."""
+    with pytest.raises(ValueError, match="line 1: expected 'key = value'"):
+        load_config(write(tmp_path, "nonsense\nuser = EF\n"))
 
 
 def test_empty_values_are_skipped(tmp_path):

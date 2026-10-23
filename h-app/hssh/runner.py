@@ -540,4 +540,4 @@ def _read_broadcast_file(broadcast_file: str) -> str:
     path = Path(broadcast_file)
     if not path.is_file():
         raise FileNotFoundError(f"Broadcast file not found: {broadcast_file}")
-    return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8-sig")
