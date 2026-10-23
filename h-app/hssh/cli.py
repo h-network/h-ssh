@@ -30,6 +30,7 @@ from .core import (
 from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS, is_connect_failure
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
+from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .vendors import VENDORS
 
@@ -1102,6 +1103,13 @@ async def main() -> int:
                 print("Aborted by user.")
                 return 0
 
+    if job_entries:
+        # A job lists one device in several entries. With the pool on they
+        # share one session per device instead of logging in once per entry
+        # (#57); the pool's per-router lock keeps a host's entries in order,
+        # and an edit entry's session is clean again before the next one.
+        pool.enable()
+
     tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
     screen = _tty(sys.stdout)     # control sequences are stripped for a terminal, kept for a pipe
 
@@ -1376,6 +1384,10 @@ async def main() -> int:
             else:
                 failures += 1
 
+    if job_entries:
+        pool.close_all(shutdown=False)   # the run is over: every session closed cleanly, in parallel
+        pool.disable()
+
     # Write structured JSONL log. It holds the same payloads, replies and
     # diffs as the audit log, so it gets the same redaction and file mode.
     # Cross-device diff (show modes only)
@@ -1565,4 +1577,9 @@ def main_sync() -> None:
         # ours, and not a traceback; the run's own verdict, if it got that
         # far, stands.
         _stdout_gone()
+    finally:
+        try:
+            pool.close_all()        # a job run that ended early (Ctrl-C, a crash) leaves no session open
+        except Exception:
+            pass
     sys.exit(rc)
