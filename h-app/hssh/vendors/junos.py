@@ -30,7 +30,7 @@ try:
     from jnpr.junos.utils.config import Config as JunosConfig
     from jnpr.junos.exception import (
         ConnectError, ConnectClosedError, LockError, ConfigLoadError, CommitError,
-        RpcTimeoutError,
+        RpcError, RpcTimeoutError,
     )
     AVAILABLE = True
 except ImportError:
@@ -52,7 +52,10 @@ except ImportError:
     class CommitError(Exception):
         pass
 
-    class RpcTimeoutError(Exception):
+    class RpcError(Exception):
+        pass
+
+    class RpcTimeoutError(RpcError):     # as in PyEZ: a timeout is an RpcError too
         pass
 
 try:
@@ -252,7 +255,15 @@ def _alive(dev, idle: float) -> bool:
     if not getattr(dev, "connected", True):
         return False
     if idle >= PROBE_AFTER:
-        dev.rpc.get_system_uptime_information(dev_timeout=SHORT_TIMEOUT)
+        try:
+            dev.rpc.get_system_uptime_information(dev_timeout=SHORT_TIMEOUT)
+        except RpcTimeoutError:
+            raise                        # no answer in time: dead, or as good as
+        except RpcError:
+            # The router answered, with a refusal: cRPD has no uptime RPC, a
+            # login class may withhold it. A refusal is proof of a live
+            # session; only the transport failing means dead (#59).
+            return True
     return True
 
 
