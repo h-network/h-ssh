@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from ..core import refusal_line, refused_reply
+from ..drivers import results as R
 
 try:
     import paramiko
@@ -266,7 +267,8 @@ def _run_commands(host: str, user: str, passwd: str, commands: List[str],
             if refused:
                 raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
             outputs.append(_format(cmd, out, err))
-        return "\n\n".join(outputs).strip() + "\n"
+        text = "\n\n".join(outputs).strip() + "\n"
+        return R.EditResult(R.APPLIED, message=text) if edit else text
     finally:
         client.close()
 
@@ -292,6 +294,6 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                     results.append({"command": cmd, "ok": True, "output": _format(cmd, out, err)})
             except Exception as e:
                 results.append({"command": cmd, "ok": False, "error": str(e)})
-        return results
+        return R.BatchResult(results)
     finally:
         client.close()

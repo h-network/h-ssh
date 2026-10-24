@@ -30,6 +30,7 @@ import time
 from typing import List, Optional
 
 from ..core import refusal_line, refused_reply
+from ..drivers import results as R
 
 AVAILABLE = shutil.which("ssh") is not None
 
@@ -323,7 +324,8 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
                 if refused:
                     raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
                 outputs.append(_format(cmd, proc))
-            return "\n\n".join(outputs).strip() + "\n"
+            text = "\n\n".join(outputs).strip() + "\n"
+            return R.EditResult(R.APPLIED, message=text) if edit else text
     finally:
         _close_master(host, user, control_path, tmpdir, session_timeout, port)
 
@@ -400,7 +402,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                                         "output": _format(cmd, proc)})
                 except Exception as exc:
                     results.append({"command": cmd, "ok": False, "error": str(exc)})
-            return results
+            return R.BatchResult(results)
     finally:
         _close_master(host, user, control_path, tmpdir, session_timeout, port)
 

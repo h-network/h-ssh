@@ -509,6 +509,11 @@ name, ok, output, ms = run_for_target(
 )                               # SafetyGate(safety_file="...") shares the cooldowns across processes
 ```
 
+`run_for_target` returns a `RunResult`: it unpacks as the four values above, and carries the driver's
+typed answer in `.result` (an `EditResult` with `status`, `diff`, `minutes`; a `BatchResult`; a
+`CommitStatus` with `.pending`; a show's text or data) and a failure in `.error`. The edit, batch and
+commit-status types are also still the text or list the drivers always returned (`hssh/drivers/results.py`).
+
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
 
 ### Transactions, comments, commit status
@@ -614,7 +619,8 @@ h-ssh/
 │   │   ├── drivers/
 │   │   │   ├── base.py      # Transport, Driver and the capability words
 │   │   │   ├── __init__.py  # the registry: dialect@transport names, today's names as aliases
-│   │   │   └── contract.py  # what a module must offer to back a driver's `supports`
+│   │   │   ├── contract.py  # what a module must offer to back a driver's `supports`
+│   │   │   └── results.py   # EditResult, BatchResult, CommitStatus: typed answers that are still their text/list
 │   │   └── vendors/
 │   │       ├── __init__.py  # VENDORS: today's vendor name → module (the drivers' shim)
 │   │       ├── junos.py     # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status

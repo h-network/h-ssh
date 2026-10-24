@@ -317,3 +317,29 @@ def test_a_device_port_in_a_run_file_is_checked_like_everywhere_else(tmp_path):
 def test_allow_missing_is_a_run_file_key(tmp_path, monkeypatch, capsys):
     from hssh.runfile import RUN_KEYS
     assert RUN_KEYS["allow_missing"] == ("allow_missing", bool)
+
+
+def test_a_verbose_batch_still_shows_the_command_echo_and_a_tuple_runner_still_works(monkeypatch, capsys, tmp_path):
+    """#82 review: the JSON entry strips the '$ cmd' echo for display on a copy,
+    so -v and --raw keep printing what the device said; and a stand-in runner
+    that returns the bare 4-tuple is still accepted, on the failure path too."""
+    import json as _json
+    from hssh import runner as _runner
+
+    class Batch(Driver):
+        def show_batch(self, host, user, passwd, cmds, st, ct, port=None, vendor_hint=None):
+            return [{"command": c, "ok": True, "output": f"$ {c}\nHostname: R1"} for c in cmds]
+    b = write(tmp_path, "b.txt", "show version\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--user", "u", "--target", "R1:10.0.0.1:junos",
+                                                              "--batch", b, "-v"], driver=Batch())
+    assert rc == 0, err
+    assert "$ show version\nHostname: R1" in out
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--user", "u", "--target", "R1:10.0.0.1:junos",
+                                                              "--batch", b, "--json"], driver=Batch())
+    assert _json.loads(out)[0]["commands"][0]["output"] == "Hostname: R1"
+
+    async def bare_tuple(**kw):
+        return ("R1", False, "DEVICE: R1\n\nERROR: no luck\n", 3)
+    monkeypatch.setattr(cli, "run_for_target_async", bare_tuple)
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--user", "u", "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
+    assert rc == 1 and "ERROR: no luck" in out

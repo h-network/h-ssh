@@ -24,6 +24,7 @@ from typing import List, Optional
 from ..core import check_confirm_minutes
 from ..dialects.junos import SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS, COMMIT_PENDING as _PENDING
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
+from ..drivers import results as R
 from ..pool import POOL
 
 try:
@@ -496,7 +497,7 @@ class Transaction:
             raise NotAppliedError("NETCONF session lost during the transaction; nothing committed")
         if not self.diff.strip():
             self.abort()
-            return f"{self.label}NO CHANGES"
+            return R.EditResult(R.NO_CHANGES, label=self.label)
         kwargs = {"timeout": self._timeout}
         if confirmed is not None:
             kwargs["confirm"] = confirmed
@@ -516,8 +517,9 @@ class Transaction:
                 f"commit outcome unknown ({type(e).__name__}: {e}); "
                 "check the device before retrying") from e
         self._finish(rollback=False, unlock=True)
-        head = f"COMMIT CONFIRMED ({confirmed} minutes)" if confirmed is not None else "COMMIT OK"
-        return f"{self.label}{head}\n\nDIFF:\n{self.diff}"
+        if confirmed is not None:
+            return R.EditResult(R.CONFIRMED, diff=self.diff, minutes=confirmed, label=self.label)
+        return R.EditResult(R.COMMITTED, diff=self.diff, label=self.label)
 
     def abort(self) -> None:
         """Discard the candidate and release the lock."""
@@ -615,11 +617,11 @@ def _transaction(host: str, user: str, passwd: str, session_timeout: int,
         raise RuntimeError("diff changed since preview; nothing committed")
     if not tx.diff.strip():
         tx.abort()
-        return f"{label}NO CHANGES"
+        return R.EditResult(R.NO_CHANGES, label=label)
     if dry_run:
         diff = tx.diff
         tx.abort()
-        return f"{label}DRY-RUN: commit check passed, nothing committed\n\nDIFF:\n{diff}"
+        return R.EditResult(R.DRY_RUN, diff=diff, label=label, note="commit check passed, nothing committed")
     return tx.commit(confirmed=commit_confirmed, comment=comment)
 
 
@@ -744,7 +746,7 @@ def confirm(host: str, user: str, passwd: str,
                 "check the device before retrying") from e
         if _unlock_quietly(cu) is not None:
             lease.discard()
-        return "COMMIT CONFIRMED OK"
+        return R.EditResult(R.CONFIRMED_OK)
 
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
@@ -770,7 +772,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                 if _timed_out(e):
                     lease.discard()
                 results.append({"command": cmd, "ok": False, "error": str(e)})
-        return results
+        return R.BatchResult(results)
 
     return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
 
@@ -898,7 +900,7 @@ def rpc_batch(host: str, user: str, passwd: str, cmds: List[str],
                 if _timed_out(e):
                     lease.discard()
                 results.append({"command": cmd, "ok": False, "error": str(e)})
-        return results
+        return R.BatchResult(results)
 
     run_on = _on_session if all(_is_read(c) for c in cmds) else _on_session_once
     return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
@@ -921,7 +923,7 @@ def commit_status(host: str, user: str, passwd: str,
     after it; h-ssh confirms with a commit.)"""
     _require()
     doc = rpc(host, user, passwd, "get-commit-information", session_timeout, command_timeout, port=port)
-    return _commit_entries(doc)
+    return R.CommitStatus(_commit_entries(doc))
 
 
 def _commit_entries(doc: dict) -> List[dict]:

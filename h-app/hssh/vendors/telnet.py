@@ -13,6 +13,7 @@ from typing import List, Optional
 from ..core import check_confirm_minutes
 from .. import drivers
 from ..dialects.base import CliSyntax, Dialect
+from ..drivers import results as R
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
 
 AVAILABLE = True  # Raw sockets, always available
@@ -298,7 +299,7 @@ def _edit_ios(sock: socket.socket, prompt_re: re.Pattern, payload: str, cli: Cli
 
     if errors:
         raise RuntimeError("; ".join(errors))
-    return "(config applied)"
+    return R.EditResult(R.APPLIED, message="(config applied)")
 
 
 def _leave_quietly(sock: socket.socket, prompt_re: re.Pattern, *cmds: str) -> None:
@@ -362,7 +363,7 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern, d: Dialect,
             raise RuntimeError("; ".join(errors))
         if changed:
             raise RuntimeError("diff changed since preview; nothing committed")
-        return f"DRY-RUN\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
+        return R.EditResult(R.DRY_RUN, diff=diff) if diff else R.EditResult(R.NO_CHANGES)
 
     if confirmed_minutes and confirmed_minutes > 0:
         commit_cmd = f"{cli.commit} confirmed {confirmed_minutes}"
@@ -385,9 +386,11 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern, d: Dialect,
 
     _leave_quietly(sock, prompt_re, cli.config_exit)
 
+    if not diff:
+        return R.EditResult(R.NO_CHANGES)
     if confirmed_minutes and confirmed_minutes > 0:
-        return f"COMMIT CONFIRMED ({confirmed_minutes} minutes)\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
-    return f"COMMIT OK\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
+        return R.EditResult(R.CONFIRMED, diff=diff, minutes=confirmed_minutes)
+    return R.EditResult(R.COMMITTED, diff=diff)
 
 
 def _pending(history: str, d: Dialect) -> bool:
@@ -431,7 +434,7 @@ def confirm(host: str, user: str, passwd: str,
             _leave_quietly(sock, prompt_re, d.cli.config_exit)
             raise RuntimeError(f"Commit failed: {out.strip()}")
         _leave_quietly(sock, prompt_re, d.cli.config_exit)
-        return "COMMIT CONFIRMED OK"
+        return R.EditResult(R.CONFIRMED_OK)
     finally:
         try:
             sock.close()
@@ -512,7 +515,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                 results.append({"command": cmd, "ok": True, "output": output})
             except Exception as e:
                 results.append({"command": cmd, "ok": False, "error": str(e)})
-        return results
+        return R.BatchResult(results)
     finally:
         try:
             sock.close()
