@@ -131,7 +131,8 @@ def test_the_run_warns_once_and_runs_with_the_lowered_workers(monkeypatch, capsy
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
                                       "--target", "R1:10.0.0.1:junos", "--workers", "64", "-sC", "show version"])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()

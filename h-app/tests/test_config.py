@@ -69,9 +69,16 @@ def test_default_path_sits_beside_devices_csv():
     assert get_config_path().parent.name == ".h-ssh"
 
 
-def test_password_is_not_read_from_config(tmp_path, monkeypatch):
-    """A config file is world-readable often enough that secrets must not live there."""
+def test_a_password_in_the_config_file_is_refused_not_read(tmp_path, monkeypatch):
+    """A config file is world-readable often enough that secrets must not live
+    there: a credential line is refused with exit 2 naming it (as a run file
+    does), never read and never quietly ignored on the way to key auth."""
     import subprocess
+    from hssh.core import load_config
+    for key in ("password", "passwd", "secret", "token", "pass"):
+        cfg = write(tmp_path, f"user = EF\n{key} = hunter2\n")
+        with pytest.raises(ValueError, match=f"line 2: '{key}' is not allowed, a config file never carries a credential"):
+            load_config(cfg)
     cfg = write(tmp_path, "user = EF\npassword = hunter2\n")
     hssh = os.path.join(os.path.dirname(__file__), "..", "h-ssh.py")
     proc = subprocess.run(
@@ -79,8 +86,8 @@ def test_password_is_not_read_from_config(tmp_path, monkeypatch):
          "-sC", "show version", "--raw", "--session-timeout", "2"],
         capture_output=True, text=True, timeout=60,
         stdin=subprocess.DEVNULL)
-    # It must not have authenticated with a config-supplied password; the run
-    # fails on connection, never on a password read out of the file.
+    assert proc.returncode == 2
+    assert "'password' is not allowed" in proc.stderr and "HSSH_PASSWORD or the prompt" in proc.stderr
     assert "hunter2" not in proc.stdout + proc.stderr
 
 
@@ -200,8 +207,8 @@ def run_main(monkeypatch, *argv, config=os.devnull):
         monkeypatch.setitem(drivers.MODULES, name, types.SimpleNamespace(AVAILABLE=True))
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u",
-                                      "--password", "p", *argv])
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u", *argv])
     rc = asyncio.run(cli.main())
     return rc, sorted(seen)
 

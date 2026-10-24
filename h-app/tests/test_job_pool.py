@@ -41,7 +41,8 @@ def fake_pyez(monkeypatch):
 def _run(monkeypatch, capsys, tmp_path, entries, *extra, cancel_after=None):
     job = tmp_path / "job.json"
     job.write_text(json.dumps(entries))
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p", "-y",
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-y",
                                       "--job", str(job), "--json", *extra])
     if cancel_after is None:
         rc = asyncio.run(cli.main())
@@ -86,7 +87,8 @@ def test_an_edit_entry_and_the_show_after_it_share_the_session(monkeypatch, caps
 
 
 def test_a_plain_show_run_still_opens_one_session_per_device_and_leaves_the_pool_off(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
                                       "--target", "R1:10.0.0.1:junos", "-sC", "show version", "--json"])
     assert asyncio.run(cli.main()) == 0
     assert not pool.POOL.enabled and len(FakeDevice.instances) == 1 and FakeDevice.instances[0].closed

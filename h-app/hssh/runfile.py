@@ -7,8 +7,8 @@ Every key is a flag name (`workers`, `session-timeout` or `session_timeout`,
 flag typed on the command line wins over the file; the file wins over the
 environment and ~/.h-ssh/config. Relative paths in the file resolve against
 the file's directory, so a run directory moves as one. A run file never
-carries a credential: the password comes from HSSH_PASSWORD, --password or
-the prompt, exactly as without a file.
+carries a credential: the password comes from HSSH_PASSWORD or the prompt,
+exactly as without a file.
 
 Three keys have no flag of their own and are the reason the file exists:
 `devices:` may be an inline list of targets, `commands:` is an inline batch,
@@ -110,7 +110,7 @@ def load_run_file(path: str) -> Dict[str, Any]:
         if key in CREDENTIAL_KEYS:
             raise ValueError(
                 f"run file '{path}': '{raw_key}' is not allowed, a run file never carries a "
-                "credential: use HSSH_PASSWORD, --password, or the prompt")
+                "credential: use HSSH_PASSWORD or the prompt")
         if key not in RUN_KEYS:
             raise ValueError(f"run file '{path}': unknown option '{raw_key}'")
         if key == "assume_yes":

@@ -28,7 +28,7 @@ COMMITS = {"device": "r1", "host": "10.0.0.1", "vendor": "junos@netconf", "ok": 
 def filled(path):
     """Three runs: a show with one failure, a batch, a commit history."""
     s = Store(str(path))
-    r1 = s.begin_run("show", ["--password", "hunter2", "-sC", "version"], "lab", 2, "1.0.0", command="version")
+    r1 = s.begin_run("show", ["--devices", "core.csv", "-sC", "version"], "lab", 2, "1.0.0", command="version")
     s.add_entry(r1, SHOW, "show version")
     s.add_entry(r1, FAILED, "show version")
     s.finish_run(r1, 1, 1, 0)
@@ -82,7 +82,7 @@ def test_one_row_per_command_kept_as_it_came(tmp_path):
     r1, r2, r3 = filled(path)
     runs = rows(path, "SELECT * FROM runs ORDER BY rowid")
     assert [r["mode"] for r in runs] == ["show", "show-batch", "commit-status"]
-    assert runs[0]["argv"] == "--password hunter2 -sC version"     # as typed: a snapshot is not edited
+    assert runs[0]["argv"] == "--devices core.csv -sC version"     # as typed: a snapshot is not edited
     assert (runs[0]["targets"], runs[0]["ok"], runs[0]["failed"], runs[0]["skipped"]) == (2, 1, 1, 0)
     assert runs[0]["finished"] and runs[0]["command"] == "version"
     show = rows(path, "SELECT * FROM results WHERE run_id = ? ORDER BY device, seq", r1)
@@ -222,7 +222,8 @@ def run_cli(monkeypatch, capsys, argv, fake=None):
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER", "HSSH_STORE"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p", *argv])
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *argv])
     try:
         rc = asyncio.run(cli.main())
     except SystemExit as e:
@@ -278,7 +279,8 @@ def test_the_store_env_var_names_the_file(tmp_path, monkeypatch, capsys):
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_STORE", str(path))
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
                                       "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()

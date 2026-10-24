@@ -22,7 +22,8 @@ def run_main(monkeypatch, capsys, argv, config=os.devnull):
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u", "--password", "p", *argv])
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u", *argv])
     try:
         rc = asyncio.run(cli.main())
     except SystemExit as e:      # argparse
@@ -181,7 +182,8 @@ def test_a_target_that_still_says_arista_is_refused_before_any_device(monkeypatc
     """#79: eAPI is gone; the old vendor name is not 'unknown', it is retired, and the line says what to use."""
     import asyncio
     from hssh import cli
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
                                       "--target", "SW1:10.0.0.1:arista", "-sC", "show version"])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()

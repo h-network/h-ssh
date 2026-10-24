@@ -106,14 +106,20 @@ Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT
 
 ```bash
 ./h-app/h-ssh.py --user admin -sC bgp                     # SSH agent / key, or type it at the prompt
-export HSSH_USER=admin HSSH_PASSWORD=secret               # or from the environment, nothing to type
+export HSSH_USER=admin HSSH_PASSWORD=secret               # a pipeline: from the environment, nothing to type
 ```
 
-`--password secret` works too, but a command line is visible to every user on the host (`ps`,
-`/proc/<pid>/cmdline`) and ends up in the shell history. On a shared jump host, use the environment
-or the prompt. The same goes for the `openssh` transport's commands: each line runs as the `ssh`
-process's argument, so a config line is readable from `ps` for the life of that process; push
-secrets over NETCONF or paramiko, not over `openssh`.
+There is no `--password` flag. h-ssh reads `HSSH_PASSWORD` when it is set, which is how a pipeline
+hands over the secret for that one process (from a vault, from the scheduler); otherwise, when stdin
+is a terminal, it asks, and Enter skips the password for keys or an agent; with neither there is no
+password. A variable that is set but empty refuses a pipeline run (exit 2) rather than falling back to
+keys without a word. A flag would show the password to every user on the host (`ps`,
+`/proc/<pid>/cmdline`), leave it in the shell history, and put it in the command line `--store` keeps.
+Your own user password belongs in neither a file nor a shell profile; the environment variable is for
+an account made for automation. The same `ps` exposure holds for the
+`openssh` transport's commands: each line runs as the `ssh` process's argument, so a config line is
+readable from `ps` for the life of that process; push secrets over NETCONF or paramiko, not over
+`openssh`.
 
 A password means the same on every transport: it is the credential, and no `~/.ssh/id_*` key and no agent key is offered first (`openssh` passes `PubkeyAuthentication=no` and `IdentitiesOnly=yes`), so a wrong password is a failed login on `junos`, `ssh` and `openssh` alike, never an OK by way of a key. Without a password the keys and the agent are what you log in with.
 
@@ -370,8 +376,8 @@ transport = openssh
 
 Precedence is flag → config file → built-in default. A value given on the command line always wins;
 only the credentials have an environment step: `--user` falls back to `HSSH_USER`, then the file's
-`user`, then the prompt, which offers your system username so Enter accepts it; the password to
-`HSSH_PASSWORD`, then the prompt.
+`user`, then the prompt, which offers your system username so Enter accepts it; the password has no
+flag and no file entry: `HSSH_PASSWORD` when set, else the prompt.
 
 `transport` is the vendor for targets that don't declare one — `name,ip` inventory rows, a bare
 `--target R1:10.0.1.1`, or a job entry without a vendor. The example above runs those through the
@@ -381,7 +387,8 @@ system `ssh` binary; a vendor on the target itself always wins.
 device costs you; on a LAN a reachable device connects in well under a second.
 
 **Passwords are never read from this file.** A config file on a shared jump host is the wrong place
-for a secret; use `HSSH_PASSWORD`, the prompt, or keys (`--password` works, but shows in `ps`).
+for a secret; a `password`, `passwd`, `secret`, `token` or `pass` line is refused with exit 2 naming
+it, exactly as in a run file. Use the prompt or keys, and `HSSH_PASSWORD` for a pipeline.
 `--config PATH` points at a different file, and that path must exist: a typo is exit 2, only the
 default path may be absent. Every line is `key = value`; a line that is not is exit 2 naming it, as
 is a value outside the flag's range (`workers` 1..256, `session_timeout` and `command_timeout`
@@ -443,8 +450,8 @@ YAML reads a bare `yes:` as a boolean, both spellings work), `structured`, `form
 Two rules the file cannot bend:
 
 - **No credential, ever.** `password`, `passwd`, `secret` and `token` keys are refused before anything
-  runs. The password comes from `HSSH_PASSWORD`, `--password`, or the prompt when stdin is a terminal,
-  exactly as without a file, so a run file can live in git or on a shared jump host.
+  runs. The password comes from `HSSH_PASSWORD` or the prompt when stdin is a terminal, exactly as
+  without a file, so a run file can live in git or on a shared jump host.
 - **Changes need a timer.** A run file that commits (`edit`, `edit-dir`, `edit-broadcast`, `rollback`,
   or a job with an edit) must set `commit-confirmed` in the file or on the command line, or be a
   `dry-run`; otherwise exit 2. Nobody watches a pipeline, and an unattended commit without a rollback
@@ -813,7 +820,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (844 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (853 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

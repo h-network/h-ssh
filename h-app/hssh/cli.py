@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import difflib
 import getpass
+import signal
 import json
 import logging
 import os
@@ -169,6 +170,37 @@ def _ranged_int(low: int, high: Optional[int], what: str):
             raise argparse.ArgumentTypeError(f"{what} takes {span}, not {value}")
         return value
     return convert
+
+
+class PromptClosed(Exception):
+    """The operator ended the input at a credential prompt (Ctrl-D)."""
+
+
+def _ask(prompt: str, secret: bool = False) -> str:
+    """One credential prompt. The question goes to the terminal, never into
+    redirected stdout; Ctrl-D is PromptClosed (one line, exit 2) instead of a
+    traceback; and the first Ctrl-C ends the run: asyncio's own SIGINT
+    handler would only cancel the task while the read goes on blocking, so
+    Python's default handler is restored for the duration of the prompt."""
+    previous = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (ValueError, OSError):            # not the main thread: keep what there is
+        previous = None
+    try:
+        if secret:
+            return getpass.getpass(prompt)
+        print(prompt, end="", file=sys.stderr, flush=True)
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line.strip()
+    except EOFError:
+        print(file=sys.stderr)
+        raise PromptClosed(prompt.split(" ")[0].rstrip(":").lower())
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
 
 
 def _tty(stream) -> bool:
@@ -369,7 +401,11 @@ async def main() -> int:
             stream.reconfigure(errors="replace")
         except (AttributeError, ValueError):
             pass
-    parser = _Parser(description="Multi-vendor network automation tool.")
+    parser = _Parser(
+        description="Multi-vendor network automation tool.",
+        epilog="The password is typed at the prompt when stdin is a terminal, or read from HSSH_PASSWORD "
+               "when a pipeline runs h-ssh; there is no --password flag, and the config file never "
+               "carries one.")
 
     parser.add_argument("--devices", default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
@@ -382,8 +418,6 @@ async def main() -> int:
                         help="Username (or HSSH_USER env var, or 'user' in ~/.h-ssh/config)")
     parser.add_argument("--config", type=str,
                         help="Config file with defaults (default: ~/.h-ssh/config)")
-    parser.add_argument("--password", type=str,
-                        help="Password (visible in the process list; prefer HSSH_PASSWORD or the prompt)")
 
     # Modes
     parser.add_argument("-sC", "--show-command", type=str,
@@ -812,11 +846,15 @@ async def main() -> int:
             print(f"ERROR: --save-output {save_dir}: {e.strerror or e}", file=sys.stderr)
             return 2
 
-    # Credentials. Flag beats environment beats config file; the password is
-    # never read from the config file, so a shell alias cannot leak it to disk.
+    # Credentials. The user: flag, environment, config file. The password has
+    # two sources and no flag: typed at the prompt when someone runs h-ssh by
+    # hand, or HSSH_PASSWORD when a pipeline runs it (handed over by whatever
+    # keeps the secret). A flag would put it in `ps`, the shell history and
+    # every stored command line; the config file is never read for it, so a
+    # shell alias cannot leak it to disk.
     config = file_config
     user = args.user or os.environ.get("HSSH_USER") or config.get("user")
-    passwd = args.password or os.environ.get("HSSH_PASSWORD")
+    passwd = os.environ.get("HSSH_PASSWORD")
     if args.raw and args.verbose:
         print("ERROR: --raw and -v are mutually exclusive.", file=sys.stderr)
         return 2
@@ -836,14 +874,26 @@ async def main() -> int:
                   file=sys.stderr)
             return 2
         default_user = getpass.getuser()
-        user = input(f"Username [{default_user}]: ").strip() or default_user
+        try:
+            user = _ask(f"Username [{default_user}]: ") or default_user
+        except PromptClosed:
+            print("ERROR: no username given at the prompt; nothing was sent.", file=sys.stderr)
+            return 2
 
+    if passwd == "" and not _tty(sys.stdin):
+        # A pipeline whose secret lookup came back empty: refused, since the
+        # run would otherwise go on to key authentication without a word.
+        print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
+        return 2
     if not passwd:
         # No transport needs a password up front: a key or an agent may do.
         if _tty(sys.stdin):
-            passwd = getpass.getpass("Password (press Enter to skip): ")
-            if not passwd:
-                passwd = None
+            try:
+                passwd = _ask("Password (press Enter to skip): ", secret=True) or None
+            except PromptClosed:
+                print("ERROR: no password given at the prompt (Enter skips it); nothing was sent.",
+                      file=sys.stderr)
+                return 2
         else:
             passwd = None
 

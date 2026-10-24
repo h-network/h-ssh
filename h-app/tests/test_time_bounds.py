@@ -26,8 +26,9 @@ def _edit_cli(monkeypatch, capsys, probe, n, extra):
     monkeypatch.setattr(cli, "check_reachability", probe)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
     targets = [a for i in range(n) for a in ("--target", f"R{i}:10.0.0.{i + 1}:junos")]
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p", "-y",
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-y",
                                       *targets, "-eC", "set system host-name x", *extra])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
