@@ -7,6 +7,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from . import drivers
 
 
 # A device name becomes a file name (<name>.set, <name>.output): hostname
@@ -353,23 +354,15 @@ def read_command_file_lines(path: Path) -> List[str]:
     return out
 
 
-DEFAULT_VENDOR_PORTS = {
-    "junos": 830,
-    "telnet": 23,
-    "telnet-ios": 23,
-    "telnet-junos": 23,
-    "telnet-arista": 23,
-    "telnet-nxos": 23,
-    "ssh": 22,
-    "openssh": 22,
-}
-
-
 def resolve_target_port(target: Target) -> int:
-    """Resolve port for a target, falling back to vendor default."""
+    """The target's port, or its transport's default (830 for NETCONF, 23 for
+    telnet, 22 otherwise)."""
     if target.port is not None:
         return target.port
-    return DEFAULT_VENDOR_PORTS.get(target.vendor, 22)
+    try:
+        return drivers.get(target.vendor).transport.default_port
+    except ValueError:
+        return 22
 
 
 JUNOS_SET_PREFIX_VERBS = (
