@@ -488,6 +488,46 @@ silent preference (`--json -v` is accepted: the JSON is printed and `-v` does no
 both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
 `output`.
 
+### The result store
+
+`--store runs.db` (or `HSSH_STORE=runs.db`) keeps every command's reply in one SQLite file, run after
+run: one row per command per device — run, device, host, driver, the command as sent, when, OK or
+not, the duration, the error, the format (`text`, `xml`, `json`) and the device's own reply. A show
+is one row, a `--batch` one row per command in order, an edit one row with the payload as the command
+and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON. A
+second table, `runs`, has one row per invocation: when it started and finished, the mode, what it was
+about, the whole command line, who ran it and from where, and the counts. The file is created 0600
+and the replies are redacted as `--log`'s are; `--store-raw` keeps them whole (a config backup keeps
+its hashes). The file is opened and its tables made before the first device, so an unusable path
+refuses the run with exit 2.
+
+The store holds output and nothing else: no parsing, no normalising, no per-command schema — what is
+done with the replies is the reader's business. `h-ssh-store` is the reader that ships, over the same
+file (`--store PATH` or `HSSH_STORE`):
+
+| Command | Prints |
+|---|---|
+| `runs [--last N]` | the runs, newest first: id, start, mode, user, targets/ok/fail, what it was about |
+| `failed [RUN]` | the failed rows of a run (default: the last), with the device's error line; exit 1 when there are any |
+| `output DEVICE [RUN] [--seq N]` | one reply, as the device gave it; the error on stderr and exit 1 for a failed row |
+| `grep PATTERN [--run] [--device] [--command] [-i]` | the lines of stored replies that match a regex, with run, device and command |
+| `field PATH [--run] [--device] [--command]` | a dotted path into JSON replies (`--format json` shows, commit histories): the device's structure read, not parsed |
+| `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ |
+| `history DEVICE [--command C] [--last N]` | every stored result for a device, newest first |
+| `slowest [RUN] [--last N]` | the slowest results, of a run or overall |
+
+A run is named by its id or any unique prefix of it (`20261024-1730` when only one run started then).
+Anything else is a `sqlite3 runs.db` query away: the schema is two tables, documented at the top of
+`hssh/store.py`.
+
+```console
+$ h-ssh --devices core.csv --store runs.db -sC "show bgp summary"
+$ h-ssh-store --store runs.db runs
+run                   started              mode  user   targets/ok/fail  command
+20261024-173057-e45e  2026-10-24T17:30:57  show  h-lab  10/10/0          show bgp summary
+$ h-ssh-store --store runs.db diff cr1 20261024-1730 20261023-0905
+```
+
 ## Failure handling
 
 A device that black-holes packets used to cost the full timeout three times over. Failures are now
@@ -549,6 +589,7 @@ ones (`--safety-file`, `--audit-log`, `--log`) apply to every mode once given.
 | Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite. The file and its `.lock` are created and locked once before the first device; a path that cannot be created, opened or locked (a missing directory, a symlink, a FIFO) refuses the run with exit 2 |
 | Audit trail | `--audit-log PATH` (or `HSSH_AUDIT_LOG`) | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`/`passwd`, `authentication-key`, `md5-key`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). One entry per device for every mode — shows included, without their output — plus pre-flight aborts and user cancellations; records diffs for edits. The file is opened once before the first device, so an unwritable path refuses the run before anything is sent (exit 2); in edit modes, audit write failures during the run fail it |
 | Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, one line as each device finishes, appended with the same 0600 mode and secret redaction as the audit trail, and probed before the first device like the audit log |
+| Result store | `--store PATH` (or `HSSH_STORE`), `--store-raw` | Every command's reply in one SQLite file, one row per command per device plus a row per run, 0600 and redacted as `--log` unless `--store-raw`; opened before the first device, so an unusable path refuses the run (exit 2). Read with `h-ssh-store` (see [The result store](#the-result-store)) |
 
 A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
 
@@ -736,6 +777,7 @@ h-ssh/
 │   │   ├── pool.py          # opt-in session pool for library use
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
+│   │   ├── store.py         # the result store (--store): SQLite writer and the h-ssh-store reader
 │   │   ├── errors.py        # NotAppliedError, AmbiguousCommitError — what the retry logic keys on
 │   │   ├── dialects/        # what each device speaks, with its shortcut library next to it
 │   │   │   ├── base.py      # Dialect, CliSyntax, the default read rule
@@ -761,7 +803,7 @@ h-ssh/
 ├── .github/workflows/tests.yml   # unit suite, Python 3.10–3.13
 ├── assets/                  # banner, badges
 ├── TESTS.md                 # what was run on which code
-└── pyproject.toml           # installs the `h-ssh` entry point from h-app/; declares the built-in drivers under `hssh.drivers`
+└── pyproject.toml           # installs the `h-ssh` and `h-ssh-store` entry points from h-app/; declares the built-in drivers under `hssh.drivers`
 ```
 
 ## Develop
@@ -771,7 +813,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (829 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (844 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
