@@ -54,12 +54,17 @@ DRIVERS = {d.name: d for d in (
     Driver(JUNOS, NETCONF, frozenset(CAPABILITIES), shim="junos"),
     Driver(NONE, SSH, _TEXT, shim="ssh"),
     Driver(NONE, OPENSSH, _TEXT, shim="openssh"),
-    # Dialects over SSH (#83): shows on an exec channel, edits through the
-    # CLI engine on a shell channel. No legacy name: the shim is the name.
+    # Dialects over SSH (#83), on paramiko and on the OpenSSH client: shows on
+    # an exec channel, edits through the CLI engine on a shell (a pty, for the
+    # OpenSSH client). No legacy name: the shim is the name.
     Driver(JUNOS, SSH, _CANDIDATE_CLI, shim="junos@ssh"),
     Driver(IOS, SSH, _TEXT, shim="ios@ssh"),
     Driver(NXOS, SSH, _TEXT, shim="nxos@ssh"),
     Driver(EOS, SSH, _TEXT | {"show_structured"}, shim="eos@ssh"),    # structured reads via `| json`
+    Driver(JUNOS, OPENSSH, _CANDIDATE_CLI, shim="junos@openssh"),
+    Driver(IOS, OPENSSH, _TEXT, shim="ios@openssh"),
+    Driver(NXOS, OPENSSH, _TEXT, shim="nxos@openssh"),
+    Driver(EOS, OPENSSH, _TEXT | {"show_structured"}, shim="eos@openssh"),
     Driver(NONE, TELNET, _TEXT, shim="telnet"),
     Driver(IOS, TELNET, _TEXT, shim="telnet-ios"),
     Driver(JUNOS, TELNET, _CANDIDATE_CLI, shim="telnet-junos"),
@@ -76,7 +81,7 @@ ALIASES = {d.shim: d.name for d in DRIVERS.values() if d.shim != d.name}
 # HTTP transports (2026-10-24).
 RETIRED = {
     "arista": "vendor 'arista' (eAPI over HTTPS) is no longer supported; EOS devices use the "
-              "ssh or openssh transport (eos@ssh for the EOS dialect), or telnet-arista",
+              "ssh or openssh transport (eos@ssh or eos@openssh for the EOS dialect), or telnet-arista",
 }
 
 

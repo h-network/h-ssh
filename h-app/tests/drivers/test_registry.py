@@ -34,11 +34,12 @@ def test_todays_names_are_aliases_of_canonical_drivers():
 
 def test_every_name_is_unique_and_listed():
     names = drivers.names()
-    assert len(names) == len(set(names)) == 20
+    assert len(names) == len(set(names)) == 24
     assert set(names) == set(drivers.ALIASES) | set(drivers.DRIVERS)
-    # the vendors table is keyed by shim: today's names, and the ssh dialect drivers by their own name
+    # the vendors table is keyed by shim: today's names, and the ssh and openssh dialect drivers by their own name
     assert set(vendors.VENDORS) == {d.shim for d in drivers.DRIVERS.values()}
-    for name in ("junos@ssh", "ios@ssh", "nxos@ssh", "eos@ssh"):
+    for name in ("junos@ssh", "ios@ssh", "nxos@ssh", "eos@ssh",
+                 "junos@openssh", "ios@openssh", "nxos@openssh", "eos@openssh"):
         assert drivers.get(name).shim == name and name not in drivers.ALIASES
 
 
@@ -46,8 +47,8 @@ def test_a_retired_name_gets_its_line_and_an_unknown_one_the_list():
     with pytest.raises(ValueError, match="eAPI over HTTPS.*no longer supported"):
         drivers.get("arista")
     assert vendors.RETIRED is drivers.RETIRED
-    with pytest.raises(ValueError, match="Unknown vendor: junos@openssh. Available: junos, ssh, "):
-        drivers.get("junos@openssh")
+    with pytest.raises(ValueError, match="Unknown vendor: ios@netconf. Available: junos, ssh, "):
+        drivers.get("ios@netconf")
 
 
 # --- the three parts -----------------------------------------------------------
@@ -81,6 +82,9 @@ def test_supports_match_what_the_runner_refused_by_name_before():
     assert drivers.get("junos@ssh").supports == drivers.get("telnet-junos").supports
     assert drivers.get("ios@ssh").supports == drivers.get("nxos@ssh").supports == {"show", "show_batch", "edit"}
     assert drivers.get("eos@ssh").supports == {"show", "show_batch", "edit", "show_structured"}
+    # the same dialects on the OpenSSH client (#83) can do the same
+    for dialect in ("junos", "ios", "nxos", "eos"):
+        assert drivers.get(f"{dialect}@openssh").supports == drivers.get(f"{dialect}@ssh").supports
 
 
 def test_a_driver_cannot_declare_nonsense():
@@ -167,5 +171,5 @@ def test_the_cli_accepts_a_canonical_target_and_refuses_an_unregistered_pair(mon
     assert rc == 0, err
     assert drv.shows == [("10.0.0.1", "show version", None)]   # the driver applies its own default port
     rc, out, err, _ = run_cli(monkeypatch, capsys, tmp_path,
-                              ["--user", "u", "--target", "R1:10.0.0.1:junos@openssh", "-sC", "show version"])
-    assert rc == 2 and "ERROR: Unknown vendor 'junos@openssh'." in err
+                              ["--user", "u", "--target", "R1:10.0.0.1:ios@netconf", "-sC", "show version"])
+    assert rc == 2 and "ERROR: Unknown vendor 'ios@netconf'." in err

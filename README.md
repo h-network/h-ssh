@@ -166,6 +166,7 @@ on an edit or `--commit-confirmed` where the driver does not list them, before a
 | `junos@ssh` | SSH, Junos CLI | paramiko | exec channel | shell: `configure exclusive` / `show \| compare` / `commit`, `--dry-run`, `--commit-confirmed`, `-eC commit` |
 | `ios@ssh`, `nxos@ssh` | SSH, IOS-shaped CLI | paramiko | exec channel | shell: `configure terminal` … `end` |
 | `eos@ssh` | SSH, EOS CLI | paramiko | exec channel, `--structured` via `\| json` | shell: `configure terminal` … `end` |
+| `junos@openssh`, `ios@openssh`, `nxos@openssh`, `eos@openssh` | the same dialects over the OpenSSH binary | built-in | `ssh host cmd` (`\| json` for `eos@openssh --structured`) | `ssh -tt host` shell, the same edit sequences |
 | `telnet` | Raw socket | built-in | raw TCP | config mode |
 | `telnet-ios` | Raw socket, IOS prompts | built-in | raw TCP | `configure terminal` |
 | `telnet-junos` | Raw socket, Junos prompts | built-in | raw TCP | `configure exclusive` / `commit` |
@@ -178,7 +179,9 @@ A dialect over SSH or telnet is typed at by one CLI engine (`hssh/transports/cli
 learns the device's own prompt, answers paging, and runs the edit sequence the dialect describes (a
 candidate diffed and committed or discarded for Junos, lines applied in config mode for the IOS-shaped
 ones). Shows over SSH use an exec channel, one command per channel; only edits and confirms open a
-shell. The plain `ssh`/`openssh` drivers (dialect `none`) never open a shell.
+shell. Over the OpenSSH binary the shell is `ssh -tt`, with a password still handed over through
+`SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh` drivers (dialect `none`) never open
+a shell.
 
 Telnet is a prompt match on a raw socket, so it is strict about what it has not seen. A read that reaches
 its timeout or loses the connection is an error, never a partial reply passed off as the device's answer,
@@ -637,7 +640,7 @@ h-ssh/
 │   │       ├── __init__.py  # VENDORS: today's vendor name → module (the drivers' shim)
 │   │       ├── junos.py     # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
 │   │       ├── generic.py   # paramiko SSH: exec channel for shows and none-dialect edits, the CLI engine on a shell for dialect edits
-│   │       ├── openssh.py   # the OpenSSH binary — zero dependencies
+│   │       ├── openssh.py   # the OpenSSH binary — zero dependencies; the CLI engine on `ssh -tt` for dialect edits
 │   │       └── telnet.py    # the CLI engine on a telnet channel, in the dialect the name says (frozen)
 │   ├── tests/
 │   ├── h-ssh.py             # CLI entry point

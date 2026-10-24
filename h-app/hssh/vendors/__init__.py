@@ -15,6 +15,11 @@ VENDORS = {
     "ios@ssh": generic,
     "nxos@ssh": generic,
     "eos@ssh": generic,
+    # the same dialects on the OpenSSH client: the openssh module, told the same way
+    "junos@openssh": openssh,
+    "ios@openssh": openssh,
+    "nxos@openssh": openssh,
+    "eos@openssh": openssh,
     "telnet": telnet,
     "telnet-ios": telnet,
     "telnet-junos": telnet,

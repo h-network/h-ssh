@@ -50,7 +50,9 @@ def test_capability_is_the_registrys_not_module_attribute_presence():
     longer the fallback signal; the registry withholds it from plain ssh."""
     assert "show_structured" in runner.bind("junos").caps
     assert "show_structured" in runner.bind("eos@ssh").caps
+    assert "show_structured" in runner.bind("eos@openssh").caps
     assert "show_structured" not in runner.bind("ssh").caps
+    assert "show_structured" not in runner.bind("openssh").caps
     assert "show_structured" not in runner.bind("telnet").caps
     assert "show_structured" not in runner.bind("telnet-ios").caps
     assert hasattr(vendors.get("ssh"), "show_structured")   # the shared module has it; ssh may not ask
