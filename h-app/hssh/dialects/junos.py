@@ -83,6 +83,9 @@ CLI = CliSyntax(
     compare="show | compare",
     discard="rollback 0",
     commit="commit",
+    # "[edit]" / "[edit system]" before the configuration-mode prompt belongs
+    # to the prompt: without this, an empty `show | compare` read as a diff.
+    context=re.compile(r"^\[edit[^\]]*\]\s*$"),
 )
 
 DIALECT = Dialect("junos", "Junos", "Junos: set syntax, candidate configuration, commit confirmed",

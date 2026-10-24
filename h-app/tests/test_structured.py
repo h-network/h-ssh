@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from hssh.core import resolve_command, resolve_structured, parse_inline_target
-from hssh import vendors
+from hssh import runner, vendors
 
 
 def test_same_shortcut_resolves_per_vendor():
@@ -43,18 +43,23 @@ def test_multi_word_command_has_no_binding():
     assert resolve_structured("show bgp summary", "junos") is None
 
 
-def test_capability_is_module_attribute_presence():
-    """runner.py branches on hasattr, so absence is the fallback signal."""
-    assert hasattr(vendors.get("junos"), "show_structured")
-    assert not hasattr(vendors.get("ssh"), "show_structured")
-    assert not hasattr(vendors.get("telnet"), "show_structured")
-    assert not hasattr(vendors.get("telnet-ios"), "show_structured")
+def test_capability_is_the_registrys_not_module_attribute_presence():
+    """The runner branches on the driver's `supports`, never on the module:
+    the paramiko module serves none@ssh and eos@ssh alike and has
+    show_structured for the latter (#83), so absence of the attribute is no
+    longer the fallback signal; the registry withholds it from plain ssh."""
+    assert "show_structured" in runner.bind("junos").caps
+    assert "show_structured" in runner.bind("eos@ssh").caps
+    assert "show_structured" not in runner.bind("ssh").caps
+    assert "show_structured" not in runner.bind("telnet").caps
+    assert "show_structured" not in runner.bind("telnet-ios").caps
+    assert hasattr(vendors.get("ssh"), "show_structured")   # the shared module has it; ssh may not ask
 
 
 def test_vendorless_target_is_ssh_not_junos():
     t = parse_inline_target("SW1:10.0.0.1")
     assert t.vendor == "ssh"
-    assert not hasattr(vendors.get(t.vendor), "show_structured")
+    assert "show_structured" not in runner.bind(t.vendor).caps
 
 
 def test_every_declared_binding_is_well_formed():

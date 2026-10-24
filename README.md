@@ -163,6 +163,9 @@ on an edit or `--commit-confirmed` where the driver does not list them, before a
 | `junos` | NETCONF | junos-eznc | PyEZ `Device.cli()` | PyEZ lock/load/diff/commit |
 | `ssh` | SSH | paramiko | `exec_command` | `exec_command` |
 | `openssh` | OpenSSH client | built-in | `ssh host cmd` | `ssh host cmd` |
+| `junos@ssh` | SSH, Junos CLI | paramiko | exec channel | shell: `configure exclusive` / `show \| compare` / `commit`, `--dry-run`, `--commit-confirmed`, `-eC commit` |
+| `ios@ssh`, `nxos@ssh` | SSH, IOS-shaped CLI | paramiko | exec channel | shell: `configure terminal` … `end` |
+| `eos@ssh` | SSH, EOS CLI | paramiko | exec channel, `--structured` via `\| json` | shell: `configure terminal` … `end` |
 | `telnet` | Raw socket | built-in | raw TCP | config mode |
 | `telnet-ios` | Raw socket, IOS prompts | built-in | raw TCP | `configure terminal` |
 | `telnet-junos` | Raw socket, Junos prompts | built-in | raw TCP | `configure exclusive` / `commit` |
@@ -170,6 +173,12 @@ on an edit or `--commit-confirmed` where the driver does not list them, before a
 | `telnet-nxos` | Raw socket, NX-OS prompts | built-in | raw TCP | `configure terminal` |
 
 Every transport runs a batch on one session per device.
+
+A dialect over SSH or telnet is typed at by one CLI engine (`hssh/transports/cli.py`): it logs in,
+learns the device's own prompt, answers paging, and runs the edit sequence the dialect describes (a
+candidate diffed and committed or discarded for Junos, lines applied in config mode for the IOS-shaped
+ones). Shows over SSH use an exec channel, one command per channel; only edits and confirms open a
+shell. The plain `ssh`/`openssh` drivers (dialect `none`) never open a shell.
 
 Telnet is a prompt match on a raw socket, so it is strict about what it has not seen. A read that reaches
 its timeout or loses the connection is an error, never a partial reply passed off as the device's answer,
@@ -616,6 +625,9 @@ h-ssh/
 │   │   │   ├── junos.py     # set-syntax guard, refusal regex, candidate CLI, commit-pending note  + junos.json
 │   │   │   ├── ios.py       # IOS-shaped CLI and `% ` refusals; nxos.py, eos.py (+ eos.json) build on it
 │   │   │   └── none.py      # no vendor knowledge: error:/% refusals, IOS-shaped prompt  + none.json
+│   │   ├── transports/
+│   │   │   ├── cli.py       # the CLI engine: login, prompt, run, paging, candidate/lines edits, confirm — on any channel
+│   │   │   └── telnet.py    # the telnet channel (socket + option negotiation); netconf/paramiko/openssh move here with #84
 │   │   ├── drivers/
 │   │   │   ├── base.py      # Transport, Driver and the capability words
 │   │   │   ├── __init__.py  # the registry: dialect@transport names, today's names as aliases
@@ -624,9 +636,9 @@ h-ssh/
 │   │   └── vendors/
 │   │       ├── __init__.py  # VENDORS: today's vendor name → module (the drivers' shim)
 │   │       ├── junos.py     # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
-│   │       ├── generic.py   # paramiko SSH
+│   │       ├── generic.py   # paramiko SSH: exec channel for shows and none-dialect edits, the CLI engine on a shell for dialect edits
 │   │       ├── openssh.py   # the OpenSSH binary — zero dependencies
-│   │       └── telnet.py    # raw socket, per-flavour prompt handling
+│   │       └── telnet.py    # the CLI engine on a telnet channel, in the dialect the name says (frozen)
 │   ├── tests/
 │   ├── h-ssh.py             # CLI entry point
 │   ├── devices.csv          # example inventory

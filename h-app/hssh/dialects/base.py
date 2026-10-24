@@ -33,7 +33,9 @@ class CliSyntax:
     the name in the first prompt seen (group 1), `prompt_tail` is what may
     follow it. `config_enter`/`config_exit` bracket an edit. A dialect with a
     candidate configuration also has `compare` (the diff), `discard` and
-    `commit`; one without applies each line as typed."""
+    `commit`; one without applies each line as typed. `context` matches a
+    line the CLI prints with its prompt rather than as part of a reply
+    (Junos's `[edit system]` banner in configuration mode)."""
     prompt: re.Pattern
     prompt_name: re.Pattern
     prompt_tail: str
@@ -42,6 +44,7 @@ class CliSyntax:
     compare: Optional[str] = None
     discard: Optional[str] = None
     commit: Optional[str] = None
+    context: Optional[re.Pattern] = None
 
     @property
     def has_candidate(self) -> bool:

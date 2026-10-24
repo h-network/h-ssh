@@ -44,27 +44,39 @@ TRANSPORTS = {t.name: t for t in (NETCONF, SSH, OPENSSH, TELNET)}
 
 _TEXT = frozenset({"show", "show_batch", "edit"})
 
+# What a dialect's CLI can do over a transport that types at it: a candidate
+# dialect (Junos) can diff and discard, arm a commit-confirmed timer and
+# confirm one; a lines dialect applies what it is given. Comments and
+# rollbacks stay NETCONF's.
+_CANDIDATE_CLI = _TEXT | {"confirm", "dry_run", "commit_confirmed"}
+
 DRIVERS = {d.name: d for d in (
     Driver(JUNOS, NETCONF, frozenset(CAPABILITIES), shim="junos"),
     Driver(NONE, SSH, _TEXT, shim="ssh"),
     Driver(NONE, OPENSSH, _TEXT, shim="openssh"),
+    # Dialects over SSH (#83): shows on an exec channel, edits through the
+    # CLI engine on a shell channel. No legacy name: the shim is the name.
+    Driver(JUNOS, SSH, _CANDIDATE_CLI, shim="junos@ssh"),
+    Driver(IOS, SSH, _TEXT, shim="ios@ssh"),
+    Driver(NXOS, SSH, _TEXT, shim="nxos@ssh"),
+    Driver(EOS, SSH, _TEXT | {"show_structured"}, shim="eos@ssh"),    # structured reads via `| json`
     Driver(NONE, TELNET, _TEXT, shim="telnet"),
     Driver(IOS, TELNET, _TEXT, shim="telnet-ios"),
-    # The telnet CLI can diff a Junos candidate and arm a commit-confirmed
-    # timer; it cannot log a comment with the commit or return to a rollback.
-    Driver(JUNOS, TELNET, _TEXT | {"confirm", "dry_run", "commit_confirmed"}, shim="telnet-junos"),
+    Driver(JUNOS, TELNET, _CANDIDATE_CLI, shim="telnet-junos"),
     Driver(EOS, TELNET, _TEXT, shim="telnet-arista"),
     Driver(NXOS, TELNET, _TEXT, shim="telnet-nxos"),
 )}
 
-ALIASES = {d.shim: d.name for d in DRIVERS.values()}
+# Today's vendor names, each the shim of its driver; a driver whose shim is
+# its own name has no alias.
+ALIASES = {d.shim: d.name for d in DRIVERS.values() if d.shim != d.name}
 
 # Names h-ssh used to speak to and no longer does, with the one line a target
 # that still carries them gets. h-ssh is SSH, NETCONF over SSH and telnet: no
 # HTTP transports (2026-10-24).
 RETIRED = {
     "arista": "vendor 'arista' (eAPI over HTTPS) is no longer supported; EOS devices use the "
-              "ssh or openssh transport (eos@ssh once dialects land), or telnet-arista",
+              "ssh or openssh transport (eos@ssh for the EOS dialect), or telnet-arista",
 }
 
 

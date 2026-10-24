@@ -21,20 +21,20 @@ def test_every_registered_driver_is_backed_by_its_module(name):
     assert contract.violations(driver, _own(driver)) == []
 
 
-@pytest.mark.parametrize("name", ["junos@netconf", "none@ssh", "none@openssh"])
+@pytest.mark.parametrize("name", ["junos@netconf", "none@openssh"])
 def test_a_module_serving_one_driver_declares_everything_it_has(name):
-    """The shared telnet module serves four dialects and offers more than most
-    of them may use (until #83); the other modules must not be under-declared,
-    or the runner would refuse what the module can do."""
+    """The telnet and paramiko modules serve several dialects and offer more
+    than most of them may use; a module behind one driver must not be
+    under-declared, or the runner would refuse what the module can do."""
     driver = drivers.get(name)
     has = {c for c in METHOD_CAPABILITIES if callable(getattr(_own(driver), c, None))}
     assert has == driver.supports & METHOD_CAPABILITIES
 
 
-def test_telnet_dialects_declare_no_more_than_the_module_has():
-    mod = importlib.import_module("hssh.vendors.telnet")
+def test_shared_modules_offer_what_every_dialect_on_them_declares():
     for driver in drivers.DRIVERS.values():
-        if driver.transport is drivers.TELNET:
+        if driver.transport in (drivers.TELNET, drivers.SSH):
+            mod = importlib.import_module(driver.transport.module)
             for cap in driver.supports & METHOD_CAPABILITIES:
                 assert callable(getattr(mod, cap, None)), f"{driver.name}: {cap}"
 

@@ -10,6 +10,11 @@ VENDORS = {
     "junos": junos,
     "ssh": generic,
     "openssh": openssh,
+    # dialects over SSH (#83): the paramiko module, told the dialect by the hint
+    "junos@ssh": generic,
+    "ios@ssh": generic,
+    "nxos@ssh": generic,
+    "eos@ssh": generic,
     "telnet": telnet,
     "telnet-ios": telnet,
     "telnet-junos": telnet,
