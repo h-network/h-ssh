@@ -14,7 +14,7 @@ import paramiko
 
 from hssh import runner
 from hssh.core import Target
-from hssh.vendors import generic
+from hssh.transports import ssh
 
 
 @pytest.fixture(autouse=True)
@@ -117,14 +117,14 @@ class OfflineSSHClient(paramiko.SSHClient):
 
 @pytest.fixture
 def offline(monkeypatch):
-    monkeypatch.setattr(generic, "paramiko", FakeParamiko(OfflineSSHClient))
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(OfflineSSHClient))
     monkeypatch.setattr(OfflineSSHClient, "auth_calls", [])
     monkeypatch.setattr(OfflineSSHClient, "server_key", paramiko.ECDSAKey.generate())
     return OfflineSSHClient
 
 
 def test_first_contact_pins_the_key(offline, home):
-    out = generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    out = ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert "output-for: show version" in out
     lines = pin_file(home).read_text().splitlines()
     assert len(lines) == 1 and lines[0].startswith("10.0.0.1 ecdsa-sha2-nistp256 ")
@@ -134,19 +134,19 @@ def test_first_contact_pins_the_key(offline, home):
 
 def test_a_changed_key_is_refused_before_any_credential_is_sent(offline, home):
     """Regression: WarningPolicy let an impostor on a known address have the password."""
-    generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     pinned = pin_file(home).read_text()
     offline.auth_calls.clear()
     offline.server_key = paramiko.ECDSAKey.generate()
     with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.1"):
-        generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert offline.auth_calls == []
     assert pin_file(home).read_text() == pinned
 
 
 def test_a_pinned_key_is_accepted_again(offline, home):
-    generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
-    generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert len(pin_file(home).read_text().splitlines()) == 1
     assert len(offline.auth_calls) == 2
 
@@ -154,33 +154,33 @@ def test_a_pinned_key_is_accepted_again(offline, home):
 def test_strict_policy_refuses_an_unknown_host(offline, home, monkeypatch):
     monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "yes")
     with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.1"):
-        generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert offline.auth_calls == []
     assert pin_file(home).read_text() == ""
 
 
 def test_strict_policy_accepts_a_pinned_host(offline, home, monkeypatch):
-    generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "yes")
-    out = generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    out = ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert "output-for: show version" in out
 
 
 def test_no_policy_warns_and_pins_nothing(offline, home, monkeypatch):
     monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "no")
     with pytest.warns(UserWarning, match="Unknown ecdsa-sha2-nistp256 host key for 10.0.0.1"):
-        generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert pin_file(home).read_text() == ""
 
 
 def test_unknown_policy_is_refused(offline, monkeypatch):
     monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "maybe")
     with pytest.raises(RuntimeError, match="invalid HSSH_HOST_KEY_POLICY"):
-        generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
 
 
 def test_another_port_is_pinned_under_its_own_name(offline, home):
-    generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10, port=2222)
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10, port=2222)
     assert pin_file(home).read_text().startswith("[10.0.0.1]:2222 ecdsa-sha2-nistp256 ")
 
 
@@ -191,7 +191,7 @@ def test_parallel_first_contacts_are_all_pinned(offline, home):
 
     def contact(host):
         try:
-            generic.show(host, "admin", "s3cret", "show version", 5, 10)
+            ssh.show(host, "admin", "s3cret", "show version", 5, 10)
         except Exception as exc:
             errors.append(exc)
 
@@ -236,7 +236,7 @@ class ExitClient:
 def exits_with(monkeypatch):
     def install(rc, stderr=b"", stdout=b"output-for: %s"):
         client_cls = type("Client", (ExitClient,), {"rc": rc, "stderr": stderr, "stdout": stdout})
-        monkeypatch.setattr(generic, "paramiko", FakeParamiko(client_cls))
+        monkeypatch.setattr(ssh, "paramiko", FakeParamiko(client_cls))
     return install
 
 
@@ -244,35 +244,35 @@ def test_edit_raises_on_a_non_zero_exit(exits_with):
     """Regression: a failed config line came back as output and the runner printed OK."""
     exits_with(127, stderr=b"sh: 1: configure: not found\n")
     with pytest.raises(RuntimeError, match="exit 127 from 'configure terminal': sh: 1: configure: not found"):
-        generic.edit("10.0.0.1", "u", "p", "configure terminal\nhostname NEW\n", 5, 10)
+        ssh.edit("10.0.0.1", "u", "p", "configure terminal\nhostname NEW\n", 5, 10)
 
 
 def test_batch_marks_a_non_zero_exit_per_command(exits_with):
     exits_with(1, stderr=b"error: syntax error\n")
-    results = generic.show_batch("10.0.0.1", "u", "p", ["show foo"], 5, 10)
+    results = ssh.show_batch("10.0.0.1", "u", "p", ["show foo"], 5, 10)
     assert results[0]["ok"] is False
     assert "exit 1" in results[0]["error"] and "syntax error" in results[0]["error"]
 
 
 def test_exit_zero_returns_the_output_block(exits_with):
     exits_with(0)
-    assert generic.show("10.0.0.1", "u", "p", "show version", 5, 10) == (
+    assert ssh.show("10.0.0.1", "u", "p", "show version", 5, 10) == (
         "$ show version\noutput-for: show version\n")
-    results = generic.show_batch("10.0.0.1", "u", "p", ["show version"], 5, 10)
+    results = ssh.show_batch("10.0.0.1", "u", "p", ["show version"], 5, 10)
     assert results == [{"command": "show version", "ok": True,
                         "output": "$ show version\noutput-for: show version"}]
 
 
 def test_no_exit_status_from_the_server_is_not_a_failure(exits_with):
     exits_with(-1)
-    assert "output-for: show version" in generic.show("10.0.0.1", "u", "p", "show version", 5, 10)
+    assert "output-for: show version" in ssh.show("10.0.0.1", "u", "p", "show version", 5, 10)
 
 
 def test_failure_detail_falls_back_to_stdout(exits_with):
     """Network OSes tend to print their errors on stdout."""
     exits_with(1, stdout=b"error: unknown command: %s\n")
     with pytest.raises(RuntimeError, match="exit 1 from 'show foo': error: unknown command: show foo"):
-        generic.show("10.0.0.1", "u", "p", "show foo", 5, 10)
+        ssh.show("10.0.0.1", "u", "p", "show foo", 5, 10)
 
 
 def test_runner_reports_a_failed_edit_as_fail(exits_with):
@@ -291,9 +291,9 @@ def test_edit_refuses_a_rollback_timer_instead_of_dropping_it(monkeypatch):
     class NoClient:
         def __init__(self, *a, **k):
             raise AssertionError("connected although the timer cannot be armed over exec")
-    monkeypatch.setattr(generic, "paramiko", FakeParamiko(NoClient))
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(NoClient))
     with pytest.raises(ValueError, match="not supported by the 'ssh' transport; nothing was sent"):
-        generic.edit("10.0.0.1", "u", "p", "hostname NEW\n", 5, 10, commit_confirmed=5)
+        ssh.edit("10.0.0.1", "u", "p", "hostname NEW\n", 5, 10, commit_confirmed=5)
 
 def test_a_failed_connect_closes_the_client(monkeypatch):
     """A refused login left paramiko's Transport thread and socket behind (#43)."""
@@ -306,9 +306,9 @@ def test_a_failed_connect_closes_the_client(monkeypatch):
         def close(self):
             closes.append(1)
             super().close()
-    monkeypatch.setattr(generic, "paramiko", FakeParamiko(Refusing))
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(Refusing))
     with pytest.raises(paramiko.AuthenticationException):
-        generic.show("10.0.0.1", "u", "wrong", "show version", 5, 10)
+        ssh.show("10.0.0.1", "u", "wrong", "show version", 5, 10)
     assert closes == [1]
 
 # --- #45: every wait in exec is bounded ----------------------------------------
@@ -340,18 +340,18 @@ def _stuck_client(status_set):
 
 
 def test_eof_without_an_exit_status_ends_in_a_timeout_not_a_pinned_worker(monkeypatch):
-    """generic.show(command_timeout=3) was still blocked after 20 s in
+    """ssh.show(command_timeout=3) was still blocked after 20 s in
     recv_exit_status; Ctrl-C could not end the run."""
-    monkeypatch.setattr(generic, "paramiko", FakeParamiko(_stuck_client(status_set=False)))
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(_stuck_client(status_set=False)))
     t0 = _time.monotonic()
     with pytest.raises(TimeoutError, match="no exit status within 1s"):
-        generic.show("10.0.0.1", "u", "p", "show version", 5, 1)
+        ssh.show("10.0.0.1", "u", "p", "show version", 5, 1)
     assert _time.monotonic() - t0 < 3
 
 
 def test_a_status_that_does_arrive_is_read_as_before(monkeypatch):
-    monkeypatch.setattr(generic, "paramiko", FakeParamiko(_stuck_client(status_set=True)))
-    assert "partial output" in generic.show("10.0.0.1", "u", "p", "show version", 5, 1)
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(_stuck_client(status_set=True)))
+    assert "partial output" in ssh.show("10.0.0.1", "u", "p", "show version", 5, 1)
 
 
 def test_a_device_that_never_stops_sending_hits_the_deadline(monkeypatch):
@@ -365,10 +365,10 @@ def test_a_device_that_never_stops_sending_hits_the_deadline(monkeypatch):
     class Client(ExitClient):
         def exec_command(self, cmd, timeout=None):
             return FakeStream(b"", 0), Endless(), FakeStream(b"", 0)
-    monkeypatch.setattr(generic, "paramiko", FakeParamiko(Client))
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(Client))
     t0 = _time.monotonic()
     with pytest.raises(TimeoutError, match="still sending"):
-        generic.show("10.0.0.1", "u", "p", "show version", 5, 1)
+        ssh.show("10.0.0.1", "u", "p", "show version", 5, 1)
     assert _time.monotonic() - t0 < 3
 
 def test_pinning_takes_a_file_lock_so_two_processes_keep_each_others_pins(offline, home, monkeypatch):
@@ -380,8 +380,8 @@ def test_pinning_takes_a_file_lock_so_two_processes_keep_each_others_pins(offlin
     def recording(fd, op):
         locks.append(op)
         return real(fd, op)
-    monkeypatch.setattr(generic.fcntl, "flock", recording)
-    generic.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    monkeypatch.setattr(ssh.fcntl, "flock", recording)
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     assert fcntl.LOCK_EX in locks and fcntl.LOCK_UN in locks
     assert pin_file(home).read_text().startswith("10.0.0.1 ")
 
@@ -391,17 +391,17 @@ def test_pinning_takes_a_file_lock_so_two_processes_keep_each_others_pins(offlin
 def test_edit_is_failed_when_the_cli_refuses_a_line_and_exits_zero(exits_with):
     exits_with(0, stdout=b"error: syntax error, expecting <statement> for %s\n")
     with pytest.raises(RuntimeError, match="'set system host-name x' was refused by the device: error: syntax error"):
-        generic.edit("10.0.0.1", "u", "p", "set system host-name x\n", 5, 10)
+        ssh.edit("10.0.0.1", "u", "p", "set system host-name x\n", 5, 10)
     exits_with(0, stdout=b"%% Invalid input detected at '^' marker. (%s)\n")
     with pytest.raises(RuntimeError, match="was refused by the device: % Invalid input"):
-        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10)
+        ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10)
 
 
 def test_a_show_that_prints_error_is_still_output(exits_with):
     exits_with(0, stdout=b"log: error: link down on ge-0/0/0 (%s)\n")
-    assert "link down" in generic.show("10.0.0.1", "u", "p", "show log", 5, 10)
+    assert "link down" in ssh.show("10.0.0.1", "u", "p", "show log", 5, 10)
     exits_with(0, stdout=b"Oct 24 12:00:00 r1 rpd[1]: up\nerror: link down on ge-0/0/0 (%s)\n")
-    assert "link down" in generic.show("10.0.0.1", "u", "p", "show log", 5, 10)
+    assert "link down" in ssh.show("10.0.0.1", "u", "p", "show log", 5, 10)
 
 
 def test_a_show_the_cli_refuses_at_exit_zero_is_failed(exits_with):
@@ -409,18 +409,18 @@ def test_a_show_the_cli_refuses_at_exit_zero_is_failed(exits_with):
     and exits 0; that is no answer, and NETCONF fails the same show."""
     exits_with(0, stdout=b"error: unknown command: %s\n")
     with pytest.raises(RuntimeError, match="'uptime' was refused by the device: error: unknown command: uptime"):
-        generic.show("10.0.0.1", "u", "p", "uptime", 5, 10)
+        ssh.show("10.0.0.1", "u", "p", "uptime", 5, 10)
     exits_with(0, stdout=b"          ^\n%% Invalid input detected at '^' marker. (%s)\n")
     with pytest.raises(RuntimeError, match="'show versionx' was refused by the device: % Invalid input"):
-        generic.show("10.0.0.1", "u", "p", "show versionx", 5, 10)
+        ssh.show("10.0.0.1", "u", "p", "show versionx", 5, 10)
 
 
 def test_a_batch_marks_the_refused_command_and_keeps_the_rest(exits_with):
     exits_with(0, stdout=b"reply to %s\n")
-    ok = generic.show_batch("10.0.0.1", "u", "p", ["show version"], 5, 10)
+    ok = ssh.show_batch("10.0.0.1", "u", "p", ["show version"], 5, 10)
     assert ok[0]["ok"] and "reply to show version" in ok[0]["output"]
     exits_with(0, stdout=b"error: unknown command: %s\n")
-    bad = generic.show_batch("10.0.0.1", "u", "p", ["uptime"], 5, 10)
+    bad = ssh.show_batch("10.0.0.1", "u", "p", ["uptime"], 5, 10)
     assert bad == [{"command": "uptime", "ok": False,
                     "error": "'uptime' was refused by the device: error: unknown command: uptime"}]
 
@@ -524,7 +524,7 @@ def shell(monkeypatch):
     def install(banner, reply):
         shells = []
         cls = type("Client", (ShellClient,), {"banner": banner, "reply": staticmethod(reply), "shells": shells})
-        monkeypatch.setattr(generic, "paramiko", FakeParamiko(cls))
+        monkeypatch.setattr(ssh, "paramiko", FakeParamiko(cls))
         return shells
     return install
 
@@ -536,12 +536,12 @@ class NeverConnects:
 
 @pytest.fixture
 def no_connection(monkeypatch):
-    monkeypatch.setattr(generic, "paramiko", FakeParamiko(NeverConnects))
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(NeverConnects))
 
 
 def test_a_junos_edit_over_ssh_commits_through_the_cli_engine_on_a_shell(shell):
     shells = shell(JUNOS_BANNER, junos_cli())
-    result = generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
+    result = ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
     assert isinstance(result, R.EditResult) and result.status == "committed"
     assert "+  host-name test;" in result.diff and result.startswith("COMMIT OK\n\nDIFF:\n")
     (sh,) = shells
@@ -552,7 +552,7 @@ def test_a_junos_edit_over_ssh_commits_through_the_cli_engine_on_a_shell(shell):
 
 def test_a_junos_dry_run_over_ssh_shows_the_diff_and_rolls_the_candidate_back(shell):
     shells = shell(JUNOS_BANNER, junos_cli())
-    result = generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10,
+    result = ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10,
                           vendor_hint="junos@ssh", dry_run=True)
     assert result.status == "dry-run" and "+  host-name test;" in result.diff
     assert shells[0].typed[-2:] == ["rollback 0", "exit"] and "commit" not in shells[0].typed
@@ -560,7 +560,7 @@ def test_a_junos_dry_run_over_ssh_shows_the_diff_and_rolls_the_candidate_back(sh
 
 def test_a_junos_commit_confirmed_over_ssh_arms_the_timer(shell):
     shells = shell(JUNOS_BANNER, junos_cli())
-    result = generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10,
+    result = ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10,
                           vendor_hint="junos@ssh", commit_confirmed=5)
     assert result.status == "confirmed" and result.minutes == 5 and result.pending
     assert "commit confirmed 5" in shells[0].typed
@@ -569,77 +569,77 @@ def test_a_junos_commit_confirmed_over_ssh_arms_the_timer(shell):
 def test_a_refused_lock_is_not_applied_and_nothing_more_is_sent(shell):
     shells = shell(JUNOS_BANNER, junos_cli(lock=LOCKED))
     with pytest.raises(NotAppliedError, match="Failed to lock config: error: configuration database locked"):
-        generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
+        ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
     assert shells[0].typed == ["configure exclusive"] and shells[0].closed
 
 
 def test_a_refused_commit_is_failed_and_the_candidate_discarded(shell):
     shells = shell(JUNOS_BANNER, junos_cli(commit="\r\nerror: configuration check-out failed" + EDIT))
     with pytest.raises(RuntimeError, match="Commit failed: error: configuration check-out failed"):
-        generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
+        ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
     assert shells[0].typed[-3:] == ["commit", "rollback 0", "exit"]
 
 
 def test_a_commit_line_in_a_junos_payload_is_refused_before_connecting(no_connection):
     with pytest.raises(ValueError, match="'commit' is not configuration"):
-        generic.edit("10.0.0.1", "lab", "p", "set system host-name test\ncommit\n", 5, 10, vendor_hint="junos@ssh")
+        ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\ncommit\n", 5, 10, vendor_hint="junos@ssh")
 
 
 def test_confirm_over_ssh_commits_the_pending_commit_confirmed(shell):
     shells = shell(JUNOS_BANNER, junos_cli())
-    result = generic.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh")
+    result = ssh.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh")
     assert isinstance(result, R.EditResult) and result.status == "confirmed-ok"
     assert shells[0].typed == ["show system commit", "configure exclusive", "commit", "exit"]
-    generic.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh", comment="ok")
+    ssh.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh", comment="ok")
     assert shells[1].typed[2] == 'commit comment "ok"'
 
 
 def test_confirm_with_nothing_pending_sends_only_the_history_read(shell):
     shells = shell(JUNOS_BANNER, junos_cli(history=CLEAN))
     with pytest.raises(NothingToConfirmError, match="nothing to confirm"):
-        generic.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh")
+        ssh.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh")
     assert shells[0].typed == ["show system commit"]
 
 
 def test_confirm_is_only_for_a_junos_dialect(no_connection):
     with pytest.raises(ValueError, match="confirm is only for a Junos dialect, not ios@ssh; nothing was sent"):
-        generic.confirm("10.0.0.1", "u", "p", 5, 10, vendor_hint="ios@ssh")
+        ssh.confirm("10.0.0.1", "u", "p", 5, 10, vendor_hint="ios@ssh")
     with pytest.raises(ValueError, match="not ssh; nothing was sent"):
-        generic.confirm("10.0.0.1", "u", "p", 5, 10, vendor_hint="ssh")
+        ssh.confirm("10.0.0.1", "u", "p", 5, 10, vendor_hint="ssh")
 
 
 @pytest.mark.parametrize("hint", ["ios@ssh", "nxos@ssh", "eos@ssh"])
 def test_an_ios_shaped_edit_over_ssh_types_the_lines_in_config_mode(shell, hint):
     shells = shell("\r\nRouter#", ios_cli)
-    result = generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint=hint)
+    result = ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint=hint)
     assert result == "(config applied)" and result.status == "applied"
     assert shells[0].typed == ["configure terminal", "hostname x", "end"]
 
 
 def test_an_ios_shaped_dialect_refuses_a_dry_run_before_connecting(no_connection):
     with pytest.raises(ValueError, match="not supported by ios@ssh; nothing was sent"):
-        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ios@ssh", dry_run=True)
+        ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ios@ssh", dry_run=True)
     with pytest.raises(ValueError, match="not supported by nxos@ssh"):
-        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="nxos@ssh", commit_confirmed=5)
+        ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="nxos@ssh", commit_confirmed=5)
 
 
 def test_eos_show_structured_asks_the_exec_channel_for_json(exits_with):
     exits_with(0, stdout=b'{"modelName": "DCS-7050SX3", "sent": "%s"}\n')
-    data = generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
+    data = ssh.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
     assert data == {"modelName": "DCS-7050SX3", "sent": "show version | json"}
     exits_with(0, stdout=b"Arista DCS-7050SX3\n(%s)\n")
     with pytest.raises(RuntimeError, match=r"'show version \| json' did not return JSON: 'Arista DCS-7050SX3'"):
-        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
+        ssh.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
     exits_with(0, stdout=b"%% Invalid input (%s)\n")
     with pytest.raises(RuntimeError, match="was refused by the device: % Invalid input"):
-        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
+        ssh.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
 
 
 def test_show_structured_is_refused_on_any_other_dialect(no_connection):
     with pytest.raises(ValueError, match="--structured is not supported by junos@ssh; nothing was sent"):
-        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="junos@ssh")
+        ssh.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="junos@ssh")
     with pytest.raises(ValueError, match="--structured is not supported by ssh; nothing was sent"):
-        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10)
+        ssh.show_structured("10.0.0.1", "u", "p", "show version", 5, 10)
 
 
 def test_a_show_is_refused_by_the_dialects_own_rule(exits_with):
@@ -648,19 +648,19 @@ def test_a_show_is_refused_by_the_dialects_own_rule(exits_with):
     knows only "error:" and "% "."""
     exits_with(0, stdout=b"syntax error, expecting <command>: %s\n")
     with pytest.raises(RuntimeError, match="'show versionx' was refused by the device: syntax error, expecting"):
-        generic.show("10.0.0.1", "u", "p", "show versionx", 5, 10, vendor_hint="junos@ssh")
-    assert "syntax error" in generic.show("10.0.0.1", "u", "p", "show versionx", 5, 10, vendor_hint="ssh")
-    assert generic.show_batch("10.0.0.1", "u", "p", ["show versionx"], 5, 10, vendor_hint="junos@ssh")[0]["ok"] is False
-    assert generic.show_batch("10.0.0.1", "u", "p", ["show versionx"], 5, 10)[0]["ok"] is True
+        ssh.show("10.0.0.1", "u", "p", "show versionx", 5, 10, vendor_hint="junos@ssh")
+    assert "syntax error" in ssh.show("10.0.0.1", "u", "p", "show versionx", 5, 10, vendor_hint="ssh")
+    assert ssh.show_batch("10.0.0.1", "u", "p", ["show versionx"], 5, 10, vendor_hint="junos@ssh")[0]["ok"] is False
+    assert ssh.show_batch("10.0.0.1", "u", "p", ["show versionx"], 5, 10)[0]["ok"] is True
 
 
 def test_the_none_dialect_refuses_a_dry_run_and_a_diff_check(no_connection):
     with pytest.raises(ValueError, match="not supported by ssh; nothing was sent to the device"):
-        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ssh", dry_run=True)
+        ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ssh", dry_run=True)
     with pytest.raises(ValueError, match="not supported by ssh; nothing was sent to the device"):
-        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, expected_diff="+ x")
+        ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, expected_diff="+ x")
     with pytest.raises(ValueError, match="commit_confirmed is not supported by the 'ssh' transport"):
-        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, commit_confirmed=5, dry_run=True)
+        ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, commit_confirmed=5, dry_run=True)
 
 
 def test_the_runner_reaches_a_junos_dry_run_over_ssh_through_the_registry(shell):

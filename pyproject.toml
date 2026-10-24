@@ -25,6 +25,11 @@ dev = [
 [project.scripts]
 h-ssh = "hssh.cli:main_sync"
 
+# Drivers from outside the package register here too: an entry point names a
+# Driver, a list of them, or a callable returning either (see hssh/drivers).
+[project.entry-points."hssh.drivers"]
+builtin = "hssh.drivers:BUILTIN"
+
 [tool.setuptools]
 package-dir = {"" = "h-app"}
 

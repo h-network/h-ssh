@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh import cli, vendors
+from hssh import cli, drivers
 from hssh.cli import build_confirm_command, format_edit_result
 from hssh.drivers.results import EditResult, as_edit
 
@@ -47,8 +47,7 @@ def run_cli(monkeypatch, capsys, tmp_path, argv, result=None, driver=None,
     The fake answers every edit with `result`, or is `driver` when a test
     needs to record calls. Returns (rc, stdout, stderr)."""
     fake = driver or types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: result)
-    monkeypatch.setitem(vendors.VENDORS, "junos", fake)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", fake)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys, "argv", [
@@ -471,8 +470,7 @@ def test_ctrl_c_reports_and_audits_the_commit_that_was_in_flight(monkeypatch, ca
         time.sleep(0.8)                      # the commit is on its way
         return "COMMIT OK\n\nDIFF:\n+ host-name X"
     driver = types.SimpleNamespace(AVAILABLE=True, edit=edit)
-    monkeypatch.setitem(vendors.VENDORS, "junos", driver)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", driver)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
     audit, log = tmp_path / "audit.jsonl", tmp_path / "run.jsonl"

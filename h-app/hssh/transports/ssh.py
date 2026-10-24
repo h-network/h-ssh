@@ -1,5 +1,5 @@
-"""The paramiko transport: SSH to any device, in the dialect the vendor_hint
-names (none for the plain `ssh` driver).
+"""The paramiko transport (``ssh``): SSH to any device, in the dialect the
+vendor_hint names (none for the plain `ssh` driver).
 
 Shows, and the none dialect's edits, run on an exec channel: one exec_command
 per command, its exit status checked the way the openssh transport checks the
@@ -31,7 +31,7 @@ from .. import drivers
 from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
-from ..transports.cli import Cli, edit_policy, refuse_commit_lines
+from .cli import Cli, edit_policy, refuse_commit_lines
 
 try:
     import paramiko
@@ -48,7 +48,7 @@ _PIN_LOCK = threading.Lock()
 def _dialect(vendor_hint: Optional[str]) -> Dialect:
     """The dialect behind a vendor_hint: junos@ssh is junos, ios@ssh is ios,
     plain ssh (and None, and a name the registry does not know) is none. The
-    hint is the shim-era way to name a dialect; #84 hands the object in."""
+    hint is a driver's name, alias or canonical."""
     try:
         return drivers.get(vendor_hint or "ssh").dialect
     except ValueError:

@@ -10,7 +10,7 @@ before any device does, and the contract test runs it over every registered
 driver.
 
 Only the declared direction is checked. A module may offer more than its
-driver declares: hssh.vendors.telnet serves four dialects and has ``confirm``
+driver declares: hssh.transports.telnet serves five dialects and has ``confirm``
 and ``dry_run`` that only junos@telnet may use, until #83 splits it.
 """
 

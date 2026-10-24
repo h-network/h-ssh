@@ -11,7 +11,7 @@ import sys
 import types
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hssh import cli, vendors, core
+from hssh import cli, drivers, core
 from hssh.core import load_devices_csv, load_config, parse_inline_target, load_jobs, check_port
 
 HSSH = os.path.join(os.path.dirname(__file__), "..", "h-ssh.py")
@@ -19,8 +19,7 @@ HSSH = os.path.join(os.path.dirname(__file__), "..", "h-ssh.py")
 
 def run_main(monkeypatch, capsys, argv, config=os.devnull):
     fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "ok", edit=lambda *a, **kw: "COMMIT OK\n")
-    monkeypatch.setitem(vendors.VENDORS, "junos", fake)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", fake)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u", "--password", "p", *argv])

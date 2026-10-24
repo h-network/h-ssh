@@ -632,7 +632,7 @@ def begin(host: str, user: str, passwd: str, payload: Optional[str],
     config) or `rollback=n`, locked, loaded, checked and diffed on the
     router's session. Then tx.commit(confirmed=, comment=) or tx.abort().
 
-        with vendors.junos.begin(host, user, None, payload, 30, 20) as tx:
+        with transports.netconf.begin(host, user, None, payload, 30, 20) as tx:
             print(tx.diff)
             if looks_right(tx.diff):
                 tx.commit(confirmed=10, comment="C1 cutover")

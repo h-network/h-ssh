@@ -6,7 +6,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh.vendors import openssh, VENDORS
+from hssh import drivers
+from hssh.transports import openssh
 
 
 @pytest.fixture
@@ -162,11 +163,12 @@ def test_host_follows_an_end_of_options_marker(fake_ssh, tmp_path):
 
 
 def test_registered_as_a_vendor():
-    from hssh.cli import VENDOR_MODULES, VENDOR_INSTALL
-    assert VENDORS["openssh"] is openssh
-    assert VENDOR_MODULES["openssh"] is openssh
-    assert VENDOR_MODULES is VENDORS      # one registry; the CLI's name for it
-    assert "openssh" in VENDOR_INSTALL
+    from hssh import cli
+    driver = drivers.get("openssh")
+    assert driver.name == "none@openssh" and driver.aliases == ("openssh",)
+    assert drivers.module_of(driver) is openssh
+    assert driver.transport.install == "the OpenSSH client ('ssh' on PATH)"
+    assert cli.drivers is drivers      # one registry; the CLI's pre-flight reads the same one
 
 
 @pytest.fixture
@@ -298,7 +300,7 @@ def test_command_line_is_reproducible():
 def test_the_child_environment_does_not_carry_hssh_password(monkeypatch):
     """HSSH_PASSWORD was inherited by ssh, the ControlMaster daemon and any
     ProxyCommand helper (#42); the askpass channel is the only carrier."""
-    from hssh.vendors.openssh import _AskPass
+    from hssh.transports.openssh import _AskPass
     monkeypatch.setenv("HSSH_PASSWORD", "Pa55w0rd-FROM-ENV")
     with _AskPass("Pa55w0rd-FROM-ENV") as ap:
         env = ap.env

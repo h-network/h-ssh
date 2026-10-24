@@ -1,53 +1,59 @@
 #!/usr/bin/env python3
 """
 Example: Using h-ssh as a library in your own scripts.
+
+A transport module (hssh.transports.netconf, .ssh, .openssh, .telnet) does
+the work for every dialect on it; the runner picks the module from the
+driver name a target carries (`junos`, `junos@ssh`, `eos@ssh`, ...).
 """
 
-from hssh import Target, vendors
+from hssh import Target
+from hssh.transports import netconf, ssh
 
-# Example 1: Direct vendor usage
-print("=== Example 1: Direct Junos call ===")
+# Example 1: Junos over NETCONF, the module called directly
+print("=== Example 1: Direct Junos call (NETCONF) ===")
 try:
-    result = vendors.junos.show(
+    result = netconf.show(
         host="192.168.1.1",
         user="admin",
         passwd="password",
         cmd="show version",
         session_timeout=30,
-        command_timeout=20
+        command_timeout=20,
     )
     print(result)
 except Exception as e:
     print(f"Error: {e}")
 
 
-# Example 2: Direct Arista call
-print("\n=== Example 2: Direct Arista call ===")
+# Example 2: an EOS switch over SSH; the vendor_hint names the dialect
+print("\n=== Example 2: Direct EOS call (SSH) ===")
 try:
-    result = vendors.arista.show(
+    result = ssh.show(
         host="192.168.1.2",
         user="admin",
         passwd="password",
         cmd="show version",
         session_timeout=30,
-        command_timeout=20
+        command_timeout=20,
+        vendor_hint="eos@ssh",
     )
     print(result)
 except Exception as e:
     print(f"Error: {e}")
 
 
-# Example 3: Using the runner with custom logic
+# Example 3: the runner, which resolves the driver from the target's vendor
 print("\n=== Example 3: Using runner with custom targets ===")
 from hssh.runner import run_for_target
 
 targets = [
     Target(name="CR1", host="192.168.1.1", vendor="junos"),
-    Target(name="SW1", host="192.168.1.2", vendor="arista"),
+    Target(name="SW1", host="192.168.1.2", vendor="eos@ssh"),
 ]
 
 for target in targets:
-    name, success, output, duration_ms = run_for_target(
+    res = run_for_target(
         t=target,
         transport=target.vendor,
         mode="show",
@@ -63,8 +69,9 @@ for target in targets:
         commit_confirmed=None,
         save_dir=None,
     )
+    name, success, output, duration_ms = res
     print(f"\n{name}: {'OK' if success else 'FAIL'} ({duration_ms}ms)")
-    print(output)
+    print(output if success else res.error)
 
 
 # Example 4: Load devices from CSV

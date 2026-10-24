@@ -6,10 +6,10 @@ paramiko SSH client, the OpenSSH client, telnet). A *driver* is one dialect on
 one transport and says what it can be asked (`supports`); the runner consults
 that set, never the module, before it touches a device.
 
-Nothing here opens a connection. The modules under hssh.vendors still do the
-work; the registry in hssh.drivers maps each driver to the module it wraps
-until the transports move into a package of their own (#83, #84). Dialects
-live in hssh.dialects; `Dialect` is re-exported here for the registry.
+Nothing here opens a connection. A transport's module (under hssh.transports)
+does the work for every dialect on it; the registry in hssh.drivers resolves
+a driver to that module. Dialects live in hssh.dialects; `Dialect` is
+re-exported here for the registry.
 """
 
 from dataclasses import dataclass
@@ -36,7 +36,7 @@ class Transport:
     """How a device is reached."""
     name: str
     description: str
-    module: str                  # the module that does the work today, under hssh.vendors
+    module: str                  # dotted path of the module that does the work (show, edit, …)
     install: str                 # what is missing when that module says AVAILABLE = False
     default_port: int
     formats: Tuple[str, ...] = ("text",)   # device-side formats it can ask for (--format)
@@ -51,9 +51,10 @@ class Driver:
     dialect: Dialect
     transport: Transport
     supports: FrozenSet[str]
-    # Today's vendor name: the key in hssh.vendors.VENDORS and the vendor_hint
-    # the module's functions take. The one field #84 removes.
-    shim: str
+    # Other names a target may carry for this driver: the vendor names h-ssh
+    # has always taken (`junos`, `ssh`, `telnet-ios`), kept for every file
+    # and script that uses them.
+    aliases: Tuple[str, ...] = ()
 
     @property
     def name(self) -> str:

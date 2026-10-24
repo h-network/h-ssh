@@ -6,7 +6,7 @@ import sys
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hssh import cli, pool
-from hssh.vendors import junos
+from hssh.transports import netconf
 from tests.test_junos import FakeConfig, FakeDevice
 
 
@@ -22,10 +22,10 @@ def fake_pyez(monkeypatch):
     FakeConfig.instances = []
     FakeConfig.diff_text = "[edit]\n+  system host-name r1;"
     FakeConfig.raise_on = {}
-    monkeypatch.setattr(junos, "AVAILABLE", True)
-    monkeypatch.setattr(junos, "JunosDevice", FakeDevice)
-    monkeypatch.setattr(junos, "JunosConfig", FakeConfig)
-    monkeypatch.setattr(junos, "_pending_on", lambda dev, t: None)
+    monkeypatch.setattr(netconf, "AVAILABLE", True)
+    monkeypatch.setattr(netconf, "JunosDevice", FakeDevice)
+    monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
+    monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: None)
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)

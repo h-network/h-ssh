@@ -183,7 +183,7 @@ def run_main(monkeypatch, *argv, config=os.devnull):
     """h-ssh main() in this process, with the runner and the pre-flight check
     replaced so nothing is contacted. Returns (rc, [(name, vendor, transport)])
     as the runner was handed the targets."""
-    from hssh import cli
+    from hssh import cli, drivers
 
     seen = []
 
@@ -196,8 +196,8 @@ def run_main(monkeypatch, *argv, config=os.devnull):
 
     monkeypatch.setattr(cli, "run_for_target_async", fake_run)
     monkeypatch.setattr(cli, "check_reachability", reachable)
-    for vendor in ("junos", "openssh"):
-        monkeypatch.setitem(cli.VENDOR_MODULES, vendor, types.SimpleNamespace(AVAILABLE=True))
+    for name in ("junos@netconf", "none@openssh"):
+        monkeypatch.setitem(drivers.MODULES, name, types.SimpleNamespace(AVAILABLE=True))
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u",

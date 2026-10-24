@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh.vendors import junos
+from hssh.transports import netconf
 from hssh.errors import AmbiguousCommitError, NotAppliedError
 
 
@@ -47,11 +47,11 @@ class FakeHost:
 
 
 def connect_error(msg="boom"):
-    return junos.ConnectError(FakeHost(), msg)
+    return netconf.ConnectError(FakeHost(), msg)
 
 
 def rpc_timeout(cmd="commit", timeout=30):
-    return junos.RpcTimeoutError(FakeHost(), cmd, timeout)
+    return netconf.RpcTimeoutError(FakeHost(), cmd, timeout)
 
 
 class FakeConfig:
@@ -105,15 +105,15 @@ def fake_pyez(monkeypatch):
     FakeConfig.instances = []
     FakeConfig.diff_text = "[edit]\n+  system host-name r1;"
     FakeConfig.raise_on = {}
-    monkeypatch.setattr(junos, "AVAILABLE", True)
-    monkeypatch.setattr(junos, "JunosDevice", FakeDevice)
-    monkeypatch.setattr(junos, "JunosConfig", FakeConfig)
+    monkeypatch.setattr(netconf, "AVAILABLE", True)
+    monkeypatch.setattr(netconf, "JunosDevice", FakeDevice)
+    monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
     # A confirm first asks the device whether anything is waiting (#63).
-    monkeypatch.setattr(junos, "_pending_on", lambda dev, t: {"seq": 0, "pending_rollback_minutes": 5})
+    monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: {"seq": 0, "pending_rollback_minutes": 5})
 
 
 def edit(payload="set system host-name r1\n", **kw):
-    return junos.edit("10.0.0.1", "u", "p", payload, 5, 30, **kw)
+    return netconf.edit("10.0.0.1", "u", "p", payload, 5, 30, **kw)
 
 
 def cfg():
@@ -123,7 +123,7 @@ def cfg():
 # --- show -------------------------------------------------------------
 
 def test_show_uses_netconf_on_830_and_strips_pager_hint():
-    out = junos.show("10.0.0.1", "u", "p", "show version | no-more", 5, 30)
+    out = netconf.show("10.0.0.1", "u", "p", "show version | no-more", 5, 30)
     dev = FakeDevice.instances[0]
     assert dev.params["port"] == 830
     assert dev.cli_calls == ["show version"]
@@ -132,19 +132,19 @@ def test_show_uses_netconf_on_830_and_strips_pager_hint():
 
 
 def test_explicit_port_is_honoured():
-    junos.show("10.0.0.1", "u", "p", "show version", 5, 30, port=22)
+    netconf.show("10.0.0.1", "u", "p", "show version", 5, 30, port=22)
     assert FakeDevice.instances[0].params["port"] == 22
 
 
 def test_connect_failure_is_not_applied():
     FakeDevice.open_error = connect_error()
     with pytest.raises(NotAppliedError):
-        junos.show("10.0.0.1", "u", "p", "show version", 5, 30)
+        netconf.show("10.0.0.1", "u", "p", "show version", 5, 30)
 
 
 def test_show_batch_one_session_and_failures_are_per_command():
     FakeDevice.cli_outputs = {"bad": RuntimeError("rpc error")}
-    res = junos.show_batch("10.0.0.1", "u", "p", ["show a", "bad", "show c"], 5, 30)
+    res = netconf.show_batch("10.0.0.1", "u", "p", ["show a", "bad", "show c"], 5, 30)
     assert len(FakeDevice.instances) == 1
     assert [r["ok"] for r in res] == [True, False, True]
     assert res[1]["error"] == "rpc error"
@@ -176,7 +176,7 @@ def test_dry_run_checks_but_never_commits():
 
 
 def test_dry_run_reports_a_rejected_candidate():
-    FakeConfig.raise_on = {"commit_check": junos.CommitError("bad")}
+    FakeConfig.raise_on = {"commit_check": netconf.CommitError("bad")}
     with pytest.raises(RuntimeError, match="Config error"):
         edit(dry_run=True)
     assert "commit" not in cfg().names
@@ -205,21 +205,21 @@ def test_commit_timeout_is_ambiguous_and_not_rolled_back():
 
 
 def test_commit_rejected_rolls_back():
-    FakeConfig.raise_on = {"commit": junos.CommitError("conflict")}
+    FakeConfig.raise_on = {"commit": netconf.CommitError("conflict")}
     with pytest.raises(RuntimeError, match="Config error"):
         edit()
     assert "rollback" in cfg().names
 
 
 def test_load_error_rolls_back_and_unlocks():
-    FakeConfig.raise_on = {"load": junos.ConfigLoadError("syntax")}
+    FakeConfig.raise_on = {"load": netconf.ConfigLoadError("syntax")}
     with pytest.raises(RuntimeError, match="Config error"):
         edit()
     assert cfg().names[-2:] == ["rollback", "unlock"]
 
 
 def test_lock_failure_is_not_applied_and_does_not_unlock():
-    FakeConfig.raise_on = {"lock": junos.LockError("held")}
+    FakeConfig.raise_on = {"lock": netconf.LockError("held")}
     with pytest.raises(NotAppliedError):
         edit()
     assert "unlock" not in cfg().names
@@ -236,7 +236,7 @@ def test_the_word_commit_is_config_not_a_command():
 
 
 def test_confirm_commits_plain_under_the_lock():
-    assert junos.confirm("10.0.0.1", "u", "p", 5, 30) == "COMMIT CONFIRMED OK"
+    assert netconf.confirm("10.0.0.1", "u", "p", 5, 30) == "COMMIT CONFIRMED OK"
     assert cfg().names == ["lock", "commit", "unlock"]
     assert cfg().calls[1][2]["confirm"] is None
 
@@ -244,23 +244,23 @@ def test_confirm_commits_plain_under_the_lock():
 def test_confirm_refused_lock_is_not_applied_and_sends_nothing():
     """Another user's uncommitted edits refuse the lock; a commit would have
     taken them along with the confirmation."""
-    FakeConfig.raise_on = {"lock": junos.LockError("configuration database modified")}
+    FakeConfig.raise_on = {"lock": netconf.LockError("configuration database modified")}
     with pytest.raises(NotAppliedError, match="Failed to lock"):
-        junos.confirm("10.0.0.1", "u", "p", 5, 30)
+        netconf.confirm("10.0.0.1", "u", "p", 5, 30)
     assert cfg().names == ["lock"]
 
 
 def test_confirm_rejected_commit_unlocks():
-    FakeConfig.raise_on = {"commit": junos.CommitError("conflict")}
+    FakeConfig.raise_on = {"commit": netconf.CommitError("conflict")}
     with pytest.raises(RuntimeError, match="Commit failed"):
-        junos.confirm("10.0.0.1", "u", "p", 5, 30)
+        netconf.confirm("10.0.0.1", "u", "p", 5, 30)
     assert cfg().names == ["lock", "commit", "unlock"]
 
 
 def test_confirm_timeout_is_ambiguous():
     FakeConfig.raise_on = {"commit": rpc_timeout()}
     with pytest.raises(AmbiguousCommitError):
-        junos.confirm("10.0.0.1", "u", "p", 5, 30)
+        netconf.confirm("10.0.0.1", "u", "p", 5, 30)
     assert "unlock" not in cfg().names          # the session goes, and the lock with it
 
 
@@ -275,7 +275,7 @@ def test_confirm_timeout_is_ambiguous():
     ("", "text"),
 ])
 def test_config_format(payload, fmt):
-    assert junos._config_format(payload) == fmt
+    assert netconf._config_format(payload) == fmt
 
 
 def test_set_comments_are_not_sent_to_the_loader():
@@ -287,7 +287,7 @@ def test_set_comments_are_not_sent_to_the_loader():
 # --- rollback ---------------------------------------------------------
 
 def rollback(n=1, **kw):
-    return junos.rollback("10.0.0.1", "u", "p", n, 5, 30, **kw)
+    return netconf.rollback("10.0.0.1", "u", "p", n, 5, 30, **kw)
 
 
 def test_rollback_sequence_and_label():
@@ -325,7 +325,7 @@ def test_rollback_number_is_checked_before_any_session():
 
 
 def test_rollback_keeps_the_edit_verdicts():
-    FakeConfig.raise_on = {"lock": junos.LockError("held")}
+    FakeConfig.raise_on = {"lock": netconf.LockError("held")}
     with pytest.raises(NotAppliedError):
         rollback(1)
     FakeConfig.raise_on = {"commit": rpc_timeout()}
@@ -363,7 +363,7 @@ def test_comment_is_logged_with_edit_rollback_and_confirm():
     rollback(1, comment="back")
     assert commit_call()["comment"] == "back"
     FakeConfig.instances.clear()
-    junos.confirm("10.0.0.1", "u", "p", 5, 30, comment="done")
+    netconf.confirm("10.0.0.1", "u", "p", 5, 30, comment="done")
     assert commit_call()["comment"] == "done"
     FakeConfig.instances.clear()
     edit()
@@ -371,7 +371,7 @@ def test_comment_is_logged_with_edit_rollback_and_confirm():
 
 
 def begin(payload="set system host-name r1\n", **kw):
-    return junos.begin("10.0.0.1", "u", "p", payload, 5, 30, **kw)
+    return netconf.begin("10.0.0.1", "u", "p", payload, 5, 30, **kw)
 
 
 def test_begin_leaves_the_candidate_open_then_commit():
@@ -414,7 +414,7 @@ def test_begin_with_rollback_and_no_changes():
 
 
 def test_begin_cleans_up_when_the_load_is_rejected():
-    FakeConfig.raise_on = {"load": junos.ConfigLoadError("syntax")}
+    FakeConfig.raise_on = {"load": netconf.ConfigLoadError("syntax")}
     with pytest.raises(RuntimeError, match="Config error"):
         begin()
     assert cfg().names == ["lock", "load", "rollback", "unlock"]
@@ -422,7 +422,7 @@ def test_begin_cleans_up_when_the_load_is_rejected():
 
 
 def test_transaction_commit_verdicts_match_edit():
-    FakeConfig.raise_on = {"commit": junos.CommitError("conflict")}
+    FakeConfig.raise_on = {"commit": netconf.CommitError("conflict")}
     tx = begin()
     with pytest.raises(RuntimeError, match="Config error"):
         tx.commit()
@@ -454,12 +454,12 @@ def history(monkeypatch, *reads):
         made.append(host)
         return reads.pop(0) if len(reads) > 1 else reads[0]
 
-    monkeypatch.setattr(junos, "commit_status", commit_status)
+    monkeypatch.setattr(netconf, "commit_status", commit_status)
     return made
 
 
 def guarded(check):
-    return junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5, check=check, comment="C1")
+    return netconf.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5, check=check, comment="C1")
 
 
 def failing_check():
@@ -554,14 +554,14 @@ def test_edit_and_rollback_refuse_a_timer_they_cannot_arm_before_any_session(min
     with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
         edit(commit_confirmed=minutes)
     with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
-        junos.rollback("10.0.0.1", "u", "p", 1, 5, 30, commit_confirmed=minutes)
+        netconf.rollback("10.0.0.1", "u", "p", 1, 5, 30, commit_confirmed=minutes)
     with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
-        junos.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=minutes, check=lambda: True)
+        netconf.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=minutes, check=lambda: True)
     assert FakeDevice.instances == [] and FakeConfig.instances == []
 
 
 def test_transaction_commit_with_a_bad_timer_leaves_the_candidate_open():
-    tx = junos.begin("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30)
+    tx = netconf.begin("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30)
     with pytest.raises(ValueError, match="commit_confirmed must be 1..65535"):
         tx.commit(confirmed=0)
     assert [c[0] for c in cfg().calls] == ["lock", "load", "diff", "commit_check"]   # nothing committed
@@ -578,17 +578,17 @@ def test_a_valid_timer_still_arms_the_commit():
 
 def test_open_asks_for_huge_replies_and_no_host_key_check_unless_told(monkeypatch):
     monkeypatch.delenv("HSSH_NETCONF_HOSTKEY", raising=False)
-    junos.show("10.0.0.1", "u", None, "show version", 5, 30)
+    netconf.show("10.0.0.1", "u", None, "show version", 5, 30)
     params = FakeDevice.instances[0].params
     assert params["huge_tree"] is True and params["hostkey_verify"] is False
     assert "look_for_keys" not in params and "allow_agent" not in params     # key auth: keys and agent stay
     monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "yes")
-    junos.show("10.0.0.2", "u", None, "show version", 5, 30)
+    netconf.show("10.0.0.2", "u", None, "show version", 5, 30)
     assert FakeDevice.instances[1].params["hostkey_verify"] is True
 
 
 def test_a_password_is_the_credential_no_key_is_tried_first():
-    junos.show("10.0.0.1", "u", "s3cret", "show version", 5, 30)
+    netconf.show("10.0.0.1", "u", "s3cret", "show version", 5, 30)
     params = FakeDevice.instances[0].params
     assert params["passwd"] == "s3cret" and params["look_for_keys"] is False and params["allow_agent"] is False
 
@@ -599,4 +599,4 @@ def test_load_ignores_statement_not_found_and_nothing_else():
     edit("delete system services telnet\n")
     load = [c for c in cfg().calls if c[0] == "load"][0]
     assert load[2]["ignore_warning"] == "statement not found"
-    assert junos.IGNORED_LOAD_WARNINGS == "statement not found"
+    assert netconf.IGNORED_LOAD_WARNINGS == "statement not found"

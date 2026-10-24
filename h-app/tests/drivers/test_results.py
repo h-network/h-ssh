@@ -6,11 +6,11 @@ import types
 
 import pytest
 
-from hssh import runner, vendors
+from hssh import runner, drivers
 from hssh.core import Target
 from hssh.drivers import results as R
 from hssh.drivers.results import EditResult, BatchResult, CommitStatus, as_edit, as_batch, as_commits
-from hssh.vendors import junos
+from hssh.transports import netconf
 from tests.test_junos import FakeDevice, FakeConfig, fake_pyez  # noqa: F401  (fixture)
 
 DIFF = "[edit system]\n+   host-name r1;\n"
@@ -87,27 +87,27 @@ def test_commit_status_is_the_list_with_the_pending_entry():
 # --- the real drivers return them --------------------------------------------------
 
 def test_the_netconf_module_returns_typed_results(monkeypatch):
-    r = junos.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30)
+    r = netconf.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30)
     assert isinstance(r, EditResult) and r.status == R.COMMITTED and r.diff == FakeConfig.diff_text
-    r = junos.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30, commit_confirmed=5)
+    r = netconf.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30, commit_confirmed=5)
     assert r.status == R.CONFIRMED and r.minutes == 5 and r.pending
-    r = junos.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30, dry_run=True)
+    r = netconf.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30, dry_run=True)
     assert r.status == R.DRY_RUN and r.diff == FakeConfig.diff_text
     FakeConfig.diff_text = ""
-    assert junos.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30).status == R.NO_CHANGES
+    assert netconf.edit("10.0.0.1", "u", "p", "set system host-name r1\n", 5, 30).status == R.NO_CHANGES
     FakeConfig.diff_text = "[edit]\n+  x;"
-    r = junos.rollback("10.0.0.1", "u", "p", 2, 5, 30)
+    r = netconf.rollback("10.0.0.1", "u", "p", 2, 5, 30)
     assert r.status == R.COMMITTED and r.label == "ROLLBACK 2: " and r.startswith("ROLLBACK 2: COMMIT OK")
-    assert junos.confirm("10.0.0.1", "u", "p", 5, 30).status == R.CONFIRMED_OK
+    assert netconf.confirm("10.0.0.1", "u", "p", 5, 30).status == R.CONFIRMED_OK
     FakeDevice.cli_outputs = {"show a": "A"}
-    b = junos.show_batch("10.0.0.1", "u", "p", ["show a"], 5, 30)
+    b = netconf.show_batch("10.0.0.1", "u", "p", ["show a"], 5, 30)
     assert isinstance(b, BatchResult) and b.ok and b[0]["output"] == "A"
 
 
 # --- the runner's RunResult ---------------------------------------------------------
 
 def _run(monkeypatch, mod, mode, **kw):
-    monkeypatch.setitem(vendors.VENDORS, "junos", mod)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode=mode,
         show_cmd=kw.pop("show_cmd", "show version"), edit_cmd=kw.pop("edit_cmd", None), config_dir=None,

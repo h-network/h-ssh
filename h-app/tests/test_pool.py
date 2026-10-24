@@ -11,11 +11,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hssh import pool
 from hssh.errors import AmbiguousCommitError, NotAppliedError
-from hssh.vendors import junos
+from hssh.transports import netconf
 from tests.test_junos import FakeConfig, FakeDevice, FakeHost, rpc_timeout
 
 # The driver's pool key: host, port, user and a digest of the password (#43).
-KEY = junos._pool_key("10.0.0.1", 830, "u", None)   # show() and edit() here use key auth
+KEY = netconf._pool_key("10.0.0.1", 830, "u", None)   # show() and edit() here use key auth
 
 
 @pytest.fixture(autouse=True)
@@ -26,9 +26,9 @@ def fake_pyez(monkeypatch):
     FakeConfig.instances = []
     FakeConfig.diff_text = "[edit]\n+  system host-name r1;"
     FakeConfig.raise_on = {}
-    monkeypatch.setattr(junos, "AVAILABLE", True)
-    monkeypatch.setattr(junos, "JunosDevice", FakeDevice)
-    monkeypatch.setattr(junos, "JunosConfig", FakeConfig)
+    monkeypatch.setattr(netconf, "AVAILABLE", True)
+    monkeypatch.setattr(netconf, "JunosDevice", FakeDevice)
+    monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
     yield
     pool.POOL.disable()
     for k in pool.POOL.stats:
@@ -39,12 +39,12 @@ def fake_pyez(monkeypatch):
 def pooled(monkeypatch):
     pool.enable(idle_timeout=300)
     # A confirm first asks the device whether anything is waiting (#63).
-    monkeypatch.setattr(junos, "_pending_on", lambda dev, t: {"seq": 0, "pending_rollback_minutes": 5})
+    monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: {"seq": 0, "pending_rollback_minutes": 5})
     yield pool.POOL
 
 
 def show(host="10.0.0.1", cmd="show version", timeout=30, **kw):
-    return junos.show(host, "u", None, cmd, 5, timeout, **kw)
+    return netconf.show(host, "u", None, cmd, 5, timeout, **kw)
 
 
 def devices():
@@ -103,7 +103,7 @@ def test_key_is_host_port_and_user(pooled):
     show(host="10.0.0.1")
     show(host="10.0.0.2")
     show(host="10.0.0.1", port=22)
-    junos.show("10.0.0.1", "other", None, "show version", 5, 30)
+    netconf.show("10.0.0.1", "other", None, "show version", 5, 30)
     show(host="10.0.0.1")
     assert len(devices()) == 4
     assert pooled.stats["reuses"] == 1
@@ -116,7 +116,7 @@ def test_command_timeout_follows_each_call(pooled):
 
 
 def test_batch_and_show_share_the_session(pooled):
-    junos.show_batch("10.0.0.1", "u", None, ["show a", "show b"], 5, 30)
+    netconf.show_batch("10.0.0.1", "u", None, ["show a", "show b"], 5, 30)
     show()
     assert len(devices()) == 1
     assert devices()[0].cli_calls == ["show a", "show b", "show version"]
@@ -134,25 +134,25 @@ def test_session_closed_by_pyez_is_replaced(pooled):
 
 
 def test_idle_session_is_probed_with_a_short_timeout(pooled, monkeypatch):
-    monkeypatch.setattr(junos, "PROBE_AFTER", 0)
+    monkeypatch.setattr(netconf, "PROBE_AFTER", 0)
 
     class Rpc:
         calls = []
 
         def get_system_uptime_information(self, **kw):
             Rpc.calls.append(kw)
-            raise junos.TransportError("gone")
+            raise netconf.TransportError("gone")
 
     show()
     devices()[0].rpc = Rpc()
     show()
-    assert Rpc.calls == [{"dev_timeout": junos.SHORT_TIMEOUT}]
+    assert Rpc.calls == [{"dev_timeout": netconf.SHORT_TIMEOUT}]
     assert len(devices()) == 2
     assert devices()[0].closed
 
 
 def test_first_borrow_is_never_probed_and_a_failed_probe_means_reopen(pooled, monkeypatch):
-    monkeypatch.setattr(junos, "PROBE_AFTER", 0)
+    monkeypatch.setattr(netconf, "PROBE_AFTER", 0)
     show()  # FakeDevice has no .rpc, so a probe here would have failed
     assert pooled.stats == {"opens": 1, "reuses": 0, "discards": 0, "reaped": 0}
     show()  # reused + idle >= PROBE_AFTER: probe raises, session replaced
@@ -179,22 +179,22 @@ def test_close_uses_a_short_timeout_and_tears_down_a_stuck_transport():
         _session = Session()
 
     dev._conn = Conn()
-    junos._close(dev)
-    assert dev.timeout_at_close == junos.SHORT_TIMEOUT
+    netconf._close(dev)
+    assert dev.timeout_at_close == netconf.SHORT_TIMEOUT
     assert Stuck.torn_down
 
 
 def test_read_on_a_dead_reused_session_is_retried_once(pooled):
     show()
     dead = devices()[0]
-    FakeDevice.cli_outputs = {"show version": junos.TransportError("closed")}
+    FakeDevice.cli_outputs = {"show version": netconf.TransportError("closed")}
 
     class Second(FakeDevice):
         def cli(self, cmd, warning=True):
             self.cli_calls.append(cmd)
             return "fresh"
 
-    junos.JunosDevice = Second
+    netconf.JunosDevice = Second
     assert show() == "fresh"
     assert dead.closed
     assert len(devices()) == 2
@@ -202,8 +202,8 @@ def test_read_on_a_dead_reused_session_is_retried_once(pooled):
 
 
 def test_read_on_a_dead_fresh_session_is_not_retried(pooled):
-    FakeDevice.cli_outputs = {"show version": junos.TransportError("closed")}
-    with pytest.raises(junos.TransportError):
+    FakeDevice.cli_outputs = {"show version": netconf.TransportError("closed")}
+    with pytest.raises(netconf.TransportError):
         show()
     assert len(devices()) == 1
     assert devices()[0].closed
@@ -212,7 +212,7 @@ def test_read_on_a_dead_fresh_session_is_not_retried(pooled):
 
 def test_rpc_timeout_discards_without_retry(pooled):
     FakeDevice.cli_outputs = {"show version": rpc_timeout("show version")}
-    with pytest.raises(junos.RpcTimeoutError):
+    with pytest.raises(netconf.RpcTimeoutError):
         show()
     assert devices()[0].closed
     FakeDevice.cli_outputs = {}
@@ -222,15 +222,15 @@ def test_rpc_timeout_discards_without_retry(pooled):
 
 def test_batch_on_a_dead_reused_session_is_rerun_on_a_fresh_one(pooled):
     show()
-    FakeDevice.cli_outputs = {"show b": junos.TransportError("closed")}
+    FakeDevice.cli_outputs = {"show b": netconf.TransportError("closed")}
 
     class Second(FakeDevice):
         def cli(self, cmd, warning=True):
             self.cli_calls.append(cmd)
             return "fresh " + cmd
 
-    junos.JunosDevice = Second
-    res = junos.show_batch("10.0.0.1", "u", None, ["show a", "show b"], 5, 30)
+    netconf.JunosDevice = Second
+    res = netconf.show_batch("10.0.0.1", "u", None, ["show a", "show b"], 5, 30)
     assert [r["output"] for r in res] == ["fresh show a", "fresh show b"]
     assert devices()[0].closed and devices()[0].cli_calls == ["show version", "show a", "show b"]
     assert devices()[1].cli_calls == ["show a", "show b"]
@@ -238,7 +238,7 @@ def test_batch_on_a_dead_reused_session_is_rerun_on_a_fresh_one(pooled):
 
 def test_batch_keeps_going_after_a_timeout_but_drops_the_session(pooled):
     FakeDevice.cli_outputs = {"show b": rpc_timeout("show b")}
-    res = junos.show_batch("10.0.0.1", "u", None, ["show a", "show b", "show c"], 5, 30)
+    res = netconf.show_batch("10.0.0.1", "u", None, ["show a", "show b", "show c"], 5, 30)
     assert [r["ok"] for r in res] == [True, False, True]
     assert devices()[0].closed
     assert pooled.live() == 0
@@ -247,7 +247,7 @@ def test_batch_keeps_going_after_a_timeout_but_drops_the_session(pooled):
 # --- edits on a pooled session ------------------------------------------
 
 def edit(payload="set system host-name r1\n", **kw):
-    return junos.edit("10.0.0.1", "u", None, payload, 5, 30, **kw)
+    return netconf.edit("10.0.0.1", "u", None, payload, 5, 30, **kw)
 
 
 def cfg():
@@ -277,7 +277,7 @@ def test_unlock_failure_discards_the_session(pooled):
 
 
 def test_rollback_failure_discards_the_session(pooled):
-    FakeConfig.raise_on = {"commit_check": junos.CommitError("bad"), "rollback": RuntimeError("x")}
+    FakeConfig.raise_on = {"commit_check": netconf.CommitError("bad"), "rollback": RuntimeError("x")}
     with pytest.raises(RuntimeError, match="Config error"):
         edit()
     assert devices()[0].closed
@@ -293,7 +293,7 @@ def test_ambiguous_commit_discards_the_session(pooled):
 
 
 def test_lock_on_a_dead_session_is_not_applied(pooled):
-    FakeConfig.raise_on = {"lock": junos.TransportError("closed")}
+    FakeConfig.raise_on = {"lock": netconf.TransportError("closed")}
     with pytest.raises(NotAppliedError, match="session lost"):
         edit()
     assert "unlock" not in cfg().names
@@ -306,8 +306,8 @@ def test_lock_wrapped_by_pyez_around_a_timeout_drops_the_session(pooled, monkeyp
     def lock_wrapping_a_timeout(self):
         try:
             raise rpc_timeout("lock")
-        except junos.RpcTimeoutError:
-            raise junos.LockError("timeout")
+        except netconf.RpcTimeoutError:
+            raise netconf.LockError("timeout")
 
     monkeypatch.setattr(FakeConfig, "lock", lock_wrapping_a_timeout)
     with pytest.raises(NotAppliedError, match="Failed to lock"):
@@ -316,15 +316,15 @@ def test_lock_wrapped_by_pyez_around_a_timeout_drops_the_session(pooled, monkeyp
 
 
 def test_lock_held_elsewhere_keeps_the_session(pooled):
-    FakeConfig.raise_on = {"lock": junos.LockError("held")}
+    FakeConfig.raise_on = {"lock": netconf.LockError("held")}
     with pytest.raises(NotAppliedError):
         edit()
     assert not devices()[0].closed
 
 
 def test_session_dying_after_the_lock_is_a_plain_failure_and_drops_it(pooled):
-    FakeConfig.raise_on = {"load": junos.TransportError("closed")}
-    with pytest.raises(junos.TransportError):
+    FakeConfig.raise_on = {"load": netconf.TransportError("closed")}
+    with pytest.raises(netconf.TransportError):
         edit()
     assert cfg().names[-2:] == ["rollback", "unlock"]
     assert devices()[0].closed
@@ -333,20 +333,20 @@ def test_session_dying_after_the_lock_is_a_plain_failure_and_drops_it(pooled):
 def test_confirm_timeout_discards_the_session(pooled):
     FakeConfig.raise_on = {"commit": rpc_timeout()}
     with pytest.raises(AmbiguousCommitError):
-        junos.confirm("10.0.0.1", "u", None, 5, 30)
+        netconf.confirm("10.0.0.1", "u", None, 5, 30)
     assert devices()[0].closed
 
 
 def test_confirm_lock_held_elsewhere_keeps_the_session(pooled):
-    FakeConfig.raise_on = {"lock": junos.LockError("held")}
+    FakeConfig.raise_on = {"lock": netconf.LockError("held")}
     with pytest.raises(NotAppliedError):
-        junos.confirm("10.0.0.1", "u", None, 5, 30)
+        netconf.confirm("10.0.0.1", "u", None, 5, 30)
     assert cfg().names == ["lock"] and not devices()[0].closed
 
 
 def test_confirm_unlock_failure_discards_the_session(pooled):
     FakeConfig.raise_on = {"unlock": RuntimeError("session gone")}
-    assert junos.confirm("10.0.0.1", "u", None, 5, 30) == "COMMIT CONFIRMED OK"
+    assert netconf.confirm("10.0.0.1", "u", None, 5, 30) == "COMMIT CONFIRMED OK"
     assert devices()[0].closed
 
 
@@ -366,7 +366,7 @@ def test_same_router_calls_never_overlap(pooled):
                 overlap["now"] -= 1
             return super().cli(cmd, warning)
 
-    junos.JunosDevice = Slow
+    netconf.JunosDevice = Slow
     in_threads(show, [{}] * 6)
     assert overlap["max"] == 1
     assert len(devices()) == 1
@@ -381,7 +381,7 @@ def test_different_routers_run_in_parallel(pooled):
             started.wait()  # both threads must be inside at the same time
             return super().cli(cmd, warning)
 
-    junos.JunosDevice = Blocking
+    netconf.JunosDevice = Blocking
     in_threads(show, [{"host": "10.0.0.1"}, {"host": "10.0.0.2"}])
     assert not started.broken
     assert len(devices()) == 2
@@ -427,7 +427,7 @@ def test_same_thread_may_reuse_its_borrowed_session():
     rides the same session instead of deadlocking."""
     pool.enable()
     key = KEY
-    with pool.POOL.get_connection(key, opener=lambda: FakeDevice(), closer=junos._close) as lease:
+    with pool.POOL.get_connection(key, opener=lambda: FakeDevice(), closer=netconf._close) as lease:
         show()
         assert len(devices()) == 1 and devices()[0] is lease.dev
 
@@ -460,7 +460,7 @@ def test_close_all_during_a_borrow_closes_it_on_return(pooled):
     released = threading.Event()
 
     def hold():
-        with pooled.get_connection(KEY, opener=None, closer=junos._close):
+        with pooled.get_connection(KEY, opener=None, closer=netconf._close):
             released.wait(2)
 
     t = threading.Thread(target=hold)
@@ -483,7 +483,7 @@ def test_disable_closes_and_returns_to_per_call(pooled):
 
 
 def test_open_failure_leaves_the_slot_empty(pooled):
-    FakeDevice.open_error = junos.ConnectError(FakeHost(), "refused")
+    FakeDevice.open_error = netconf.ConnectError(FakeHost(), "refused")
     with pytest.raises(NotAppliedError):
         show()
     assert pooled.live() == 0
@@ -498,9 +498,9 @@ def test_half_opened_device_is_closed_not_leaked():
     class Half(FakeDevice):
         def open(self):
             self.opened = True
-            raise junos.ConnectError(FakeHost(), "auth failed after the transport came up")
+            raise netconf.ConnectError(FakeHost(), "auth failed after the transport came up")
 
-    junos.JunosDevice = Half
+    netconf.JunosDevice = Half
     with pytest.raises(NotAppliedError):
         show()
     assert devices()[0].opened and devices()[0].closed
@@ -520,7 +520,7 @@ def test_close_all_waits_when_not_shutting_down(pooled):
     released = threading.Event()
 
     def hold():
-        with pooled.get_connection(KEY, opener=None, closer=junos._close):
+        with pooled.get_connection(KEY, opener=None, closer=netconf._close):
             released.wait(2)
 
     t = threading.Thread(target=hold)
@@ -538,10 +538,10 @@ def test_nested_call_that_dies_does_not_close_the_outer_session(pooled):
     """show() inside an open Transaction hits a dead transport: the session is
     marked, not closed, so the transaction finishes on its own terms — and
     commit() refuses with NotAppliedError instead of sending into the void."""
-    tx = junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
+    tx = netconf.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
     dev = devices()[0]
-    FakeDevice.cli_outputs = {"show version": junos.TransportError("closed")}
-    with pytest.raises(junos.TransportError):
+    FakeDevice.cli_outputs = {"show version": netconf.TransportError("closed")}
+    with pytest.raises(netconf.TransportError):
         show()                                   # nested borrow, same thread, same session
     assert not dev.closed and tx.open            # still the transaction's session
     assert pooled.live() == 1
@@ -552,7 +552,7 @@ def test_nested_call_that_dies_does_not_close_the_outer_session(pooled):
 
 
 def test_nested_show_on_a_healthy_session_is_plain_reuse(pooled):
-    with junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30) as tx:
+    with netconf.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30) as tx:
         assert show() == "output of show version"
         assert tx.show("show version") == "output of show version"
         assert len(devices()) == 1 and pooled.stats["opens"] == 1
@@ -561,8 +561,8 @@ def test_nested_show_on_a_healthy_session_is_plain_reuse(pooled):
 
 def test_nested_discard_is_honoured_once_the_outer_borrow_returns(pooled):
     key = KEY
-    with pooled.get_connection(key, opener=lambda: FakeDevice(), closer=junos._close) as outer:
-        with pooled.get_connection(key, opener=None, closer=junos._close) as inner:
+    with pooled.get_connection(key, opener=lambda: FakeDevice(), closer=netconf._close) as outer:
+        with pooled.get_connection(key, opener=None, closer=netconf._close) as inner:
             inner.discard()
         assert not devices()[0].closed and outer.doomed
     assert devices()[0].closed and pooled.live() == 0
@@ -574,10 +574,10 @@ def test_nested_discard_is_honoured_once_the_outer_borrow_returns(pooled):
 def test_a_different_credential_gets_its_own_session(pooled):
     """The key had no credential: a call with a wrong, different or absent
     password rode the session the first password opened."""
-    junos.show("10.0.0.1", "u", "correct-horse", "show version", 5, 30)
-    junos.show("10.0.0.1", "u", "correct-horse", "show version", 5, 30)
-    junos.show("10.0.0.1", "u", "wrong", "show version", 5, 30)
-    junos.show("10.0.0.1", "u", None, "show version", 5, 30)
+    netconf.show("10.0.0.1", "u", "correct-horse", "show version", 5, 30)
+    netconf.show("10.0.0.1", "u", "correct-horse", "show version", 5, 30)
+    netconf.show("10.0.0.1", "u", "wrong", "show version", 5, 30)
+    netconf.show("10.0.0.1", "u", None, "show version", 5, 30)
     assert pooled.stats["opens"] == 3 and pooled.stats["reuses"] == 1
     assert [d.params.get("passwd") for d in devices()] == ["correct-horse", "wrong", None]
     assert not any("correct-horse" in str(k) for k in pooled._connections)   # a digest, never the password
@@ -586,7 +586,7 @@ def test_a_different_credential_gets_its_own_session(pooled):
 def test_a_transaction_finished_on_another_thread_sends_nothing_and_wedges_nothing(pooled):
     """commit() from a thread other than begin()'s once landed the commit, then
     raised from the RLock release and left the router's slot locked forever."""
-    tx = junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
+    tx = netconf.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
     outcome = {}
 
     def elsewhere():
@@ -609,7 +609,7 @@ def test_a_transaction_finished_on_another_thread_sends_nothing_and_wedges_nothi
 
 
 def test_leaving_the_with_block_on_another_thread_does_not_abort_for_the_owner(pooled):
-    tx = junos.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
+    tx = netconf.begin("10.0.0.1", "u", None, "set system host-name r1\n", 5, 30)
 
     def elsewhere():
         with tx:
@@ -709,11 +709,11 @@ def test_the_reaper_releases_the_descriptors_of_what_it_closed():
 def test_a_probe_the_router_refuses_keeps_the_session(pooled, monkeypatch):
     """cRPD answers the uptime RPC with 'command is not valid on the crpd':
     the router replied, so the session is alive and reused, not replaced."""
-    monkeypatch.setattr(junos, "PROBE_AFTER", 0)
+    monkeypatch.setattr(netconf, "PROBE_AFTER", 0)
 
     class Rpc:
         def get_system_uptime_information(self, **kw):
-            raise junos.RpcError("command is not valid on the crpd")
+            raise netconf.RpcError("command is not valid on the crpd")
 
     show()
     devices()[0].rpc = Rpc()
@@ -723,7 +723,7 @@ def test_a_probe_the_router_refuses_keeps_the_session(pooled, monkeypatch):
 
 
 def test_a_probe_that_times_out_still_means_dead(pooled, monkeypatch):
-    monkeypatch.setattr(junos, "PROBE_AFTER", 0)
+    monkeypatch.setattr(netconf, "PROBE_AFTER", 0)
 
     class Rpc:
         def get_system_uptime_information(self, **kw):
