@@ -7,7 +7,7 @@ import pytest
 from hssh import dialects
 from hssh.drivers import results as R
 from hssh.errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
-from hssh.transports.cli import Cli, edit_policy, pending_in, refuse_commit_lines, strip_ansi
+from hssh.transports.cli import Cli, edit_policy, pending_in, refuse_commit_lines, strip_ansi, complaint
 
 OP = "lab@R1> "
 CFG = "\r\n[edit]\r\nlab@R1# "
@@ -20,10 +20,12 @@ class ScriptChannel:
     """A device played from a dict: what it says first, then a reply per
     command (a callable gets the line). Typed lines are echoed as a tty does.
     `hang_on` names a command left unanswered, `close_on` one answered by
-    hanging up."""
+    hanging up. `split_at` makes the first read that holds that text end
+    right after it, as a device pausing there would."""
 
-    def __init__(self, first, replies, echo=True, hang_on=None, close_on=None):
+    def __init__(self, first, replies, echo=True, hang_on=None, close_on=None, split_at=None):
         self.queue = bytearray(first.encode())
+        self.split_at = split_at
         self.replies = replies
         self.echo = echo
         self.hang_on = hang_on
@@ -33,6 +35,9 @@ class ScriptChannel:
         self.eof = False
 
     def recv(self, n, timeout):
+        if self.split_at and self.split_at.encode() in self.queue:
+            n = min(n, self.queue.index(self.split_at.encode()) + len(self.split_at))
+            self.split_at = None
         if self.queue:
             data = bytes(self.queue[:n])
             del self.queue[:n]
@@ -197,6 +202,33 @@ def test_a_refused_lock_sends_nothing_else_and_a_syntax_error_rolls_back():
     with pytest.raises(RuntimeError, match="'set bogus': syntax error"):
         s.edit_candidate("set bogus\n", dry_run=False)
     assert ch.typed[-2:] == ["rollback 0", "exit"]
+
+
+def test_a_cli_that_checks_a_line_as_it_is_typed_is_read_past_its_redraw():
+    """cRPD on a pty refuses a bad word when the space after it is typed, prints
+    the prompt and the line again (with backspaces), then refuses the Enter: two
+    complaints and a prompt in the middle of one reply. The error is one line,
+    and the prompt in the middle does not end the read early even when the
+    device pauses right after it."""
+    redraw = ("set interfaces lo0 bogus-knob\r\n" + " " * 30 + "^\r\nsyntax error.\r\n\r\n"
+              "lab@R1# set interfaces lo0 bogus-knob   \x08\x08\x081\r\n" + " " * 30 + "^\r\nsyntax error." + CFG)
+    ch = ScriptChannel("\r\n" + OP, junos_device(**{"set interfaces lo0 bogus-knob 1": redraw}),
+                       echo=False, split_at="\r\n\r\nlab@R1# ")
+    s = Cli(ch, dialects.junos.DIALECT, 5)
+    s.login("lab", "secret")
+    with pytest.raises(RuntimeError, match=r"^'set interfaces lo0 bogus-knob 1': syntax error\.$"):
+        s.edit_candidate("set interfaces lo0 bogus-knob 1\n", dry_run=False)
+    assert ch.typed == ["configure exclusive", "set interfaces lo0 bogus-knob 1", "show | compare", "rollback 0", "exit"]
+    assert not ch.queue                       # every reply was read by the command it answered
+
+
+def test_the_complaint_is_the_devices_refusal_line_not_the_caret_art():
+    ios = dialects.ios.DIALECT
+    assert complaint("\n" + " " * 12 + "^\n% Invalid input detected at '^' marker.\n", ios) == \
+        "% Invalid input detected at '^' marker."
+    assert complaint("Translating \"bogus\"\n% Unknown command\n", ios) == "% Unknown command"
+    assert complaint("\n   ^\nsomething the dialect does not know\n", ios) == "something the dialect does not know"
+    assert complaint("warning: statement ignored\n", dialects.junos.DIALECT) == "warning: statement ignored"
 
 
 def test_a_refused_commit_is_discarded_and_an_unanswered_one_is_outcome_unknown():

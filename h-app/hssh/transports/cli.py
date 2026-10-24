@@ -15,7 +15,7 @@ import re
 import time
 from typing import Callable, Optional
 
-from ..core import check_confirm_minutes
+from ..core import check_confirm_minutes, refusal_line
 from ..dialects.base import CliSyntax, Dialect
 from ..drivers import results as R
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
@@ -50,6 +50,23 @@ def is_echo(line: str, cmd: str) -> bool:
     """The device's echo of what was typed ends with the command itself; a
     reply line that merely mentions the command is not it."""
     return line.strip().endswith(cmd.strip())
+
+
+def complaint(output: str, dialect: Dialect) -> str:
+    """The line in which the device refused what was typed: the dialect's
+    own refusal where the reply has one, else the first line that is neither
+    blank nor a caret marker. A CLI that checks a line as it is typed (Junos
+    on a pty) refuses the bad word when the space after it arrives, redraws
+    the prompt and the line, then refuses the Enter too: the reply is two
+    complaints, a prompt and a redraw with backspaces, and the complaint is
+    one line of it."""
+    found = refusal_line(output, dialect=dialect)
+    if found:
+        return found
+    for ln in output.splitlines():
+        if ln.strip() and set(ln.strip()) != {"^"}:
+            return ln.strip()
+    return output.strip()
 
 
 def refuse_commit_lines(payload: str) -> None:
@@ -129,6 +146,24 @@ class Cli:
         seen = [l.strip() for l in strip_ansi(buf).splitlines() if l.strip()]
         tail = f"; last line: {seen[-1][:80]!r}" if seen else ""
         raise TimeoutError(f"no prompt within {timeout}s{tail}")
+
+    def _settle(self, buffer: str, seconds: float) -> str:
+        """What else arrives within `seconds`, for a reply whose prompt may
+        not have been the last: a CLI that refused a line as it was typed
+        redraws the prompt and the line, then refuses the Enter after it."""
+        buf = buffer
+        deadline = time.monotonic() + seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return buf
+            try:
+                chunk = self.channel.recv(4096, remaining).decode("utf-8", errors="replace")
+            except (TimeoutError, OSError):
+                return buf
+            if not chunk:
+                return buf
+            buf += chunk
 
     def read_until_prompt(self, timeout: int, buffer: str = "") -> str:
         return self._read_until(self.prompt_re.search, timeout, buffer)
@@ -226,6 +261,10 @@ class Cli:
             return prompt_re.search(lines[-1]) is not None
 
         output = self._read_until(done, command_timeout)
+        if self.dialect.refused.search(output):
+            # A refusal may have been typed-time: the prompt that ended the
+            # read was a redraw, and the Enter's own complaint is still coming.
+            output = strip_ansi(self._settle(output, 0.3))
 
         lines = output.splitlines()
         if lines and is_echo(lines[0], cmd):
@@ -271,7 +310,7 @@ class Cli:
             # mistaken for the device's complaint about it.
             output = self.run(line, 10)
             if "invalid" in output.lower() or "error" in output.lower() or "%" in output:
-                errors.append(f"'{line}': {output.strip()}")
+                errors.append(f"'{line}': {complaint(output, self.dialect)}")
 
         self.run(cli.config_exit, 10)
 
@@ -303,7 +342,7 @@ class Cli:
                 continue
             output = self.run(line, 10)
             if d.refused.search(output):
-                errors.append(f"'{line}': {output.strip()}")
+                errors.append(f"'{line}': {complaint(output, d)}")
 
         diff = self.run(cli.compare, 30).strip()
         changed = expected_diff is not None and diff != expected_diff.strip()
