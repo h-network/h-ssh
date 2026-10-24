@@ -1,8 +1,8 @@
 """
 h-ssh: Multi-vendor network automation framework.
 
-Supports parallel execution across Juniper, Arista, and other network devices
-with multiple transport mechanisms: SSH, NETCONF, eAPI, telnet, and raw sockets.
+Parallel reads and gated edits across a fleet over NETCONF (Junos), SSH, the
+OpenSSH client and telnet; a driver is one dialect on one transport.
 """
 
 from .core import Target, load_devices_csv, resolve_command, get_available_commands, parse_inline_target, load_jobs

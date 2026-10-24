@@ -32,7 +32,7 @@ lands in a JSONL audit trail.
 - **Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
 - **One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
 - **Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing and `--commit-confirmed N` for changes that undo themselves unless you confirm within N minutes (both Junos), and an opt-in per-device rate limit and cooldown (`--safety-file`).
-- **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an EOS switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
+- **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an EOS switch each their own command. Drop your own in `~/.h-ssh/commands/{dialect}.json` (`junos`, `eos`, `none`) to override.
 - **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely. A whole fleet run fits in one YAML file (`--run fleet.yaml`) that a pipeline step or a jump-host session runs as it is.
 - **Built for a maintenance, not just a run.** A session pool keeps one NETCONF session per router open for a whole script; `rpc()` and `--format json|xml` return the router's own data instead of CLI text; `begin()` holds a diffed candidate open until a gate decides; `--rollback N`, commit comments, `--commit-status` and `guarded_commit()` cover the commit-confirmed lifecycle without a `| match` in sight.
 - **One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
@@ -453,7 +453,7 @@ Exit codes: `0` success (also when the operator answers N) · `1` a device faile
 | `junos` | PyEZ Table/View over NETCONF | A **different** request: the binding names an RPC, so this is not a parse of the CLI output |
 | `ssh`, `openssh`, `telnet` | — | No bindings; always text |
 
-Bindings live in the same `h-app/commands/{vendor}.json` entry as the command, under an optional `structured` key:
+Bindings live in the same `h-app/hssh/dialects/{dialect}.json` entry as the command, under an optional `structured` key:
 
 ```json
 "bgp": {
@@ -606,9 +606,13 @@ h-ssh/
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
 │   │   ├── errors.py        # NotAppliedError, AmbiguousCommitError — what the retry logic keys on
-│   │   ├── commands/        # per-vendor template library: junos.json, ssh.json, arista.json (EOS shortcuts, for the dialect to come)
+│   │   ├── dialects/        # what each device speaks, with its shortcut library next to it
+│   │   │   ├── base.py      # Dialect, CliSyntax, the default read rule
+│   │   │   ├── junos.py     # set-syntax guard, refusal regex, candidate CLI, commit-pending note  + junos.json
+│   │   │   ├── ios.py       # IOS-shaped CLI and `% ` refusals; nxos.py, eos.py (+ eos.json) build on it
+│   │   │   └── none.py      # no vendor knowledge: error:/% refusals, IOS-shaped prompt  + none.json
 │   │   ├── drivers/
-│   │   │   ├── base.py      # Dialect, Transport, Driver and the capability words
+│   │   │   ├── base.py      # Transport, Driver and the capability words
 │   │   │   ├── __init__.py  # the registry: dialect@transport names, today's names as aliases
 │   │   │   └── contract.py  # what a module must offer to back a driver's `supports`
 │   │   └── vendors/
@@ -617,7 +621,6 @@ h-ssh/
 │   │       ├── generic.py   # paramiko SSH
 │   │       ├── openssh.py   # the OpenSSH binary — zero dependencies
 │   │       └── telnet.py    # raw socket, per-flavour prompt handling
-│   ├── commands -> hssh/commands
 │   ├── tests/
 │   ├── h-ssh.py             # CLI entry point
 │   ├── devices.csv          # example inventory

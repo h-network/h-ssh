@@ -52,9 +52,11 @@ def test_a_retired_name_gets_its_line_and_an_unknown_one_the_list():
 def test_transports_say_what_they_are():
     assert drivers.NETCONF.default_port == 830 and drivers.NETCONF.pooled
     assert drivers.NETCONF.formats == ("text", "xml", "json")
+    for t in (drivers.NETCONF, drivers.SSH, drivers.OPENSSH):
+        assert t.banner == b"SSH-"
     for t in (drivers.SSH, drivers.OPENSSH):
-        assert t.default_port == 22 and t.formats == ("text",) and t.over_ssh and not t.pooled
-    assert drivers.TELNET.default_port == 23 and drivers.TELNET.frozen and not drivers.TELNET.over_ssh
+        assert t.default_port == 22 and t.formats == ("text",) and not t.pooled
+    assert drivers.TELNET.default_port == 23 and drivers.TELNET.frozen and drivers.TELNET.banner is None
     assert [t for t in drivers.TRANSPORTS.values() if t.frozen] == [drivers.TELNET]
     assert [t for t in drivers.TRANSPORTS.values() if t.pooled] == [drivers.NETCONF]
 

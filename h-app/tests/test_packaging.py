@@ -32,3 +32,6 @@ def test_wheel_build_includes_hssh_without_top_level_commands(tmp_path):
         names = archive.namelist()
     assert "hssh/cli.py" in names
     assert not any(name.startswith("commands/") for name in names)
+    # The shortcut libraries ship next to their dialects (#81).
+    assert {"hssh/dialects/junos.json", "hssh/dialects/eos.json", "hssh/dialects/none.json"} <= set(names)
+    assert not any(name.startswith("hssh/commands/") for name in names)
