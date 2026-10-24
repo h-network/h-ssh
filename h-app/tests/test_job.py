@@ -13,9 +13,9 @@ def test_parse_inline_target_two_parts():
 
 
 def test_parse_inline_target_with_vendor():
-    t = parse_inline_target("SW1:10.0.0.2:arista")
+    t = parse_inline_target("SW1:10.0.0.2:openssh")
     assert t.name == "SW1"
-    assert t.vendor == "arista"
+    assert t.vendor == "openssh"
 
 
 def test_parse_inline_target_with_port():
@@ -124,11 +124,11 @@ def test_load_jobs_default_vendor_fills_undeclared_targets(tmp_path):
     job_file = tmp_path / "test.json"
     job_file.write_text(json.dumps([
         {"target": "R1:10.0.0.1", "show": "show version"},
-        {"target": "SW1:10.0.0.2:arista", "show": "show version"},
+        {"target": "SW1:10.0.0.2:openssh", "show": "show version"},
     ]))
     entries = load_jobs(str(job_file), default_vendor="junos")
     assert entries[0].target.vendor == "junos"
-    assert entries[1].target.vendor == "arista", "a declared vendor must win"
+    assert entries[1].target.vendor == "openssh", "a declared vendor must win"
 
 
 @pytest.mark.parametrize("entry, text", [

@@ -2,7 +2,7 @@
 
 Uses raw sockets instead of telnetlib (deprecated in Python 3.11, removed in 3.13).
 Handles login sequences, --More-- pagination, and per-vendor prompt detection.
-Supports IOS, Junos, Arista, and NX-OS style prompts.
+Supports IOS, Junos, Arista (EOS) and NX-OS style prompts.
 """
 
 import re

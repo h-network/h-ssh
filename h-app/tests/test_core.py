@@ -12,7 +12,7 @@ def test_load_csv_with_header():
         f.write("name,ip,vendor\n")
         f.write("CR1,10.0.1.1,junos\n")
         f.write("CR2,10.0.1.2,junos\n")
-        f.write("SW1,10.0.2.1,arista\n")
+        f.write("SW1,10.0.2.1,openssh\n")
         f.flush()
 
         targets = load_devices_csv(f.name)
@@ -23,14 +23,14 @@ def test_load_csv_with_header():
     assert targets[0].name == "CR1"
     assert targets[0].host == "10.0.1.1"
     assert targets[0].vendor == "junos"
-    assert targets[2].vendor == "arista"
+    assert targets[2].vendor == "openssh"
 
 
 def test_load_csv_without_header():
     """Test loading CSV without header (backwards compatibility)."""
     with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
         f.write("CR1,10.0.1.1,junos\n")
-        f.write("CR2,10.0.1.2,arista\n")
+        f.write("CR2,10.0.1.2,openssh\n")
         f.flush()
 
         targets = load_devices_csv(f.name)
@@ -102,9 +102,9 @@ def test_load_csv_default_vendor():
 def test_load_csv_default_vendor_is_the_callers(tmp_path):
     """The CLI passes --transport as default_vendor; a declared vendor still wins."""
     inv = tmp_path / "devices.csv"
-    inv.write_text("name,ip,vendor\nCR1,10.0.1.1\nSW1,10.0.2.1,arista\n")
+    inv.write_text("name,ip,vendor\nCR1,10.0.1.1\nSW1,10.0.2.1,openssh\n")
     targets = load_devices_csv(str(inv), default_vendor="junos")
-    assert [t.vendor for t in targets] == ["junos", "arista"]
+    assert [t.vendor for t in targets] == ["junos", "openssh"]
 
 
 def test_load_csv_name_only_rows_get_the_default_vendor(tmp_path):
@@ -154,8 +154,8 @@ def test_resolve_target_port():
     assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="junos", port=2222)) == 2222
     # Junos defaults to 830
     assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="junos")) == 830
-    # Arista defaults to 443
-    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="arista")) == 443
+    # telnet-arista (EOS over telnet) defaults to 23
+    assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="telnet-arista")) == 23
     # Telnet defaults to 23
     assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="telnet")) == 23
     assert resolve_target_port(Target(name="R1", host="10.0.1.1", vendor="telnet-ios")) == 23
@@ -380,3 +380,14 @@ def test_preflight_passes_only_on_an_ssh_banner_for_ssh_vendors():
         assert ok                                    # telnet has no banner to ask for
     finally:
         closes.close(); speaks.close()
+
+
+# --- #79: eAPI is gone; the vendor name gets one clear line --------------------------
+
+def test_the_arista_eapi_vendor_is_retired_with_one_clear_line():
+    from hssh import vendors
+    assert "arista" not in vendors.VENDORS and "telnet-arista" in vendors.VENDORS
+    with pytest.raises(ValueError, match="vendor 'arista' \\(eAPI over HTTPS\\) is no longer supported; EOS devices use the ssh or openssh transport"):
+        vendors.get("arista")
+    import importlib
+    assert importlib.util.find_spec("hssh.vendors.arista") is None

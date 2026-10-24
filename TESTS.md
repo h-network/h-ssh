@@ -12,7 +12,6 @@ every one was run against the code before its fix and failed there.
 
 | Suite | Tests | Covers |
 |-------|------:|--------|
-| test_arista.py | 11 | eAPI driver: `return_node`, TLS verified by default (`HSSH_EAPI_CA`, `HSSH_EAPI_VERIFY=no`), config session + commit, `command_timeout`, batch |
 | test_audit.py | 8 | JSONL audit trail, 0600, redaction (text and JSON values), `secure_append`, graceful failure |
 | test_cli_edit_output.py | 24 | default-mode verdict + diff for edits, the commit-confirmed reminder, `--show-diff` preview → prompt → commit and the abort paths, confirm hint from `sys.argv[0]` and job targets, `--log` 0600 + redacted |
 | test_cli_junos_safety.py | 12 | Junos set-syntax guard (also through `--transport junos`), show-batch error handling, `--rollback`/`--comment`/`--show-diff`/`--commit-status`/`--format` usage errors |
@@ -119,7 +118,7 @@ re-run clean.
 | 8 | Config verification after edit | Pass |
 | 9 | Save output to per-device files (`--save-output`) | Pass |
 | 10 | Safety gate wiring through runner | Pass |
-| 11 | Command templates — Junos (15) and Arista (8) | Pass |
+| 11 | Command templates — Junos (15) and EOS (8, for the dialect to come) | Pass |
 | 12 | Edit broadcast — same config to 3 routers in parallel | Pass |
 | 13 | Job mode via stdin pipe (`--job -`) | Pass |
 | 14 | Safety gate with edit + file persistence | Pass |

@@ -360,7 +360,6 @@ DEFAULT_VENDOR_PORTS = {
     "telnet-junos": 23,
     "telnet-arista": 23,
     "telnet-nxos": 23,
-    "arista": 443,
     "ssh": 22,
     "openssh": 22,
 }
@@ -482,7 +481,7 @@ def resolve_structured(cmd: str, vendor: str) -> Optional[Dict]:
     A template entry may carry an optional "structured" key. Its meaning is
     vendor-specific and deliberately not normalised across vendors:
 
-      arista: true          -- ask eAPI for JSON instead of flattening to text
+      (an empty mapping marks a vendor whose structured path needs no field map)
       junos:  {rpc, item, key, fields}
                             -- a PyEZ Table/View definition, fetched over
                                NETCONF as a different request than the CLI one

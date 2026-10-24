@@ -15,13 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 junos = ["junos-eznc"]
-arista = ["pyeapi"]
-all = ["junos-eznc", "pyeapi"]
+all = ["junos-eznc"]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "junos-eznc",
-    "pyeapi",
 ]
 
 [project.scripts]

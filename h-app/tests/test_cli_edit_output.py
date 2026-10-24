@@ -112,7 +112,7 @@ def test_confirm_command_names_the_program_as_it_was_started(monkeypatch):
     assert cmd.startswith('/home/me/h-ssh/h-app/h-ssh.py -eC "commit"')
 
 
-@pytest.mark.parametrize("transport", ["ssh", "openssh", "arista", "telnet"])
+@pytest.mark.parametrize("transport", ["ssh", "openssh", "telnet"])
 def test_confirm_command_drops_a_transport_that_cannot_confirm(transport):
     cmd = build_confirm_command("admin", ["R1:10.0.1.1:junos"], "devices.csv", transport)
     assert "--transport" not in cmd

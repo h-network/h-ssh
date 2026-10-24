@@ -60,7 +60,7 @@ def test_junos_dry_run_reaches_the_driver(monkeypatch):
     assert v.edit_calls[0]["dry_run"] is True
 
 
-@pytest.mark.parametrize("vendor", ["ssh", "arista", "openssh", "telnet-ios"])
+@pytest.mark.parametrize("vendor", ["ssh", "openssh", "telnet-ios"])
 def test_dry_run_is_refused_where_it_cannot_be_real(monkeypatch, vendor):
     v = FakeVendor()
     _, ok, out, _ = run(monkeypatch, vendor, v, dry_run=True)
@@ -68,7 +68,7 @@ def test_dry_run_is_refused_where_it_cannot_be_real(monkeypatch, vendor):
     assert v.edit_calls == []
 
 
-@pytest.mark.parametrize("vendor", ["ssh", "arista", "telnet-ios"])
+@pytest.mark.parametrize("vendor", ["ssh", "telnet-ios"])
 def test_commit_confirmed_is_refused_where_it_would_be_ignored(monkeypatch, vendor):
     v = FakeVendor()
     _, ok, out, _ = run(monkeypatch, vendor, v, commit_confirmed=5)

@@ -32,7 +32,7 @@ from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
-from .vendors import VENDORS
+from .vendors import VENDORS, RETIRED
 
 
 # Supported vendor names for validation: the vendors registry itself, under
@@ -40,7 +40,7 @@ from .vendors import VENDORS
 VENDOR_MODULES = VENDORS
 
 VENDOR_INSTALL = {
-    "junos": "junos-eznc", "arista": "pyeapi", "ssh": "paramiko",
+    "junos": "junos-eznc", "ssh": "paramiko",
     "openssh": "the OpenSSH client ('ssh' on PATH)",
     "telnet": "(built-in)", "telnet-ios": "(built-in)",
     "telnet-junos": "(built-in)", "telnet-arista": "(built-in)",
@@ -191,7 +191,7 @@ CONFIG_DEFAULTS = {
 }
 
 
-TRANSPORT_CHOICES = ["junos", "arista", "ssh", "openssh", "telnet"]
+TRANSPORT_CHOICES = ["junos", "ssh", "openssh", "telnet"]
 # The floor a config-file value must reach; a flag has argparse for this.
 CONFIG_FLOORS = {"workers": 1, "retries": 0, "session_timeout": 1, "command_timeout": 1}
 CONFIG_CEILINGS = {"workers": MAX_WORKERS, "session_timeout": MAX_SECONDS, "command_timeout": MAX_SECONDS}
@@ -366,7 +366,7 @@ async def main() -> int:
                         help="Transport for targets that don't declare one (default: ssh)")
     parser.add_argument("--structured", action="store_true",
                         help="Return structured data where the vendor supports it "
-                             "(junos NETCONF, arista eAPI); falls back to text elsewhere")
+                             "(junos NETCONF); falls back to text elsewhere")
     parser.add_argument("--user", type=str,
                         help="Username (or HSSH_USER env var, or 'user' in ~/.h-ssh/config)")
     parser.add_argument("--config", type=str,
@@ -728,7 +728,7 @@ async def main() -> int:
     for v in set(t.vendor for t in targets):
         mod = VENDOR_MODULES.get(v)
         if mod is None:
-            print(f"ERROR: Unknown vendor '{v}'.", file=sys.stderr)
+            print(f"ERROR: {RETIRED[v]}." if v in RETIRED else f"ERROR: Unknown vendor '{v}'.", file=sys.stderr)
             return 2
         if not mod.AVAILABLE:
             install = VENDOR_INSTALL.get(v, v)
@@ -794,13 +794,8 @@ async def main() -> int:
         user = input(f"Username [{default_user}]: ").strip() or default_user
 
     if not passwd:
-        needs_password = any(t.vendor in ("arista",) for t in targets)
-        if needs_password:
-            if not _tty(sys.stdin):
-                print("ERROR: Arista requires a password but stdin is not a TTY.", file=sys.stderr)
-                return 2
-            passwd = getpass.getpass("Password: ")
-        elif _tty(sys.stdin):
+        # No transport needs a password up front: a key or an agent may do.
+        if _tty(sys.stdin):
             passwd = getpass.getpass("Password (press Enter to skip): ")
             if not passwd:
                 passwd = None

@@ -51,7 +51,7 @@ _PERMANENT = (
     "rejected the operational command",
     "no rpc equivalent",
     "no 'ssh' binary",
-    # A device that rejected the command will reject it again: eAPI says
+    # A device that rejected the command will reject it again: EOS says
     # "invalid command [Invalid input (at token ...)]", IOS "% Invalid input".
     # A bare "invalid" also caught paramiko's "Invalid SSH banner" and the
     # OS's "Invalid argument", which are transport trouble, not a verdict.
