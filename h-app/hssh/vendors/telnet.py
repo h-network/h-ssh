@@ -11,6 +11,8 @@ import time
 from typing import List, Optional
 
 from ..core import check_confirm_minutes
+from .. import drivers
+from ..dialects.base import CliSyntax, Dialect
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
 
 AVAILABLE = True  # Raw sockets, always available
@@ -18,14 +20,25 @@ AVAILABLE = True  # Raw sockets, always available
 # ANSI escape code stripper
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][0-9A-B]|\x0f|\x00')
 
-# Per-vendor prompt patterns. The IOS-style ones take the config-mode
-# suffix too (Router(config)#, Switch(config-if-Et1/1)#): a reader that does
-# not recognise it would wait out its timeout on every config line.
+def _dialect(vendor_hint: Optional[str]) -> Dialect:
+    """The dialect behind a vendor_hint: telnet-junos is junos, telnet-ios is
+    ios, plain telnet is none (an IOS-shaped prompt, as always). The hint is
+    the shim-era way to name a dialect; #83 hands the object in."""
+    try:
+        return drivers.get(vendor_hint or "telnet").dialect
+    except ValueError:
+        return drivers.NONE
+
+
+# The prompts by the flavour names telnet used, for the tests that read them.
+# The IOS-style ones take the config-mode suffix too (Router(config)#,
+# Switch(config-if-Et1/1)#): a reader that does not recognise it would wait
+# out its timeout on every config line.
 PROMPT_PATTERNS = {
-    "ios":    re.compile(r'[\w\-\.]+(\([^\s()]+\))?[>#]\s*$'),
-    "junos":  re.compile(r'[\w\-\.]+@[\w\-\.]+[>%#]\s*$'),
-    "arista": re.compile(r'[\w\-\.]+(\([^\s()]+\))?[>#]\s*$'),
-    "nxos":   re.compile(r'[\w\-\.]+(\([^\s()]+\))?[>#]\s*$'),
+    "ios": drivers.IOS.cli.prompt,
+    "junos": drivers.JUNOS.cli.prompt,
+    "arista": drivers.EOS.cli.prompt,
+    "nxos": drivers.NXOS.cli.prompt,
 }
 
 # --More-- patterns for pagination
@@ -44,13 +57,6 @@ PASSWORD_RE = re.compile(r'(Password|password)\s*:\s*$', re.IGNORECASE)
 # take the credentials; quoted in the error, the re-prompt itself is the tell.
 _LOGIN_REJECTED = ("login incorrect", "bad password", "login invalid",
                    "authentication failed", "access denied", "permission denied")
-
-# A Junos CLI error, matched at line start on the reply without the echoed
-# command: a description that says "error-disabled" is not one.
-_JUNOS_ERROR_RE = re.compile(
-    r'^\s*(error:|syntax error|missing argument|unknown command|commit failed)',
-    re.MULTILINE | re.IGNORECASE)
-
 
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from output."""
@@ -174,15 +180,16 @@ def _check_login(reply: str) -> None:
 
 def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
                        port: int, session_timeout: int,
-                       vendor_hint: str = "ios") -> tuple:
-    """Open raw socket, negotiate telnet, handle login.
+                       cli: CliSyntax) -> tuple:
+    """Open raw socket, negotiate telnet, handle login against the dialect's
+    CLI shape.
 
     Returns (socket, prompt_re) tuple. Raises NotAppliedError when the device
     rejects the credentials or shows no prompt within session_timeout, even
     after an Enter: no command was sent, and the runner treats a failed login
     as permanent.
     """
-    prompt_re = PROMPT_PATTERNS.get(vendor_hint, PROMPT_PATTERNS["ios"])
+    prompt_re = cli.prompt
     sock = socket.create_connection((host, port), timeout=session_timeout)
     sock.settimeout(session_timeout)
 
@@ -210,7 +217,7 @@ def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
             _send(sock, (passwd or "") + "\n")
             last = _read_until_prompt_or_login(sock, prompt_re, timeout=session_timeout)
             _check_login(last)
-        prompt_re = _learn_prompt(last, prompt_re, vendor_hint)
+        prompt_re = _learn_prompt(last, prompt_re, cli)
     except Exception as e:
         sock.close()
         if isinstance(e, TimeoutError):
@@ -261,24 +268,20 @@ def _send_command(sock: socket.socket, prompt_re: re.Pattern,
     return "\n".join(lines)
 
 
-def _learn_prompt(reply: str, prompt_re: re.Pattern, sub_vendor: str) -> re.Pattern:
+def _learn_prompt(reply: str, prompt_re: re.Pattern, cli: CliSyntax) -> re.Pattern:
     """The device's own prompt, from the first one seen after login: from
     then on only `user@host` (or `Router`, with its config-mode suffix) ends a
     reply, not any line that happens to end in `>` or `#`."""
     seen = [l.strip() for l in reply.splitlines() if l.strip()]
     if not seen:
         return prompt_re
-    last = seen[-1]
-    if sub_vendor == "junos":
-        m = re.search(r'([\w\-\.]+@[\w\-\.]+)[>%#]\s*$', last)
-        return re.compile(re.escape(m.group(1)) + r'[>%#]\s*$') if m else prompt_re
-    m = re.search(r'^([\w\-\.]+)(\([^\s()]+\))?[>#]\s*$', last)
-    return re.compile(re.escape(m.group(1)) + r'(\([^\s()]+\))?[>#]\s*$') if m else prompt_re
+    m = cli.prompt_name.search(seen[-1])
+    return re.compile(re.escape(m.group(1)) + cli.prompt_tail) if m else prompt_re
 
 
-def _edit_ios(sock: socket.socket, prompt_re: re.Pattern, payload: str) -> str:
-    """IOS config mode: configure terminal -> commands -> end."""
-    _send_command(sock, prompt_re, "configure terminal", 10)
+def _edit_ios(sock: socket.socket, prompt_re: re.Pattern, payload: str, cli: CliSyntax) -> str:
+    """Config mode without a candidate: configure terminal -> commands -> end."""
+    _send_command(sock, prompt_re, cli.config_enter, 10)
 
     errors = []
     for line in payload.strip().splitlines():
@@ -291,7 +294,7 @@ def _edit_ios(sock: socket.socket, prompt_re: re.Pattern, payload: str) -> str:
         if "invalid" in output.lower() or "error" in output.lower() or "%" in output:
             errors.append(f"'{line}': {output.strip()}")
 
-    _send_command(sock, prompt_re, "end", 10)
+    _send_command(sock, prompt_re, cli.config_exit, 10)
 
     if errors:
         raise RuntimeError("; ".join(errors))
@@ -323,10 +326,10 @@ def _refuse_commit_lines(payload: str) -> None:
                              "with -eC \"commit\" alone. Nothing was sent to the device")
 
 
-def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
+def _edit_junos(sock: socket.socket, prompt_re: re.Pattern, d: Dialect,
                 payload: str, dry_run: bool, confirmed_minutes: int = 0,
                 expected_diff: Optional[str] = None) -> str:
-    """Junos config mode: configure exclusive -> commands -> show|compare -> commit/rollback.
+    """Config mode with a candidate: configure exclusive -> commands -> show|compare -> commit/rollback.
 
     Exclusive mode keeps the candidate to this session, as the NETCONF
     driver's lock does: commit and rollback 0 never touch another user's
@@ -335,9 +338,10 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
     (what a dry run showed) the candidate is committed only if
     `show | compare` says the same again.
     """
+    cli = d.cli
     _refuse_commit_lines(payload)
-    reply = _send_command(sock, prompt_re, "configure exclusive", 10)
-    if _JUNOS_ERROR_RE.search(reply):
+    reply = _send_command(sock, prompt_re, cli.config_enter, 10)
+    if d.refused.search(reply):
         raise NotAppliedError(f"Failed to lock config: {reply.strip()}")
 
     errors = []
@@ -346,14 +350,14 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
         if not line or line.startswith("#"):
             continue
         output = _send_command(sock, prompt_re, line, 10)
-        if _JUNOS_ERROR_RE.search(output):
+        if d.refused.search(output):
             errors.append(f"'{line}': {output.strip()}")
 
-    diff = _send_command(sock, prompt_re, "show | compare", 30).strip()
+    diff = _send_command(sock, prompt_re, cli.compare, 30).strip()
     changed = expected_diff is not None and diff != expected_diff.strip()
 
     if dry_run or errors or changed:
-        _leave_quietly(sock, prompt_re, "rollback 0", "exit")
+        _leave_quietly(sock, prompt_re, cli.discard, cli.config_exit)
         if errors:
             raise RuntimeError("; ".join(errors))
         if changed:
@@ -361,9 +365,9 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
         return f"DRY-RUN\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
 
     if confirmed_minutes and confirmed_minutes > 0:
-        commit_cmd = f"commit confirmed {confirmed_minutes}"
+        commit_cmd = f"{cli.commit} confirmed {confirmed_minutes}"
     else:
-        commit_cmd = "commit"
+        commit_cmd = cli.commit
     try:
         commit_output = _send_command(sock, prompt_re, commit_cmd, 60)
     except OSError as e:
@@ -373,22 +377,24 @@ def _edit_junos(sock: socket.socket, prompt_re: re.Pattern,
             f"commit outcome unknown ({type(e).__name__}: {e}); "
             "check the device before retrying") from e
 
-    if _JUNOS_ERROR_RE.search(commit_output):
+    if d.refused.search(commit_output):
         # A refused commit leaves the change in our candidate; discard it so
         # the exit is clean and the lock goes with it.
-        _leave_quietly(sock, prompt_re, "rollback 0", "exit")
+        _leave_quietly(sock, prompt_re, cli.discard, cli.config_exit)
         raise RuntimeError(f"Commit failed: {commit_output.strip()}")
 
-    _leave_quietly(sock, prompt_re, "exit")
+    _leave_quietly(sock, prompt_re, cli.config_exit)
 
     if confirmed_minutes and confirmed_minutes > 0:
         return f"COMMIT CONFIRMED ({confirmed_minutes} minutes)\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
     return f"COMMIT OK\n\nDIFF:\n{diff}" if diff else "NO CHANGES"
 
 
-# The latest entry of `show system commit` while a commit confirmed waits:
-# "0   2026-10-22 08:00:00 UTC by lab via cli commit confirmed, rollback in 5mins"
-_PENDING_LINE = re.compile(r"^\s*0\s+.*rollback in \d+\s*min", re.I | re.M)
+def _pending(history: str, d: Dialect) -> bool:
+    """The latest entry of `show system commit` while a commit confirmed waits:
+    "0   2026-10-22 08:00:00 UTC by lab via cli commit confirmed, rollback in 5mins"."""
+    return any(re.match(r"^\s*0\s+", line) and d.commit_pending.search(line)
+               for line in history.splitlines())
 
 
 def confirm(host: str, user: str, passwd: str,
@@ -399,21 +405,21 @@ def confirm(host: str, user: str, passwd: str,
     exclusive, a bare `commit` (`commit comment "…"` with a comment), exit.
     Without this the runner handed the word `commit` to the edit path, which
     committed twice and reported someone else's diff."""
-    sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint and vendor_hint.startswith("telnet") else vendor_hint
-    if sub_vendor != "junos":
-        raise ValueError(f"confirm is only for telnet-junos, not telnet-{sub_vendor}; nothing was sent")
+    d = _dialect(vendor_hint)
+    if d.commit_pending is None or not d.cli.has_candidate:
+        raise ValueError(f"confirm is only for telnet-junos, not {vendor_hint}; nothing was sent")
     sock, prompt_re = _connect_and_login(host, user, passwd, port if port is not None else 23,
-                                         session_timeout, "junos")
+                                         session_timeout, d.cli)
     try:
         # Nothing waiting means the timer expired or it was confirmed
         # already; a commit now would hide that from the operator.
         history = _send_command(sock, prompt_re, "show system commit", command_timeout)
-        if not _PENDING_LINE.search(history):
+        if not _pending(history, d):
             raise NothingToConfirmError(
                 "nothing to confirm: no commit-confirmed is pending on the device "
                 "(the timer expired, or it was confirmed already); nothing was sent")
-        reply = _send_command(sock, prompt_re, "configure exclusive", 10)
-        if _JUNOS_ERROR_RE.search(reply):
+        reply = _send_command(sock, prompt_re, d.cli.config_enter, 10)
+        if d.refused.search(reply):
             raise NotAppliedError(f"Failed to lock config: {reply.strip()}")
         commit_cmd = f'commit comment "{comment}"' if comment else "commit"
         try:
@@ -421,10 +427,10 @@ def confirm(host: str, user: str, passwd: str,
         except OSError as e:
             raise AmbiguousCommitError(
                 f"commit outcome unknown ({type(e).__name__}: {e}); check the device before retrying") from e
-        if _JUNOS_ERROR_RE.search(out):
-            _leave_quietly(sock, prompt_re, "exit")
+        if d.refused.search(out):
+            _leave_quietly(sock, prompt_re, d.cli.config_exit)
             raise RuntimeError(f"Commit failed: {out.strip()}")
-        _leave_quietly(sock, prompt_re, "exit")
+        _leave_quietly(sock, prompt_re, d.cli.config_exit)
         return "COMMIT CONFIRMED OK"
     finally:
         try:
@@ -442,12 +448,8 @@ def show(host: str, user: str, passwd: str, cmd: str,
          port: int = None, vendor_hint: str = "telnet") -> str:
     """Send a single show command via raw-socket telnet."""
     effective_port = port if port is not None else 23
-    sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint.startswith("telnet") else vendor_hint
-    if sub_vendor == "telnet":
-        sub_vendor = "ios"
-
     sock, prompt_re = _connect_and_login(host, user, passwd, effective_port,
-                                         session_timeout, sub_vendor)
+                                         session_timeout, _dialect(vendor_hint).cli)
     try:
         return _send_command(sock, prompt_re, cmd, command_timeout)
     finally:
@@ -471,25 +473,23 @@ def edit(host: str, user: str, passwd: str, payload: str,
     run that lands or a commit with no timer.
     """
     effective_port = port if port is not None else 23
-    sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint.startswith("telnet") else vendor_hint
-    if sub_vendor == "telnet":
-        sub_vendor = "ios"
-    if sub_vendor != "junos" and (dry_run or commit_confirmed is not None or expected_diff is not None):
+    d = _dialect(vendor_hint)
+    if not d.cli.has_candidate and (dry_run or commit_confirmed is not None or expected_diff is not None):
         raise ValueError(f"dry_run, commit_confirmed and expected_diff are not supported by "
-                         f"telnet-{sub_vendor}; nothing was sent to the device")
+                         f"{vendor_hint}; nothing was sent to the device")
     check_confirm_minutes(commit_confirmed)
-    if sub_vendor == "junos":
+    if d.cli.has_candidate:
         _refuse_commit_lines(payload)
 
     sock, prompt_re = _connect_and_login(host, user, passwd, effective_port,
-                                         session_timeout, sub_vendor)
+                                         session_timeout, d.cli)
     try:
-        if sub_vendor == "junos":
-            return _edit_junos(sock, prompt_re, payload, dry_run=dry_run,
+        if d.cli.has_candidate:
+            return _edit_junos(sock, prompt_re, d, payload, dry_run=dry_run,
                                confirmed_minutes=commit_confirmed or 0,
                                expected_diff=expected_diff)
         else:
-            return _edit_ios(sock, prompt_re, payload)
+            return _edit_ios(sock, prompt_re, payload, d.cli)
     finally:
         try:
             sock.close()
@@ -502,12 +502,8 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                port: int = None, vendor_hint: str = "telnet") -> List[dict]:
     """Execute multiple show commands on a single telnet connection."""
     effective_port = port if port is not None else 23
-    sub_vendor = vendor_hint.replace("telnet-", "") if vendor_hint.startswith("telnet") else vendor_hint
-    if sub_vendor == "telnet":
-        sub_vendor = "ios"
-
     sock, prompt_re = _connect_and_login(host, user, passwd, effective_port,
-                                         session_timeout, sub_vendor)
+                                         session_timeout, _dialect(vendor_hint).cli)
     try:
         results = []
         for cmd in cmds:

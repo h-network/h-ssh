@@ -365,91 +365,34 @@ def resolve_target_port(target: Target) -> int:
         return 22
 
 
-JUNOS_SET_PREFIX_VERBS = (
-    "set ",
-    "delete ",
-    "activate ",
-    "deactivate ",
-    "insert ",
-    "rename ",
-    "copy ",
-    "annotate ",
-    "protect ",
-    "unprotect ",
-)
-JUNOS_SET_EXACT_VERBS = ("commit", "commit;")
-JUNOS_SET_VERBS = JUNOS_SET_PREFIX_VERBS + ("commit",)
+# The Junos edit guard lives with its dialect; these names stay for importers.
+from .dialects.junos import SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS  # noqa: E402
+from .dialects.junos import check_edit as validate_junos_set_syntax  # noqa: E402
 
 
-def validate_junos_set_syntax(payload: str, allow_commit: bool = True) -> Tuple[bool, str]:
-    """Validate that every non-empty, non-comment line starts with a valid Junos set verb.
-
-    Allows comments (#) and blank lines.
-    Rejects any non-empty, non-comment line that does not start with one of the valid Junos set verbs.
-    If allow_commit is True, a single standalone 'commit' or 'commit;' command is permitted (for confirming).
-    'commit' cannot be mixed with set commands.
-    If allow_commit is False (e.g. for -eD/-eB config files), 'commit' commands are rejected.
-    Returns (is_valid, error_description).
-    """
-    lines = payload.splitlines()
-    meaningful = []
-    for idx, raw_line in enumerate(lines, 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        meaningful.append((idx, line))
-
-    if not meaningful:
-        return False, "configuration payload contains no commands"
-
-    # Standalone commit command is only permitted if allow_commit is True and it is the single command
-    if len(meaningful) == 1:
-        idx, line = meaningful[0]
-        if line in JUNOS_SET_EXACT_VERBS:
-            if not allow_commit:
-                return False, f"line {idx}: 'commit' is not permitted in configuration files (-eD/-eB)"
-            return True, ""
-
-    for idx, line in meaningful:
-        if line in JUNOS_SET_EXACT_VERBS:
-            return False, f"line {idx}: 'commit' cannot be combined with set commands (standalone only)"
-        # Junos CLI requires lowercase set verbs (reject uppercase like 'SET')
-        if not any(line.startswith(verb) for verb in JUNOS_SET_PREFIX_VERBS):
-            return False, f"line {idx}: invalid Junos set command {line!r} (must start with a valid set verb such as 'set', 'delete', 'activate', etc.)"
-
-    return True, ""
+def _merge_shortcuts(commands: Dict, path: Path) -> None:
+    if path.is_file():
+        try:
+            commands.update(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            pass
 
 
 def _load_commands_json(vendor: str) -> Dict:
-    """Load command templates from JSON file for a vendor.
-
-    Lookup order:
-    - Package shipped defaults (hssh/commands/{vendor}.json, or the checkout's
-      h-app/commands/{vendor}.json next to the package)
-    - ~/.h-ssh/commands/{vendor}.json (user overrides)
-    """
-    commands = {}
-
-    # Shipped defaults: check hssh/commands/ then ../commands/ relative to core.py
-    pkg_dir = Path(__file__).resolve().parent
-    package_path = pkg_dir / "commands" / f"{vendor}.json"
-    if not package_path.is_file():
-        package_path = pkg_dir.parent / "commands" / f"{vendor}.json"
-
-    if package_path.is_file():
-        try:
-            commands.update(json.loads(package_path.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-
-    # User home overrides
-    home_path = Path.home() / ".h-ssh" / "commands" / f"{vendor}.json"
-    if home_path.is_file():
-        try:
-            commands.update(json.loads(home_path.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-
+    """The shortcut library for a target's vendor name: what its dialect
+    ships (hssh/dialects/<dialect>.json), with the operator's own entries on
+    top from ~/.h-ssh/commands/<dialect>.json and, as before #81, from
+    ~/.h-ssh/commands/<vendor as typed>.json. An unknown vendor has none."""
+    try:
+        dialect = drivers.get(vendor).dialect
+    except ValueError:
+        return {}
+    commands: Dict = {}
+    if dialect.shortcuts:
+        _merge_shortcuts(commands, Path(__file__).resolve().parent / "dialects" / f"{dialect.shortcuts}.json")
+    home = Path.home() / ".h-ssh" / "commands"
+    for stem in dict.fromkeys((dialect.name, vendor)):
+        _merge_shortcuts(commands, home / f"{stem}.json")
     return commands
 
 
@@ -505,15 +448,14 @@ def get_available_commands(vendor: str) -> Dict[str, str]:
     return result
 
 
-# A CLI that exits 0 after refusing a line still said so: Junos answers
-# "error: syntax error", IOS and Arista "% Invalid input ...".
-_REFUSAL = re.compile(r"^\s*(error:|% )", re.M)
-
-
-def refusal_line(*texts: str):
-    """The first line in which the device refused the command, or None."""
+def refusal_line(*texts: str, dialect=None):
+    """The first line in which the device refused the command, or None. A CLI
+    that exits 0 after refusing a line still said so; how it says so is the
+    dialect's (`refused`). Without one, the `none` dialect's rule: a line
+    starting with "error:" (Junos) or "% " (IOS, EOS, NX-OS)."""
+    pattern = (dialect or drivers.NONE).refused
     for text in texts:
-        m = _REFUSAL.search(text or "")
+        m = pattern.search(text or "")
         if m:
-            return (text[m.start(1):].splitlines() or [""])[0].strip()
+            return (text[m.start():].strip().splitlines() or [""])[0].strip()
     return None

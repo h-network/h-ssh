@@ -19,7 +19,7 @@ from hssh.vendors import generic, junos
 # --- M7: permanent means one attempt -------------------------------------------
 
 @pytest.mark.parametrize("message", [
-    "No structured binding for 'show foo' on junos. Add a \"structured\" key to the entry in commands/junos.json.",
+    "No structured binding for 'show foo' on junos. Add a \"structured\" key to the entry in hssh/dialects/junos.json.",
     "No authentication methods available for u@10.0.0.1: no password was given and no key was found in ~/.ssh or from an agent.",
     "ssh exit 255: hostname contains invalid characters",
     "ssh exit 255: remote username contains invalid characters",
