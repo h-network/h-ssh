@@ -2,11 +2,11 @@
 
 `--store runs.db` (or HSSH_STORE=runs.db) keeps one row per command per
 device: who ran what, when, against which device, whether it worked, how
-long it took, and the device's own reply, redacted the way --log is unless
---store-raw says otherwise. Nothing is parsed, normalised or modelled: the
-store holds output, and what is done with it is the reader's business
-(`h-ssh-store`, or any sqlite3 client). One file serves many runs, and
-replaces a directory of --save-output files.
+long it took, and the device's own reply, byte for byte. A snapshot one
+may have to restore from is kept as it came: nothing is redacted, parsed,
+normalised or modelled. The store holds output, and what is done with it
+is the reader's business (`h-ssh-store`, or any sqlite3 client). One file
+serves many runs, and replaces a directory of --save-output files.
 
 Two tables. `runs`: one row per h-ssh invocation (run_id, when it started
 and finished, the mode, the command line, who ran it, the counts).
@@ -29,8 +29,6 @@ import sqlite3
 import stat
 import sys
 from typing import Iterable, List, Optional
-
-from .audit import redact_secrets
 
 ENV_VAR = "HSSH_STORE"
 
@@ -89,11 +87,10 @@ class StoreError(Exception):
 class Store:
     """One SQLite file, opened for writing by the run and for reading by
     `h-ssh-store`. The file is created 0600, as --log's is: it holds
-    replies, diffs and payloads."""
+    replies, diffs and payloads as the devices gave them."""
 
-    def __init__(self, path: str, raw: bool = False, readonly: bool = False):
+    def __init__(self, path: str, readonly: bool = False):
         self.path = path
-        self.raw = raw
         if readonly:
             if not os.path.exists(path):
                 raise StoreError(f"{path}: no such store")
@@ -138,25 +135,18 @@ class Store:
 
     # --- writing ------------------------------------------------------------
 
-    def _text(self, text: Optional[str]) -> Optional[str]:
-        if text is None:
-            return None
-        return text if self.raw else redact_secrets(text)
-
     def begin_run(self, mode: str, argv: List[str], user: Optional[str], targets: int,
                   version: str, origin: Optional[str] = None, command: Optional[str] = None,
                   run_id: Optional[str] = None) -> str:
         """Record that a run started; its row is completed by finish_run().
-        `command` is what the run was about (the show, the batch file, the
-        edit); the command line is kept whole and redacted: a password typed
-        on it stays out."""
+        `command` is what the run was about (the show, the batch, the edit);
+        `argv` the command line as typed."""
         run_id = run_id or new_run_id()
         with self.conn:
             self.conn.execute(
                 "INSERT INTO runs (run_id, started, mode, command, argv, user, origin, version, targets) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, _now(), mode, self._text(command), redact_secrets(" ".join(argv)), user, origin,
-                 version, targets))
+                (run_id, _now(), mode, command, " ".join(argv), user, origin, version, targets))
         return run_id
 
     def add(self, run_id: str, device: str, seq: int, command: str, ok: bool,
@@ -169,8 +159,8 @@ class Store:
             self.conn.execute(
                 "INSERT OR REPLACE INTO results (run_id, device, seq, host, vendor, command, ts, ok, "
                 "duration_ms, error, format, output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, device, seq, host, vendor, self._text(command), ts or _now(), 1 if ok else 0,
-                 duration_ms, self._text(error), fmt, self._text(output)))
+                (run_id, device, seq, host, vendor, command, ts or _now(), 1 if ok else 0,
+                 duration_ms, error, fmt, output))
 
     def add_entry(self, run_id: str, entry: dict, command: str, fmt: str = "text") -> int:
         """The rows of one device's result as the CLI builds it (`entry`: the

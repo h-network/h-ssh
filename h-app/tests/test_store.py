@@ -1,5 +1,5 @@
 """The result store (--store, h-ssh-store): every command's reply in one
-SQLite file, redacted as --log is, read back by run, device and command."""
+SQLite file, byte for byte, read back by run, device and command."""
 
 import asyncio
 import json
@@ -77,19 +77,18 @@ def test_run_ids_sort_by_time_and_differ_within_a_second():
     assert all(len(i) == len("20261024-173055-6dc0") for i in ids)
 
 
-def test_one_row_per_command_redacted_as_the_log_is(tmp_path):
+def test_one_row_per_command_kept_as_it_came(tmp_path):
     path = tmp_path / "runs.db"
     r1, r2, r3 = filled(path)
     runs = rows(path, "SELECT * FROM runs ORDER BY rowid")
     assert [r["mode"] for r in runs] == ["show", "show-batch", "commit-status"]
-    assert runs[0]["argv"] == "--password [REDACTED] -sC version"
+    assert runs[0]["argv"] == "--password hunter2 -sC version"     # as typed: a snapshot is not edited
     assert (runs[0]["targets"], runs[0]["ok"], runs[0]["failed"], runs[0]["skipped"]) == (2, 1, 1, 0)
     assert runs[0]["finished"] and runs[0]["command"] == "version"
     show = rows(path, "SELECT * FROM results WHERE run_id = ? ORDER BY device, seq", r1)
     assert [(r["device"], r["seq"], r["ok"]) for r in show] == [("r1", 0, 1), ("r2", 0, 0)]
     assert show[0]["command"] == "show version" and show[0]["format"] == "text"
-    assert "$9$" not in show[0]["output"] and "[REDACTED]" in show[0]["output"]
-    assert show[0]["output"].startswith("Hostname: r1\nJunos: 23.2\n")
+    assert show[0]["output"] == SHOW["output"]                       # the hash stays: a restore needs it
     assert show[1]["output"] is None and show[1]["error"] == "ERROR: connect timed out"
     batch = rows(path, "SELECT * FROM results WHERE run_id = ? ORDER BY seq", r2)
     assert [(r["seq"], r["command"], r["ok"]) for r in batch] == \
@@ -101,17 +100,15 @@ def test_one_row_per_command_redacted_as_the_log_is(tmp_path):
     assert commits[0]["command"] == "show system commit"
 
 
-def test_raw_keeps_the_hashes_and_a_json_reply_is_stored_as_json(tmp_path):
+def test_a_json_reply_is_stored_as_json(tmp_path):
     path = tmp_path / "runs.db"
-    s = Store(str(path), raw=True)
-    run = s.begin_run("show", ["-sC", "show configuration"], "lab", 1, "1.0.0")
-    s.add_entry(run, SHOW, "show configuration")
+    s = Store(str(path))
+    run = s.begin_run("show", ["-sC", "show version"], "lab", 1, "1.0.0")
     s.add_entry(run, {**SHOW, "device": "r9", "output": {"software-information": [{"host-name": [{"data": "r9"}]}]}},
                 "show version", fmt="json")
     s.close()
-    got = {r["device"]: r for r in rows(path, "SELECT * FROM results")}
-    assert "$9$abcDEF" in got["r1"]["output"]
-    assert got["r9"]["format"] == "json" and json.loads(got["r9"]["output"])["software-information"]
+    got = rows(path, "SELECT * FROM results")[0]
+    assert got["format"] == "json" and json.loads(got["output"])["software-information"]
 
 
 def test_a_second_result_for_the_same_command_replaces_the_first(tmp_path):
@@ -163,7 +160,7 @@ def test_runs_failed_and_output(tmp_path, capsys):
     rc, out, _ = reader(capsys, path, "failed", r3)
     assert rc == 0 and "0 failed" in out
     rc, out, err = reader(capsys, path, "output", "r1", r1)
-    assert rc == 0 and out.startswith("Hostname: r1\nJunos: 23.2\n") and "[REDACTED]" in out
+    assert rc == 0 and out == SHOW["output"]
     rc, out, err = reader(capsys, path, "output", "r2", r1)
     assert rc == 1 and out == "" and "connect timed out" in err
     rc, out, _ = reader(capsys, path, "output", "r1", r2, "--seq", "1")
@@ -245,11 +242,11 @@ def test_a_show_run_lands_in_the_store_with_its_run_row(tmp_path, monkeypatch, c
     assert run["mode"] == "show" and run["user"] == "u" and run["command"] == "show version"
     assert (run["targets"], run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (2, 2, 0, 0, 0)
     assert run["finished"] is not None and run["version"] == cli.__version__
-    assert "--password [REDACTED]" in run["argv"] and "hunter" not in run["argv"] and " p " not in run["argv"] + " "
+    assert run["argv"].startswith("--config ") and "--store" in run["argv"]
     got = {r["device"]: r for r in rows(path, "SELECT * FROM results")}
     assert set(got) == {"R1", "R2"}
     assert got["R1"]["command"] == "show version" and got["R1"]["vendor"] == "junos" and got["R1"]["host"] == "10.0.0.1"
-    assert got["R1"]["output"].startswith("Hostname: 10.0.0.1\n") and "$9$" not in got["R1"]["output"]
+    assert got["R1"]["output"] == "Hostname: 10.0.0.1\nroot-authentication encrypted-password \"$9$zz\""
     assert got["R1"]["ok"] == 1 and got["R1"]["format"] == "text" and got["R1"]["duration_ms"] is not None
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -274,18 +271,15 @@ def test_a_batch_is_one_row_per_command_and_a_failure_is_the_devices_line(tmp_pa
     assert rc == 1 and "show nothing" in capsys.readouterr()[0]
 
 
-def test_the_store_env_var_and_raw_flag(tmp_path, monkeypatch, capsys):
+def test_the_store_env_var_names_the_file(tmp_path, monkeypatch, capsys):
     path = tmp_path / "runs.db"
-    rc, out, err = run_cli(monkeypatch, capsys, ["--store-raw", "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
-    assert rc == 2 and "--store-raw goes with --store" in err
-    monkeypatch.setattr(sys, "argv", ["h-ssh"])
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(
         AVAILABLE=True, show=lambda *a, **kw: "encrypted-password \"$9$keep\"\n"))
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_STORE", str(path))
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
-                                      "--store-raw", "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
+                                      "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
     assert rc == 0, err

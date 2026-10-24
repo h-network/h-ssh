@@ -458,10 +458,8 @@ async def main() -> int:
     parser.add_argument("--log", type=str,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
     parser.add_argument("--store", type=str, default=os.environ.get(STORE_ENV),
-                        help=f"Keep every command's reply in this SQLite file (0600, one row per command per device, "
-                             f"redacted as --log is; read it with h-ssh-store; default ${STORE_ENV})")
-    parser.add_argument("--store-raw", action="store_true",
-                        help="With --store: keep replies unredacted (a config backup keeps its hashes)")
+                        help=f"Keep every command's reply in this SQLite file, as the device gave it (0600, one row "
+                             f"per command per device; read it with h-ssh-store; default ${STORE_ENV})")
     parser.add_argument("--audit-log", type=str,
                         default=os.environ.get("HSSH_AUDIT_LOG"),
                         help="Edit audit log path for JSONL audit trail (or set HSSH_AUDIT_LOG env var)")
@@ -784,15 +782,12 @@ async def main() -> int:
                 print(f"ERROR: {label} {e}; refusing to start.", file=sys.stderr)
                 return 2
     store = None
-    if args.store_raw and not args.store:
-        print("ERROR: --store-raw goes with --store.", file=sys.stderr)
-        return 2
     if args.store:
         # Opened, and its tables made, before the first device is touched:
         # a store that cannot be written is found out now, not after the
         # commits landed.
         try:
-            store = Store(args.store, raw=args.store_raw)
+            store = Store(args.store)
         except StoreError as e:
             print(f"ERROR: --store {e}; refusing to start.", file=sys.stderr)
             return 2

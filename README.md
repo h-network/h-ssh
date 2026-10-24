@@ -496,10 +496,10 @@ not, the duration, the error, the format (`text`, `xml`, `json`) and the device'
 is one row, a `--batch` one row per command in order, an edit one row with the payload as the command
 and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON. A
 second table, `runs`, has one row per invocation: when it started and finished, the mode, what it was
-about, the whole command line, who ran it and from where, and the counts. The file is created 0600
-and the replies are redacted as `--log`'s are; `--store-raw` keeps them whole (a config backup keeps
-its hashes). The file is opened and its tables made before the first device, so an unusable path
-refuses the run with exit 2.
+about, the whole command line, who ran it and from where, and the counts. Everything is kept as it
+came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
+a `show configuration` keeps its hashes. The file is created 0600, opened and its tables made before
+the first device, so an unusable path refuses the run with exit 2.
 
 The store holds output and nothing else: no parsing, no normalising, no per-command schema — what is
 done with the replies is the reader's business. `h-ssh-store` is the reader that ships, over the same
@@ -589,7 +589,7 @@ ones (`--safety-file`, `--audit-log`, `--log`) apply to every mode once given.
 | Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite. The file and its `.lock` are created and locked once before the first device; a path that cannot be created, opened or locked (a missing directory, a symlink, a FIFO) refuses the run with exit 2 |
 | Audit trail | `--audit-log PATH` (or `HSSH_AUDIT_LOG`) | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`/`passwd`, `authentication-key`, `md5-key`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). One entry per device for every mode — shows included, without their output — plus pre-flight aborts and user cancellations; records diffs for edits. The file is opened once before the first device, so an unwritable path refuses the run before anything is sent (exit 2); in edit modes, audit write failures during the run fail it |
 | Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, one line as each device finishes, appended with the same 0600 mode and secret redaction as the audit trail, and probed before the first device like the audit log |
-| Result store | `--store PATH` (or `HSSH_STORE`), `--store-raw` | Every command's reply in one SQLite file, one row per command per device plus a row per run, 0600 and redacted as `--log` unless `--store-raw`; opened before the first device, so an unusable path refuses the run (exit 2). Read with `h-ssh-store` (see [The result store](#the-result-store)) |
+| Result store | `--store PATH` (or `HSSH_STORE`) | Every command's reply in one SQLite file, as the device gave it, one row per command per device plus a row per run; 0600, nothing redacted (it is a snapshot to restore from); opened before the first device, so an unusable path refuses the run (exit 2). Read with `h-ssh-store` (see [The result store](#the-result-store)) |
 
 A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
 
