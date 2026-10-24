@@ -511,7 +511,7 @@ async def main() -> int:
         else:
             print(f"\nNo command shortcuts found for '{args.transport}'.")
             print(f"Create shortcuts in: ~/.h-ssh/commands/{args.transport}.json")
-            print(f"See h-app/commands/junos.json for format example.\n")
+            print(f"See h-app/hssh/dialects/junos.json for format example.\n")
         return 0
 
     # Two different paths: a binding's few fields, or the router's whole reply.

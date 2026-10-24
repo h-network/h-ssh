@@ -357,7 +357,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
     against two different representations. `cmd` is accepted only to keep the
     signature aligned with show().
 
-    The binding is the "structured" entry from commands/junos.json:
+    The binding is the "structured" entry from hssh/dialects/junos.json:
 
         {"rpc": "get-bgp-neighbor-information",
          "item": "bgp-peer",
@@ -372,7 +372,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
     if not binding:
         raise ValueError(
             f"No structured binding for '{cmd}' on junos. "
-            "Add a \"structured\" key to the entry in commands/junos.json."
+            "Add a \"structured\" key to the entry in hssh/dialects/junos.json."
         )
 
     from jnpr.junos.factory import FactoryLoader
