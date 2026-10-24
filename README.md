@@ -595,7 +595,7 @@ the next caller, when something left it in doubt: a commit whose outcome is unkn
 unlock that failed, an RPC timeout, or the router closing it. A read (`show`, `show_structured`,
 `show_batch`, and `rpc`/`rpc_batch` for a `show …` command or `get-*` RPC) that finds its reused
 session dead opens a new one and runs once more; any other RPC (`request-*`, …) and an edit never do —
-an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI never enables the pool, so `h-ssh` runs behave exactly as before.
+an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run.
 
 ## Package structure
 
