@@ -17,6 +17,7 @@ from hssh.runner import _retry_loop, _with_retry, is_permanent_failure, _backoff
     "Cannot resolve r1.",
     "Unknown vendor 'nope'.",
     "--commit-confirmed is not supported by the 'openssh' transport",
+    "'uptime' was refused by the device: error: unknown command: uptime",
     "password authentication needs OpenSSH >= 8.4",
     "Junos rejected the operational command",
     "login failed: Login incorrect",

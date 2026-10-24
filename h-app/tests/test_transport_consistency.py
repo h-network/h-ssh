@@ -35,6 +35,19 @@ def test_refusal_line_reads_junos_and_ios_refusals():
         "error: syntax error, expecting <command>: bad-line"
 
 
+def test_refused_reply_is_a_refusal_that_opens_the_reply():
+    """#88: a show the CLI refuses says so first and nothing else; the same
+    words further down a reply are output (a log)."""
+    from hssh.core import refused_reply
+    assert refused_reply("", "error: unknown command: uptime\n") == "error: unknown command: uptime"
+    assert refused_reply("", "\n  error: syntax error, expecting <command>: x\n") == "error: syntax error, expecting <command>: x"
+    assert refused_reply("", "           ^\n% Invalid input detected at '^' marker.\n") == "% Invalid input detected at '^' marker."
+    assert refused_reply("% Bad command\n", "") == "% Bad command"
+    assert refused_reply("", "Oct 24 12:00:00 r1 rpd[1]: error: link down\n") is None
+    assert refused_reply("", "line one\nerror: later\n") is None
+    assert refused_reply("", "") is None and refused_reply("", "100% done\n") is None
+
+
 @pytest.fixture
 def fake_ssh(tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
@@ -53,7 +66,10 @@ def fake_ssh(tmp_path, monkeypatch):
 def test_openssh_edit_stops_at_the_refused_line(fake_ssh):
     with pytest.raises(RuntimeError, match="'set bad line' was refused by the device: error: syntax error"):
         openssh.edit("h", "u", None, "set good line\nset bad line\nset never sent\n", 5, 5)
-    assert "error: syntax error" in openssh.show("h", "u", None, "show bad", 5, 5)   # a show is output
+    # A show the CLI refuses is failed too, not handed back as its output (#88).
+    with pytest.raises(RuntimeError, match="'show bad' was refused by the device: error: syntax error"):
+        openssh.show("h", "u", None, "show bad", 5, 5)
+    assert "ok: show good" in openssh.show("h", "u", None, "show good", 5, 5)
 
 
 def test_a_server_that_closes_after_the_password_is_a_failed_login():
