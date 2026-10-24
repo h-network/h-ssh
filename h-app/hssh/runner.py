@@ -6,13 +6,13 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from .errors import NotAppliedError
 from .audit import secure_write
 from .core import Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
-from . import vendors
+from . import drivers
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 3]  # seconds between attempt 1->2, 2->3
@@ -150,64 +150,82 @@ def is_read_command(command: str) -> bool:
     return text.startswith("show ") or text.startswith("get") or text == "show"
 
 
-# Transports whose edit() can really validate a candidate and discard it, and
-# the ones that can really arm a commit-confirmed rollback timer. Everything
-# else must refuse rather than quietly do something weaker.
-DRY_RUN_EDIT_VENDORS = frozenset({"junos", "telnet-junos"})
-COMMIT_CONFIRMED_VENDORS = frozenset({"junos", "telnet-junos"})
-# Only the NETCONF driver logs a comment with the commit.
-COMMENT_VENDORS = frozenset({"junos"})
+class Bound(NamedTuple):
+    """The driver a target resolved to: the module that does the work, the
+    name the operator used (for messages), what it may be asked, and the
+    vendor_hint its functions take."""
+    mod: object
+    vendor: str
+    caps: frozenset
+    hint: str
 
 
-def _comment_kwargs(vendor, comment):
+def bind(vendor: str) -> Bound:
+    """Resolve a target's vendor name through the driver registry. What the
+    run may ask is the driver's `supports`; a module standing in for the
+    driver's own (a test double) is believed on the functions it has, with
+    the by-name policies (dry run, commit confirmed, comment) still the
+    registry's. Everything else must refuse rather than quietly do something
+    weaker: an edit that cannot really validate a candidate and discard it,
+    a commit that cannot really arm a rollback timer."""
+    driver = drivers.get(vendor)
+    mod = drivers.module_of(driver)
+    return Bound(mod, vendor, drivers.supports_of(driver, mod), driver.shim)
+
+
+def _comment_kwargs(b: Bound, comment):
     """{"comment": ...} for drivers that take one; refused elsewhere rather
     than silently dropped."""
     if comment is None:
         return {}
-    if vendor not in COMMENT_VENDORS:
-        raise ValueError(f"--comment is not supported by the '{vendor}' transport")
+    if "comment" not in b.caps:
+        raise ValueError(f"--comment is not supported by the '{b.vendor}' transport")
     return {"comment": comment}
 
 
-def _expected_diff_kwargs(vendor, expected_diff):
+def _expected_diff_kwargs(b: Bound, expected_diff):
     """{"expected_diff": ...} for the drivers that diff a candidate before
     committing it (the ones that can dry-run); refused elsewhere, since a
     transport that cannot show a diff cannot check one either."""
     if expected_diff is None:
         return {}
-    if vendor not in DRY_RUN_EDIT_VENDORS:
+    if "dry_run" not in b.caps:
         raise ValueError(
-            f"expected_diff is not supported by the '{vendor}' transport; "
+            f"expected_diff is not supported by the '{b.vendor}' transport; "
             "nothing was sent to the device")
     return {"expected_diff": expected_diff}
 
 
-def _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
+def _check_edit_policy(b: Bound, commit_confirmed, dry_run):
+    check_confirm_minutes(commit_confirmed)
+    if commit_confirmed and "commit_confirmed" not in b.caps:
+        raise ValueError(
+            f"--commit-confirmed is not supported by the '{b.vendor}' transport; "
+            "the change would be applied with no rollback timer")
+    if dry_run and "dry_run" not in b.caps:
+        raise ValueError(
+            f"--dry-run is not supported by the '{b.vendor}' transport for edits; "
+            "nothing was sent to the device")
+
+
+def _apply_rollback(b: Bound, name, quiet, max_attempts, host, user, passwd,
                     n, session_timeout, command_timeout, commit_confirmed, port, dry_run=False,
                     comment=None, expected_diff=None):
     """Return to rollback n. Same rules as an edit: refused where the transport
     cannot really do it, retried only when nothing reached the device, and
     with `expected_diff` committed only if the device shows that diff again."""
-    if not hasattr(vendor_mod, "rollback"):
-        raise ValueError(f"--rollback is not supported by the '{vendor}' transport")
-    check_confirm_minutes(commit_confirmed)
-    if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
-        raise ValueError(
-            f"--commit-confirmed is not supported by the '{vendor}' transport; "
-            "the change would be applied with no rollback timer")
-    if dry_run and vendor not in DRY_RUN_EDIT_VENDORS:
-        raise ValueError(
-            f"--dry-run is not supported by the '{vendor}' transport for edits; "
-            "nothing was sent to the device")
+    if "rollback" not in b.caps:
+        raise ValueError(f"--rollback is not supported by the '{b.vendor}' transport")
+    _check_edit_policy(b, commit_confirmed, dry_run)
     return _retry_loop(
-        vendor_mod.rollback, name, quiet, max_attempts,
+        b.mod.rollback, name, quiet, max_attempts,
         lambda e: isinstance(e, NotAppliedError),
         host, user, passwd, n, session_timeout, command_timeout,
-        port=port, vendor_hint=vendor, dry_run=dry_run, commit_confirmed=commit_confirmed,
-        **_comment_kwargs(vendor, comment), **_expected_diff_kwargs(vendor, expected_diff))
+        port=port, vendor_hint=b.hint, dry_run=dry_run, commit_confirmed=commit_confirmed,
+        **_comment_kwargs(b, comment), **_expected_diff_kwargs(b, expected_diff))
 
 
-def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passwd,
+def _apply_edit(b: Bound, name, quiet, max_attempts, host, user, passwd,
                 payload, session_timeout, command_timeout, commit_confirmed,
                 port, dry_run=False, comment=None, expected_diff=None):
     """Push configuration. An edit is not idempotent, so it is only retried when
@@ -215,34 +233,26 @@ def _apply_edit(vendor_mod, vendor, name, quiet, max_attempts, host, user, passw
     failure, and above all a timeout around a commit, is reported, not repeated.
     `expected_diff` is the diff a dry run showed: the driver commits only if
     the candidate produces it again."""
-    check_confirm_minutes(commit_confirmed)
-    if commit_confirmed and vendor not in COMMIT_CONFIRMED_VENDORS:
-        raise ValueError(
-            f"--commit-confirmed is not supported by the '{vendor}' transport; "
-            "the change would be applied with no rollback timer")
-    kwargs = {"port": port, "vendor_hint": vendor, **_comment_kwargs(vendor, comment),
-              **_expected_diff_kwargs(vendor, expected_diff)}
+    _check_edit_policy(b, commit_confirmed, dry_run)
+    kwargs = {"port": port, "vendor_hint": b.hint, **_comment_kwargs(b, comment),
+              **_expected_diff_kwargs(b, expected_diff)}
     if dry_run:
-        if vendor not in DRY_RUN_EDIT_VENDORS:
-            raise ValueError(
-                f"--dry-run is not supported by the '{vendor}' transport for edits; "
-                "nothing was sent to the device")
         kwargs["dry_run"] = True
     return _retry_loop(
-        vendor_mod.edit, name, quiet, max_attempts,
+        b.mod.edit, name, quiet, max_attempts,
         lambda e: isinstance(e, NotAppliedError),
         host, user, passwd, payload, session_timeout, command_timeout,
         commit_confirmed, **kwargs)
 
 
-def _rpc_call(vendor_mod, vendor, batch=False):
+def _rpc_call(b: Bound, batch=False):
     """The transport's rpc() (rpc_batch() for a batch), or a refusal. Only a
     driver that can ask the router for a command's own JSON or XML has one;
     a text transport must say so rather than hand back the text as before."""
-    fn = getattr(vendor_mod, "rpc_batch" if batch else "rpc", None)
+    fn = getattr(b.mod, "rpc_batch" if batch else "rpc", None) if "rpc" in b.caps else None
     if fn is None:
         raise ValueError(
-            f"--format json/xml is not supported by the '{vendor}' transport; "
+            f"--format json/xml is not supported by the '{b.vendor}' transport; "
             "nothing was sent to the device")
     return fn
 
@@ -294,8 +304,7 @@ def _run_for_target_sync(
     if not quiet:
         _say(f"{name:16s} STARTED")
 
-    # Get vendor module
-    vendor_mod = vendors.get(vendor)
+    b = bind(vendor)
 
     output = []
     output.append(f"DEVICE: {name}")
@@ -324,44 +333,45 @@ def _run_for_target_sync(
                 # The router's own JSON or XML for the command, through its
                 # RPC translation. Only the NETCONF driver can do that; a
                 # transport that cannot refuses here, before any device I/O.
-                data = _with_retry(_rpc_call(vendor_mod, vendor), name, quiet, max_attempts,
+                data = _with_retry(_rpc_call(b), name, quiet, max_attempts,
                                    host, user, passwd, show_cmd, session_timeout, command_timeout,
-                                   port=t.port, vendor_hint=vendor, fmt=fmt)
+                                   port=t.port, vendor_hint=b.hint, fmt=fmt)
                 result = data if fmt == "xml" else json.dumps(data, indent=2)
-            elif structured and hasattr(vendor_mod, "show_structured"):
-                # Absence of show_structured on a vendor module is the whole
-                # capability check — generic and telnet simply don't have one,
-                # so they fall through to the text path below.
-                data = _with_retry(vendor_mod.show_structured, name, quiet, attempts,
+            elif structured and "show_structured" in b.caps:
+                # A driver without show_structured (ssh, openssh, telnet)
+                # falls through to the text path below.
+                data = _with_retry(b.mod.show_structured, name, quiet, attempts,
                                    host, user, passwd, show_cmd,
                                    session_timeout, command_timeout,
-                                   port=t.port, vendor_hint=vendor,
+                                   port=t.port, vendor_hint=b.hint,
                                    binding=structured_binding)
                 result = json.dumps(data, indent=2, default=str)
             else:
                 if not read and not quiet:
                     _say(f"{name:16s} NOTE {show_cmd!r} is not a read: sent once, never retried")
-                result = _with_retry(vendor_mod.show, name, quiet, attempts,
+                result = _with_retry(b.mod.show, name, quiet, attempts,
                                      host, user, passwd, show_cmd, session_timeout, command_timeout,
-                                     port=t.port, vendor_hint=vendor)
+                                     port=t.port, vendor_hint=b.hint)
             output.append(result.rstrip())
 
         elif mode == "edit-cmd":
             if not edit_cmd:
                 raise ValueError("No edit command provided.")
             payload = edit_cmd.strip() + "\n"
-            if payload.strip() in ("commit", "commit;") and hasattr(vendor_mod, "confirm"):
+            if payload.strip() in ("commit", "commit;") and "confirm" in b.caps:
                 # Only a literal -eC "commit" confirms a pending commit-confirmed;
                 # the same word inside an -eD/-eB file is just (invalid) config.
+                # A driver that cannot confirm gets it as an edit, and every
+                # edit() refuses a commit line before the device is contacted.
                 if dry_run:
                     raise ValueError("--dry-run cannot preview a commit confirmation")
-                result = _retry_loop(vendor_mod.confirm, name, quiet, max_attempts,
+                result = _retry_loop(b.mod.confirm, name, quiet, max_attempts,
                                      lambda e: isinstance(e, NotAppliedError),
                                      host, user, passwd, session_timeout, command_timeout,
-                                     port=t.port, vendor_hint=vendor,
-                                     **_comment_kwargs(vendor, comment))
+                                     port=t.port, vendor_hint=b.hint,
+                                     **_comment_kwargs(b, comment))
             else:
-                result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
+                result = _apply_edit(b, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
                                      expected_diff)
@@ -373,7 +383,7 @@ def _run_for_target_sync(
             # The CLI hands over the text it validated; a file re-read here
             # could differ from what the guard saw.
             payload = payload_text if payload_text is not None else read_set_file_for_device(config_dir, name)
-            result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
+            result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
                                  expected_diff)
@@ -383,29 +393,29 @@ def _run_for_target_sync(
             if not broadcast_file:
                 raise ValueError("No broadcast file provided for -eB.")
             payload = payload_text if payload_text is not None else _read_broadcast_file(broadcast_file)
-            result = _apply_edit(vendor_mod, vendor, name, quiet, max_attempts,
+            result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
                                  expected_diff)
             output.append(result.rstrip())
 
         elif mode == "commit-status":
-            if not hasattr(vendor_mod, "commit_status"):
+            if "commit_status" not in b.caps:
                 raise ValueError(f"--commit-status is not supported by the '{vendor}' transport")
             if dry_run:
                 # A dry run contacts no device, for a read too.
                 output.append("DRY-RUN commit-status (no session opened)")
                 output.append(json.dumps([]))
             else:
-                entries = _with_retry(vendor_mod.commit_status, name, quiet, max_attempts,
+                entries = _with_retry(b.mod.commit_status, name, quiet, max_attempts,
                                       host, user, passwd, session_timeout, command_timeout,
-                                      port=t.port, vendor_hint=vendor)
+                                      port=t.port, vendor_hint=b.hint)
                 output.append(json.dumps(entries))
 
         elif mode == "rollback":
             if rollback is None:
                 raise ValueError("No rollback number provided for --rollback.")
-            result = _apply_rollback(vendor_mod, vendor, name, quiet, max_attempts,
+            result = _apply_rollback(b, name, quiet, max_attempts,
                                      host, user, passwd, rollback, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
                                      expected_diff)
@@ -419,13 +429,13 @@ def _run_for_target_sync(
             if dry_run:
                 cmd_results = [{"command": c, "ok": True, "output": f"DRY-RUN show: {c}"} for c in batch_cmds]
             elif fmt != "text":
-                cmd_results = _with_retry(_rpc_call(vendor_mod, vendor, batch=True), name, quiet, max_attempts,
+                cmd_results = _with_retry(_rpc_call(b, batch=True), name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
-                                          port=t.port, vendor_hint=vendor, fmt=fmt)
+                                          port=t.port, vendor_hint=b.hint, fmt=fmt)
             else:
-                cmd_results = _with_retry(vendor_mod.show_batch, name, quiet, max_attempts,
+                cmd_results = _with_retry(b.mod.show_batch, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
-                                          port=t.port, vendor_hint=vendor)
+                                          port=t.port, vendor_hint=b.hint)
             all_ok = all(r["ok"] for r in cmd_results)
             result_json = json.dumps(cmd_results)
             duration_ms = int((time.time() - start_time) * 1000)

@@ -27,25 +27,21 @@ from .core import (
 
     path_inside,
 )
-from .runner import run_for_target_async, COMMIT_CONFIRMED_VENDORS, is_connect_failure
+from .runner import run_for_target_async, is_connect_failure
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
-from .vendors import VENDORS, RETIRED
+from .vendors import VENDORS
+from . import drivers
 
 
 # Supported vendor names for validation: the vendors registry itself, under
 # the name the CLI has always used, so one table cannot drift from the other.
 VENDOR_MODULES = VENDORS
 
-VENDOR_INSTALL = {
-    "junos": "junos-eznc", "ssh": "paramiko",
-    "openssh": "the OpenSSH client ('ssh' on PATH)",
-    "telnet": "(built-in)", "telnet-ios": "(built-in)",
-    "telnet-junos": "(built-in)", "telnet-arista": "(built-in)",
-    "telnet-nxos": "(built-in)",
-}
+# What to install when a target's transport reports itself unavailable.
+VENDOR_INSTALL = {name: drivers.get(name).transport.install for name in drivers.names()}
 
 
 
@@ -274,7 +270,7 @@ def build_confirm_command(user, target_specs, devices: str, transport: str) -> s
         cmd.extend("--target " + shlex.quote(spec) for spec in target_specs)
     else:
         cmd.append("--devices " + shlex.quote(devices))
-    if transport in COMMIT_CONFIRMED_VENDORS:
+    if "commit_confirmed" in drivers.get(transport).supports:
         cmd.append("--transport " + transport)
     return " ".join(cmd)
 
@@ -294,9 +290,6 @@ def get_default_devices_path() -> str:
     return "devices.csv"
 
 
-SSH_VENDORS = ("junos", "ssh", "openssh")
-
-
 async def check_reachability(target, timeout: int = 2) -> tuple:
     """Quick reachability check for a target."""
     port = resolve_target_port(target)
@@ -310,7 +303,7 @@ async def check_reachability(target, timeout: int = 2) -> tuple:
                 timeout=timeout,
             )
             try:
-                if target.vendor in SSH_VENDORS:
+                if drivers.get(target.vendor).transport.over_ssh:
                     # A port that accepts and closes (a NAT in front of a dead
                     # container, sshd at its connection limit) is not a device:
                     # the SSH banner is.
@@ -724,11 +717,17 @@ async def main() -> int:
         print("ERROR: --format goes with a show (-sC, --batch, or a --job's show entries).", file=sys.stderr)
         return 2
 
-    # Validate vendor libraries for all targets
+    # Every target's vendor name resolves to a driver whose module is installed
     for v in set(t.vendor for t in targets):
-        mod = VENDOR_MODULES.get(v)
+        if v in drivers.RETIRED:
+            print(f"ERROR: {drivers.RETIRED[v]}.", file=sys.stderr)
+            return 2
+        try:
+            mod = VENDOR_MODULES.get(drivers.get(v).shim)
+        except ValueError:
+            mod = None
         if mod is None:
-            print(f"ERROR: {RETIRED[v]}." if v in RETIRED else f"ERROR: Unknown vendor '{v}'.", file=sys.stderr)
+            print(f"ERROR: Unknown vendor '{v}'.", file=sys.stderr)
             return 2
         if not mod.AVAILABLE:
             install = VENDOR_INSTALL.get(v, v)

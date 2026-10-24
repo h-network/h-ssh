@@ -152,6 +152,12 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 
 ## Transports
 
+A target names a *driver*: one dialect (what the device speaks) on one transport (how it is reached).
+The canonical name is `dialect@transport` — `junos@netconf`, `ios@telnet` — and the names in the
+table below are its aliases; both work in a target, a CSV and a job file. The driver declares what it
+can be asked (`hssh.drivers`): the runner refuses `--rollback`, `--format`, `--comment`, `--dry-run`
+on an edit or `--commit-confirmed` where the driver does not list them, before any device is touched.
+
 | Vendor | Transport | Library | Show | Edit |
 |---|---|---|---|---|
 | `junos` | NETCONF | junos-eznc | PyEZ `Device.cli()` | PyEZ lock/load/diff/commit |
@@ -601,8 +607,12 @@ h-ssh/
 │   │   ├── audit.py         # JSONL audit trail
 │   │   ├── errors.py        # NotAppliedError, AmbiguousCommitError — what the retry logic keys on
 │   │   ├── commands/        # per-vendor template library: junos.json, ssh.json, arista.json (EOS shortcuts, for the dialect to come)
+│   │   ├── drivers/
+│   │   │   ├── base.py      # Dialect, Transport, Driver and the capability words
+│   │   │   ├── __init__.py  # the registry: dialect@transport names, today's names as aliases
+│   │   │   └── contract.py  # what a module must offer to back a driver's `supports`
 │   │   └── vendors/
-│   │       ├── __init__.py  # VENDORS: transport name → module
+│   │       ├── __init__.py  # VENDORS: today's vendor name → module (the drivers' shim)
 │   │       ├── junos.py     # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
 │   │       ├── generic.py   # paramiko SSH
 │   │       ├── openssh.py   # the OpenSSH binary — zero dependencies
