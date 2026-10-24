@@ -459,3 +459,18 @@ def refusal_line(*texts: str, dialect=None):
         if m:
             return (text[m.start():].strip().splitlines() or [""])[0].strip()
     return None
+
+
+def refused_reply(*texts: str, dialect=None):
+    """The refusal a show got instead of an answer, or None. A CLI that
+    refuses a show says so first: Junos answers "error: syntax error, …"
+    and nothing else, IOS a caret line then "% Invalid input …". So only a
+    refusal that opens the reply counts (blank and caret-only lines
+    skipped); "error:" further down is the device's output, as in a log."""
+    pattern = (dialect or drivers.NONE).refused
+    for text in texts:
+        for line in (text or "").splitlines():
+            if not line.strip() or set(line.strip()) == {"^"}:
+                continue
+            return line.strip() if pattern.match(line) else None
+    return None

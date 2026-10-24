@@ -400,3 +400,26 @@ def test_edit_is_failed_when_the_cli_refuses_a_line_and_exits_zero(exits_with):
 def test_a_show_that_prints_error_is_still_output(exits_with):
     exits_with(0, stdout=b"log: error: link down on ge-0/0/0 (%s)\n")
     assert "link down" in generic.show("10.0.0.1", "u", "p", "show log", 5, 10)
+    exits_with(0, stdout=b"Oct 24 12:00:00 r1 rpd[1]: up\nerror: link down on ge-0/0/0 (%s)\n")
+    assert "link down" in generic.show("10.0.0.1", "u", "p", "show log", 5, 10)
+
+
+def test_a_show_the_cli_refuses_at_exit_zero_is_failed(exits_with):
+    """#88: the Junos CLI over an exec channel writes its refusal to stdout
+    and exits 0; that is no answer, and NETCONF fails the same show."""
+    exits_with(0, stdout=b"error: unknown command: %s\n")
+    with pytest.raises(RuntimeError, match="'uptime' was refused by the device: error: unknown command: uptime"):
+        generic.show("10.0.0.1", "u", "p", "uptime", 5, 10)
+    exits_with(0, stdout=b"          ^\n%% Invalid input detected at '^' marker. (%s)\n")
+    with pytest.raises(RuntimeError, match="'show versionx' was refused by the device: % Invalid input"):
+        generic.show("10.0.0.1", "u", "p", "show versionx", 5, 10)
+
+
+def test_a_batch_marks_the_refused_command_and_keeps_the_rest(exits_with):
+    exits_with(0, stdout=b"reply to %s\n")
+    ok = generic.show_batch("10.0.0.1", "u", "p", ["show version"], 5, 10)
+    assert ok[0]["ok"] and "reply to show version" in ok[0]["output"]
+    exits_with(0, stdout=b"error: unknown command: %s\n")
+    bad = generic.show_batch("10.0.0.1", "u", "p", ["uptime"], 5, 10)
+    assert bad == [{"command": "uptime", "ok": False,
+                    "error": "'uptime' was refused by the device: error: unknown command: uptime"}]

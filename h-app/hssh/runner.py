@@ -58,6 +58,9 @@ _PERMANENT = (
     "invalid command",
     "invalid input",
     "syntax error",
+    # The text transports' own verdict on a reply (#88): the same command
+    # gets the same refusal.
+    "was refused by the device",
     # The request itself is wrong: the same call cannot come out differently,
     # and each retry costs a full session timeout per device on a fleet.
     "no structured binding",                 # --structured on a command without one (junos)

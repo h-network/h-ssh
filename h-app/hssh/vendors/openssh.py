@@ -29,7 +29,7 @@ import tempfile
 import time
 from typing import List, Optional
 
-from ..core import refusal_line
+from ..core import refusal_line, refused_reply
 
 AVAILABLE = shutil.which("ssh") is not None
 
@@ -315,10 +315,11 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
                     raise RuntimeError("SSH transport failed: %s" % exc)
                 if proc.returncode != 0:
                     raise RuntimeError(_describe_failure(host, proc))
-                # For an edit the reply counts as well as the exit status: a
-                # CLI that answers "error: ..." or "% ..." and exits 0 has
-                # refused the line (M6).
-                refused = refusal_line(proc.stderr, proc.stdout) if edit else None
+                # The reply counts as well as the exit status: a CLI that
+                # answers "error: ..." or "% ..." and exits 0 has refused the
+                # line (M6); a show whose reply opens that way got no answer.
+                refused = (refusal_line(proc.stderr, proc.stdout) if edit
+                           else refused_reply(proc.stderr, proc.stdout))
                 if refused:
                     raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
                 outputs.append(_format(cmd, proc))
@@ -387,9 +388,13 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                 try:
                     proc = _exec(host, user, askpass, cmd, session_timeout,
                                  command_timeout, port, control_path)
+                    refused = refused_reply(proc.stderr, proc.stdout) if proc.returncode == 0 else None
                     if proc.returncode != 0:
                         results.append({"command": cmd, "ok": False,
                                         "error": _describe_failure(host, proc)})
+                    elif refused:
+                        results.append({"command": cmd, "ok": False,
+                                        "error": "'%s' was refused by the device: %s" % (cmd, refused)})
                     else:
                         results.append({"command": cmd, "ok": True,
                                         "output": _format(cmd, proc)})

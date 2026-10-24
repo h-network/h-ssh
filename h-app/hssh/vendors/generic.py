@@ -19,7 +19,7 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
-from ..core import refusal_line
+from ..core import refusal_line, refused_reply
 
 try:
     import paramiko
@@ -248,9 +248,10 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
 def _run_commands(host: str, user: str, passwd: str, commands: List[str],
                   session_timeout: int, command_timeout: int, port: int = None,
                   edit: bool = False) -> str:
-    """Execute commands via SSH on any device. For an edit the reply is read
-    as well as the exit status: a CLI that answers "error: ..." or "% ..."
-    and exits 0 has refused the line, and the edit stops there."""
+    """Execute commands via SSH on any device. The reply is read as well as
+    the exit status: a CLI that answers "error: ..." or "% ..." and exits 0
+    has refused the line, and the edit stops there; a show whose reply opens
+    that way got no answer, and is failed rather than reported as output."""
     client = _connect(host, user, passwd, session_timeout, port)
 
     try:
@@ -261,7 +262,7 @@ def _run_commands(host: str, user: str, passwd: str, commands: List[str],
             # a failure; some network OSes never send one.
             if rc > 0:
                 raise RuntimeError(_describe_failure(cmd, rc, out, err))
-            refused = refusal_line(err, out) if edit else None
+            refused = refusal_line(err, out) if edit else refused_reply(err, out)
             if refused:
                 raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
             outputs.append(_format(cmd, out, err))
@@ -280,9 +281,13 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
         for cmd in cmds:
             try:
                 rc, out, err = _exec(client, cmd, command_timeout)
+                refused = refused_reply(err, out) if rc <= 0 else None
                 if rc > 0:
                     results.append({"command": cmd, "ok": False,
                                     "error": _describe_failure(cmd, rc, out, err)})
+                elif refused:
+                    results.append({"command": cmd, "ok": False,
+                                    "error": "'%s' was refused by the device: %s" % (cmd, refused)})
                 else:
                     results.append({"command": cmd, "ok": True, "output": _format(cmd, out, err)})
             except Exception as e:
