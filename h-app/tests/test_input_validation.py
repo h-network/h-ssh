@@ -176,3 +176,15 @@ def test_a_closed_stdout_is_not_a_terminal_and_not_a_traceback(monkeypatch):
 def test_a_whitespace_command_is_refused(monkeypatch, capsys, flag):
     rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", flag, "   "])
     assert rc == 2 and f"{flag} is empty" in err
+
+
+def test_a_target_that_still_says_arista_is_refused_before_any_device(monkeypatch, capsys):
+    """#79: eAPI is gone; the old vendor name is not 'unknown', it is retired, and the line says what to use."""
+    import asyncio
+    from hssh import cli
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
+                                      "--target", "SW1:10.0.0.1:arista", "-sC", "show version"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 2
+    assert "ERROR: vendor 'arista' (eAPI over HTTPS) is no longer supported; EOS devices use the ssh or openssh transport" in err

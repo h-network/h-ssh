@@ -6,14 +6,14 @@
 
 [![License: PolyForm Noncommercial 1.0.0](assets/badges/license.svg)](LICENSE)
 ![Python 3.10+](assets/badges/python.svg)
-![Vendors: junos arista ssh openssh telnet](assets/badges/vendors.svg)
+![Vendors: junos ssh openssh telnet](assets/badges/vendors.svg)
 ![Runtime dependency: paramiko only](assets/badges/deps.svg)
 
 </div>
 
 # h-ssh
 
-`h-ssh` runs commands across a fleet of network devices: one device or three hundred, Juniper, Arista, any SSH host, or a console
+`h-ssh` runs commands across a fleet of network devices: one device or three hundred, Juniper, any SSH host, or a console
 still speaking telnet. Devices are worked in parallel, results are collected per device, and one dead box does not sink a show
 run; an edit run checks every target is reachable first and refuses to start a partial deployment.
 
@@ -28,11 +28,11 @@ lands in a JSONL audit trail.
 
 ## Features
 
-- **Five transports, one interface.** Juniper (PyEZ over NETCONF), Arista (eAPI), any SSH host through paramiko or the system `ssh` binary, and raw-socket telnet with IOS-, Junos-, Arista- and NX-OS-flavoured prompt handling. Same flags whichever you point it at; the ones only a Junos transport can honour (`--dry-run` on an edit, `--show-diff`, `--commit-confirmed`, and over NETCONF `--comment`, `--format`, `--rollback`, `--commit-status`) are refused on the others before anything is sent, never faked.
+- **Four transports, one interface.** Juniper (PyEZ over NETCONF), any SSH host through paramiko or the system `ssh` binary, and raw-socket telnet with IOS-, Junos-, Arista- and NX-OS-flavoured prompt handling. Same flags whichever you point it at; the ones only a Junos transport can honour (`--dry-run` on an edit, `--show-diff`, `--commit-confirmed`, and over NETCONF `--comment`, `--format`, `--rollback`, `--commit-status`) are refused on the others before anything is sent, never faked.
 - **Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
 - **One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
 - **Writes are gated.** Pre-flight reachability check, `y/N` confirmation, `--dry-run` that shows the diff without committing and `--commit-confirmed N` for changes that undo themselves unless you confirm within N minutes (both Junos), and an opt-in per-device rate limit and cooldown (`--safety-file`).
-- **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an Arista switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
+- **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an EOS switch each their own command. Drop your own in `~/.h-ssh/commands/{vendor}.json` to override.
 - **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely. A whole fleet run fits in one YAML file (`--run fleet.yaml`) that a pipeline step or a jump-host session runs as it is.
 - **Built for a maintenance, not just a run.** A session pool keeps one NETCONF session per router open for a whole script; `rpc()` and `--format json|xml` return the router's own data instead of CLI text; `begin()` holds a diffed candidate open until a gate decides; `--rollback N`, commit comments, `--commit-status` and `guarded_commit()` cover the commit-confirmed lifecycle without a `| match` in sight.
 - **One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
@@ -46,8 +46,8 @@ lands in a JSONL audit trail.
                     ▼                          │           show/edit → PyEZ NETCONF
         ┌───────────────────────┐              │                  lock → load → diff
         │ safety gate (opt-in)  │              │                  → commit → unlock
-        │ rate limit 10/device  │──▶ workers ──┼─ arista   eAPI over HTTPS
-        │ cooldown 120s on fail │              ├─ ssh      exec_command
+        │ rate limit 10/device  │──▶ workers ──┼─ ssh      exec_command
+        │ cooldown 120s on fail │              │
         │ --safety-file, flock'd│              ├─ openssh  the ssh binary, no deps
         └───────────────────────┘              └─ telnet   raw TCP + prompt match
                     │                                          │
@@ -66,7 +66,6 @@ pip install -e .                  # core (paramiko) — SSH + telnet
                                   # nothing installable? the openssh transport
                                   # runs straight from the checkout, no deps
 pip install -e '.[junos]'         # + junos-eznc (NETCONF config)
-pip install -e '.[arista]'        # + pyeapi
 pip install -e '.[all]'           # + both
 pip install -e '.[dev]'           # + pytest, both vendor libs
 ```
@@ -79,7 +78,7 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 # show command across two routers, inline targets
 ./h-app/h-ssh.py --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
-# ... or from a CSV inventory, as JSON (the sample inventory has junos, arista and ssh rows: needs `.[all]` and a password)
+# ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows: needs `.[junos]` and a password)
 ./h-app/h-ssh.py --user admin --json -sC "show version" --devices h-app/devices.csv
 
 # compare one command's output across the fleet
@@ -101,7 +100,7 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 
 Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints); an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device.Each device is listed once: the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
 
-**A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` or `arista` on the target to get NETCONF or eAPI, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
+**A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` on the target to get NETCONF, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
 ### Authentication
 
@@ -156,7 +155,6 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 | Vendor | Transport | Library | Show | Edit |
 |---|---|---|---|---|
 | `junos` | NETCONF | junos-eznc | PyEZ `Device.cli()` | PyEZ lock/load/diff/commit |
-| `arista` | eAPI (HTTPS) | pyeapi | eAPI enable | eAPI `configure session` / diff / `commit` |
 | `ssh` | SSH | paramiko | `exec_command` | `exec_command` |
 | `openssh` | OpenSSH client | built-in | `ssh host cmd` | `ssh host cmd` |
 | `telnet` | Raw socket | built-in | raw TCP | config mode |
@@ -165,8 +163,7 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 | `telnet-arista` | Raw socket, EOS prompts | built-in | raw TCP | `configure terminal` |
 | `telnet-nxos` | Raw socket, NX-OS prompts | built-in | raw TCP | `configure terminal` |
 
-Every transport runs a batch on one session per device; eAPI is HTTP, so there each command is its own
-request on the same node.
+Every transport runs a batch on one session per device.
 
 Telnet is a prompt match on a raw socket, so it is strict about what it has not seen. A read that reaches
 its timeout or loses the connection is an error, never a partial reply passed off as the device's answer,
@@ -223,13 +220,6 @@ per-host identities work with no extra flags. Host key policy defaults to `accep
 Two limits, both deliberate: `--structured` has no bindings here, and `--commit-confirmed` is
 rejected rather than silently ignored — as it is on every transport but `junos` and `telnet-junos`,
 the two that can arm a rollback timer; dropping the timer without saying so would be worse than refusing.
-
-### `arista` — eAPI over HTTPS
-
-The switch's certificate is verified against the system CAs. A lab CA goes in
-`HSSH_EAPI_CA=/path/ca.pem`; a self-signed switch needs `HSSH_EAPI_VERIFY=no`, an explicit choice
-where pyeapi's own default is to verify nothing. `session_timeout` covers the TCP and TLS handshake,
-`command_timeout` each request after it.
 
 Edits run in an EOS configure session: the lines load into the session, its diff comes back, and
 `commit` makes them live together. A rejected line aborts the session and leaves running-config as
@@ -376,7 +366,7 @@ classified before anything is retried:
 
 | Failure | Behaviour |
 |---|---|
-| Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh`, `telnet*` and `arista` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker) |
+| Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh` and `telnet*` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker) |
 | Authentication, host key, rejected command (and an unresolvable name on `junos`/`openssh`) | fail immediately |
 | The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
 | Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2) |
@@ -384,7 +374,7 @@ classified before anything is retried:
 The split is whether a connection was established. A connect-phase failure has already spent the
 full `ConnectTimeout`; spending it twice more is what lets one dead device dominate a fleet run.
 Unreachable means unreachable for the duration of the run on the transports that report it as such
-(`junos`, `openssh`); `ssh`, `telnet*` and `arista` still spend `--retries` extra connect timeouts on a dead
+(`junos`, `openssh`); `ssh` and `telnet*` still spend `--retries` extra connect timeouts on a dead
 or unresolvable host. Once a session exists, a read failure may well be transient, so those still get retried. **Edits are different:** a config push is retried only when
 the driver reports that nothing reached the device (for Junos: a candidate-lock failure, over NETCONF
 or a refused `configure exclusive`; a connect failure is unreachable like any other and stops at one).
@@ -446,7 +436,7 @@ Exit codes: `0` success (also when the operator answers N) · `1` a device faile
 
 ## Structured output
 
-`--structured` returns parsed data instead of text where the vendor can provide it. The fallback is per transport, not per command: `ssh`, `openssh` and `telnet*` have no `show_structured`, so they return text as usual; on `junos` a shortcut without a `structured` binding (or a typed command) fails for that device, and on `arista` every command is asked as JSON, so one eAPI cannot render fails. There is no capability list to maintain — a vendor module either implements `show_structured` or it doesn't, and that absence *is* the fallback signal.
+`--structured` returns parsed data instead of text where the vendor can provide it. The fallback is per transport, not per command: `ssh`, `openssh` and `telnet*` have no `show_structured`, so they return text as usual; on `junos` a shortcut without a `structured` binding (or a typed command) fails for that device. There is no capability list to maintain — a vendor module either implements `show_structured` or it doesn't, and that absence *is* the fallback signal.
 
 ```bash
 ./h-app/h-ssh.py --user admin -sC bgp --structured --json --target R1:10.0.1.1:junos
@@ -454,7 +444,6 @@ Exit codes: `0` success (also when the operator answers N) · `1` a device faile
 
 | Vendor | Mechanism | Notes |
 |---|---|---|
-| `arista` | eAPI JSON | The same request — eAPI already answers in JSON, the text path just flattens it |
 | `junos` | PyEZ Table/View over NETCONF | A **different** request: the binding names an RPC, so this is not a parse of the CLI output |
 | `ssh`, `openssh`, `telnet` | — | No bindings; always text |
 
@@ -476,7 +465,7 @@ Bindings live in the same `h-app/commands/{vendor}.json` entry as the command, u
 }
 ```
 
-Output is **vendor-shaped, not normalised** — `bgp` returns the binding's fields (`remote_as`, `is_up`, …) keyed by peer address on a router and eAPI's own JSON on a switch. Nothing here promises the two match, which is why there's no cross-vendor schema to keep in sync. Add bindings one command at a time; without `--structured`, commands without one keep working exactly as before — with it, a junos command without a binding is an error, not text.
+Output is **vendor-shaped, not normalised** — `bgp` returns the binding's fields (`remote_as`, `is_up`, …) keyed by peer address on a router. Nothing here promises two vendors match, which is why there's no cross-vendor schema to keep in sync. Add bindings one command at a time; without `--structured`, commands without one keep working exactly as before — with it, a junos command without a binding is an error, not text.
 
 `--format json` (or `xml`) needs no binding at all: the router is asked for its RPC translation of the
 CLI command (what `| display xml rpc` does) and the reply comes back as the router produces it — the
@@ -611,11 +600,10 @@ h-ssh/
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
 │   │   ├── errors.py        # NotAppliedError, AmbiguousCommitError — what the retry logic keys on
-│   │   ├── commands/        # per-vendor template library: arista.json, junos.json, ssh.json (shipped with the package)
+│   │   ├── commands/        # per-vendor template library: junos.json, ssh.json, arista.json (EOS shortcuts, for the dialect to come)
 │   │   └── vendors/
 │   │       ├── __init__.py  # VENDORS: transport name → module
 │   │       ├── junos.py     # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
-│   │       ├── arista.py    # eAPI
 │   │       ├── generic.py   # paramiko SSH
 │   │       ├── openssh.py   # the OpenSSH binary — zero dependencies
 │   │       └── telnet.py    # raw socket, per-flavour prompt handling

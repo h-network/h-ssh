@@ -27,9 +27,6 @@ def test_junos_binding_is_an_rpc_definition():
     assert "remote_as" in b["fields"]
 
 
-def test_arista_binding_is_a_bare_marker():
-    """eAPI needs no field map, so the binding carries no structure."""
-    assert resolve_structured("bgp", "arista") == {}
 
 
 def test_no_binding_where_none_declared():
@@ -45,7 +42,6 @@ def test_multi_word_command_has_no_binding():
 def test_capability_is_module_attribute_presence():
     """runner.py branches on hasattr, so absence is the fallback signal."""
     assert hasattr(vendors.get("junos"), "show_structured")
-    assert hasattr(vendors.get("arista"), "show_structured")
     assert not hasattr(vendors.get("ssh"), "show_structured")
     assert not hasattr(vendors.get("telnet"), "show_structured")
     assert not hasattr(vendors.get("telnet-ios"), "show_structured")
