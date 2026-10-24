@@ -636,3 +636,69 @@ def test_close_all_closes_sessions_side_by_side(monkeypatch):
     t0 = time.monotonic()
     p.close_all(shutdown=False)
     assert len(closed) == 20 and p.live() == 0 and time.monotonic() - t0 < 2.0
+
+
+# --- #58: a closed session's descriptors are released with the session -------------
+
+class _PipeDevice:
+    """A device whose descriptors live and die with it, like ncclient's selector."""
+
+    def __init__(self):
+        self.r, self.w = os.pipe()
+        self.connected = True
+
+    def __del__(self):
+        for fd in (self.r, self.w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _close_in_a_cycle(dev):
+    """What ncclient's reader thread leaves behind: the frame that closed the
+    session survives in a cycle with the exception that ended its loop."""
+    dev.connected = False
+    try:
+        raise RuntimeError("session closed")
+    except RuntimeError as e:
+        dev.cycle = (dev, e)             # dev -> tuple -> exception -> traceback -> frame -> dev
+
+
+def _fd_open(fd):
+    try:
+        os.fstat(fd)
+        return True
+    except OSError:
+        return False
+
+
+def test_close_all_releases_the_descriptors_of_closed_sessions_without_waiting_for_the_gc():
+    import gc
+    gc.disable()
+    try:
+        pool.enable(idle_timeout=300)
+        fds = []
+        for i in range(5):
+            with pool.POOL.get_connection(("p", i), opener=_PipeDevice, closer=_close_in_a_cycle) as lease:
+                fds += [lease.dev.r, lease.dev.w]
+            del lease                      # the test holds no reference; only the pool does
+        assert all(_fd_open(fd) for fd in fds)
+        pool.close_all()
+        assert not any(_fd_open(fd) for fd in fds), "descriptors outlived close_all"
+    finally:
+        gc.enable()
+
+
+def test_the_reaper_releases_the_descriptors_of_what_it_closed():
+    import gc
+    gc.disable()
+    try:
+        pool.enable(idle_timeout=1)
+        with pool.POOL.get_connection(("p", "idle"), opener=_PipeDevice, closer=_close_in_a_cycle) as lease:
+            fds = [lease.dev.r, lease.dev.w]
+        del lease
+        assert pool.reap(now=time.time() + 5) == 1
+        assert not any(_fd_open(fd) for fd in fds)
+    finally:
+        gc.enable()

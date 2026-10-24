@@ -26,6 +26,7 @@ What a library needs on top, and only that:
 
 import atexit
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import logging
 import os
 import threading
@@ -330,6 +331,8 @@ class ConnectionPool:
                     log.info("Pool: closed idle connection to %s (idle %.0fs)", key, idle)
             finally:
                 entry["lock"].release()
+        if closed:
+            _release_closed_sessions()
         return closed
 
     reap = _cleanup_idle
@@ -378,7 +381,19 @@ class ConnectionPool:
         else:
             for item in live:
                 close_one(item)
+        if live:
+            _release_closed_sessions()
         log.info("Connection pool: all connections closed")
+
+
+def _release_closed_sessions() -> None:
+    """A closed ncclient session keeps one descriptor until the garbage
+    collector runs: its reader thread's selector (an epoll fd) is a local of
+    a frame that survives in a reference cycle with the exception that ended
+    the loop (#58). Five hundred closed sessions are five hundred fds until
+    the next full collection; one collection here, after the closes, frees
+    them now. Once per close_all() or reaper pass, never per session."""
+    gc.collect()
 
 
 SessionPool = ConnectionPool   # the name the first h-ssh pool had
