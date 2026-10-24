@@ -22,7 +22,7 @@ from .core import (
     Target, load_devices_csv, load_config, get_config_path,
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
-    load_jobs, parse_jobs, resolve_target_port, validate_junos_set_syntax, check_unique,
+    load_jobs, parse_jobs, resolve_target_port, check_unique,
     check_confirm_minutes,
 
     path_inside,
@@ -290,9 +290,21 @@ def get_default_devices_path() -> str:
     return "devices.csv"
 
 
+def edit_guard(vendor: str):
+    """The dialect whose `check_edit` an edit payload for this vendor must
+    pass, or None: a dialect without a guard, or a vendor name the check
+    further down will report as unknown."""
+    try:
+        dialect = drivers.get(vendor).dialect
+    except ValueError:
+        return None
+    return dialect if dialect.check_edit else None
+
+
 async def check_reachability(target, timeout: int = 2) -> tuple:
     """Quick reachability check for a target."""
     port = resolve_target_port(target)
+    banner = drivers.get(target.vendor).transport.banner
 
     loop = asyncio.get_running_loop()
     try:
@@ -303,13 +315,14 @@ async def check_reachability(target, timeout: int = 2) -> tuple:
                 timeout=timeout,
             )
             try:
-                if drivers.get(target.vendor).transport.over_ssh:
+                if banner:
                     # A port that accepts and closes (a NAT in front of a dead
                     # container, sshd at its connection limit) is not a device:
-                    # the SSH banner is.
-                    banner = await asyncio.wait_for(reader.readline(), timeout=timeout)
-                    if not banner.startswith(b"SSH-"):
-                        return (target.name, False, f"port {port} open but no SSH banner")
+                    # the transport's banner is.
+                    first = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                    if not first.startswith(banner):
+                        return (target.name, False,
+                                f"port {port} open but no {banner.decode('ascii', 'replace').rstrip('-')} banner")
             finally:
                 writer.close()
                 await writer.wait_closed()
@@ -534,10 +547,11 @@ async def main() -> int:
         has_edits = any(e.mode.startswith("edit") for e in job_entries)
         mode = "job"
         for je in job_entries:
-            if je.target.vendor in ("junos", "telnet-junos") and je.mode.startswith("edit"):
-                valid, err = validate_junos_set_syntax(je.command, allow_commit=True)
+            guard = edit_guard(je.target.vendor)
+            if guard and je.mode.startswith("edit"):
+                valid, err = guard.check_edit(je.command, allow_commit=True)
                 if not valid:
-                    print(f"ERROR: Junos job command for '{je.target.name}' only accepts set-style commands: {err}", file=sys.stderr)
+                    print(f"ERROR: {guard.title} job command for '{je.target.name}' only accepts set-style commands: {err}", file=sys.stderr)
                     return 2
     else:
         # Determine mode
@@ -598,30 +612,37 @@ async def main() -> int:
             print(f"ERROR: {'inline targets' if args.target else args.devices}: {e}", file=sys.stderr)
             return 2
 
-        # Junos set-syntax check keys off the targets, not a global flag —
+        # The edit guard keys off the targets' dialects, not a global flag —
         # a mixed inventory can have some devices that care and some that don't.
         broadcast_text = None
         edit_payloads = {}
-        has_junos = any(t.vendor in ("junos", "telnet-junos") for t in targets)
-        if has_junos:
+        guards = {}
+        for t in targets:
+            guard = edit_guard(t.vendor)
+            if guard:
+                guards[guard.name] = guard
+        if guards:
             if args.edit_command:
-                valid, err = validate_junos_set_syntax(args.edit_command, allow_commit=True)
-                if not valid:
-                    print(f"ERROR: Junos -eC only accepts 'set ...' commands: {err}", file=sys.stderr)
-                    return 2
+                for guard in guards.values():
+                    valid, err = guard.check_edit(args.edit_command, allow_commit=True)
+                    if not valid:
+                        print(f"ERROR: {guard.title} -eC only accepts 'set ...' commands: {err}", file=sys.stderr)
+                        return 2
             elif args.edit_broadcast:
                 try:
                     b_content = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
                 except Exception as e:
                     print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
                     return 2
-                valid, err = validate_junos_set_syntax(b_content, allow_commit=False)
-                if not valid:
-                    print(f"ERROR: Junos broadcast file '{args.edit_broadcast}' only accepts 'set ...' commands: {err}", file=sys.stderr)
-                    return 2
+                for guard in guards.values():
+                    valid, err = guard.check_edit(b_content, allow_commit=False)
+                    if not valid:
+                        print(f"ERROR: {guard.title} broadcast file '{args.edit_broadcast}' only accepts 'set ...' commands: {err}", file=sys.stderr)
+                        return 2
             elif args.edit_dir:
                 for t in targets:
-                    if t.vendor in ("junos", "telnet-junos"):
+                    guard = edit_guard(t.vendor)
+                    if guard:
                         set_file = path_inside(args.edit_dir, f"{t.name}.set")
                         if set_file.is_file():
                             try:
@@ -629,9 +650,9 @@ async def main() -> int:
                             except Exception as e:
                                 print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
                                 return 2
-                            valid, err = validate_junos_set_syntax(d_content, allow_commit=False)
+                            valid, err = guard.check_edit(d_content, allow_commit=False)
                             if not valid:
-                                print(f"ERROR: Junos config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
+                                print(f"ERROR: {guard.title} config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
                                 return 2
 
         # The payloads, read once here and handed to the runner and the audit

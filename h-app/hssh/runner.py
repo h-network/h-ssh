@@ -142,14 +142,6 @@ def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
     return _retry_loop(fn, name, quiet, max_attempts, lambda e: True, *args, **kwargs)
 
 
-def is_read_command(command: str) -> bool:
-    """A `show …` command or a `get-*` RPC name reads; anything else
-    (`request …`, `clear …`, `restart …`, a request-* RPC) acts on the device
-    and is sent once, never re-sent by a retry."""
-    text = command.strip().lower()
-    return text.startswith("show ") or text.startswith("get") or text == "show"
-
-
 class Bound(NamedTuple):
     """The driver a target resolved to: the module that does the work, the
     name the operator used (for messages), what it may be asked, and the
@@ -158,6 +150,7 @@ class Bound(NamedTuple):
     vendor: str
     caps: frozenset
     hint: str
+    dialect: object
 
 
 def bind(vendor: str) -> Bound:
@@ -170,7 +163,7 @@ def bind(vendor: str) -> Bound:
     a commit that cannot really arm a rollback timer."""
     driver = drivers.get(vendor)
     mod = drivers.module_of(driver)
-    return Bound(mod, vendor, drivers.supports_of(driver, mod), driver.shim)
+    return Bound(mod, vendor, drivers.supports_of(driver, mod), driver.shim, driver.dialect)
 
 
 def _comment_kwargs(b: Bound, comment):
@@ -321,7 +314,7 @@ def _run_for_target_sync(
             # neighbor`) is sent once: a timeout after it must not mean two
             # more reboots. --format turns the text into an RPC and sends it
             # with no gate at all, so there it is refused outright.
-            read = is_read_command(show_cmd)
+            read = b.dialect.is_read(show_cmd)
             attempts = max_attempts if read else 1
             if dry_run:
                 result = f"DRY-RUN show: {show_cmd}"
@@ -422,7 +415,7 @@ def _run_for_target_sync(
             output.append(result.rstrip())
 
         elif mode == "show-batch":
-            if batch_cmds and not all(is_read_command(c) for c in batch_cmds):
+            if batch_cmds and not all(b.dialect.is_read(c) for c in batch_cmds):
                 max_attempts = 1
             if not batch_cmds:
                 raise ValueError("No batch commands provided.")

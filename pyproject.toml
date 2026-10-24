@@ -36,7 +36,7 @@ where = ["h-app"]
 include = ["hssh*"]
 
 [tool.setuptools.package-data]
-hssh = ["commands/*.json"]
+hssh = ["dialects/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["h-app"]

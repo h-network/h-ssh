@@ -21,7 +21,8 @@ import time
 from contextlib import contextmanager
 from typing import List, Optional
 
-from ..core import JUNOS_SET_PREFIX_VERBS, check_confirm_minutes
+from ..core import check_confirm_minutes
+from ..dialects.junos import SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS, COMMIT_PENDING as _PENDING
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
 from ..pool import POOL
 
@@ -903,7 +904,6 @@ def rpc_batch(host: str, user: str, passwd: str, cmds: List[str],
     return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
 
 
-_PENDING = re.compile(r"rollback in (\d+)\s*min", re.I)
 
 
 def commit_status(host: str, user: str, passwd: str,

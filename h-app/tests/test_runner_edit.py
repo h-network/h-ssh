@@ -427,7 +427,9 @@ def test_format_refuses_an_rpc_that_is_not_a_read(monkeypatch):
 
 
 def test_is_read_command():
+    """The default read rule now lives with the dialects; every dialect uses it today."""
+    from hssh import dialects
     for cmd in ("show version", "get-chassis-inventory", "get_system_information", "SHOW route", "show"):
-        assert runner.is_read_command(cmd)
+        assert dialects.is_read(cmd) and all(d.is_read(cmd) for d in dialects.ALL)
     for cmd in ("request system reboot", "clear bgp neighbor", "restart routing", "request-system-reboot", "file delete x"):
-        assert not runner.is_read_command(cmd)
+        assert not dialects.is_read(cmd) and not any(d.is_read(cmd) for d in dialects.ALL)

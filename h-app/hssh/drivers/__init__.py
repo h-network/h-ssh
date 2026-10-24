@@ -9,6 +9,7 @@ import importlib
 
 from .base import (Dialect, Transport, Driver, CAPABILITIES, METHOD_CAPABILITIES,
                    POLICY_CAPABILITIES)
+from .. import dialects as _dialects
 
 __all__ = ["Dialect", "Transport", "Driver", "CAPABILITIES", "METHOD_CAPABILITIES",
            "POLICY_CAPABILITIES", "DIALECTS", "TRANSPORTS", "DRIVERS", "ALIASES", "RETIRED",
@@ -16,13 +17,13 @@ __all__ = ["Dialect", "Transport", "Driver", "CAPABILITIES", "METHOD_CAPABILITIE
 
 # --- dialects -----------------------------------------------------------------
 
-JUNOS = Dialect("junos", "Junos: set syntax, candidate configuration, commit confirmed")
-IOS = Dialect("ios", "Cisco IOS and IOS-XE")
-NXOS = Dialect("nxos", "Cisco NX-OS")
-EOS = Dialect("eos", "Arista EOS")
-NONE = Dialect("none", "no vendor knowledge: a line in, its text out")
+JUNOS = _dialects.junos.DIALECT
+IOS = _dialects.ios.DIALECT
+NXOS = _dialects.nxos.DIALECT
+EOS = _dialects.eos.DIALECT
+NONE = _dialects.none.DIALECT
 
-DIALECTS = {d.name: d for d in (JUNOS, IOS, NXOS, EOS, NONE)}
+DIALECTS = {d.name: d for d in _dialects.ALL}
 
 # --- transports ---------------------------------------------------------------
 
@@ -35,7 +36,7 @@ OPENSSH = Transport("openssh", "the OpenSSH client", module="hssh.vendors.openss
                     install="the OpenSSH client ('ssh' on PATH)", default_port=22)
 # Legacy fallback (2026-10-24): it inherits dialects and fixes, nothing else.
 TELNET = Transport("telnet", "telnet", module="hssh.vendors.telnet", install="(built-in)",
-                   default_port=23, over_ssh=False, frozen=True)
+                   default_port=23, banner=None, frozen=True)
 
 TRANSPORTS = {t.name: t for t in (NETCONF, SSH, OPENSSH, TELNET)}
 

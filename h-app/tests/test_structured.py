@@ -11,7 +11,11 @@ from hssh import vendors
 def test_same_shortcut_resolves_per_vendor():
     """The point of per-target resolution: one name, two vendor commands."""
     assert resolve_command("bgp", "junos") == "show bgp summary | no-more"
-    assert resolve_command("bgp", "arista") == "show ip bgp summary"
+    # The EOS library follows the dialect: every eos@… driver, by either name.
+    assert resolve_command("bgp", "telnet-arista") == "show ip bgp summary"
+    assert resolve_command("bgp", "eos@telnet") == "show ip bgp summary"
+    # And the retired eAPI vendor name has none.
+    assert resolve_command("bgp", "arista") == "bgp"
 
 
 def test_unknown_shortcut_passes_through():
@@ -55,7 +59,7 @@ def test_vendorless_target_is_ssh_not_junos():
 
 def test_every_declared_binding_is_well_formed():
     """A junos binding must carry what FactoryLoader needs."""
-    for path in (Path(__file__).resolve().parent.parent / "commands").glob("*.json"):
+    for path in (Path(__file__).resolve().parent.parent / "hssh" / "dialects").glob("*.json"):
         entries = json.loads(path.read_text())
         for name, entry in entries.items():
             if not isinstance(entry, dict) or "structured" not in entry:

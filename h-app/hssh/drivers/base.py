@@ -8,12 +8,14 @@ that set, never the module, before it touches a device.
 
 Nothing here opens a connection. The modules under hssh.vendors still do the
 work; the registry in hssh.drivers maps each driver to the module it wraps
-until the transports and dialects move into packages of their own (#81, #83,
-#84). Dialects carry no knowledge yet: that moves in with #81.
+until the transports move into a package of their own (#83, #84). Dialects
+live in hssh.dialects; `Dialect` is re-exported here for the registry.
 """
 
 from dataclasses import dataclass
-from typing import FrozenSet, Tuple
+from typing import FrozenSet, Optional, Tuple
+
+from ..dialects.base import CliSyntax, Dialect  # noqa: F401  (re-exported)
 
 # A capability is a word the runner asks for. The first group names a function
 # the module has: the contract (hssh.drivers.contract) checks it exists and
@@ -30,15 +32,6 @@ CAPABILITIES = METHOD_CAPABILITIES | POLICY_CAPABILITIES
 
 
 @dataclass(frozen=True)
-class Dialect:
-    """What the device speaks. Vendor knowledge (shortcuts, the set-syntax
-    guard, refusal patterns, prompts, the config-mode sequence) lands here with
-    #81; today a dialect is a name the driver carries."""
-    name: str
-    description: str
-
-
-@dataclass(frozen=True)
 class Transport:
     """How a device is reached."""
     name: str
@@ -47,7 +40,7 @@ class Transport:
     install: str                 # what is missing when that module says AVAILABLE = False
     default_port: int
     formats: Tuple[str, ...] = ("text",)   # device-side formats it can ask for (--format)
-    over_ssh: bool = True        # an SSH banner proves the port is a device (pre-flight)
+    banner: Optional[bytes] = b"SSH-"   # what the port must say to be a device (pre-flight); None: open is enough
     pooled: bool = False         # sessions can outlive one command (hssh.pool)
     frozen: bool = False         # kept working, gets nothing new
 
