@@ -702,3 +702,35 @@ def test_the_reaper_releases_the_descriptors_of_what_it_closed():
         assert not any(_fd_open(fd) for fd in fds)
     finally:
         gc.enable()
+
+
+# --- #59: a refused probe is a live session ------------------------------------------
+
+def test_a_probe_the_router_refuses_keeps_the_session(pooled, monkeypatch):
+    """cRPD answers the uptime RPC with 'command is not valid on the crpd':
+    the router replied, so the session is alive and reused, not replaced."""
+    monkeypatch.setattr(junos, "PROBE_AFTER", 0)
+
+    class Rpc:
+        def get_system_uptime_information(self, **kw):
+            raise junos.RpcError("command is not valid on the crpd")
+
+    show()
+    devices()[0].rpc = Rpc()
+    show()
+    assert pooled.stats == {"opens": 1, "reuses": 1, "discards": 0, "reaped": 0}
+    assert len(devices()) == 1 and not devices()[0].closed
+
+
+def test_a_probe_that_times_out_still_means_dead(pooled, monkeypatch):
+    monkeypatch.setattr(junos, "PROBE_AFTER", 0)
+
+    class Rpc:
+        def get_system_uptime_information(self, **kw):
+            raise rpc_timeout("get-system-uptime-information")
+
+    show()
+    devices()[0].rpc = Rpc()
+    show()
+    assert pooled.stats["opens"] == 2 and pooled.stats["discards"] == 1
+    assert devices()[0].closed and not devices()[1].closed
