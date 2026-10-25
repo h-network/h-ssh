@@ -53,3 +53,8 @@ wheels/
 
 # Local scripts and data of whoever uses h-ssh from a checkout (not part of the tool)
 scripts/
+
+# the result store a run leaves in the directory it ran from
+h-ssh.db
+h-ssh.db-wal
+h-ssh.db-shm

@@ -96,6 +96,10 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 
 # a console server still speaking telnet
 ./h-app/h-ssh.py --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
+
+# every run is kept in ./h-ssh.db, as the devices answered; read it back
+h-ssh-store runs
+h-ssh-store output R1
 ```
 
 Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints); an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device.Each device is listed once: the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
@@ -497,20 +501,24 @@ both drop it, and `--json` reports it as its own `command` field instead of repe
 
 ### The result store
 
-`--store runs.db` (or `HSSH_STORE=runs.db`) keeps every command's reply in one SQLite file, run after
-run: one row per command per device — run, device, host, driver, the command as sent, when, OK or
-not, the duration, the error, the format (`text`, `xml`, `json`) and the device's own reply. A show
+Every run is kept. The store is `h-ssh.db` in the directory you run from, so the evidence sits with
+the job (`cd customer-x && h-ssh ...`); `--store PATH`, `HSSH_STORE=PATH` or `store = PATH` in
+`~/.h-ssh/config` name another file, in that order of precedence, and `--no-store` keeps nothing of
+one run. One SQLite file, run after run: one row per command per device — run, device, host, driver,
+the command as sent, when, OK or not, the duration, the error, the format (`text`, `xml`, `json`) and
+the device's own reply. A show
 is one row, a `--batch` one row per command in order, an edit one row with the payload as the command
 and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON. A
 second table, `runs`, has one row per invocation: when it started and finished, the mode, what it was
 about, the whole command line, who ran it and from where, and the counts. Everything is kept as it
 came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
 a `show configuration` keeps its hashes. The file is created 0600, opened and its tables made before
-the first device, so an unusable path refuses the run with exit 2.
+the first device: a store that cannot be written is no run (exit 2, nothing sent), because a run
+nobody can look up afterwards is not worth having.
 
 The store holds output and nothing else: no parsing, no normalising, no per-command schema — what is
-done with the replies is the reader's business. `h-ssh-store` is the reader that ships, over the same
-file (`--store PATH` or `HSSH_STORE`):
+done with the replies is the reader's business. `h-ssh-store` is the reader that ships; it looks where
+the run wrote (`--store PATH`, `HSSH_STORE`, the config file's `store`, else `./h-ssh.db`):
 
 | Command | Prints |
 |---|---|
@@ -528,11 +536,11 @@ Anything else is a `sqlite3 runs.db` query away: the schema is two tables, docum
 `hssh/store.py`.
 
 ```console
-$ h-ssh --devices core.csv --store runs.db -sC "show bgp summary"
-$ h-ssh-store --store runs.db runs
+$ h-ssh --devices core.csv -sC "show bgp summary"
+$ h-ssh-store runs
 run                   started              mode  user   targets/ok/fail  command
 20261024-173057-e45e  2026-10-24T17:30:57  show  h-lab  10/10/0          show bgp summary
-$ h-ssh-store --store runs.db diff cr1 20261024-1730 20261023-0905
+$ h-ssh-store diff cr1 20261024-1730 20261023-0905
 ```
 
 ## Failure handling
@@ -596,7 +604,7 @@ ones (`--safety-file`, `--audit-log`, `--log`) apply to every mode once given.
 | Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite. The file and its `.lock` are created and locked once before the first device; a path that cannot be created, opened or locked (a missing directory, a symlink, a FIFO) refuses the run with exit 2 |
 | Audit trail | `--audit-log PATH` (or `HSSH_AUDIT_LOG`) | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`/`passwd`, `authentication-key`, `md5-key`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). One entry per device for every mode — shows included, without their output — plus pre-flight aborts and user cancellations; records diffs for edits. The file is opened once before the first device, so an unwritable path refuses the run before anything is sent (exit 2); in edit modes, audit write failures during the run fail it |
 | Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, one line as each device finishes, appended with the same 0600 mode and secret redaction as the audit trail, and probed before the first device like the audit log |
-| Result store | `--store PATH` (or `HSSH_STORE`) | Every command's reply in one SQLite file, as the device gave it, one row per command per device plus a row per run; 0600, nothing redacted (it is a snapshot to restore from); opened before the first device, so an unusable path refuses the run (exit 2). Read with `h-ssh-store` (see [The result store](#the-result-store)) |
+| Result store | *(always on)* `./h-ssh.db`; `--store PATH`, `HSSH_STORE`, `store =` in the config; `--no-store` | Every command's reply in one SQLite file, as the device gave it, one row per command per device plus a row per run; 0600, nothing redacted (it is a snapshot to restore from); opened before the first device, so a store that cannot be written is no run (exit 2). Read with `h-ssh-store` (see [The result store](#the-result-store)) |
 
 A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
 
@@ -784,7 +792,7 @@ h-ssh/
 │   │   ├── pool.py          # opt-in session pool for library use
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
-│   │   ├── store.py         # the result store (--store): SQLite writer and the h-ssh-store reader
+│   │   ├── store.py         # the result store (./h-ssh.db, every run): SQLite writer and the h-ssh-store reader
 │   │   ├── errors.py        # NotAppliedError, AmbiguousCommitError — what the retry logic keys on
 │   │   ├── dialects/        # what each device speaks, with its shortcut library next to it
 │   │   │   ├── base.py      # Dialect, CliSyntax, the default read rule
@@ -820,7 +828,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (853 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (857 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

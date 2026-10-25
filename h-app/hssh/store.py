@@ -1,12 +1,16 @@
 """The result store: every command's reply, as it came back, in one SQLite file.
 
-`--store runs.db` (or HSSH_STORE=runs.db) keeps one row per command per
-device: who ran what, when, against which device, whether it worked, how
-long it took, and the device's own reply, byte for byte. A snapshot one
-may have to restore from is kept as it came: nothing is redacted, parsed,
-normalised or modelled. The store holds output, and what is done with it
-is the reader's business (`h-ssh-store`, or any sqlite3 client). One file
-serves many runs, and replaces a directory of --save-output files.
+Every run is kept. The store is h-ssh.db in the directory h-ssh runs from,
+unless --store PATH, HSSH_STORE or `store = PATH` in ~/.h-ssh/config says
+another file; --no-store skips it for one run. A store that cannot be
+written is no run: it is opened before the first device is touched. One
+row per command per device: who ran what, when, against which device,
+whether it worked, how long it took, and the device's own reply, byte for
+byte. A snapshot one may have to restore from is kept as it came: nothing
+is redacted, parsed, normalised or modelled. The store holds output, and
+what is done with it is the reader's business (`h-ssh-store`, or any
+sqlite3 client). One file serves many runs, and replaces a directory of
+--save-output files.
 
 Two tables. `runs`: one row per h-ssh invocation (run_id, when it started
 and finished, the mode, the command line, who ran it, the counts).
@@ -31,6 +35,15 @@ import sys
 from typing import Iterable, List, Optional
 
 ENV_VAR = "HSSH_STORE"
+DEFAULT = "h-ssh.db"          # in the directory h-ssh runs from: the evidence sits with the job
+CONFIG_KEY = "store"          # `store = PATH` in ~/.h-ssh/config
+
+
+def where(flag: Optional[str] = None, config: Optional[dict] = None) -> str:
+    """The store a run writes and the reader reads: --store, else HSSH_STORE,
+    else the config file's `store`, else h-ssh.db in the current directory."""
+    return (flag or os.environ.get(ENV_VAR) or (config or {}).get(CONFIG_KEY)
+            or os.path.expanduser(DEFAULT))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -93,7 +106,8 @@ class Store:
         self.path = path
         if readonly:
             if not os.path.exists(path):
-                raise StoreError(f"{path}: no such store")
+                raise StoreError(f"no store at {path}: no run has been kept here "
+                                 f"(--store PATH or {ENV_VAR} for another file)")
             uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
             try:
                 self.conn = sqlite3.connect(uri, uri=True)
@@ -261,10 +275,14 @@ class Store:
 # --- the reader: h-ssh-store -----------------------------------------------------
 
 def _store_path(args) -> str:
-    path = args.store or os.environ.get(ENV_VAR)
-    if not path:
-        raise StoreError(f"no store given: --store PATH or {ENV_VAR}=PATH")
-    return path
+    """The reader looks where the run wrote: --store, HSSH_STORE, the config
+    file's `store`, else h-ssh.db here."""
+    try:
+        from .core import load_config
+        config = load_config()
+    except ValueError:
+        config = {}
+    return where(args.store, config)
 
 
 def _table(rows: Iterable[Iterable[str]], head: Iterable[str]) -> List[str]:
@@ -396,7 +414,8 @@ def cmd_slowest(store: Store, args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="h-ssh-store",
                                 description="Read what h-ssh --store kept: runs, failures, outputs, diffs.")
-    p.add_argument("--store", help=f"the SQLite file (default: ${ENV_VAR})")
+    p.add_argument("--store", help=f"the SQLite file (default: ${ENV_VAR}, the config file's store, "
+                                    f"else ./{DEFAULT})")
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("runs", help="the runs in the store, newest first")
     s.add_argument("--last", type=int, default=20)

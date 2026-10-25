@@ -34,7 +34,7 @@ from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
-from .store import Store, StoreError, ENV_VAR as STORE_ENV
+from .store import Store, StoreError, ENV_VAR as STORE_ENV, DEFAULT as STORE_DEFAULT, where as store_where
 from . import __version__
 from . import drivers
 
@@ -491,9 +491,12 @@ async def main() -> int:
                         help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted)")
     parser.add_argument("--log", type=str,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
-    parser.add_argument("--store", type=str, default=os.environ.get(STORE_ENV),
-                        help=f"Keep every command's reply in this SQLite file, as the device gave it (0600, one row "
-                             f"per command per device; read it with h-ssh-store; default ${STORE_ENV})")
+    parser.add_argument("--store", type=str,
+                        help=f"The SQLite file every run is kept in: one row per command per device, the reply as "
+                             f"the device gave it, 0600 (default ${STORE_ENV}, else `store` in the config file, "
+                             f"else ./{STORE_DEFAULT}; read it with h-ssh-store)")
+    parser.add_argument("--no-store", action="store_true",
+                        help="Keep nothing of this run")
     parser.add_argument("--audit-log", type=str,
                         default=os.environ.get("HSSH_AUDIT_LOG"),
                         help="Edit audit log path for JSONL audit trail (or set HSSH_AUDIT_LOG env var)")
@@ -816,14 +819,18 @@ async def main() -> int:
                 print(f"ERROR: {label} {e}; refusing to start.", file=sys.stderr)
                 return 2
     store = None
-    if args.store:
-        # Opened, and its tables made, before the first device is touched:
-        # a store that cannot be written is found out now, not after the
-        # commits landed.
+    if args.no_store and args.store:
+        print("ERROR: --no-store and --store contradict each other.", file=sys.stderr)
+        return 2
+    if not args.no_store:
+        # Every run is kept. The store is opened, and its tables made, before
+        # the first device is touched: one that cannot be written is no run,
+        # found out now and not after the commits landed.
         try:
-            store = Store(args.store)
+            store = Store(store_where(args.store, file_config))
         except StoreError as e:
-            print(f"ERROR: --store {e}; refusing to start.", file=sys.stderr)
+            print(f"ERROR: store {e}; every run is kept, so a store that cannot be written is no run: "
+                  f"use --store PATH for another file, or --no-store; refusing to start.", file=sys.stderr)
             return 2
     safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
     try:
@@ -1072,7 +1079,7 @@ async def main() -> int:
             store_run = store.begin_run(mode, sys.argv[1:], user, len(units), __version__,
                                         origin=socket.gethostname(), command=about)
         except Exception as e:                    # the file went away between the probe and the run
-            print(f"ERROR: --store {args.store}: {e}; refusing to start.", file=sys.stderr)
+            print(f"ERROR: store {store.path}: {e}; refusing to start.", file=sys.stderr)
             return 2
 
 
@@ -1346,7 +1353,7 @@ async def main() -> int:
                                 fmt=args.format if dev_mode in ("show", "show-batch") else "text")
             except Exception as e:
                 if not store_warned:
-                    print(f"WARNING: --store {args.store}: {e}", file=sys.stderr)
+                    print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
                     store_warned = True
 
         # Audit logging for operations
@@ -1611,7 +1618,7 @@ async def main() -> int:
         try:
             store.finish_run(store_run, ok_count, failures, skipped + not_run, interrupted)
         except Exception as e:
-            print(f"WARNING: --store {args.store}: {e}", file=sys.stderr)
+            print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
     if store is not None:
         store.close()
 
