@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 887/887 passed
+## Unit Tests — 888/888 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
 the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
