@@ -189,6 +189,10 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
         "timeout": session_timeout_float,
         "banner_timeout": session_timeout_float,
         "auth_timeout": session_timeout_float,
+        # The shell for an edit opens a channel with no clock of its own;
+        # paramiko would wait an hour for a device that authenticates and
+        # then says nothing. (A show's exec channel has the command timeout.)
+        "channel_timeout": session_timeout_float,
     }
 
     if passwd is not None:
