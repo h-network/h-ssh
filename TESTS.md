@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 875/875 passed
+## Unit Tests — 877/877 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
 the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
@@ -38,11 +38,11 @@ telnet runs against a scripted server on localhost.
 | test_error_classification.py | 29 | #65: a failure the same call cannot fix is reported once, in words that say what happened; a device the operator interrupted while it was still being connected to is interrupted, not failed |
 | test_fail_closed.py | 13 | #64: a run finds out before the first device that it cannot do its job — an audit or run log that cannot be written, a safety file that cannot be kept, a device without its set file, a device listed twice or under two names |
 | test_format.py | 21 | `--format json\|xml` through `rpc()`/`rpc_batch()`, refusal on other transports and on edits, `--json`/`--raw`/`-v`/`--diff` shapes |
-| test_generic.py | 43 | the paramiko transport (`hssh/transports/ssh.py`): host keys pinned in `~/.h-ssh/known_hosts` (0600) under a file lock, `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure, reads and the exit status bounded by the command timeout, a reply the CLI refuses at exit 0, the Junos and IOS-shaped dialect edits and confirms on a fake shell channel, EOS `\| json` |
+| test_generic.py | 44 | the paramiko transport (`hssh/transports/ssh.py`): host keys pinned in `~/.h-ssh/known_hosts` (0600) under a file lock, the known_hosts files parsed once per process and shared until they change (a pin this process adds is in the shared copy), `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure, reads and the exit status bounded by the command timeout, a reply the CLI refuses at exit 0, the Junos and IOS-shaped dialect edits and confirms on a fake shell channel, EOS `\| json` |
 | test_input_validation.py | 34 | #62: wrong input is refused with a named reason before anything runs — numeric flags and config keys out of range, ports, BOM inventories, a `--config` that is not a file, `--save-output` on a file, a closed stdout, whitespace commands, unknown job keys, lines without `=`, wide CSV rows, a target that still says `arista` |
 | test_job_pool.py | 4 | #57: a job's entries share one NETCONF session per device |
 | test_job.py | 20 | `--job` files and stdin, `default_vendor`, same device twice (entries carried with their results) |
-| test_junos.py | 54 | the NETCONF transport (`hssh/transports/netconf.py`) over a fake PyEZ: show, batch, edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `confirm()` under the lock, `guarded_commit()` and its history check, `expected_diff`, a timer that cannot be armed refused before any session, `statement not found` the one load warning ignored |
+| test_junos.py | 55 | the NETCONF transport (`hssh/transports/netconf.py`) over a fake PyEZ: show, batch, the session close off the caller's clock (a helper thread, `wait_for_closes()` at the end of a run), edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `confirm()` under the lock, `guarded_commit()` and its history check, `expected_diff`, a timer that cannot be armed refused before any session, `statement not found` the one load warning ignored |
 | test_openssh_dialects.py | 26 | #83: `junos@openssh`, `ios@openssh`, `nxos@openssh`, `eos@openssh` — shows on an exec like the plain `openssh` driver, edits and confirms through the CLI engine on `ssh -tt`, against a fake `ssh` on PATH |
 | test_openssh.py | 27 | the OpenSSH-binary transport, `SSH_ASKPASS`, ControlMaster, `--` before the host, the session clock read from ssh's `-v` log |
 | test_output_hygiene.py | 11 | #63: a closed stdout (`\| head`) is not an error, paramiko's transport tracebacks stay off the screen, the confirm reminder prints only for timers that are running, a confirm with nothing pending commits nothing |
