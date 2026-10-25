@@ -31,6 +31,7 @@ from .core import (
 from .runner import run_for_target_async, is_connect_failure, RunResult, error_line
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
+from . import profiles
 from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
@@ -435,6 +436,9 @@ async def main() -> int:
                              "(they count as skipped: exit 3)")
     parser.add_argument("--batch", type=str,
                         help="File containing show commands to run in batch (one per line, # comments)")
+    parser.add_argument("--profile", type=str, metavar="NAME",
+                        help="A named command set, run like --batch: ~/.h-ssh/profiles/NAME.txt, else one that "
+                             "ships with h-ssh (--list-profiles shows both)")
     parser.add_argument("--job", type=str,
                         help="JSON job file with per-device commands (use - for stdin)")
     parser.add_argument("--run", type=str, metavar="FILE",
@@ -477,6 +481,8 @@ async def main() -> int:
     parser.add_argument("--list-vendors", action="store_true",
                         help="List every driver a target may name: aliases, transport, dialect, "
                              "formats, what it supports, and where it came from")
+    parser.add_argument("--list-profiles", action="store_true",
+                        help="List the command sets --profile can name: yours (~/.h-ssh/profiles) and the shipped ones")
 
     # Inline targets
     parser.add_argument("--target", type=str, action="append",
@@ -517,6 +523,21 @@ async def main() -> int:
     # only args.target is looked at, bare_hosts remembers which were bare.
     bare_hosts = list(args.hosts)
     args.target = (bare_hosts + list(args.target or [])) or None
+    if args.list_profiles:
+        for line in profiles.listing_lines():
+            print(line)
+        return 0
+    if args.profile:
+        # A profile is a batch file by name; from here on it is --batch, and
+        # as a command-line value it wins over a run file's `batch`.
+        if args.batch:
+            print("ERROR: --profile and --batch both name the commands; give one of them", file=sys.stderr)
+            return 2
+        try:
+            args.batch = str(profiles.profile_path(args.profile))
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
     args.batch_commands = None   # an inline batch, only a run file sets it
     args.jobs_data = None        # job entries from a run file
 
