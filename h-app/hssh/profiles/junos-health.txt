@@ -1,0 +1,9 @@
+# Junos health: software, alarms, uptime, interfaces, protocols, routes
+show version
+show chassis alarms
+show system alarms
+show system uptime
+show interfaces terse
+show bgp summary
+show ospf neighbor
+show route summary

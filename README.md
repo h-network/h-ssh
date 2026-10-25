@@ -124,6 +124,7 @@ h-ssh --user admin -eB configs/all.set --commit-confirmed 10 -y
 
 # several commands per device, one connection
 h-ssh --batch commands.txt R1:10.0.1.1:junos
+h-ssh --profile junos-health R1:10.0.1.1:junos     # a named command set, yours or shipped (--list-profiles)
 
 # a console server still speaking telnet
 h-ssh -sC "show version" SW1:10.0.0.1:5000:telnet-ios
@@ -167,6 +168,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 | `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
 | `-eB` | Edit broadcast | One config file applied to all targets |
 | `--batch` | Batch | Several show commands from a file, one connection per device |
+| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt`, or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
@@ -869,7 +871,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (878 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (882 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

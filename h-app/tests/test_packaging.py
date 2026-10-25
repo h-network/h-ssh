@@ -35,3 +35,5 @@ def test_wheel_build_includes_hssh_without_top_level_commands(tmp_path):
     # The shortcut libraries ship next to their dialects (#81).
     assert {"hssh/dialects/junos.json", "hssh/dialects/eos.json", "hssh/dialects/none.json"} <= set(names)
     assert not any(name.startswith("hssh/commands/") for name in names)
+    # The shipped command sets (--profile) travel with the package too.
+    assert {"hssh/profiles/junos-health.txt", "hssh/profiles/junos-snapshot.txt"} <= set(names)

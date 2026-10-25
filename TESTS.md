@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 878/878 passed
+## Unit Tests — 882/882 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
 the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
@@ -48,6 +48,7 @@ telnet runs against a scripted server on localhost.
 | test_output_hygiene.py | 11 | #63: a closed stdout (`\| head`) is not an error, paramiko's transport tracebacks stay off the screen, the confirm reminder prints only for timers that are running, a confirm with nothing pending commits nothing |
 | test_packaging.py | 1 | wheel contents: `hssh/`, the dialects' JSON libraries next to them, no top-level `commands/` |
 | test_pool.py | 51 | session pool: reuse per `(host, port, user, credential)`, stale detection and probe, discard rules on every edit failure, reopen-once for reads, threads never share a session, reaper, `close_all`, re-entrancy, a nested borrow never closes the session under an open transaction |
+| test_profiles.py | 4 | `--profile NAME`: a batch file by name, yours in `~/.h-ssh/profiles` before the shipped `junos-health`/`junos-snapshot`, with or without `.txt`, a path taken as given; run exactly like `--batch`; `--profile` with `--batch` or an unknown name is exit 2; `--list-profiles` lists yours then the shipped ones with their command counts and descriptions |
 | test_raw.py | 10 | `--raw` output contract and the JSON output shape |
 | test_retry.py | 42 | failure classification (PyEZ connect phase by its prefix, `invalid` narrowed, a rejected command permanent), backoff, the attempt budget, workers clamped and really parallel, edits retried only on `NotAppliedError` |
 | test_rpc.py | 19 | `rpc()`: CLI-command translation, RPC name + args, JSON/XML, never re-sending non-reads, `rpc_batch()`, `commit_status()` (pending only on the latest commit) |
