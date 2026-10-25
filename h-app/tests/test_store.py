@@ -136,7 +136,7 @@ def test_a_run_is_found_by_its_id_or_a_unique_prefix_or_as_the_last(tmp_path):
     with pytest.raises(StoreError, match="no result for"):
         s.output(r1, "r9")
     s.close()
-    with pytest.raises(StoreError, match="no such store"):
+    with pytest.raises(StoreError, match="no store at"):
         Store(str(tmp_path / "missing.db"), readonly=True)
 
 
@@ -197,15 +197,25 @@ def test_grep_field_diff_history_slowest(tmp_path, capsys):
     assert rc == 0 and lines[1].split()[:2] == ["5000", "r2"] and len(lines) == 3
 
 
-def test_the_reader_needs_a_store(tmp_path, capsys, monkeypatch):
+def test_the_reader_looks_where_the_run_wrote(tmp_path, capsys, monkeypatch):
+    """--store, else HSSH_STORE, else the config file's `store`, else h-ssh.db here."""
+    from hssh import core
     monkeypatch.delenv("HSSH_STORE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(core, "get_config_path", lambda: tmp_path / "no-config")
     rc = store_main(["runs"])
-    assert rc == 2 and "no store given" in capsys.readouterr()[1]
+    assert rc == 2 and "no store at h-ssh.db: no run has been kept here" in capsys.readouterr()[1]
     rc = store_main(["--store", str(tmp_path / "none.db"), "runs"])
-    assert rc == 2 and "no such store" in capsys.readouterr()[1]
-    filled(tmp_path / "runs.db")
-    monkeypatch.setenv("HSSH_STORE", str(tmp_path / "runs.db"))
-    assert store_main(["runs"]) == 0
+    assert rc == 2 and "no store at" in capsys.readouterr()[1]
+    filled(tmp_path / "h-ssh.db")
+    assert store_main(["runs"]) == 0                       # the default: h-ssh.db in the current directory
+    capsys.readouterr()
+    filled(tmp_path / "from-config.db")
+    (tmp_path / "config").write_text(f"store = {tmp_path / 'from-config.db'}\n")
+    monkeypatch.setattr(core, "get_config_path", lambda: tmp_path / "config")
+    assert store_main(["runs"]) == 0 and "from-config" not in capsys.readouterr()[0]   # read, no error
+    monkeypatch.setenv("HSSH_STORE", str(tmp_path / "missing.db"))
+    assert store_main(["runs"]) == 2                       # the variable beats the config file
 
 
 # --- through the CLI ----------------------------------------------------------------
@@ -295,8 +305,70 @@ def test_an_unwritable_store_refuses_to_start(tmp_path, monkeypatch, capsys):
     fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: calls.append(1) or "ok")
     rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(blocker / "runs.db"), "--target", "R1:10.0.0.1:junos",
                                                  "-sC", "show version"], fake=fake)
-    assert rc == 2 and "--store" in err and "refusing to start" in err
+    assert rc == 2 and "every run is kept" in err and "--no-store" in err and "refusing to start" in err
     assert calls == []
+
+
+def test_every_run_is_kept_in_h_ssh_db_in_the_current_directory(tmp_path, monkeypatch, capsys):
+    """No flag, no variable, no config: the store is ./h-ssh.db, and the
+    evidence sits with the job."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HSSH_STORE", raising=False)
+    rc, out, err = run_cli(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "show version"])
+    assert rc == 0, err
+    assert (tmp_path / "h-ssh.db").is_file() and stat.S_IMODE((tmp_path / "h-ssh.db").stat().st_mode) == 0o600
+    got = rows(tmp_path / "h-ssh.db", "SELECT device, command, ok FROM results")
+    assert got == [{"device": "R1", "command": "show version", "ok": 1}]
+    # the reader finds it the same way
+    assert store_main(["runs"]) == 0 and "show version" in capsys.readouterr()[0]
+
+
+def test_the_config_file_can_name_the_store(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HSSH_STORE", raising=False)
+    cfg = tmp_path / "config"
+    cfg.write_text(f"store = {tmp_path / 'kept' / 'fleet.db'}\n")
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "ok"))
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", str(cfg), "--user", "u", "--target", "R1:10.0.0.1:junos",
+                                      "-sC", "show version"])
+    assert asyncio.run(cli.main()) == 0
+    assert (tmp_path / "kept" / "fleet.db").is_file() and not (tmp_path / "h-ssh.db").exists()
+    # the variable beats the file, the flag beats both
+    monkeypatch.setenv("HSSH_STORE", str(tmp_path / "env.db"))
+    assert asyncio.run(cli.main()) == 0 and (tmp_path / "env.db").is_file()
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", str(cfg), "--user", "u", "--store", str(tmp_path / "flag.db"),
+                                      "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
+    assert asyncio.run(cli.main()) == 0 and (tmp_path / "flag.db").is_file()
+    assert len(rows(tmp_path / "env.db", "SELECT * FROM runs")) == 1
+
+
+def test_no_store_keeps_nothing_and_contradicts_store(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HSSH_STORE", raising=False)
+    rc, out, err = run_cli(monkeypatch, capsys, ["--no-store", "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
+    assert rc == 0, err
+    assert not (tmp_path / "h-ssh.db").exists() and "R1" in out
+    rc, out, err = run_cli(monkeypatch, capsys, ["--no-store", "--store", str(tmp_path / "x.db"), "--target", "R1:10.0.0.1:junos",
+                                                 "-sC", "show version"])
+    assert rc == 2 and "contradict" in err and not (tmp_path / "x.db").exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes anywhere")
+def test_a_directory_you_cannot_write_in_is_no_run(tmp_path, monkeypatch, capsys):
+    """The user's rule: not being able to store is a no-go for the run."""
+    ro = tmp_path / "ro"
+    ro.mkdir(mode=0o500)
+    monkeypatch.chdir(ro)
+    monkeypatch.delenv("HSSH_STORE", raising=False)
+    calls = []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: calls.append(1) or "ok")
+    rc, out, err = run_cli(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "show version"], fake=fake)
+    assert rc == 2 and "h-ssh.db" in err and "every run is kept" in err and calls == []
+    rc, out, err = run_cli(monkeypatch, capsys, ["--no-store", "--target", "R1:10.0.0.1:junos", "-sC", "show version"], fake=fake)
+    assert rc == 0 and calls == [1]
 
 
 def test_a_dry_run_edit_stores_the_payload_and_the_verdict(tmp_path, monkeypatch, capsys):
