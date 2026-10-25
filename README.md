@@ -561,6 +561,7 @@ the run wrote (`--store PATH`, `HSSH_STORE`, the config file's `store`, else `./
 | `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ |
 | `history DEVICE [--command C] [--last N]` | every stored result for a device, newest first |
 | `slowest [RUN] [--last N]` | the slowest results, of a run or overall |
+| `export [RUN] [--all] [--device D] [--command C] [--format csv\|jsonl] [--out FILE]` | the rows as they are, for a spreadsheet or a notebook: CSV (a multi-line reply is one quoted cell) or JSON Lines; one run (default: the last) or the whole store. The file itself is plain SQLite, so `pandas.read_sql("SELECT * FROM results", sqlite3.connect("h-ssh.db"))` works as well |
 
 A run is named by its id or any unique prefix of it (`20261024-1730` when only one run started then).
 Anything else is a `sqlite3 runs.db` query away: the schema is two tables, documented at the top of
@@ -859,7 +860,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (867 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (868 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
