@@ -33,6 +33,8 @@ from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
+from .store import Store, StoreError, ENV_VAR as STORE_ENV
+from . import __version__
 from . import drivers
 
 
@@ -455,6 +457,9 @@ async def main() -> int:
                         help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted)")
     parser.add_argument("--log", type=str,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
+    parser.add_argument("--store", type=str, default=os.environ.get(STORE_ENV),
+                        help=f"Keep every command's reply in this SQLite file, as the device gave it (0600, one row "
+                             f"per command per device; read it with h-ssh-store; default ${STORE_ENV})")
     parser.add_argument("--audit-log", type=str,
                         default=os.environ.get("HSSH_AUDIT_LOG"),
                         help="Edit audit log path for JSONL audit trail (or set HSSH_AUDIT_LOG env var)")
@@ -776,6 +781,16 @@ async def main() -> int:
             except OSError as e:
                 print(f"ERROR: {label} {e}; refusing to start.", file=sys.stderr)
                 return 2
+    store = None
+    if args.store:
+        # Opened, and its tables made, before the first device is touched:
+        # a store that cannot be written is found out now, not after the
+        # commits landed.
+        try:
+            store = Store(args.store)
+        except StoreError as e:
+            print(f"ERROR: --store {e}; refusing to start.", file=sys.stderr)
+            return 2
     safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
     try:
         safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
@@ -998,6 +1013,17 @@ async def main() -> int:
     not_run = skipped_missing if not job_entries else 0      # no set file (--allow-missing): not in the results
     json_results = []
     run_start = time.time()
+    store_run = None
+    store_warned = False
+    if store is not None:
+        try:
+            about = ("\n".join(batch_cmds) if batch_cmds else
+                     show_cmd or edit_cmd or args.edit_broadcast or (args.edit_dir and f"dir:{args.edit_dir}") or mode)
+            store_run = store.begin_run(mode, sys.argv[1:], user, len(units), __version__,
+                                        origin=socket.gethostname(), command=about)
+        except Exception as e:                    # the file went away between the probe and the run
+            print(f"ERROR: --store {args.store}: {e}; refusing to start.", file=sys.stderr)
+            return 2
 
 
     # A job may list one device in several entries. Those run one at a time
@@ -1243,30 +1269,39 @@ async def main() -> int:
             entry["error"] = f"interrupted while connecting: {entry['error']}"
         json_results.append(entry)
 
+        # What was sent to this device, for the audit log and the store: the
+        # resolved show, the edit payload, the rollback, the commit history ask.
+        sent = ""
+        if mode == "edit-cmd":
+            sent = edit_cmd or ""
+        elif mode == "edit-dir":
+            sent = edit_payloads.get(name) or f"<no config file for {name}>"
+        elif mode == "edit-broadcast":
+            sent = broadcast_text or ""
+        elif mode == "rollback":
+            sent = f"rollback {args.rollback}"
+        elif mode == "commit-status":
+            sent = "show system commit"
+        elif mode == "job":
+            sent = ((resolve_command(je.command, t.vendor) if je.mode == "show" else je.command)
+                    if je.command else "")
+        elif mode == "show":
+            sent = resolve_command(show_cmd, t.vendor) if show_cmd else ""
+        elif mode == "show-batch":
+            sent = json.dumps([resolve_command(c, t.vendor) for c in batch_cmds]) if batch_cmds else ""
+
+        if store_run is not None:
+            try:
+                store.add_entry(store_run, entry, sent,
+                                fmt=args.format if dev_mode in ("show", "show-batch") else "text")
+            except Exception as e:
+                if not store_warned:
+                    print(f"WARNING: --store {args.store}: {e}", file=sys.stderr)
+                    store_warned = True
+
         # Audit logging for operations
         if args.audit_log:
-            audit_payload = ""
-            if mode == "edit-cmd":
-                audit_payload = edit_cmd or ""
-            elif mode == "edit-dir":
-                audit_payload = edit_payloads.get(name) or f"<no config file for {name}>"
-            elif mode == "edit-broadcast":
-                audit_payload = broadcast_text or ""
-            elif mode == "rollback":
-                audit_payload = f"rollback {args.rollback}"
-            elif mode == "commit-status":
-                audit_payload = "show system commit"
-            elif mode == "job":
-                audit_payload = ((resolve_command(je.command, t.vendor) if je.mode == "show" else je.command)
-                                 if je.command else "")
-            elif mode == "show":
-                audit_payload = resolve_command(show_cmd, t.vendor) if show_cmd else ""
-            elif mode == "show-batch":
-                audit_payload = (
-                    json.dumps([resolve_command(c, t.vendor) for c in batch_cmds])
-                    if batch_cmds else ""
-                )
-
+            audit_payload = sent
             is_show_op = dev_mode in ("show", "show-batch", "commit-status")
             audit_diff = entry.get("output", "") if (ok and not is_show_op) else None
 
@@ -1521,6 +1556,14 @@ async def main() -> int:
         "mode": stderr_mode,
     })
     print(f"[h-ssh] {summary}", file=sys.stderr)
+
+    if store_run is not None:
+        try:
+            store.finish_run(store_run, ok_count, failures, skipped + not_run, interrupted)
+        except Exception as e:
+            print(f"WARNING: --store {args.store}: {e}", file=sys.stderr)
+    if store is not None:
+        store.close()
 
     if safety_gate is not None:
         safety_gate.close()

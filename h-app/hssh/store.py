@@ -1,0 +1,463 @@
+"""The result store: every command's reply, as it came back, in one SQLite file.
+
+`--store runs.db` (or HSSH_STORE=runs.db) keeps one row per command per
+device: who ran what, when, against which device, whether it worked, how
+long it took, and the device's own reply, byte for byte. A snapshot one
+may have to restore from is kept as it came: nothing is redacted, parsed,
+normalised or modelled. The store holds output, and what is done with it
+is the reader's business (`h-ssh-store`, or any sqlite3 client). One file
+serves many runs, and replaces a directory of --save-output files.
+
+Two tables. `runs`: one row per h-ssh invocation (run_id, when it started
+and finished, the mode, the command line, who ran it, the counts).
+`results`: one row per command on one device, unique on (run_id, device,
+seq): a show is seq 0, a batch is seq 0..n-1 in the batch's order, an edit
+is seq 0 with the payload as the command and the device's verdict (the diff,
+or the commit line) as the output. `format` says what the output is: text,
+xml or json as the device was asked for; a commit history is json.
+"""
+
+import argparse
+import datetime as _dt
+import difflib
+import json
+import os
+import pathlib
+import re
+import secrets
+import sqlite3
+import stat
+import sys
+from typing import Iterable, List, Optional
+
+ENV_VAR = "HSSH_STORE"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id     TEXT PRIMARY KEY,
+    started    TEXT NOT NULL,
+    finished   TEXT,
+    mode       TEXT NOT NULL,
+    command    TEXT,
+    argv       TEXT NOT NULL,
+    user       TEXT,
+    origin     TEXT,
+    version    TEXT,
+    targets    INTEGER,
+    ok         INTEGER,
+    failed     INTEGER,
+    skipped    INTEGER,
+    interrupted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS results (
+    run_id      TEXT NOT NULL REFERENCES runs(run_id),
+    device      TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    host        TEXT,
+    vendor      TEXT,
+    command     TEXT NOT NULL,
+    ts          TEXT NOT NULL,
+    ok          INTEGER NOT NULL,
+    duration_ms INTEGER,
+    error       TEXT,
+    format      TEXT NOT NULL DEFAULT 'text',
+    output      TEXT,
+    PRIMARY KEY (run_id, device, seq)
+);
+CREATE INDEX IF NOT EXISTS results_device ON results(device, ts);
+CREATE INDEX IF NOT EXISTS results_command ON results(command);
+"""
+
+
+def _now() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def new_run_id(now: Optional[_dt.datetime] = None) -> str:
+    """When the run started plus four hex digits: sortable, and two runs
+    started in the same second stay apart."""
+    now = now or _dt.datetime.now()
+    return now.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+
+
+class StoreError(Exception):
+    """The store file cannot be used: the message says why, for the operator."""
+
+
+class Store:
+    """One SQLite file, opened for writing by the run and for reading by
+    `h-ssh-store`. The file is created 0600, as --log's is: it holds
+    replies, diffs and payloads as the devices gave them."""
+
+    def __init__(self, path: str, readonly: bool = False):
+        self.path = path
+        if readonly:
+            if not os.path.exists(path):
+                raise StoreError(f"{path}: no such store")
+            uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
+            try:
+                self.conn = sqlite3.connect(uri, uri=True)
+            except sqlite3.Error as e:
+                raise StoreError(f"{path}: {e}") from e
+        else:
+            self._create_private(path)
+            try:
+                self.conn = sqlite3.connect(path)
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                self.conn.executescript(SCHEMA)
+                self.conn.commit()
+            except sqlite3.Error as e:
+                raise StoreError(f"{path}: {e}") from e
+        self.conn.row_factory = sqlite3.Row
+
+    @staticmethod
+    def _create_private(path: str) -> None:
+        """The file is made 0600 before SQLite ever opens it, and must be a
+        regular file (no following a planted symlink into another file)."""
+        directory = os.path.dirname(os.path.abspath(path))
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags, 0o600)
+        except OSError as e:
+            raise StoreError(f"{path}: {e.strerror or e}") from e
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise StoreError(f"{path}: not a regular file")
+        finally:
+            os.close(fd)
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except sqlite3.Error:
+            pass
+
+    # --- writing ------------------------------------------------------------
+
+    def begin_run(self, mode: str, argv: List[str], user: Optional[str], targets: int,
+                  version: str, origin: Optional[str] = None, command: Optional[str] = None,
+                  run_id: Optional[str] = None) -> str:
+        """Record that a run started; its row is completed by finish_run().
+        `command` is what the run was about (the show, the batch, the edit);
+        `argv` the command line as typed."""
+        run_id = run_id or new_run_id()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO runs (run_id, started, mode, command, argv, user, origin, version, targets) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, _now(), mode, command, " ".join(argv), user, origin, version, targets))
+        return run_id
+
+    def add(self, run_id: str, device: str, seq: int, command: str, ok: bool,
+            duration_ms: Optional[int] = None, error: Optional[str] = None,
+            output: Optional[str] = None, fmt: str = "text", host: Optional[str] = None,
+            vendor: Optional[str] = None, ts: Optional[str] = None) -> None:
+        """One command's row. A second result for the same (run, device,
+        seq) replaces the first: a retry's verdict is the one that stands."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO results (run_id, device, seq, host, vendor, command, ts, ok, "
+                "duration_ms, error, format, output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, device, seq, host, vendor, command, ts or _now(), 1 if ok else 0,
+                 duration_ms, error, fmt, output))
+
+    def add_entry(self, run_id: str, entry: dict, command: str, fmt: str = "text") -> int:
+        """The rows of one device's result as the CLI builds it (`entry`: the
+        --json record): a batch is one row per command in its order; anything
+        else one row, with `command` what was sent (the resolved show, the
+        edit payload, `rollback N`, `show system commit`) and the output the
+        reply, the diff, or the commit history as JSON. Returns the rows
+        written."""
+        device, host, vendor = entry["device"], entry.get("host"), entry.get("vendor")
+        duration = entry.get("duration_ms")
+        if "commands" in entry and isinstance(entry["commands"], list) and entry["commands"]:
+            for seq, cr in enumerate(entry["commands"]):
+                out = cr.get("output")
+                self.add(run_id, device, seq, cr.get("command", ""), bool(cr.get("ok")),
+                         duration if seq == 0 else None, cr.get("error"),
+                         out if isinstance(out, str) or out is None else json.dumps(out),
+                         fmt if isinstance(out, str) else "json", host, vendor)
+            return len(entry["commands"])
+        if "commits" in entry:
+            output = json.dumps(entry["commits"]) if entry.get("ok") else None
+            self.add(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+                     output, "json", host, vendor)
+            return 1
+        output = entry.get("output")
+        if output is not None and not isinstance(output, str):
+            output, fmt = json.dumps(output), "json"
+        self.add(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+                 output, fmt, host, vendor)
+        return 1
+
+    def finish_run(self, run_id: str, ok: int, failed: int, skipped: int, interrupted: bool = False) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE runs SET finished = ?, ok = ?, failed = ?, skipped = ?, interrupted = ? WHERE run_id = ?",
+                (_now(), ok, failed, skipped, 1 if interrupted else 0, run_id))
+
+    # --- reading ------------------------------------------------------------
+
+    def runs(self, last: int = 20) -> List[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM runs ORDER BY started DESC, rowid DESC LIMIT ?",
+                                 (last,)).fetchall()
+
+    def last_run_id(self) -> Optional[str]:
+        row = self.conn.execute("SELECT run_id FROM runs ORDER BY started DESC, rowid DESC LIMIT 1").fetchone()
+        return row["run_id"] if row else None
+
+    def resolve_run(self, run: Optional[str]) -> str:
+        """A run id as typed, a unique prefix of one, or the last run when
+        none is given."""
+        if not run:
+            found = self.last_run_id()
+            if not found:
+                raise StoreError("the store holds no runs")
+            return found
+        rows = self.conn.execute("SELECT run_id FROM runs WHERE run_id = ? OR run_id LIKE ? "
+                                 "ORDER BY run_id", (run, run + "%")).fetchall()
+        exact = [r["run_id"] for r in rows if r["run_id"] == run]
+        if exact:
+            return exact[0]
+        if len(rows) == 1:
+            return rows[0]["run_id"]
+        if not rows:
+            raise StoreError(f"no run {run!r}")
+        raise StoreError(f"{run!r} matches {len(rows)} runs: " + ", ".join(r["run_id"] for r in rows[:6]))
+
+    def results(self, run_id: Optional[str] = None, device: Optional[str] = None,
+                command: Optional[str] = None, ok: Optional[bool] = None,
+                order: str = "run_id, device, seq", limit: Optional[int] = None) -> List[sqlite3.Row]:
+        where, params = [], []
+        if run_id:
+            where.append("run_id = ?")
+            params.append(run_id)
+        if device:
+            where.append("device = ?")
+            params.append(device)
+        if command:
+            where.append("command = ?")
+            params.append(command)
+        if ok is not None:
+            where.append("ok = ?")
+            params.append(1 if ok else 0)
+        sql = "SELECT * FROM results"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += f" ORDER BY {order}"
+        if limit:
+            sql += " LIMIT %d" % int(limit)
+        return self.conn.execute(sql, params).fetchall()
+
+    def output(self, run_id: str, device: str, seq: int = 0) -> sqlite3.Row:
+        row = self.conn.execute("SELECT * FROM results WHERE run_id = ? AND device = ? AND seq = ?",
+                                (run_id, device, seq)).fetchone()
+        if row is None:
+            raise StoreError(f"no result for {device} seq {seq} in run {run_id}")
+        return row
+
+
+# --- the reader: h-ssh-store -----------------------------------------------------
+
+def _store_path(args) -> str:
+    path = args.store or os.environ.get(ENV_VAR)
+    if not path:
+        raise StoreError(f"no store given: --store PATH or {ENV_VAR}=PATH")
+    return path
+
+
+def _table(rows: Iterable[Iterable[str]], head: Iterable[str]) -> List[str]:
+    rows = [tuple(str(c) for c in r) for r in rows]
+    head = tuple(head)
+    if not rows:
+        return ["(nothing)"]
+    widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head) - 1)]
+    fmt = "  ".join("{:<%d}" % w for w in widths) + "  {}"
+    return [fmt.format(*head)] + [fmt.format(*r) for r in rows]
+
+
+def _short_cmd(text: str, width: int = 48) -> str:
+    first = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    more = (text or "").strip().count("\n")
+    if more:
+        first += f" (+{more} lines)"
+    return first if len(first) <= width else first[:width - 1] + "…"
+
+
+def cmd_runs(store: Store, args) -> int:
+    rows = [(r["run_id"], r["started"][:19], r["mode"], r["user"] or "-",
+             f"{r['targets'] or 0}/{r['ok'] if r['ok'] is not None else '?'}/{r['failed'] if r['failed'] is not None else '?'}"
+             + ("/int" if r["interrupted"] else ""), _short_cmd(r["command"] or r["argv"], 60))
+            for r in store.runs(args.last)]
+    print("\n".join(_table(rows, ("run", "started", "mode", "user", "targets/ok/fail", "command"))))
+    return 0
+
+
+def cmd_failed(store: Store, args) -> int:
+    run_id = store.resolve_run(args.run)
+    rows = [(r["device"], r["seq"], _short_cmd(r["command"]), (r["error"] or "").strip().splitlines()[0] if r["error"] else "-")
+            for r in store.results(run_id=run_id, ok=False)]
+    print(f"run {run_id}: {len(rows)} failed")
+    if rows:
+        print("\n".join(_table(rows, ("device", "seq", "command", "error"))))
+    return 0 if not rows else 1
+
+
+def cmd_output(store: Store, args) -> int:
+    run_id = store.resolve_run(args.run)
+    row = store.output(run_id, args.device, args.seq)
+    if row["output"] is not None:
+        sys.stdout.write(row["output"] if row["output"].endswith("\n") else row["output"] + "\n")
+    if not row["ok"]:
+        print(f"ERROR: {row['error'] or 'failed'}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_grep(store: Store, args) -> int:
+    try:
+        pattern = re.compile(args.pattern, re.IGNORECASE if args.ignore_case else 0)
+    except re.error as e:
+        raise StoreError(f"bad pattern {args.pattern!r}: {e}")
+    run_id = store.resolve_run(args.run) if args.run else None
+    hits = 0
+    for r in store.results(run_id=run_id, device=args.device, command=args.command, ok=True):
+        for line in (r["output"] or "").splitlines():
+            if pattern.search(line):
+                hits += 1
+                print(f"{r['run_id']}  {r['device']}  {_short_cmd(r['command'], 32)}: {line.rstrip()}")
+    return 0 if hits else 1
+
+
+def _json_path(value, path: str):
+    for key in [k for k in path.split(".") if k]:
+        if isinstance(value, dict):
+            value = value.get(key)
+        elif isinstance(value, list) and key.lstrip("-").isdigit():
+            try:
+                value = value[int(key)]
+            except IndexError:
+                return None
+        else:
+            return None
+    return value
+
+
+def cmd_field(store: Store, args) -> int:
+    """A dotted path into a JSON reply (a `--format json` show, or a commit
+    history): the device's own structure, read, not parsed."""
+    run_id = store.resolve_run(args.run) if args.run else None
+    shown = 0
+    for r in store.results(run_id=run_id, device=args.device, command=args.command, ok=True):
+        if r["format"] != "json" or not r["output"]:
+            continue
+        try:
+            data = json.loads(r["output"])
+        except ValueError:
+            continue
+        value = _json_path(data, args.path)
+        if value is None:
+            continue
+        shown += 1
+        text = value if isinstance(value, str) else json.dumps(value)
+        print(f"{r['run_id']}  {r['device']}  {args.path} = {text}")
+    return 0 if shown else 1
+
+
+def cmd_diff(store: Store, args) -> int:
+    a, b = store.resolve_run(args.run_a), store.resolve_run(args.run_b)
+    ra, rb = store.output(a, args.device, args.seq), store.output(b, args.device, args.seq)
+    la, lb = (ra["output"] or "").splitlines(keepends=True), (rb["output"] or "").splitlines(keepends=True)
+    diff = list(difflib.unified_diff(la, lb, fromfile=f"{args.device} {a}", tofile=f"{args.device} {b}"))
+    sys.stdout.writelines(diff)
+    if diff and not diff[-1].endswith("\n"):
+        print()
+    return 1 if diff else 0
+
+
+def cmd_history(store: Store, args) -> int:
+    rows = [(r["ts"][:19], r["run_id"], r["seq"], _short_cmd(r["command"]), "OK" if r["ok"] else "FAIL",
+             r["duration_ms"] if r["duration_ms"] is not None else "-")
+            for r in store.results(device=args.device, command=args.command, order="ts DESC, seq", limit=args.last)]
+    print("\n".join(_table(rows, ("when", "run", "seq", "command", "verdict", "ms"))))
+    return 0
+
+
+def cmd_slowest(store: Store, args) -> int:
+    run_id = store.resolve_run(args.run) if args.run else None
+    rows = [(r["duration_ms"], r["device"], r["run_id"], _short_cmd(r["command"]), "OK" if r["ok"] else "FAIL")
+            for r in store.results(run_id=run_id, order="duration_ms DESC", limit=args.last)
+            if r["duration_ms"] is not None]
+    print("\n".join(_table(rows, ("ms", "device", "run", "command", "verdict"))))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="h-ssh-store",
+                                description="Read what h-ssh --store kept: runs, failures, outputs, diffs.")
+    p.add_argument("--store", help=f"the SQLite file (default: ${ENV_VAR})")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("runs", help="the runs in the store, newest first")
+    s.add_argument("--last", type=int, default=20)
+    s.set_defaults(fn=cmd_runs)
+    s = sub.add_parser("failed", help="what failed in a run (default: the last run)")
+    s.add_argument("run", nargs="?")
+    s.set_defaults(fn=cmd_failed)
+    s = sub.add_parser("output", help="one device's reply from a run")
+    s.add_argument("device")
+    s.add_argument("run", nargs="?", help="run id or a unique prefix; default: the last run")
+    s.add_argument("--seq", type=int, default=0, help="which command of a batch (default 0)")
+    s.set_defaults(fn=cmd_output)
+    s = sub.add_parser("grep", help="lines of stored output that match a regex")
+    s.add_argument("pattern")
+    s.add_argument("--run")
+    s.add_argument("--device")
+    s.add_argument("--command", help="only results of exactly this command")
+    s.add_argument("-i", "--ignore-case", action="store_true")
+    s.set_defaults(fn=cmd_grep)
+    s = sub.add_parser("field", help="a dotted path into JSON replies (--format json shows, commit history)")
+    s.add_argument("path")
+    s.add_argument("--run")
+    s.add_argument("--device")
+    s.add_argument("--command")
+    s.set_defaults(fn=cmd_field)
+    s = sub.add_parser("diff", help="one device's reply in two runs, as a unified diff")
+    s.add_argument("device")
+    s.add_argument("run_a")
+    s.add_argument("run_b")
+    s.add_argument("--seq", type=int, default=0)
+    s.set_defaults(fn=cmd_diff)
+    s = sub.add_parser("history", help="every stored result for a device, newest first")
+    s.add_argument("device")
+    s.add_argument("--command")
+    s.add_argument("--last", type=int, default=50)
+    s.set_defaults(fn=cmd_history)
+    s = sub.add_parser("slowest", help="the slowest results (of a run, or overall)")
+    s.add_argument("run", nargs="?")
+    s.add_argument("--last", type=int, default=20)
+    s.set_defaults(fn=cmd_slowest)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        store = Store(_store_path(args), readonly=True)
+    except StoreError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    try:
+        return args.fn(store, args)
+    except StoreError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except sqlite3.Error as e:
+        print(f"ERROR: {store.path}: {e}", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+
+def main_sync() -> None:
+    sys.exit(main())
