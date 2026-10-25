@@ -736,6 +736,62 @@ binding names the RPC and the few fields to keep — and the two cannot be combi
 
 ## Library usage
 
+The fleet from a script, with no thread in sight:
+
+```python
+import json
+from hssh import Fleet
+
+with Fleet(["10.0.1.1", "10.0.1.2", "cr3:10.0.1.3:junos"], transport="junos", user="admin") as fleet:
+    for r in fleet.show("show bgp summary"):            # results as the devices finish
+        print(r.device, "OK" if r.ok else r.error, f"{r.duration_ms} ms")
+        if r.ok:
+            print(r.output)                              # the reply, as the device gave it
+
+    res = fleet.batch(["show version", "show route summary"])      # both commands on one session per device
+    for r in res:
+        for c in r.commands:                             # {"command", "ok", "output"} or {"command", "ok", "error"}
+            print(r.device, c["command"], c.get("output", c.get("error")))
+    print(json.dumps(res.to_dicts()))                   # every device as data, once the last is in
+
+    hw = {r.device: r.output for r in fleet.show("show chassis hardware", fmt="json") if r.ok}   # the router's own data
+
+    # from asyncio code, the same run:  async for r in fleet.show_async("show version"): ...
+```
+
+`Fleet(targets, transport="ssh", user=None, passwd=None, workers=32, session_timeout=30, command_timeout=60,
+retries=0, store=None)` takes targets as the CLI does: bare hosts (a device named after its host, on
+`transport`), `name:host[:vendor][:port]`, `Target` objects, a `pathlib.Path` to a CSV inventory, or the
+inventory path as a plain string; a name or host listed twice is refused before anything runs. `user=None`
+is the name you are logged in as, `passwd=None` means keys or an agent. The library reads no environment
+variable and no config file; that is the CLI's job. What it does for you:
+
+- threads talk to the devices, `workers` at a time; you iterate on your own thread and get one `DeviceResult`
+  per device in the order they finish: `device`, `host`, `vendor`, `ok`, `output`, `error`, `duration_ms`,
+  `ts`, `command`, and for a batch `commands` (one entry per command, in the batch's order); `result` is the
+  driver's typed answer and `text` the runner's full report;
+- a failure is a value (`ok` False, the failure in one line in `error`), never an exception out of the loop,
+  and the other devices still run;
+- every device gets the runner's run: `session_timeout` and `command_timeout` as the CLI's flags, `retries`
+  with the same classification (a failure the same call cannot fix — unreachable, refused, authentication —
+  is tried once; a command that is not a read is sent once). A transport call that has not returned within
+  those bounds plus 10 s is reported as that device's failure and its thread left to finish on its own, so
+  one wedged device cannot hold the run (it does hold one worker until it returns);
+- one session per device, pooled for the Fleet's lifetime however many commands you run, closed when the
+  `with` block ends (`close()` otherwise);
+- `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
+  command line `Fleet.show show bgp summary`; one result row per device, per command for a batch), written
+  from the thread that iterates; a run you broke out of is recorded as interrupted when the Fleet closes;
+- `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only; on another
+  transport that is the device's failure, nothing sent); `to_dicts()` is JSON-serialisable, in the shape of
+  the CLI's `--json` records.
+
+Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's). Edits keep their gates
+in the CLI (the set-syntax guard, the pre-flight check, the question) and in the transports' own
+`edit()`/`begin()` below.
+
+### One device, one call
+
 ```python
 from hssh import SafetyGate, Target
 from hssh.runner import run_for_target
@@ -853,10 +909,11 @@ an edit reports `NotAppliedError` if the session died before the lock, and the u
 h-ssh/
 ├── h-app/
 │   ├── hssh/
-│   │   ├── __init__.py      # public API: Target, run_for_target, SafetyGate, pool, drivers, transports; __version__
+│   │   ├── __init__.py      # public API: Target, Fleet, run_for_target, SafetyGate, pool, drivers, transports; __version__
 │   │   ├── core.py          # Target, CSV loader, template resolver, job parser
 │   │   ├── cli.py           # argument parsing + orchestration
 │   │   ├── runner.py        # concurrent execution engine
+│   │   ├── fleet.py         # Fleet: show/batch across the fleet from a script, results as values, pooled sessions, the store
 │   │   ├── pool.py          # opt-in session pool for library use
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
@@ -896,7 +953,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (886 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (907 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

@@ -4,10 +4,10 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 886/886 passed
+## Unit Tests — 907/907 passed
 
-`pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
-the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
+`pip install -e '.[dev]' && pytest` from the checkout root (`feat/fleet`, 2026-10-25, with the dialect /
+transport / driver split of #80–#84 complete and the `Fleet` library API). The standalone review of `develop` (18
 items, issues #23–#29, PRs #30–#36) added 110 regression tests; every one was run against the code
 before its fix and failed there.
 
@@ -38,6 +38,7 @@ telnet runs against a scripted server on localhost.
 | test_core.py | 34 | targets (incl. `NAME:[v6]:vendor:port`), CSV inventory, device names that stay inside their directory, the one set-file reader (inline `#` kept), shortcut resolution, job parsing, the pre-flight banner rule, the retired `arista` line |
 | test_error_classification.py | 29 | #65: a failure the same call cannot fix is reported once, in words that say what happened; a device the operator interrupted while it was still being connected to is interrupted, not failed |
 | test_fail_closed.py | 13 | #64: a run finds out before the first device that it cannot do its job — an audit or run log that cannot be written, a safety file that cannot be kept, a device without its set file, a device listed twice or under two names |
+| test_fleet.py | 21 | the `Fleet` library API (`hssh/fleet.py`): results as values in completion order (a slow device last, every device arrives), at most `workers` devices in flight, a failure as a value with the rest still running, retries by the runner's classification (a permanent failure once, a non-read sent once), a transport call that never returns given up on within the bound and the queue behind held workers failed at once rather than waited for, `batch` one answer per command, `async for` the same set, `to_dicts()` JSON-serialisable in the CLI's record shape, `fmt="json"` as data and refused on a text transport, breaking out early loses nothing, the store's run row and one row per result written from the iterating thread (a run left unfinished recorded as interrupted, a caller's `Store` left open), sessions pooled for the Fleet's lifetime (opens == devices across two runs, closed on exit; two Fleets share the pool, a caller's pool is left alone; the NETCONF transport over a fake PyEZ logs in once per device), every target form (bare host, `name:host[:vendor][:port]`, `Target`, CSV by `Path` or as the one string), duplicates and bad arguments refused before anything runs, `user=None` the login name with no environment variable read |
 | test_format.py | 21 | `--format json\|xml` through `rpc()`/`rpc_batch()`, refusal on other transports and on edits, `--json`/`--raw`/`-v`/`--diff` shapes |
 | test_generic.py | 44 | the paramiko transport (`hssh/transports/ssh.py`): host keys pinned in `~/.h-ssh/known_hosts` (0600) under a file lock, the known_hosts files parsed once per process and shared until they change (a pin this process adds is in the shared copy), `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure, reads and the exit status bounded by the command timeout, a reply the CLI refuses at exit 0, the Junos and IOS-shaped dialect edits and confirms on a fake shell channel, EOS `\| json` |
 | test_input_validation.py | 34 | #62: wrong input is refused with a named reason before anything runs — numeric flags and config keys out of range, ports, BOM inventories, a `--config` that is not a file, `--save-output` on a file, a closed stdout, whitespace commands, unknown job keys, lines without `=`, wide CSV rows, a target that still says `arista` |

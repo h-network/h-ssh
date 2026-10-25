@@ -7,6 +7,7 @@ OpenSSH client and telnet; a driver is one dialect on one transport.
 
 from .core import Target, load_devices_csv, resolve_command, get_available_commands, parse_inline_target, parse_bare_target, load_jobs
 from .runner import run_for_target, run_for_target_async
+from .fleet import Fleet
 from .safety import SafetyGate
 from .audit import write_audit_entry
 from . import pool
@@ -17,6 +18,6 @@ __version__ = "1.0.0"
 __all__ = [
     'Target', 'load_devices_csv', 'resolve_command', 'get_available_commands',
     'parse_inline_target', 'parse_bare_target', 'load_jobs',
-    'run_for_target', 'run_for_target_async',
+    'run_for_target', 'run_for_target_async', 'Fleet',
     'SafetyGate', 'write_audit_entry', 'pool', 'drivers', 'transports',
 ]
