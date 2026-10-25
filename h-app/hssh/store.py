@@ -148,7 +148,11 @@ class Store:
         else:
             self._create_private(path)
             try:
-                self.conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT)
+                # Not pinned to the opening thread: a library caller may open a
+                # store here and write it from the thread that consumes the results.
+                # One writer at a time is still the rule; the CLI writes from its
+                # main thread only, Fleet from the iterating thread only.
+                self.conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT, check_same_thread=False)
                 _wal(self.conn)
                 # WAL with synchronous=NORMAL: every commit is safe against the
                 # process dying, the file never corrupts, and only a power cut

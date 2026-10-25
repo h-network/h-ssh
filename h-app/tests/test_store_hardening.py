@@ -13,7 +13,7 @@ import pytest
 
 from hssh import store as S
 from hssh.store import Store
-from tests.test_store import BATCH, SHOW, rows, run_cli
+from tests.test_store import BATCH, FAILED, SHOW, rows, run_cli
 
 
 def _racer(path, barrier, q):
@@ -197,3 +197,28 @@ def test_the_banner_hints_at_more_workers_for_a_big_fleet(tmp_path, monkeypatch,
     big = [x for i in range(1, 251) for x in ("--target", f"R{i}:10.1.{i // 256}.{i % 256}:junos")]
     rc, out, err = run_cli(monkeypatch, capsys, [*big, "-sC", "show version", "--workers", "64", "--store", str(tmp_path / "h.db")])
     assert rc == 0 and "Hint:" not in out                     # 4 waves at 64: nothing more to suggest
+
+
+def test_a_store_may_be_written_from_another_thread_than_the_one_that_opened_it(tmp_path):
+    """A library caller opens the store where it builds the fleet and writes it
+    from the thread that consumes the results. One writer at a time is still
+    the rule; the thread need not be the opening one."""
+    import threading
+    st = Store(str(tmp_path / "t.db"))
+    run = st.begin_run("show", ["t"], "u", 2, "0")
+    errors = []
+
+    def writer():
+        try:
+            st.add_entry(run, FAILED, "show version")            # r2's failure, r1's two batch rows
+            st.add_entry(run, BATCH, "")
+        except Exception as e:                       # pragma: no cover - the failure we are testing against
+            errors.append(e)
+
+    th = threading.Thread(target=writer)
+    th.start()
+    th.join(10)
+    st.finish_run(run, 2, 0, 0)
+    st.close()
+    assert errors == []
+    assert rows(tmp_path / "t.db", "SELECT COUNT(*) AS n FROM results")[0]["n"] == 3
