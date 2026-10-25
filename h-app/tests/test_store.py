@@ -72,10 +72,30 @@ def test_a_symlink_in_place_of_the_store_is_refused(tmp_path):
         Store(str(link))
 
 
-def test_run_ids_sort_by_time_and_differ_within_a_second():
-    ids = {new_run_id() for _ in range(20)}
-    assert len(ids) == 20
-    assert all(len(i) == len("20261024-173055-6dc0") for i in ids)
+def test_run_ids_sort_by_time_and_carry_four_hex_digits():
+    import datetime
+    a = new_run_id(datetime.datetime(2026, 10, 24, 17, 30, 55))
+    b = new_run_id(datetime.datetime(2026, 10, 24, 17, 30, 56))
+    assert a < b and a.startswith("20261024-173055-") and b.startswith("20261024-173056-")
+    assert all(len(i) == len("20261024-173055-6dc0") and int(i[-4:], 16) >= 0 for i in (a, b))
+    assert len({new_run_id()[-4:] for _ in range(5)}) > 1       # the suffix is random, not a clock
+
+
+def test_two_runs_of_the_same_second_with_the_same_suffix_still_get_different_ids(tmp_path, monkeypatch):
+    # Four hex digits collide once in 65536; a run must take another id
+    # then, not fail. The suffix is pinned so the collision is certain.
+    suffixes = iter(["6dc0", "6dc0", "6dc0", "9f12"])
+    monkeypatch.setattr(store_module.secrets, "token_hex", lambda n=2: next(suffixes))
+    store = Store(str(tmp_path / "runs.db"))
+    first = store.begin_run("show", ["h-ssh"], "me", 1, "0")
+    second = store.begin_run("show", ["h-ssh"], "me", 1, "0")
+    assert first != second
+    # The second run took the fresh suffix, unless the clock ticked between the two.
+    assert second.endswith("-9f12") or second[:15] != first[:15]
+    assert {r["run_id"] for r in store.runs()} == {first, second}
+    # An id the caller chose is not replaced behind their back.
+    with pytest.raises(sqlite3.IntegrityError):
+        store.begin_run("show", ["h-ssh"], "me", 1, "0", run_id=first)
 
 
 def test_one_row_per_command_kept_as_it_came(tmp_path):
