@@ -7,7 +7,7 @@
 [![License: PolyForm Noncommercial 1.0.0](assets/badges/license.svg)](LICENSE)
 ![Python 3.10+](assets/badges/python.svg)
 ![Vendors: junos ssh openssh telnet](assets/badges/vendors.svg)
-![Runtime dependency: paramiko only](assets/badges/deps.svg)
+![Runtime dependencies: paramiko and PyEZ](assets/badges/deps.svg)
 
 </div>
 
@@ -35,7 +35,7 @@ lands in a JSONL audit trail.
 - **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an EOS switch each their own command. Drop your own in `~/.h-ssh/commands/{dialect}.json` (`junos`, `eos`, `none`) to override.
 - **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely. A whole fleet run fits in one YAML file (`--run fleet.yaml`) that a pipeline step or a jump-host session runs as it is.
 - **Built for a maintenance, not just a run.** A session pool keeps one NETCONF session per router open for a whole script; `rpc()` and `--format json|xml` return the router's own data instead of CLI text; `begin()` holds a diffed candidate open until a gate decides; `--rollback N`, commit comments, `--commit-status` and `guarded_commit()` cover the commit-confirmed lifecycle without a `| match` in sight.
-- **One runtime dependency — or none.** `paramiko`. Vendor libraries are optional extras, telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a locked-down jump host with nothing installable still runs the whole tool.
+- **Two runtime dependencies — or none.** `paramiko` and `junos-eznc` come with the package. Telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a checkout on a locked-down jump host with nothing installable still runs shows and edits over `ssh`.
 
 ## How it works
 
@@ -67,11 +67,22 @@ h-ssh --list-vendors
 ```
 
 The installer puts h-ssh in a Python environment of its own, `~/.h-ssh/venv`, with every transport
-(paramiko and PyEZ come with it), and links `h-ssh` and `h-ssh-store` into `~/.local/bin`. It touches
-nothing else: your config, inventory and stores live next to it under `~/.h-ssh`. Running the same line
-again upgrades; `H_SSH_REF=v1.0.0` in front of it picks a tag or branch; `sh install.sh --uninstall`
-removes the environment and the two links. Read the script first if you like: it is sixty lines of
-POSIX sh and does what this paragraph says.
+(paramiko and PyEZ come with it), and links `h-ssh` and `h-ssh-store` into `~/.local/bin`, creating
+that directory when it is missing; if it is not on your `PATH` yet the script says so and how to add
+it. Your config, inventory and stores live next to the environment under `~/.h-ssh`, and pip's download
+cache lands in `~/.cache/pip`. Running the same line again upgrades, whatever the version number says.
+It installs the `develop` branch; a knob on the `sh` side of the pipe picks another branch or tag:
+`curl -fsSL … | H_SSH_REF=main sh` (`H_SSH_HOME`, `H_SSH_BIN` and `H_SSH_PYTHON` are the others, see
+the script's header). Removing it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/h-network/h-ssh/develop/install.sh | sh -s -- --uninstall
+```
+
+takes the environment and the two links away and leaves `~/.h-ssh` otherwise alone; it never touches
+an `h-ssh` in `~/.local/bin` that it did not put there (a pipx or uv install, your own wrapper), and
+neither does an install. Read the script first if you like: a page of POSIX sh that does what this
+paragraph says.
 
 If you already use [pipx](https://pipx.pypa.io) or [uv](https://docs.astral.sh/uv/), the same thing in
 their words: `pipx install git+https://github.com/h-network/h-ssh.git` or
@@ -85,32 +96,33 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'           # the package, editable, plus pytest
 ```
 
-The checkout's `./h-app/h-ssh.py` works uninstalled too.
+The checkout's `./h-app/h-ssh.py` is the same CLI without installing, on an interpreter that has
+`paramiko` and `junos-eznc`; the `openssh` and `telnet` transports need neither.
 
 ## Quick start
 
 ```bash
-# show command across two routers, inline targets
-./h-app/h-ssh.py --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
+# show command across two routers, inline targets (the password is asked for; keys and agents need nothing)
+h-ssh --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
 # ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows)
-./h-app/h-ssh.py --user admin --json -sC "show version" --devices h-app/devices.csv
+h-ssh --user admin --json -sC "show version" --devices h-app/devices.csv
 
 # compare one command's output across the fleet
-./h-app/h-ssh.py --user admin -sC bgp --diff --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
+h-ssh --user admin -sC bgp --diff --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
 # config change — look before you leap (no --target/--devices: the inventory is ~/.h-ssh/devices.csv, or ./devices.csv)
-./h-app/h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" --dry-run
-./h-app/h-ssh.py --user admin -eC "set system ntp server 10.0.0.1" -y
+h-ssh --user admin -eC "set system ntp server 10.0.0.1" --dry-run
+h-ssh --user admin -eC "set system ntp server 10.0.0.1" -y
 
 # a change that rolls itself back in 10 minutes unless you confirm
-./h-app/h-ssh.py --user admin -eB configs/all.set --commit-confirmed 10 -y
+h-ssh --user admin -eB configs/all.set --commit-confirmed 10 -y
 
 # several commands per device, one connection
-./h-app/h-ssh.py --user admin --batch commands.txt --target R1:10.0.1.1:junos
+h-ssh --user admin --batch commands.txt --target R1:10.0.1.1:junos
 
 # a console server still speaking telnet
-./h-app/h-ssh.py --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
+h-ssh --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
 
 # every run is kept in ./h-ssh.db, as the devices answered; read it back
 h-ssh-store runs
@@ -124,7 +136,7 @@ Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT
 ### Authentication
 
 ```bash
-./h-app/h-ssh.py --user admin -sC bgp                     # SSH agent / key, or type it at the prompt
+h-ssh --user admin -sC bgp                     # SSH agent / key, or type it at the prompt
 export HSSH_USER=admin HSSH_PASSWORD=secret               # a pipeline: from the environment, nothing to type
 ```
 
@@ -478,7 +490,7 @@ Two rules the file cannot bend:
   they do for flags, and the banner names the file, the device count and the timer.
 
 The file is declarative: no variables, loops or templating. A pipeline that needs them generates the
-file. YAML needs PyYAML, which the `junos` extra already installs; a JSON run file needs nothing.
+file. YAML needs PyYAML, which comes along with junos-eznc, so every install has it; a JSON run file needs nothing.
 
 ## Output
 
