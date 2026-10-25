@@ -7,10 +7,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh import runner, vendors
+from hssh import runner, drivers
 from hssh.core import Target, read_set_file_for_device
 from hssh.errors import AmbiguousCommitError, NotAppliedError
-from hssh.vendors import junos
+from hssh.transports import netconf
 
 
 class FakeVendor:
@@ -44,7 +44,7 @@ def no_sleep(monkeypatch):
 def run(monkeypatch, vendor_name, mod, mode="edit-cmd", edit_cmd="set a b",
         dry_run=False, commit_confirmed=None, config_dir=None, broadcast_file=None, attempts=3,
         expected_diff=None):
-    monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
+    monkeypatch.setitem(drivers.MODULES, drivers.get(vendor_name).name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode=mode,
         show_cmd=None, edit_cmd=edit_cmd, config_dir=config_dir, broadcast_file=broadcast_file,
@@ -158,7 +158,7 @@ def test_dash_eD_and_dash_eB_load_the_same_lines(monkeypatch, tmp_path):
     run(monkeypatch, "junos", by_file, mode="edit-broadcast", edit_cmd=None,
         broadcast_file=str(tmp_path / "R1.set"))
     assert by_file.edit_calls[0]["payload"] == SET_FILE      # -eB hands the driver the file as is
-    assert junos._strip_comments(by_file.edit_calls[0]["payload"]) + "\n" == by_dir.edit_calls[0]["payload"]
+    assert netconf._strip_comments(by_file.edit_calls[0]["payload"]) + "\n" == by_dir.edit_calls[0]["payload"]
 
 
 def test_runner_leaves_name_resolution_to_the_transport(monkeypatch):
@@ -187,7 +187,7 @@ class FakeGate:
 
 
 def run_gated(monkeypatch, vendor_name, mod, gate, **kw):
-    monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
+    monkeypatch.setitem(drivers.MODULES, drivers.get(vendor_name).name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode="edit-cmd",
         show_cmd=None, edit_cmd="set a b", config_dir=None, broadcast_file=None,
@@ -231,7 +231,7 @@ class RollbackVendor(FakeVendor):
 
 def run_rollback(monkeypatch, vendor_name, mod, n=1, dry_run=False, commit_confirmed=None, attempts=3,
                  expected_diff=None):
-    monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
+    monkeypatch.setitem(drivers.MODULES, drivers.get(vendor_name).name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode="rollback",
         show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
@@ -269,7 +269,7 @@ def test_rollback_retries_only_when_nothing_was_applied(monkeypatch):
 
 def test_comment_reaches_the_junos_driver_and_is_refused_elsewhere(monkeypatch):
     v = FakeVendor()
-    monkeypatch.setitem(vendors.VENDORS, "junos", v)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", v)
     runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="edit-cmd",
         show_cmd=None, edit_cmd="set a b", config_dir=None, broadcast_file=None,
@@ -277,7 +277,7 @@ def test_comment_reaches_the_junos_driver_and_is_refused_elsewhere(monkeypatch):
         dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, comment="C1 cutover")
     assert v.edit_calls[0]["comment"] == "C1 cutover"
     v = FakeVendor()
-    monkeypatch.setitem(vendors.VENDORS, "telnet-junos", v)
+    monkeypatch.setitem(drivers.MODULES, "junos@telnet", v)
     _, ok, out, _ = runner.run_for_target(
         t=Target("R1", "10.0.0.1", "telnet-junos"), transport="telnet-junos", mode="edit-cmd",
         show_cmd=None, edit_cmd="set a b", config_dir=None, broadcast_file=None,
@@ -290,7 +290,7 @@ def test_commit_status_mode_returns_json(monkeypatch):
     class V(FakeVendor):
         def commit_status(self, host, user, passwd, st, ct, port=None, vendor_hint=None):
             return [{"seq": 0, "user": "h-lab", "pending_rollback_minutes": 5}]
-    monkeypatch.setitem(vendors.VENDORS, "junos", V())
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", V())
     name, ok, out, _ = runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="commit-status",
         show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
@@ -298,7 +298,7 @@ def test_commit_status_mode_returns_json(monkeypatch):
         dry_run=False, commit_confirmed=None, save_dir=None, quiet=True)
     import json as _json
     assert ok and _json.loads(out.splitlines()[-1]) == [{"seq": 0, "user": "h-lab", "pending_rollback_minutes": 5}]
-    monkeypatch.setitem(vendors.VENDORS, "ssh", FakeVendor())
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", FakeVendor())
     _, ok, out, _ = runner.run_for_target(
         t=Target("R1", "10.0.0.1", "ssh"), transport="ssh", mode="commit-status",
         show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
@@ -326,7 +326,7 @@ def test_commit_status_dry_run_opens_no_session(monkeypatch):
             Mod.calls.append(a)
             return [{"seq": 0}]
 
-    monkeypatch.setitem(vendors.VENDORS, "junos", Mod)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", Mod)
     name, ok, out, _ = runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="commit-status",
         show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
@@ -368,7 +368,7 @@ def test_save_output_files_are_0600_and_raw(monkeypatch, tmp_path):
     import os
     os.umask(0o022)
     v = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: 'encrypted-password "$6$HASH"; ## SECRET-DATA\n')
-    monkeypatch.setitem(vendors.VENDORS, "junos", v)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", v)
     save = tmp_path / "out"
     name, ok, out, _ = runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
@@ -399,7 +399,7 @@ def _show_mod(calls, fail_times=2):
 
 
 def _show(monkeypatch, mod, cmd, fmt="text"):
-    monkeypatch.setitem(vendors.VENDORS, "junos", mod)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
         show_cmd=cmd, edit_cmd=None, config_dir=None, broadcast_file=None,

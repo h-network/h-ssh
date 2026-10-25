@@ -60,7 +60,7 @@ class Dialect:
     name: str                 # the half of a driver name before the @
     title: str                # as printed to the operator ("Junos", "IOS")
     description: str
-    shortcuts: Optional[str] = None      # stem of the shipped library, hssh/dialects/<stem>.json
+    shortcuts: Optional[str] = None      # the shipped library: a stem (hssh/dialects/<stem>.json) or a path to a .json
     check_edit: Optional[Callable[[str, bool], Tuple[bool, str]]] = None
     is_read: Callable[[str], bool] = is_read
     refused: Optional[re.Pattern] = None   # a line in which the CLI refused the command (MULTILINE)

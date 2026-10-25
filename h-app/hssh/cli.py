@@ -33,16 +33,25 @@ from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
-from .vendors import VENDORS
 from . import drivers
 
 
-# Supported vendor names for validation: the vendors registry itself, under
-# the name the CLI has always used, so one table cannot drift from the other.
-VENDOR_MODULES = VENDORS
 
-# What to install when a target's transport reports itself unavailable.
-VENDOR_INSTALL = {name: drivers.get(name).transport.install for name in drivers.names()}
+def list_vendors_lines():
+    """`--list-vendors`: one line per driver, in the registry's order (the
+    built-ins first), then the entry points that failed to load."""
+    rows = []
+    for name, d in drivers.DRIVERS.items():
+        transport = d.transport.name + (" (frozen)" if d.transport.frozen else "")
+        rows.append((name, ", ".join(d.aliases) or "-", transport, d.dialect.name,
+                     ",".join(d.transport.formats), " ".join(sorted(d.supports)), drivers.SOURCES[name]))
+    head = ("name", "aliases", "transport", "dialect", "formats", "supports", "source")
+    widths = [max(len(r[i]) for r in rows + [head]) for i in range(len(head) - 1)]
+    fmt = "  ".join("{:<%d}" % w for w in widths) + "  {}"
+    lines = [fmt.format(*head)] + [fmt.format(*r) for r in rows]
+    for ep, why in drivers.BROKEN.items():
+        lines.append(f"broken entry point '{ep}': {why}")
+    return lines
 
 
 
@@ -427,6 +436,9 @@ async def main() -> int:
                         help="Print only each device's output, no progress lines or headers")
     parser.add_argument("--list-commands", action="store_true",
                         help="List available command shortcuts for the selected transport")
+    parser.add_argument("--list-vendors", action="store_true",
+                        help="List every driver a target may name: aliases, transport, dialect, "
+                             "formats, what it supports, and where it came from")
 
     # Inline targets
     parser.add_argument("--target", type=str, action="append",
@@ -487,6 +499,11 @@ async def main() -> int:
         if value is not None and not value.strip():
             print(f"ERROR: {flag} is empty.", file=sys.stderr)
             return 2
+
+    if args.list_vendors:
+        for line in list_vendors_lines():
+            print(line)
+        return 0
 
     # Handle --list-commands
     if args.list_commands:
@@ -738,15 +755,14 @@ async def main() -> int:
             print(f"ERROR: {drivers.RETIRED[v]}.", file=sys.stderr)
             return 2
         try:
-            mod = VENDOR_MODULES.get(drivers.get(v).shim)
-        except ValueError:
-            mod = None
-        if mod is None:
+            driver = drivers.get(v)
+            mod = drivers.module_of(driver)
+        except (ValueError, ImportError):
             print(f"ERROR: Unknown vendor '{v}'.", file=sys.stderr)
             return 2
-        if not mod.AVAILABLE:
-            install = VENDOR_INSTALL.get(v, v)
-            print(f"ERROR: {install} not installed (required for vendor '{v}').", file=sys.stderr)
+        if not getattr(mod, "AVAILABLE", True):
+            print(f"ERROR: {driver.transport.install} not installed (required for vendor '{v}').",
+                  file=sys.stderr)
             return 2
 
     # Everything the run will write is proven writable before the first

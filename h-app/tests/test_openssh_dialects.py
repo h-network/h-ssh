@@ -13,12 +13,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh import drivers, runner, vendors
+from hssh import drivers, runner
 from hssh.core import Target
 from hssh.drivers import contract
 from hssh.drivers import results as R
 from hssh.errors import NotAppliedError, NothingToConfirmError
-from hssh.vendors import openssh
+from hssh.transports import openssh
 
 FAKE_SSH = r'''
 """A fake ssh. `ssh -V` prints a version. With -tt it plays a device CLI on
@@ -499,8 +499,8 @@ def test_the_process_channel_times_out_echoes_closes_and_reads_sshs_verdict(tmp_
 def test_the_four_dialect_drivers_exist_on_the_openssh_transport():
     for name in ("junos@openssh", "ios@openssh", "nxos@openssh", "eos@openssh"):
         d = drivers.get(name)
-        assert d.name == d.shim == name and d.transport is drivers.OPENSSH
-        assert vendors.VENDORS[name] is openssh and drivers.module_of(d) is openssh
+        assert d.name == name and d.aliases == () and d.transport is drivers.OPENSSH
+        assert name not in drivers.ALIASES and drivers.module_of(d) is openssh
         assert contract.violations(d, openssh) == []
         assert runner.bind(name).caps == d.supports
     assert drivers.get("junos@openssh").supports == drivers.get("junos@ssh").supports == {

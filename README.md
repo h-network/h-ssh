@@ -183,6 +183,11 @@ shell. Over the OpenSSH binary the shell is `ssh -tt`, with a password still han
 `SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh` drivers (dialect `none`) never open
 a shell.
 
+`h-ssh --list-vendors` prints the registry: every driver a target may name, its aliases, transport,
+dialect, the formats `--format` can ask it for, what it supports, and where it came from (`built-in`,
+or the package that registered it: see [Adding a vendor](#adding-a-vendor)). `h-ssh --list-commands
+--transport junos` lists a dialect's shortcut library the same way.
+
 Telnet is a prompt match on a raw socket, so it is strict about what it has not seen. A read that reaches
 its timeout or loses the connection is an error, never a partial reply passed off as the device's answer,
 and a `login:`/`Password:` prompt back after the password is a failed login, reported once — not the
@@ -242,6 +247,112 @@ the two that can arm a rollback timer; dropping the timer without saying so woul
 Edits run in an EOS configure session: the lines load into the session, its diff comes back, and
 `commit` makes them live together. A rejected line aborts the session and leaves running-config as
 it was; `NO CHANGES` means the session diff was empty and nothing was committed.
+
+## Adding a vendor
+
+A vendor is a driver: a dialect (what the device speaks) on a transport (how it is reached). The
+built-ins are declared in `hssh/drivers/__init__.py`; a package installed next to h-ssh declares its
+own through the `hssh.drivers` entry-point group, so an internal package can ship a dialect, or a
+driver pairing one with an existing transport, without a fork of h-ssh. Four pieces and one test run.
+
+**A dialect file.** A `Dialect` (`hssh/dialects/base.py`) is everything h-ssh knows about the device
+and nothing about connections; `hssh/dialects/ios.py` and `none.py` are the smallest built-in ones.
+
+| Field | What it is |
+|---|---|
+| `name` | the half of a driver name before the `@` (`ios` in `ios@ssh`), and the stem of the operator's shortcut file |
+| `title`, `description` | the name as printed to the operator, and one line on the dialect |
+| `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. Every text transport reads replies with it: a show whose reply opens with such a line is a failure, not output, and an edit stops at the line that got one. A dialect on `ssh`, `openssh` or `telnet` must have one |
+| `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*` |
+| `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
+| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt). `None`: the dialect shows over those transports but cannot edit |
+| `commit_pending` | a regex whose group 1 is the minutes left on a pending commit-confirmed, as `show system commit` prints them; `-eC commit` confirms only when it finds one |
+| `shortcuts` | the stem of a shipped library, `hssh/dialects/<stem>.json` — built-in dialects only, see below |
+
+```python
+# acme_hssh/__init__.py — an IOS-shaped switch, shows and edits over paramiko
+import re
+from hssh import drivers
+from hssh.dialects.base import CliSyntax, Dialect
+from hssh.drivers import Driver
+
+CLI = CliSyntax(prompt=re.compile(r"[\w\-\.]+(\([^\s()]+\))?[>#]\s*$"),
+                prompt_name=re.compile(r"^([\w\-\.]+)(\([^\s()]+\))?[>#]\s*$"),
+                prompt_tail=r"(\([^\s()]+\))?[>#]\s*$",
+                config_enter="configure terminal", config_exit="end")
+DIALECT = Dialect("acme", "AcmeOS", "Acme switches: an IOS-shaped CLI",
+                  refused=re.compile(r"^\s*% ", re.M), cli=CLI)
+
+DRIVERS = [Driver(DIALECT, drivers.SSH, frozenset({"show", "show_batch", "edit"}))]
+```
+
+**A `Driver` on a transport.** `Driver(dialect, transport, supports, aliases=())`. The transport is one
+of `drivers.SSH`, `drivers.OPENSSH`, `drivers.NETCONF` and `drivers.TELNET` (frozen: it takes a
+dialect, nothing else), or a `Transport` of the package's own whose `module` meets the contract below.
+`supports` is the set of words the runner may ask for: `show`, `show_batch`, `show_structured`, `rpc`,
+`edit`, `rollback`, `confirm`, `commit_status`, and the policies `dry_run`, `commit_confirmed` and
+`comment`. A word the driver does not list is refused by name before any device is touched, so list
+what the transport's module really does for this dialect. The `ssh` and `openssh` modules show on an
+exec channel for any dialect with a `refused`, edit through the CLI engine for one with a `cli`, and
+need a candidate (`compare`, `discard`, `commit`) for `dry_run`, `commit_confirmed` and `confirm`;
+`show_structured` there is EOS's `| json`, and `rpc`, `rollback`, `commit_status` and `comment` are
+NETCONF's. `Driver` itself refuses nonsense (`rpc` on a text-only transport, a policy without `edit`).
+An alias is another name a target may carry (`telnet-ios` for `ios@telnet`) and must be free.
+
+**A JSON of shortcuts.** `-sC bgp` resolves against the dialect's library: for a built-in dialect the
+file next to it, `hssh/dialects/<dialect>.json`, and for every dialect the operator's
+`~/.h-ssh/commands/<dialect>.json` and `~/.h-ssh/commands/<vendor as typed>.json` on top, later files
+overriding earlier entries. A built-in dialect names its library by stem (`shortcuts="junos"`); a
+dialect from another package names its own file by path (`shortcuts=str(Path(__file__).with_name("acme.json"))`),
+and the operator's `~/.h-ssh/commands/acme.json` still goes on top. The format is
+`hssh/dialects/junos.json`'s — a name, the command, a description, and for NETCONF an optional
+`structured` binding:
+
+```json
+{
+  "version": {"command": "show version", "description": "Software version and uptime"},
+  "bgp": {"command": "show ip bgp summary", "description": "BGP neighbor summary"}
+}
+```
+
+**The entry point.** In the package's own `pyproject.toml`:
+
+```toml
+[project.entry-points."hssh.drivers"]
+acme = "acme_hssh:DRIVERS"
+```
+
+It names a `Driver`, a list of them, or a callable returning either. Installed next to h-ssh, the
+package's drivers load after the built-ins, and `acme@ssh` works in a target, a CSV row, a job and a
+run file like any built-in name (`--transport` keeps its four choices). `h-ssh --list-vendors` shows
+it with where it came from:
+
+```console
+$ h-ssh --list-vendors
+name           aliases  transport  dialect  formats        supports                                      source
+junos@netconf  junos    netconf    junos    text,xml,json  comment commit_confirmed commit_status …      built-in
+none@ssh       ssh      ssh        none     text           edit show show_batch                          built-in
+…
+acme@ssh       -        ssh        acme     text           edit show show_batch                          acme-hssh (entry point acme)
+```
+
+An entry point is taken whole or not at all. One whose import raises, that hands over something that is
+not a `Driver`, or that claims a name or alias already registered is listed by name at the end of that
+output — `broken entry point 'acme': ImportError: …` — never as a traceback, and the rest still load.
+The registry is `hssh.drivers`: `DRIVERS`, `SOURCES` and `BROKEN` are what `--list-vendors` prints,
+and `load()` rebuilds them.
+
+**The contract test run.** `pytest h-app/tests/drivers/test_contract.py` puts every registered driver
+through `hssh.drivers.contract.violations()`: the module behind the driver has an `AVAILABLE` flag and
+a function for each capability declared — `show`, `show_batch`, `edit`, … — that takes what the runner
+passes: `host, user, passwd`, then the command, commands, payload or rollback number, then
+`session_timeout, command_timeout` (and `commit_confirmed` for an edit), with `port=` and
+`vendor_hint=` as keywords; `dry_run=` and `expected_diff=` on `edit` for a driver that declares
+`dry_run`, `comment=` on `edit`, `confirm` and `rollback` for `comment`, and `rpc_batch()` next to
+`rpc()`. A capability declared and not backed would otherwise fail on the first device with a
+`TypeError` where a refusal should have been. Run it with the package installed; for one that is not,
+build the entry point in a test and hand it to `drivers.load([...])`, as `tests/test_entry_points.py`
+does with the packages under `tests/fixtures/`.
 
 ## Defaults
 
@@ -502,11 +613,13 @@ binding names the RPC and the few fields to keep — and the two cannot be combi
 ## Library usage
 
 ```python
-from hssh import SafetyGate, Target, vendors
+from hssh import SafetyGate, Target
 from hssh.runner import run_for_target
+from hssh.transports import netconf, ssh
 
-# straight at a vendor
-output = vendors.junos.show("10.0.1.1", "admin", None, "show version", 30, 20)
+# straight at a transport: netconf speaks Junos; ssh and openssh speak the dialect the vendor_hint names
+output = netconf.show("10.0.1.1", "admin", None, "show version", 30, 20)
+output = ssh.show("10.0.2.1", "admin", None, "show version", 30, 20, vendor_hint="ios@ssh")
 
 # or through the runner, with the safety gate in place — none is applied unless you pass one
 target = Target(name="R1", host="10.0.1.1", vendor="junos")
@@ -534,18 +647,18 @@ A maintenance wants to look at the diff *before* deciding, keep the candidate on
 find its commits again on the box afterwards:
 
 ```python
-with vendors.junos.begin(host, user, None, payload, 30, 20) as tx:   # lock, load, diff, commit check
+with netconf.begin(host, user, None, payload, 30, 20) as tx:         # lock, load, diff, commit check
     print(tx.diff)                                                   # tx.show()/tx.rpc() still work here
     if gate_says_yes(tx.diff):
         tx.commit(confirmed=10, comment="C1 cutover")                 # or tx.abort(); leaving the block aborts
 
-vendors.junos.confirm(host, user, None, 30, 20, comment="C1 cutover (confirmed)")
-vendors.junos.commit_status(host, user, None, 30, 20)
+netconf.confirm(host, user, None, 30, 20, comment="C1 cutover (confirmed)")
+netconf.commit_status(host, user, None, 30, 20)
 # [{'seq': 0, 'user': 'h-lab', 'client': 'netconf', 'time': '…', 'epoch': 1792…, 'comment': 'C1 cutover',
 #   'note': 'commit confirmed, rollback in 10mins', 'pending_rollback_minutes': 10}, …]
 
-vendors.junos.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
-                             check=lambda: checks_pass(), comment="C1 cutover")
+netconf.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
+                       check=lambda: checks_pass(), comment="C1 cutover")
 # commit confirmed → check() → confirm, or an immediate `rollback 1` commit; returns what happened:
 # {'final': 'confirmed' | 'rolled back' | 'not confirmed' | 'not rolled back' | 'no changes', …}
 ```
@@ -570,12 +683,12 @@ refused before anything is sent, because the session's lock belongs to the threa
 command you know into its RPC (what `| display xml rpc` does), and answers in its own JSON:
 
 ```python
-hw = vendors.junos.rpc("10.0.1.1", "admin", None, "show chassis hardware", 30, 20)
+hw = netconf.rpc("10.0.1.1", "admin", None, "show chassis hardware", 30, 20)
 # -> {'chassis-inventory': [{'chassis': [{'serial-number': [{'data': 'VM6AD25B940C'}], ...}]}]}
 
-vendors.junos.rpc(host, user, None, "get-interface-information", 30, 20,
-                  args={"interface-name": "ge-0/0/0", "terse": True})   # RPC name + arguments
-vendors.junos.rpc(host, user, None, "show route summary", 30, 20, fmt="xml")   # the reply XML, as text
+netconf.rpc(host, user, None, "get-interface-information", 30, 20,
+            args={"interface-name": "ge-0/0/0", "terse": True})   # RPC name + arguments
+netconf.rpc(host, user, None, "show route summary", 30, 20, fmt="xml")   # the reply XML, as text
 ```
 
 `rpc()` runs on the pooled session like everything else, and `rpc_batch()` answers a list of
@@ -591,10 +704,11 @@ Junos call reuses the router's open session:
 
 ```python
 from hssh import pool
+from hssh.transports import netconf
 pool.enable()                     # sessions idle 300 s are closed (reaper runs once a minute); pool.enable(idle_timeout=60) or HSSH_POOL_IDLE_TIMEOUT=60 to change
 
 for cmd in ("show version", "show bgp summary", "show route summary"):
-    vendors.junos.show("10.0.1.1", "admin", None, cmd, 30, 20)   # one NETCONF session, three RPCs
+    netconf.show("10.0.1.1", "admin", None, cmd, 30, 20)   # one NETCONF session, three RPCs
 
 print(pool.POOL.stats)            # {'opens': 1, 'reuses': 2, 'discards': 0, 'reaped': 0}
 pool.close_all()                  # also runs at interpreter exit
@@ -615,7 +729,7 @@ an edit reports `NotAppliedError` if the session died before the lock, and the u
 h-ssh/
 ├── h-app/
 │   ├── hssh/
-│   │   ├── __init__.py      # public API: Target, run_for_target, SafetyGate, pool, vendors; __version__
+│   │   ├── __init__.py      # public API: Target, run_for_target, SafetyGate, pool, drivers, transports; __version__
 │   │   ├── core.py          # Target, CSV loader, template resolver, job parser
 │   │   ├── cli.py           # argument parsing + orchestration
 │   │   ├── runner.py        # concurrent execution engine
@@ -628,21 +742,18 @@ h-ssh/
 │   │   │   ├── junos.py     # set-syntax guard, refusal regex, candidate CLI, commit-pending note  + junos.json
 │   │   │   ├── ios.py       # IOS-shaped CLI and `% ` refusals; nxos.py, eos.py (+ eos.json) build on it
 │   │   │   └── none.py      # no vendor knowledge: error:/% refusals, IOS-shaped prompt  + none.json
-│   │   ├── transports/
-│   │   │   ├── cli.py       # the CLI engine: login, prompt, run, paging, candidate/lines edits, confirm — on any channel
-│   │   │   └── telnet.py    # the telnet channel (socket + option negotiation); netconf/paramiko/openssh move here with #84
-│   │   ├── drivers/
-│   │   │   ├── base.py      # Transport, Driver and the capability words
-│   │   │   ├── __init__.py  # the registry: dialect@transport names, today's names as aliases
-│   │   │   ├── contract.py  # what a module must offer to back a driver's `supports`
-│   │   │   └── results.py   # EditResult, BatchResult, CommitStatus: typed answers that are still their text/list
-│   │   └── vendors/
-│   │       ├── __init__.py  # VENDORS: today's vendor name → module (the drivers' shim)
-│   │       ├── junos.py     # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
-│   │       ├── generic.py   # paramiko SSH: exec channel for shows and none-dialect edits, the CLI engine on a shell for dialect edits
-│   │       ├── openssh.py   # the OpenSSH binary — zero dependencies; the CLI engine on `ssh -tt` for dialect edits
-│   │       └── telnet.py    # the CLI engine on a telnet channel, in the dialect the name says (frozen)
-│   ├── tests/
+│   │   ├── transports/      # how a device is reached: each module does one transport's work for every dialect on it
+│   │   │   ├── netconf.py   # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
+│   │   │   ├── ssh.py       # paramiko: exec channel for shows and none-dialect edits, the CLI engine on a shell for dialect edits
+│   │   │   ├── openssh.py   # the OpenSSH binary — zero dependencies; the CLI engine on `ssh -tt` for dialect edits
+│   │   │   ├── telnet.py    # the telnet channel (socket + option negotiation), the CLI engine on it in the dialect the name says (frozen)
+│   │   │   └── cli.py       # the CLI engine: login, prompt, run, paging, candidate/lines edits, confirm — on any channel
+│   │   └── drivers/
+│   │       ├── base.py      # Transport, Driver and the capability words
+│   │       ├── __init__.py  # the registry: dialect@transport names, today's names as aliases, the `hssh.drivers` entry points
+│   │       ├── contract.py  # what a module must offer to back a driver's `supports`
+│   │       └── results.py   # EditResult, BatchResult, CommitStatus: typed answers that are still their text/list
+│   ├── tests/               # the unit suite; tests/dialects, tests/drivers, tests/transports per layer, tests/fixtures the packages the entry-point tests load
 │   ├── h-ssh.py             # CLI entry point
 │   ├── devices.csv          # example inventory
 │   ├── example_library_usage.py       # library walkthrough
@@ -650,7 +761,7 @@ h-ssh/
 ├── .github/workflows/tests.yml   # unit suite, Python 3.10–3.13
 ├── assets/                  # banner, badges
 ├── TESTS.md                 # what was run on which code
-└── pyproject.toml           # installs the `h-ssh` entry point from h-app/
+└── pyproject.toml           # installs the `h-ssh` entry point from h-app/; declares the built-in drivers under `hssh.drivers`
 ```
 
 ## Develop
@@ -660,8 +771,9 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (419 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
-`python` containers, no JavaScript actions). Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
+The unit suite (829 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+`python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
+contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
 gate (failure handling, edit safety, one real commit per write feature, the library API on one pooled session); the earlier
 59-test run covered every CLI mode, both edit paths, concurrency, error handling, exit codes and the safety gate. What was run

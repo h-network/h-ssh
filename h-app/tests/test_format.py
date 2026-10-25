@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh import cli, runner, vendors
+from hssh import cli, runner, drivers
 from hssh.core import Target
 
 
@@ -65,7 +65,7 @@ class FakeVendor:
 
 def run(monkeypatch, vendor_name, mod, mode="show", fmt="text", batch_cmds=None,
         dry_run=False, attempts=1):
-    monkeypatch.setitem(vendors.VENDORS, vendor_name, mod)
+    monkeypatch.setitem(drivers.MODULES, drivers.get(vendor_name).name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode=mode,
         show_cmd="show version", edit_cmd=None, config_dir=None, broadcast_file=None,
@@ -140,8 +140,7 @@ R1 = ["--target", "R1:10.0.0.1:junos"]
 def run_cli(monkeypatch, capsys, fake, *argv):
     """h-ssh main() in this process; the fake is the junos module for both the
     CLI's availability check and the runner."""
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", fake)
-    monkeypatch.setitem(vendors.VENDORS, "junos", fake)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
     monkeypatch.delenv("HSSH_AUDIT_LOG", raising=False)
     monkeypatch.delenv("HSSH_SAFETY_FILE", raising=False)
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",

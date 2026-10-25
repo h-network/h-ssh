@@ -49,7 +49,7 @@ from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
 from ..errors import NotAppliedError
-from ..transports.cli import Cli, edit_policy, refuse_commit_lines
+from .cli import Cli, edit_policy, refuse_commit_lines
 
 AVAILABLE = shutil.which("ssh") is not None
 
@@ -86,8 +86,7 @@ def _openssh_version() -> tuple:
 def _dialect(vendor_hint: Optional[str]) -> Dialect:
     """The dialect behind a vendor_hint: junos@openssh is junos, ios@openssh
     is ios, plain openssh (and None, and a name the registry does not know)
-    is none. The hint is the shim-era way to name a dialect; #84 hands the
-    object in."""
+    is none. The hint is a driver's name, alias or canonical."""
     try:
         return drivers.get(vendor_hint or "openssh").dialect
     except ValueError:

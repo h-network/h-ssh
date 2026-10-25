@@ -348,7 +348,7 @@ def test_set_file_and_save_paths_stay_inside_their_directory(tmp_path):
 
 # --- #44: the pre-flight wants an SSH banner, not just an open port --------------
 
-def test_preflight_passes_only_on_an_ssh_banner_for_ssh_vendors():
+def test_preflight_passes_only_on_an_ssh_banner_for_ssh_transports():
     import asyncio
     import socket
     import threading
@@ -385,9 +385,9 @@ def test_preflight_passes_only_on_an_ssh_banner_for_ssh_vendors():
 # --- #79: eAPI is gone; the vendor name gets one clear line --------------------------
 
 def test_the_arista_eapi_vendor_is_retired_with_one_clear_line():
-    from hssh import vendors
-    assert "arista" not in vendors.VENDORS and "telnet-arista" in vendors.VENDORS
+    from hssh import drivers
+    assert "arista" not in drivers.names() and "telnet-arista" in drivers.ALIASES
     with pytest.raises(ValueError, match="vendor 'arista' \\(eAPI over HTTPS\\) is no longer supported; EOS devices use the ssh or openssh transport"):
-        vendors.get("arista")
+        drivers.get("arista")
     import importlib
-    assert importlib.util.find_spec("hssh.vendors.arista") is None
+    assert importlib.util.find_spec("hssh.transports.arista") is None

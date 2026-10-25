@@ -13,7 +13,7 @@ import pytest
 from hssh import cli, core, dialects, drivers, runner
 from hssh.core import Target, refusal_line, resolve_command, get_available_commands
 from hssh.dialects.base import CliSyntax, Dialect
-from hssh.vendors import telnet
+from hssh.transports import telnet
 from tests.test_cli_runfile import run as run_cli
 
 HERE = Path(__file__).resolve().parent.parent.parent / "hssh" / "dialects"
@@ -125,11 +125,10 @@ def test_the_runner_asks_the_dialect_which_commands_read(monkeypatch):
         raise RuntimeError("boom")
     monkeypatch.setattr(runner.time, "sleep", lambda s: None)
     fake = types.SimpleNamespace(AVAILABLE=True, show=show)
-    import hssh.vendors as vendors
-    monkeypatch.setitem(vendors.VENDORS, "junos", fake)
     strict = Dialect("strict", "Strict", "nothing is a read", is_read=lambda c: False)
-    monkeypatch.setitem(drivers.DRIVERS, "junos@netconf",
-                        drivers.Driver(strict, drivers.NETCONF, drivers.get("junos").supports, shim="junos"))
+    driver = drivers.Driver(strict, drivers.NETCONF, drivers.get("junos").supports, aliases=("junos",))
+    monkeypatch.setitem(drivers.DRIVERS, "junos@netconf", driver)   # what "junos" now resolves to
+    monkeypatch.setitem(drivers.MODULES, driver.name, fake)          # and the module that does its work
     runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show", show_cmd="show version",
         edit_cmd=None, config_dir=None, broadcast_file=None, user="u", passwd="p", session_timeout=5,
@@ -147,7 +146,7 @@ def test_the_cli_guards_an_edit_by_the_targets_dialect(monkeypatch, capsys, tmp_
     assert len(drv.edits) == 1
 
 
-def test_edit_guard_is_none_for_guardless_or_unknown_vendors():
+def test_edit_guard_is_none_for_guardless_or_unknown_vendor_names():
     assert cli.edit_guard("junos") is cli.edit_guard("telnet-junos") is dialects.junos.DIALECT
     assert cli.edit_guard("ssh") is None and cli.edit_guard("ios@telnet") is None
     assert cli.edit_guard("nope") is None and cli.edit_guard("arista") is None

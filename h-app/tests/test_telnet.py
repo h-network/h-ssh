@@ -120,7 +120,7 @@ def arista_server():
 
 def test_ansi_strip():
     """ANSI escape codes are stripped from output."""
-    from hssh.vendors.telnet import _strip_ansi
+    from hssh.transports.telnet import _strip_ansi
 
     assert _strip_ansi("\x1b[32mgreen\x1b[0m") == "green"
     assert _strip_ansi("no escapes here") == "no escapes here"
@@ -131,7 +131,7 @@ def test_ansi_strip():
 
 def test_ios_show_version(ios_server):
     """Show command via IOS telnet returns device output."""
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
     result = show("127.0.0.1", "admin", "admin", "show version",
                   session_timeout=5, command_timeout=5,
                   port=ios_server.port, vendor_hint="telnet-ios")
@@ -141,7 +141,7 @@ def test_ios_show_version(ios_server):
 
 def test_ios_show_ip_route(ios_server):
     """Show ip route via IOS telnet."""
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
     result = show("127.0.0.1", "admin", "admin", "show ip route",
                   session_timeout=5, command_timeout=5,
                   port=ios_server.port, vendor_hint="telnet-ios")
@@ -150,7 +150,7 @@ def test_ios_show_ip_route(ios_server):
 
 def test_arista_show_interfaces(arista_server):
     """Show interfaces via Arista telnet."""
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
     result = show("127.0.0.1", "admin", "admin", "show interfaces",
                   session_timeout=5, command_timeout=5,
                   port=arista_server.port, vendor_hint="telnet-arista")
@@ -159,7 +159,7 @@ def test_arista_show_interfaces(arista_server):
 
 def test_show_batch(ios_server):
     """Multiple commands on a single connection."""
-    from hssh.vendors.telnet import show_batch
+    from hssh.transports.telnet import show_batch
     results = show_batch("127.0.0.1", "admin", "admin",
                          ["show version", "show ip route"],
                          session_timeout=5, command_timeout=5,
@@ -171,7 +171,7 @@ def test_show_batch(ios_server):
 
 
 def _junos_edit(server, **kw):
-    from hssh.vendors.telnet import edit
+    from hssh.transports.telnet import edit
     return edit("127.0.0.1", "admin", "admin", "set system host-name test\n",
                 session_timeout=5, command_timeout=5, port=server.port,
                 vendor_hint="telnet-junos", **kw)
@@ -192,7 +192,7 @@ def test_junos_edit_commits_only_the_diff_the_dry_run_showed(junos_server):
 
 def test_telnet_always_available():
     """Raw socket telnet is always available (no external deps)."""
-    from hssh.vendors.telnet import AVAILABLE
+    from hssh.transports.telnet import AVAILABLE
     assert AVAILABLE is True
 
 
@@ -337,7 +337,7 @@ def ios_rejects_every_login(srv):
 
 
 def _edit(srv, payload="set system host-name test\n", **kw):
-    from hssh.vendors.telnet import edit
+    from hssh.transports.telnet import edit
     return edit("127.0.0.1", "lab", "secret", payload, session_timeout=5, command_timeout=5,
                 port=srv.port, vendor_hint="telnet-junos", **kw)
 
@@ -347,7 +347,7 @@ def _edit(srv, payload="set system host-name test\n", **kw):
 def test_reader_raises_on_timeout_and_on_eof():
     """A deadline is a TimeoutError naming the last line seen, a closed peer a
     ConnectionError; neither returns what happened to arrive."""
-    from hssh.vendors.telnet import PROMPT_PATTERNS, _read_until_prompt
+    from hssh.transports.telnet import PROMPT_PATTERNS, _read_until_prompt
     ours, theirs = socket.socketpair()
     try:
         theirs.sendall(b"Building configuration...\r\n")
@@ -371,12 +371,12 @@ def test_reader_raises_on_timeout_and_on_eof():
 def test_ios_style_config_prompts_are_recognised(vendor, prompt):
     """A reader that does not know the config-mode prompt waits out its
     timeout on every config line."""
-    from hssh.vendors.telnet import PROMPT_PATTERNS
+    from hssh.transports.telnet import PROMPT_PATTERNS
     assert PROMPT_PATTERNS[vendor].search(prompt)
 
 
 def test_login_prompt_is_not_the_last_login_line():
-    from hssh.vendors.telnet import LOGIN_RE
+    from hssh.transports.telnet import LOGIN_RE
     assert LOGIN_RE.search("R1 (ttyp0)\r\n\r\nlogin: ")
     assert LOGIN_RE.search("User Access Verification\r\n\r\nUsername: ")
     assert LOGIN_RE.search("debian login: ")
@@ -386,7 +386,7 @@ def test_login_prompt_is_not_the_last_login_line():
 def test_ios_edit_applies_config_lines(ios_server):
     """A telnet-ios edit against config-mode prompts: every line is answered
     at once, no prompt-timeout wait per line."""
-    from hssh.vendors.telnet import edit
+    from hssh.transports.telnet import edit
     t0 = time.monotonic()
     result = edit("127.0.0.1", "admin", "admin",
                   "interface GigabitEthernet0/0\ndescription error-disabled uplink\n",
@@ -406,7 +406,7 @@ def test_failed_login_is_an_error_not_output(hint, handler, said):
     """A login prompt back after the password is a failed login: show() raises
     with the device's words, and the command is never typed in as a username."""
     from hssh.errors import NotAppliedError
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
     srv = ScriptedTelnetServer(handler)
     with pytest.raises(NotAppliedError, match="login failed") as exc:
         show("127.0.0.1", "admin", "wrong", "show version",
@@ -419,7 +419,7 @@ def test_connection_dropped_during_login_is_retried_not_permanent():
     """A device that hangs up after the username is a reset after connecting:
     the ConnectionError reaches the runner unwrapped, so the run is retried,
     unlike a refused login which is final."""
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
 
     def hangs_up_after_username(srv):
         srv.send("\r\nR1 (ttyp0)\r\n\r\nlogin: ")
@@ -437,7 +437,7 @@ def test_silent_device_is_a_failed_login():
     of silence; still nothing is a failed login, not an empty read handed back
     as the command's output."""
     from hssh.errors import NotAppliedError
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
     srv = ScriptedTelnetServer(lambda srv: (srv.readline(), srv.readline()), echo=False)
     with pytest.raises(NotAppliedError, match="login failed: no prompt within 1s"):
         show("127.0.0.1", "lab", "secret", "show version",
@@ -449,7 +449,7 @@ def test_console_line_at_a_prompt_wakes_on_enter():
     """The README's console server: a line left at a logged-in prompt prints
     nothing until Enter, and the Enter comes only once the wait is up, so a
     slow login prompt never finds it typed ahead as the username."""
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
     def console_line(srv):
         srv.readline()                            # nothing until Enter
         srv.send("\r\nSW1#")
@@ -466,7 +466,7 @@ def test_console_line_at_a_prompt_wakes_on_enter():
 
 def test_login_then_show():
     """The real thing: login, password, MOTD with its "Last login:" line, prompt."""
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
     srv = ScriptedTelnetServer(junos_cli(login=True))
     out = show("127.0.0.1", "lab", "secret", "show version",
                session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-junos")
@@ -549,7 +549,7 @@ def test_junos_refused_commit_is_a_failure_and_discarded():
 def test_junos_unanswered_commit_is_outcome_unknown(monkeypatch, how):
     """No reply to commit - the deadline passes, or the device hangs up - is
     neither COMMIT OK nor a failure, and nothing is rolled back."""
-    import hssh.vendors.telnet as telnet
+    from hssh.transports import telnet
     from hssh.errors import AmbiguousCommitError
     real = telnet._read_until_prompt
     monkeypatch.setattr(telnet, "_read_until_prompt",
@@ -568,7 +568,7 @@ def test_junos_commit_that_drops_the_session_is_still_ok(monkeypatch, how):
     """commit complete, then the exit goes unanswered or the device hangs up:
     the change took the management address or the telnet service with it, the
     --commit-confirmed use. The commit was seen to land, so it is COMMIT OK."""
-    import hssh.vendors.telnet as telnet
+    from hssh.transports import telnet
     real = telnet._read_until_prompt
     monkeypatch.setattr(telnet, "_read_until_prompt",
                         lambda sock, prompt_re, timeout, buffer="":
@@ -595,7 +595,7 @@ def test_junos_refused_commit_keeps_its_words_when_the_rollback_drops():
 @pytest.mark.parametrize("kw", [{"dry_run": True}, {"commit_confirmed": 5}, {"expected_diff": "+ x"}])
 def test_ios_flavour_refuses_dry_run_timer_and_diff_check_before_connecting(monkeypatch, kw):
     """dry_run=True once applied the config and returned '(config applied)'."""
-    from hssh.vendors import telnet
+    from hssh.transports import telnet
 
     def never(*a, **k):
         raise AssertionError("connected although the request could not be honoured")
@@ -606,7 +606,7 @@ def test_ios_flavour_refuses_dry_run_timer_and_diff_check_before_connecting(monk
 
 @pytest.mark.parametrize("minutes", [0, -3])
 def test_junos_flavour_refuses_a_timer_it_cannot_arm(monkeypatch, minutes):
-    from hssh.vendors import telnet
+    from hssh.transports import telnet
 
     def never(*a, **k):
         raise AssertionError("connected although the timer could not be armed")
@@ -619,7 +619,7 @@ def test_a_console_that_echoes_the_password_does_not_put_it_in_the_error():
     """The timeout message quoted the last line seen; an echoing console
     line after 'Password:' made that the operator's password (#42)."""
     from hssh.errors import NotAppliedError
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
 
     def echoing_console(srv):
         srv.send("Password: ")
@@ -669,7 +669,7 @@ def test_a_set_line_ending_in_prompt_shaped_text_does_not_hide_a_refused_commit(
     """The echo of `description noc@example.com>` satisfied the prompt match;
     every later read was one reply behind and the refused commit came back
     as COMMIT OK (#46)."""
-    from hssh.vendors.telnet import edit
+    from hssh.transports.telnet import edit
     srv = ScriptedTelnetServer(junos_cli_slow())
     with pytest.raises(RuntimeError, match="Commit failed: error: configuration check-out failed"):
         edit("127.0.0.1", "lab", "secret",
@@ -681,7 +681,7 @@ def test_a_set_line_ending_in_prompt_shaped_text_does_not_hide_a_refused_commit(
 
 
 def test_the_learned_prompt_ignores_a_reply_line_that_looks_like_one():
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
 
     def handler(srv):
         srv.send("\r\n" + OP)
@@ -697,7 +697,7 @@ def test_the_learned_prompt_ignores_a_reply_line_that_looks_like_one():
 
 
 def test_more_keeps_what_followed_the_marker_in_the_same_chunk():
-    from hssh.vendors.telnet import show
+    from hssh.transports.telnet import show
 
     def handler(srv):
         srv.send("\r\n" + OP)
@@ -713,7 +713,7 @@ def test_more_keeps_what_followed_the_marker_in_the_same_chunk():
 def test_confirm_is_one_bare_commit_in_exclusive_mode():
     """-eC commit on telnet-junos went through the edit path: configure
     exclusive, commit as a config line, show | compare, commit again (#46)."""
-    from hssh.vendors import telnet
+    from hssh.transports import telnet
     assert hasattr(telnet, "confirm")
     srv = ScriptedTelnetServer(junos_cli(commit_reply="\r\ncommit complete"))
     out = telnet.confirm("127.0.0.1", "lab", "secret", session_timeout=5, command_timeout=5,
@@ -724,7 +724,7 @@ def test_confirm_is_one_bare_commit_in_exclusive_mode():
 
 def test_confirm_refused_lock_is_not_applied():
     from hssh.errors import NotAppliedError
-    from hssh.vendors import telnet
+    from hssh.transports import telnet
     srv = ScriptedTelnetServer(junos_cli(lock_reply="\r\nerror: configuration database locked by: other"))
     with pytest.raises(NotAppliedError, match="Failed to lock config"):
         telnet.confirm("127.0.0.1", "lab", "secret", session_timeout=5, command_timeout=5,
@@ -735,7 +735,7 @@ def test_confirm_refused_lock_is_not_applied():
 def test_a_commit_line_inside_a_payload_is_refused_before_anything_is_sent(monkeypatch):
     """A dry run of -eC commit sent the commit (#46); now the word is never
     accepted as configuration, dry run or not."""
-    from hssh.vendors import telnet
+    from hssh.transports import telnet
     sent = []
     srv = ScriptedTelnetServer(junos_cli())
     for payload in ("commit\n", "set system host-name x\ncommit confirmed 5\n"):

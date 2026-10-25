@@ -378,18 +378,28 @@ def _merge_shortcuts(commands: Dict, path: Path) -> None:
             pass
 
 
+def shipped_shortcuts(spec: str) -> Path:
+    """Where a dialect's own library is: `junos` is the stem of a file shipped
+    next to the built-in dialects, `/opt/acme/acme.json` (anything ending in
+    .json) is the file itself, for a dialect from another package."""
+    if spec.endswith(".json"):
+        return Path(spec).expanduser()
+    return Path(__file__).resolve().parent / "dialects" / f"{spec}.json"
+
+
 def _load_commands_json(vendor: str) -> Dict:
     """The shortcut library for a target's vendor name: what its dialect
-    ships (hssh/dialects/<dialect>.json), with the operator's own entries on
-    top from ~/.h-ssh/commands/<dialect>.json and, as before #81, from
-    ~/.h-ssh/commands/<vendor as typed>.json. An unknown vendor has none."""
+    ships (hssh/dialects/<dialect>.json for a built-in one; a dialect from
+    another package names its own file by path), with the operator's own
+    entries on top from ~/.h-ssh/commands/<dialect>.json and, as before #81,
+    from ~/.h-ssh/commands/<vendor as typed>.json. An unknown vendor has none."""
     try:
         dialect = drivers.get(vendor).dialect
     except ValueError:
         return {}
     commands: Dict = {}
     if dialect.shortcuts:
-        _merge_shortcuts(commands, Path(__file__).resolve().parent / "dialects" / f"{dialect.shortcuts}.json")
+        _merge_shortcuts(commands, shipped_shortcuts(dialect.shortcuts))
     home = Path.home() / ".h-ssh" / "commands"
     for stem in dict.fromkeys((dialect.name, vendor)):
         _merge_shortcuts(commands, home / f"{stem}.json")

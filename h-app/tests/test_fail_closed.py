@@ -9,7 +9,7 @@ import sys
 import types
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hssh import cli, vendors
+from hssh import cli, drivers
 from hssh.audit import probe_append
 from hssh.core import check_unique, Target
 from hssh.safety import SafetyGate
@@ -35,8 +35,7 @@ class Driver:
 
 def run(monkeypatch, capsys, argv):
     drv = Driver()
-    monkeypatch.setitem(vendors.VENDORS, "junos", drv)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", drv)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", drv)
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)

@@ -10,10 +10,10 @@ import time
 import types
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hssh import cli, vendors
+from hssh import cli, drivers
 from hssh.errors import NotAppliedError
 from hssh.runner import _retry_loop, is_connect_failure, is_permanent_failure
-from hssh.vendors import generic, junos
+from hssh.transports import netconf, ssh
 
 
 # --- M7: permanent means one attempt -------------------------------------------
@@ -112,12 +112,12 @@ def _pyez(kind, cause=None, orig=None):
      "SSH negotiation with 10.0.0.1:830 failed: Incompatible ssh peer (no acceptable kex algorithm)"),
 ])
 def test_connect_reason_reads_the_exception_pyez_was_handling(exc, elapsed, expect):
-    assert junos._connect_reason(exc, "10.0.0.1", "u", 830, 10, elapsed) == expect
+    assert netconf._connect_reason(exc, "10.0.0.1", "u", 830, 10, elapsed) == expect
 
 
 def test_an_ipv6_literal_is_named_as_the_reason():
     exc = _pyez("ConnectUnknownHostError", socket.gaierror(-2, "Name or service not known"))
-    assert junos._connect_reason(exc, "[2001:db8::1]", "u", 830, 10, 0.0) == \
+    assert netconf._connect_reason(exc, "[2001:db8::1]", "u", 830, 10, 0.0) == \
         "cannot resolve [2001:db8::1] (an IPv6 literal is not accepted by this PyEZ/ncclient; use a name)"
 
 
@@ -126,9 +126,9 @@ def test_open_wraps_pyez_host_validation_as_a_connect_failure(monkeypatch):
         def __init__(self, **kw):
             raise ValueError("Invalid 'host' value 'fd00::1': only alphanumerics, dots, underscores, "
                              "hyphens, or bracketed IPv6 literals are permitted.")
-    monkeypatch.setattr(junos, "JunosDevice", Dev)
+    monkeypatch.setattr(netconf, "JunosDevice", Dev)
     with pytest.raises(NotAppliedError, match="NETCONF connect failed: PyEZ does not accept host 'fd00::1'"):
-        junos._open("fd00::1", "u", "p", 10, 30, None)
+        netconf._open("fd00::1", "u", "p", 10, 30, None)
 
 
 def test_open_reports_the_reason_and_closes_the_device(monkeypatch):
@@ -142,13 +142,13 @@ def test_open_reports_the_reason_and_closes_the_device(monkeypatch):
             try:
                 raise SSHError("Could not open socket to 10.0.0.1:830")
             except SSHError:
-                raise junos.ConnectError("ConnectRefusedError(10.0.0.1)")
+                raise netconf.ConnectError("ConnectRefusedError(10.0.0.1)")
 
         def close(self):
             closed.append(1)
-    monkeypatch.setattr(junos, "JunosDevice", Dev)
+    monkeypatch.setattr(netconf, "JunosDevice", Dev)
     with pytest.raises(NotAppliedError, match=r"NETCONF connect failed: .*10\.0\.0\.1:830"):
-        junos._open("10.0.0.1", "u", "p", 10, 30, None)
+        netconf._open("10.0.0.1", "u", "p", 10, 30, None)
     assert closed == [1]
 
 
@@ -163,7 +163,7 @@ def test_a_malformed_known_hosts_line_is_refused_before_connecting(monkeypatch, 
     connected = []
     monkeypatch.setattr(paramiko.SSHClient, "connect", lambda self, **kw: connected.append(kw))
     with pytest.raises(ValueError, match=r"\.ssh/known_hosts: malformed known_hosts line: 'r1 ssh-ed25519 not-base64!!'; fix or remove it"):
-        generic._connect("10.0.0.1", "u", "p", 5, None)
+        ssh._connect("10.0.0.1", "u", "p", 5, None)
     assert connected == []
     assert is_permanent_failure(ValueError("x: malformed known_hosts line: 'r1'; fix or remove it"))
 
@@ -177,7 +177,7 @@ def test_no_credential_at_all_is_said_in_words(monkeypatch, tmp_path):
         raise paramiko.SSHException("No authentication methods available")
     monkeypatch.setattr(paramiko.SSHClient, "connect", connect)
     with pytest.raises(RuntimeError, match="No authentication methods available for u@10.0.0.1: no password was given"):
-        generic._connect("10.0.0.1", "u", None, 5, None)
+        ssh._connect("10.0.0.1", "u", None, 5, None)
 
 
 # --- M8: Ctrl-C during a connect is interrupted, not a failed device --------------
@@ -194,8 +194,7 @@ def _main_cancelled_after(delay):
 
 
 def _cli_env(monkeypatch, driver):
-    monkeypatch.setitem(vendors.VENDORS, "junos", driver)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", driver)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)

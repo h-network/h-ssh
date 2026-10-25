@@ -11,10 +11,10 @@ import time
 import types
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hssh import cli, vendors
+from hssh import cli, drivers
 from hssh.errors import NotAppliedError
 from hssh.runner import is_connect_failure, is_permanent_failure
-from hssh.vendors import junos, openssh
+from hssh.transports import netconf, openssh
 
 
 # --- H1: the pre-flight runs like the run ------------------------------------------
@@ -22,8 +22,7 @@ from hssh.vendors import junos, openssh
 def _edit_cli(monkeypatch, capsys, probe, n, extra):
     driver = types.SimpleNamespace(AVAILABLE=True,
                                    edit=lambda host, user, passwd, payload, st, ct, *a, **kw: "COMMIT OK\n")
-    monkeypatch.setitem(vendors.VENDORS, "junos", driver)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", driver)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
     monkeypatch.setattr(cli, "check_reachability", probe)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
@@ -88,15 +87,15 @@ def test_paramiko_timeouts_answer_with_what_is_left_of_the_deadline():
     pytest.importorskip("paramiko")
     a, b = socket.socketpair()
     try:
-        t = junos._DeadlineTransport(a)
+        t = netconf._DeadlineTransport(a)
         assert (t.banner_timeout, t.handshake_timeout, t.auth_timeout) == (15, 15, 30)   # no deadline: paramiko's own
         t.banner_timeout = 4                       # paramiko's own assignment still lands
         assert t.banner_timeout == 4
-        junos._DEADLINE.at = time.monotonic() + 2.0
+        netconf._DEADLINE.at = time.monotonic() + 2.0
         try:
-            t = junos._DeadlineTransport(a)        # the deadline is taken at construction, on this thread
+            t = netconf._DeadlineTransport(a)        # the deadline is taken at construction, on this thread
         finally:
-            junos._DEADLINE.at = None
+            netconf._DEADLINE.at = None
         assert 1.5 < t.banner_timeout <= 2.0 and 1.5 < t.handshake_timeout <= 2.0 and 1.5 < t.auth_timeout <= 2.0
         result = {}
         threading.Thread(target=lambda: result.setdefault("t", t.banner_timeout)).start()
@@ -111,8 +110,8 @@ def test_paramiko_timeouts_answer_with_what_is_left_of_the_deadline():
 
 def test_ncclient_builds_the_deadline_transport():
     ncssh = pytest.importorskip("ncclient.transport.ssh")
-    assert ncssh.paramiko.Transport is junos._DeadlineTransport
-    assert ncssh.paramiko.SSHException is junos._paramiko.SSHException      # everything else as it was
+    assert ncssh.paramiko.Transport is netconf._DeadlineTransport
+    assert ncssh.paramiko.SSHException is netconf._paramiko.SSHException      # everything else as it was
 
 
 def test_a_router_that_accepts_tcp_and_says_nothing_costs_the_session_timeout():
@@ -121,10 +120,10 @@ def test_a_router_that_accepts_tcp_and_says_nothing_costs_the_session_timeout():
     try:
         started = time.monotonic()
         with pytest.raises(NotAppliedError, match=rf"NETCONF connect failed: no SSH banner from 127.0.0.1:{port} within 2s"):
-            junos._open("127.0.0.1", "u", "p", 2, 30, port)
+            netconf._open("127.0.0.1", "u", "p", 2, 30, port)
         elapsed = time.monotonic() - started
         assert elapsed < 3.5, f"{elapsed:.1f}s: paramiko's 15 s banner timeout won"
-        assert junos._DEADLINE.at is None
+        assert netconf._DEADLINE.at is None
     finally:
         srv.close()
 

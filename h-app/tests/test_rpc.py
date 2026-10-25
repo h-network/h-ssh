@@ -1,4 +1,4 @@
-"""vendors.junos.rpc(): CLI command or RPC name in, the router's JSON or XML out."""
+"""transports.netconf.rpc(): CLI command or RPC name in, the router's JSON or XML out."""
 import os
 import sys
 
@@ -8,7 +8,7 @@ from lxml import etree
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hssh import pool
-from hssh.vendors import junos
+from hssh.transports import netconf
 from tests.test_junos import FakeConfig, FakeDevice, rpc_timeout
 
 
@@ -61,9 +61,9 @@ def fake_pyez(monkeypatch):
     FakeConfig.instances = []
     RpcDevice.executed = []
     RpcDevice.execute_error = None
-    monkeypatch.setattr(junos, "AVAILABLE", True)
-    monkeypatch.setattr(junos, "JunosDevice", RpcDevice)
-    monkeypatch.setattr(junos, "JunosConfig", FakeConfig)
+    monkeypatch.setattr(netconf, "AVAILABLE", True)
+    monkeypatch.setattr(netconf, "JunosDevice", RpcDevice)
+    monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
     yield
     pool.POOL.disable()
     for k in pool.POOL.stats:
@@ -71,7 +71,7 @@ def fake_pyez(monkeypatch):
 
 
 def rpc(command, **kw):
-    return junos.rpc("10.0.0.1", "u", None, command, 5, 30, **kw)
+    return netconf.rpc("10.0.0.1", "u", None, command, 5, 30, **kw)
 
 
 def sent():
@@ -136,7 +136,7 @@ def test_one_session_per_call_when_the_pool_is_off():
 def test_rpc_and_show_share_the_pooled_session():
     pool.enable()
     rpc("show chassis hardware")
-    junos.show("10.0.0.1", "u", None, "show version", 5, 30)
+    netconf.show("10.0.0.1", "u", None, "show version", 5, 30)
     rpc("get-chassis-inventory")
     assert len(FakeDevice.instances) == 1
     assert pool.POOL.stats["opens"] == 1 and pool.POOL.stats["reuses"] == 2
@@ -146,13 +146,13 @@ def test_get_rpc_on_a_dead_reused_session_is_retried_once():
     pool.enable()
     rpc("show chassis hardware")
     dead = FakeDevice.instances[0]
-    RpcDevice.execute_error = junos.TransportError("closed")
+    RpcDevice.execute_error = netconf.TransportError("closed")
 
     class Fresh(RpcDevice):
         def execute(self, element):
             return {"fresh": True}
 
-    junos.JunosDevice = Fresh
+    netconf.JunosDevice = Fresh
     assert rpc("get-chassis-inventory") == {"fresh": True}
     assert dead.closed and len(FakeDevice.instances) == 2
 
@@ -161,8 +161,8 @@ def test_request_rpc_is_never_resent():
     pool.enable()
     rpc("show chassis hardware")
     dead = FakeDevice.instances[0]
-    RpcDevice.execute_error = junos.TransportError("closed")
-    with pytest.raises(junos.TransportError):
+    RpcDevice.execute_error = netconf.TransportError("closed")
+    with pytest.raises(netconf.TransportError):
         rpc("request-system-reboot")
     assert dead.closed
     assert len(FakeDevice.instances) == 1  # no second attempt
@@ -173,7 +173,7 @@ def test_rpc_timeout_drops_the_pooled_session():
     pool.enable()
     rpc("show chassis hardware")
     RpcDevice.execute_error = rpc_timeout("get-chassis-inventory")
-    with pytest.raises(junos.RpcTimeoutError):
+    with pytest.raises(netconf.RpcTimeoutError):
         rpc("get-chassis-inventory")
     assert FakeDevice.instances[0].closed
     assert pool.POOL.live() == 0
@@ -187,13 +187,13 @@ def test_commit_status_reads_the_history_as_data():
         {"sequence-number": [{"data": "1"}], "user": [{"data": "h-lab"}], "client": [{"data": "cli"}],
          "date-time": [{"data": "2026-10-19 02:33:16 CEST"}]},
     ]}]}
-    entries = junos.commit_status("10.0.0.1", "u", None, 5, 30)
+    entries = netconf.commit_status("10.0.0.1", "u", None, 5, 30)
     assert entries[0] == {"seq": 0, "user": "h-lab", "client": "netconf", "time": "2026-10-20 19:19:11 CEST",
                           "epoch": 1792516751.0, "comment": "C1 cutover",
                           "note": "commit confirmed, rollback in 5mins", "pending_rollback_minutes": 5}
     assert entries[1]["pending_rollback_minutes"] is None and entries[1]["comment"] is None
-    assert junos.pending_commit(entries)["seq"] == 0
-    assert junos.pending_commit(entries[1:]) is None
+    assert netconf.pending_commit(entries)["seq"] == 0
+    assert netconf.pending_commit(entries[1:]) is None
     assert sent().tag == "get-commit-information"
 
 
@@ -207,16 +207,16 @@ def test_a_confirmed_commit_keeps_its_note_but_is_not_pending():
          "date-time": [{"data": "2026-10-21 02:47:55 UTC"}],
          "comment": [{"data": "commit confirmed, rollback in 3mins"}], "log": [{"data": "C1"}]},
     ]}]}
-    entries = junos.commit_status("10.0.0.1", "u", None, 5, 30)
+    entries = netconf.commit_status("10.0.0.1", "u", None, 5, 30)
     assert entries[1]["note"] == "commit confirmed, rollback in 3mins"
     assert entries[1]["pending_rollback_minutes"] is None
-    assert junos.pending_commit(entries) is None
+    assert netconf.pending_commit(entries) is None
 
 
 # --- rpc_batch: several commands on one session --------------------------------
 
 def rpc_batch(cmds, **kw):
-    return junos.rpc_batch("10.0.0.1", "u", None, cmds, 5, 30, **kw)
+    return netconf.rpc_batch("10.0.0.1", "u", None, cmds, 5, 30, **kw)
 
 
 def test_batch_answers_each_command_on_one_session():
@@ -244,13 +244,13 @@ def test_batch_of_reads_on_a_dead_reused_session_is_rerun_once():
     pool.enable()
     rpc("show chassis hardware")
     dead = FakeDevice.instances[0]
-    RpcDevice.execute_error = junos.TransportError("closed")
+    RpcDevice.execute_error = netconf.TransportError("closed")
 
     class Fresh(RpcDevice):
         def execute(self, element):
             return {"fresh": element.tag}
 
-    junos.JunosDevice = Fresh
+    netconf.JunosDevice = Fresh
     res = rpc_batch(["show chassis hardware", "get-chassis-inventory"])
     assert [r["output"] for r in res] == [{"fresh": "get-chassis-inventory"}] * 2
     assert dead.closed and len(FakeDevice.instances) == 2
@@ -259,8 +259,8 @@ def test_batch_of_reads_on_a_dead_reused_session_is_rerun_once():
 def test_batch_with_a_request_rpc_is_never_resent():
     pool.enable()
     rpc("show chassis hardware")
-    RpcDevice.execute_error = junos.TransportError("closed")
-    with pytest.raises(junos.TransportError):
+    RpcDevice.execute_error = netconf.TransportError("closed")
+    with pytest.raises(netconf.TransportError):
         rpc_batch(["show chassis hardware", "request-system-reboot"])
     assert len(FakeDevice.instances) == 1 and pool.POOL.live() == 0
 

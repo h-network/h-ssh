@@ -4,33 +4,57 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 419/419 passed
+## Unit Tests — 829/829 passed
 
-`pip install -e '.[dev]' && pytest` from the checkout root (`develop` 9462f99, 2026-10-21). The
-standalone review of `develop` (18 items, issues #23–#29, PRs #30–#36) added 110 regression tests;
-every one was run against the code before its fix and failed there.
+`pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
+the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
+items, issues #23–#29, PRs #30–#36) added 110 regression tests; every one was run against the code
+before its fix and failed there.
+
+The suite is laid out by layer where the package is: `tests/dialects` (what each dialect knows),
+`tests/drivers` (the registry, the contract, the typed results), `tests/transports` (the CLI engine on
+a scripted channel), and the transport, runner and CLI tests at the top level. `tests/fixtures/` holds
+the packages the entry-point tests load, not tests: `hssh_dummy` registers `dummy@ssh` on the paramiko
+transport, `hssh_broken` raises `ImportError` on import, `hssh_taken` claims names the registry already
+has. No test opens a connection to a real device: paramiko, PyEZ and the `ssh` binary are faked, and
+telnet runs against a scripted server on localhost.
 
 | Suite | Tests | Covers |
 |-------|------:|--------|
-| test_audit.py | 8 | JSONL audit trail, 0600, redaction (text and JSON values), `secure_append`, graceful failure |
-| test_cli_edit_output.py | 24 | default-mode verdict + diff for edits, the commit-confirmed reminder, `--show-diff` preview → prompt → commit and the abort paths, confirm hint from `sys.argv[0]` and job targets, `--log` 0600 + redacted |
+| dialects/test_dialects.py | 15 | #81: vendor knowledge lives with the dialect — the set-syntax guard, the refusal regexes, the prompts, the commit-pending note, the read rule — and core, cli, runner and the telnet module ask it |
+| drivers/test_contract.py | 22 | #80: every registered driver's `supports` is backed by its module's signatures (`violations()`); a module serving one driver declares everything it has, shared modules offer what every dialect on them declares; a stub that falls short is named, `*args` satisfies the contract |
+| drivers/test_registry.py | 15 | #80: `dialect@transport` names with today's names as aliases, the retired `arista` line, what each transport says of itself, `supports` per driver, every driver resolving to its transport's module, stand-ins in `drivers.MODULES`, default ports and install hints from the transport, the CLI taking a canonical target |
+| drivers/test_results.py | 37 | #82: `EditResult`, `BatchResult` and `CommitStatus` still the text or list they were, `RunResult` unpacking as the old tuple with `.result` and `.error`, parsing that never changes the text, pickle and copy |
+| transports/test_cli.py | 21 | #83: the CLI engine (`hssh/transports/cli.py`) on an in-memory channel — login, learning the prompt, paging, candidate and lines edits, confirm, a refusal read past its redraw |
+| test_entry_points.py | 19 | #84: a driver from an `hssh.drivers` entry point loads after the built-ins and `SOURCES` names the entry point (or the distribution); a broken one is listed by name and the rest still load; a taken name or alias, an object that is not a `Driver`, a driver listed twice refuse the whole entry point; `--list-vendors` shows the row and the broken line; the contract and the runner take the driver, a stand-in in `drivers.MODULES` does its work; h-ssh's own `builtin` entry point is never loaded twice; `pyproject.toml` declares it |
+| test_audit.py | 32 | JSONL audit trail, 0600 whatever the umask, redaction (text, XML and JSON values; the type words stay), `secure_append`/`secure_write` refusing a planted symlink or FIFO, graceful failure |
+| test_cli_edit_output.py | 39 | default-mode verdict + diff for edits, the commit-confirmed reminder, `--show-diff` preview → prompt → commit and the abort paths, confirm hint from `sys.argv[0]` and job targets, a job naming one device twice, `--log` 0600 + redacted, a malformed target as a usage error |
 | test_cli_junos_safety.py | 12 | Junos set-syntax guard (also through `--transport junos`), show-batch error handling, `--rollback`/`--comment`/`--show-diff`/`--commit-status`/`--format` usage errors |
-| test_config.py | 24 | `~/.h-ssh/config`, precedence flag → env → file → default, `transport` reaching undeclared targets (flag, file, inline/CSV/job forms, declared vendor wins) |
-| test_core.py | 14 | targets (incl. `NAME:[v6]:vendor:port`), CSV inventory, the one set-file reader (inline `#` kept), template resolution, job parsing |
+| test_cli_runfile.py | 26 | #60: `--run FILE` in YAML or JSON — every key a flag, the command line wins, no credential in the file, relative paths against the file, an edit from a file needs a timer or a dry run, YAML without PyYAML is a clear error |
+| test_config.py | 25 | `~/.h-ssh/config`, precedence flag → env → file → default, `transport` reaching undeclared targets (flag, file, inline/CSV/job forms, declared vendor wins) |
+| test_core.py | 34 | targets (incl. `NAME:[v6]:vendor:port`), CSV inventory, device names that stay inside their directory, the one set-file reader (inline `#` kept), shortcut resolution, job parsing, the pre-flight banner rule, the retired `arista` line |
+| test_error_classification.py | 29 | #65: a failure the same call cannot fix is reported once, in words that say what happened; a device the operator interrupted while it was still being connected to is interrupted, not failed |
+| test_fail_closed.py | 13 | #64: a run finds out before the first device that it cannot do its job — an audit or run log that cannot be written, a safety file that cannot be kept, a device without its set file, a device listed twice or under two names |
 | test_format.py | 21 | `--format json\|xml` through `rpc()`/`rpc_batch()`, refusal on other transports and on edits, `--json`/`--raw`/`-v`/`--diff` shapes |
-| test_generic.py | 15 | paramiko transport: host keys pinned in `~/.h-ssh/known_hosts` (0600), `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure |
-| test_job.py | 16 | `--job` files and stdin, `default_vendor`, same device twice (entries carried with their results) |
-| test_junos.py | 45 | PyEZ driver: show, batch, edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `confirm()` under the lock, `guarded_commit()` and its history check, `expected_diff` |
-| test_openssh.py | 26 | the OpenSSH-binary transport, `SSH_ASKPASS`, ControlMaster, `--` before the host |
-| test_packaging.py | 1 | wheel contents |
-| test_pool.py | 43 | session pool: reuse per `(host, port, user)`, stale detection and probe, discard rules on every edit failure, reopen-once for reads, threads never share a session, reaper, `close_all`, re-entrancy, a nested borrow never closes the session under an open transaction |
-| test_raw.py | 10 | `--raw` output contract |
-| test_retry.py | 41 | failure classification (PyEZ connect phase by its prefix, `invalid` narrowed), backoff, edits retried only on `NotAppliedError` |
+| test_generic.py | 43 | the paramiko transport (`hssh/transports/ssh.py`): host keys pinned in `~/.h-ssh/known_hosts` (0600) under a file lock, `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure, reads and the exit status bounded by the command timeout, a reply the CLI refuses at exit 0, the Junos and IOS-shaped dialect edits and confirms on a fake shell channel, EOS `\| json` |
+| test_input_validation.py | 34 | #62: wrong input is refused with a named reason before anything runs — numeric flags and config keys out of range, ports, BOM inventories, a `--config` that is not a file, `--save-output` on a file, a closed stdout, whitespace commands, unknown job keys, lines without `=`, wide CSV rows, a target that still says `arista` |
+| test_job_pool.py | 4 | #57: a job's entries share one NETCONF session per device |
+| test_job.py | 20 | `--job` files and stdin, `default_vendor`, same device twice (entries carried with their results) |
+| test_junos.py | 54 | the NETCONF transport (`hssh/transports/netconf.py`) over a fake PyEZ: show, batch, edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `confirm()` under the lock, `guarded_commit()` and its history check, `expected_diff`, a timer that cannot be armed refused before any session, `statement not found` the one load warning ignored |
+| test_openssh_dialects.py | 26 | #83: `junos@openssh`, `ios@openssh`, `nxos@openssh`, `eos@openssh` — shows on an exec like the plain `openssh` driver, edits and confirms through the CLI engine on `ssh -tt`, against a fake `ssh` on PATH |
+| test_openssh.py | 27 | the OpenSSH-binary transport, `SSH_ASKPASS`, ControlMaster, `--` before the host, the session clock read from ssh's `-v` log |
+| test_output_hygiene.py | 11 | #63: a closed stdout (`\| head`) is not an error, paramiko's transport tracebacks stay off the screen, the confirm reminder prints only for timers that are running, a confirm with nothing pending commits nothing |
+| test_packaging.py | 1 | wheel contents: `hssh/`, the dialects' JSON libraries next to them, no top-level `commands/` |
+| test_pool.py | 51 | session pool: reuse per `(host, port, user, credential)`, stale detection and probe, discard rules on every edit failure, reopen-once for reads, threads never share a session, reaper, `close_all`, re-entrancy, a nested borrow never closes the session under an open transaction |
+| test_raw.py | 10 | `--raw` output contract and the JSON output shape |
+| test_retry.py | 42 | failure classification (PyEZ connect phase by its prefix, `invalid` narrowed, a rejected command permanent), backoff, the attempt budget, workers clamped and really parallel, edits retried only on `NotAppliedError` |
 | test_rpc.py | 19 | `rpc()`: CLI-command translation, RPC name + args, JSON/XML, never re-sending non-reads, `rpc_batch()`, `commit_status()` (pending only on the latest commit) |
-| test_runner_edit.py | 26 | runner policy: dry-run and commit-confirmed refusals, retry rule, confirm, rollback mode, comments, commit-status mode, `-eD`/`-eB` load the same lines, no resolver call |
-| test_safety.py | 21 | SafetyGate rate limit, cooldown, flock (one yield: an `OSError` in the body propagates), corrupt-file handling |
-| test_structured.py | 9 | `--structured` bindings and fallback |
-| test_telnet.py | 33 | raw-socket telnet on a scripted fake server: readers raise on timeout/EOF, failed login detected, silent console gets one Enter, `configure exclusive`, anchored error match, commit outcome unknown, best-effort cleanup |
+| test_runner_edit.py | 33 | runner policy by the driver's `supports`: dry-run and commit-confirmed refusals, retry rule, confirm, rollback mode, comments, commit-status mode, `-eD`/`-eB` load the same lines, no resolver call |
+| test_safety.py | 22 | SafetyGate rate limit, cooldown, flock (one yield: an `OSError` in the body propagates), corrupt-file handling |
+| test_structured.py | 8 | `--structured` bindings and fallback, the same shortcut resolving per vendor, every shipped binding well-formed, the capability being the registry's and not module attribute presence |
+| test_telnet.py | 45 | the telnet transport on a scripted fake server: readers raise on timeout/EOF, failed login detected, silent console gets one Enter, `configure exclusive`, anchored error match, commit outcome unknown, a commit that drops the session still ok, the dry run's diff committed only if it shows again, best-effort cleanup |
+| test_time_bounds.py | 11 | #66: `--session-timeout` and `--workers` bound everything that touches a device, the pre-flight included; a router that accepts TCP and then says nothing costs the session timeout, not a library default |
+| test_transport_consistency.py | 8 | #67: the transports agree on what a password means, an edit's verdict comes from the reply as well as the exit status, a delete of what is not there is not a failure, the open-file limit is checked before it bites |
 
 ## Live checks on `develop` — lab AX4 + PE1, vMX 24.2R1-S2.5 (2026-10-20/21)
 

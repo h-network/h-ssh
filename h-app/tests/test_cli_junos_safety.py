@@ -196,7 +196,7 @@ def test_cli_comment_show_diff_and_commit_status_usage(tmp_path):
 def _main(monkeypatch, capsys, *argv):
     """main() in-process with the runner and the pre-flight check replaced, so
     a payload the guard lets through is recorded here and never sent anywhere."""
-    from hssh import cli
+    from hssh import cli, drivers
 
     sent = []
 
@@ -209,7 +209,7 @@ def _main(monkeypatch, capsys, *argv):
 
     monkeypatch.setattr(cli, "run_for_target_async", fake_run)
     monkeypatch.setattr(cli, "check_reachability", reachable)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", types.SimpleNamespace(AVAILABLE=True))
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True))
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "test",

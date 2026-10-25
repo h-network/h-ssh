@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 
 from hssh.core import resolve_command, resolve_structured, parse_inline_target
-from hssh import runner, vendors
+from hssh import runner, drivers
 
 
 def test_same_shortcut_resolves_per_vendor():
@@ -55,7 +55,7 @@ def test_capability_is_the_registrys_not_module_attribute_presence():
     assert "show_structured" not in runner.bind("openssh").caps
     assert "show_structured" not in runner.bind("telnet").caps
     assert "show_structured" not in runner.bind("telnet-ios").caps
-    assert hasattr(vendors.get("ssh"), "show_structured")   # the shared module has it; ssh may not ask
+    assert hasattr(drivers.module_of(drivers.get("ssh")), "show_structured")   # the shared module has it; ssh may not ask
 
 
 def test_vendorless_target_is_ssh_not_junos():

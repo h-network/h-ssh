@@ -20,7 +20,7 @@ What a library needs on top, and only that:
 
     from hssh import pool
     pool.enable()                 # sessions idle for 300 s are closed
-    ... vendors.junos.show(...)   # every call now reuses the router's session
+    ... transports.netconf.show(...)   # every call now reuses the router's session
     pool.close_all()              # or leave it to atexit
 """
 

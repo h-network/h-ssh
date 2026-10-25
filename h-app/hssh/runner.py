@@ -204,7 +204,7 @@ def bind(vendor: str) -> Bound:
     a commit that cannot really arm a rollback timer."""
     driver = drivers.get(vendor)
     mod = drivers.module_of(driver)
-    return Bound(mod, vendor, drivers.supports_of(driver, mod), driver.shim, driver.dialect)
+    return Bound(mod, vendor, drivers.supports_of(driver, mod), driver.name, driver.dialect)
 
 
 def _comment_kwargs(b: Bound, comment):

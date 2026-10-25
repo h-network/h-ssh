@@ -8,9 +8,9 @@ import sys
 import types
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hssh import cli, vendors
+from hssh import cli, drivers
 from hssh.core import refusal_line
-from hssh.vendors import openssh
+from hssh.transports import openssh
 
 
 # --- M5: the password is the credential on every transport ------------------------
@@ -127,8 +127,7 @@ async def _reachable(target, timeout=2):
 def test_the_run_warns_once_and_runs_with_the_lowered_workers(monkeypatch, capsys):
     _rlimits(monkeypatch, 64, 64, settable=False)
     driver = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "ok")
-    monkeypatch.setitem(vendors.VENDORS, "junos", driver)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", driver)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)

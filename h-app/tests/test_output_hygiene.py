@@ -9,7 +9,7 @@ import sys
 import types
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hssh import cli, vendors, runner
+from hssh import cli, drivers, runner
 from hssh.errors import NothingToConfirmError, NotAppliedError
 
 
@@ -18,8 +18,7 @@ async def _reachable(target, timeout=2):
 
 
 def run_main(monkeypatch, capsys, argv, driver):
-    monkeypatch.setitem(vendors.VENDORS, "junos", driver)
-    monkeypatch.setitem(cli.VENDOR_MODULES, "junos", driver)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
@@ -103,32 +102,32 @@ def test_confirm_reminder_only_when_a_timer_was_armed(monkeypatch, capsys, reply
 # --- L7: a confirm with nothing pending ---------------------------------------
 
 def test_junos_confirm_with_nothing_pending_sends_nothing(monkeypatch):
-    from hssh.vendors import junos
+    from hssh.transports import netconf
     from tests.test_junos import FakeDevice, FakeConfig
     FakeDevice.instances, FakeConfig.instances = [], []
-    monkeypatch.setattr(junos, "AVAILABLE", True)
-    monkeypatch.setattr(junos, "JunosDevice", FakeDevice)
-    monkeypatch.setattr(junos, "JunosConfig", FakeConfig)
-    monkeypatch.setattr(junos, "_pending_on", lambda dev, t: None)
+    monkeypatch.setattr(netconf, "AVAILABLE", True)
+    monkeypatch.setattr(netconf, "JunosDevice", FakeDevice)
+    monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
+    monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: None)
     with pytest.raises(NothingToConfirmError, match="nothing to confirm"):
-        junos.confirm("10.0.0.1", "u", "p", 5, 30)
+        netconf.confirm("10.0.0.1", "u", "p", 5, 30)
     assert FakeConfig.instances == []           # no lock, no commit
 
 
 def test_junos_pending_on_reads_the_history(monkeypatch):
-    from hssh.vendors import junos
+    from hssh.transports import netconf
     doc = {"commit-information": [{"commit-history": [
         {"sequence-number": [{"data": "0"}], "user": [{"data": "u"}], "client": [{"data": "netconf"}],
          "date-time": [{"data": "x", "attributes": {"junos:seconds": "1"}}],
          "comment": [{"data": "commit confirmed, rollback in 5mins"}]}]}]}
-    monkeypatch.setattr(junos, "_rpc_reply", lambda dev, cmd, args, fmt: doc)
-    assert junos._pending_on(object(), 5)["pending_rollback_minutes"] == 5
+    monkeypatch.setattr(netconf, "_rpc_reply", lambda dev, cmd, args, fmt: doc)
+    assert netconf._pending_on(object(), 5)["pending_rollback_minutes"] == 5
     doc["commit-information"][0]["commit-history"][0]["comment"] = [{"data": ""}]
-    assert junos._pending_on(object(), 5) is None
+    assert netconf._pending_on(object(), 5) is None
 
 
 def test_telnet_confirm_with_nothing_pending_sends_nothing():
-    from hssh.vendors import telnet
+    from hssh.transports import telnet
     from tests.test_telnet import ScriptedTelnetServer, junos_cli, HISTORY_CLEAN, _received
     srv = ScriptedTelnetServer(junos_cli(history=HISTORY_CLEAN))
     with pytest.raises(NothingToConfirmError, match="nothing to confirm"):

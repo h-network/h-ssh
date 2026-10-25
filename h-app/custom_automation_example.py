@@ -7,7 +7,7 @@ This shows how you can build your own automation framework on top of hssh.
 
 import getpass
 from hssh import Target, load_devices_csv
-from hssh.vendors import junos
+from hssh.transports import netconf as junos
 
 def check_junos_uptime(devices_file: str, username: str, password: str):
     """Custom function to check uptime on all Junos devices."""
@@ -20,7 +20,7 @@ def check_junos_uptime(devices_file: str, username: str, password: str):
     results = []
     for device in devices:
         try:
-            # Call Junos vendor module directly
+            # Call the NETCONF transport module directly
             output = junos.show(
                 host=device.host,
                 user=username,
