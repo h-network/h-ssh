@@ -798,7 +798,8 @@ The library reads no environment variable and no config file; that is the CLI's 
   the devices a worker is talking to get `wait` seconds to answer (a Ctrl-C handler may pass a few), and what
   returned by then is a result and a store row; the run is recorded as interrupted with the rest as skipped;
   iterating its results afterwards gives what was done by then and nothing more (a call that returns later is
-  dropped, its row says skipped), so the store and the script agree. A store this Fleet opened is closed, and
+  dropped, its row says skipped), so the store and the script agree; a script waiting in its `for` loop wakes at
+  once, whichever thread called `close()`. A store this Fleet opened is closed, and
   the sessions close (one still in use closes when its call returns). `async with Fleet(...)` and `aclose()`
   do the same off the event loop;
 - `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
@@ -981,7 +982,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (921 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (924 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

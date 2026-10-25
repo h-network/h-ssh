@@ -133,12 +133,15 @@ class _DaemonPool:
         with self._lock:
             if self._down:
                 raise RuntimeError("the worker pool is shut down")
-            self._queue.put((future, fn, args))
-            # No worker waiting for work, and room for one more: start it.
-            if not self._idle.acquire(timeout=0) and len(self._threads) < self._max:
+            # Room for one more thread and no worker waiting for work: start
+            # it, before the item is queued, so a thread the system refuses
+            # (ulimit -u, memory) is the caller's error and not an item that
+            # waits for a worker that never came.
+            if len(self._threads) < self._max and not self._idle.acquire(timeout=0):
                 t = threading.Thread(target=self._loop, name=f"{self._name}-{len(self._threads) + 1}", daemon=True)
-                self._threads.append(t)
                 t.start()
+                self._threads.append(t)
+            self._queue.put((future, fn, args))
         return future
 
     def _loop(self) -> None:
@@ -350,6 +353,10 @@ class _Run:
         self.not_kept = 0                # of those, the ones it could not keep
         self.store_error: Optional[str] = None
         self._lock = threading.RLock()
+        # Among the futures a consumer waits on; end() completes it (as a
+        # cancelled one), so a close() from another thread wakes the
+        # consumer at once rather than when the next device answers.
+        self.stop: cf.Future = cf.Future()
 
     # --- on the calling thread ----------------------------------------------
 
@@ -372,6 +379,14 @@ class _Run:
                 self.ended = True
             fleet._forget(self)
             raise
+        try:
+            self._submit_all(workers)
+        except BaseException:
+            self.end(interrupted=True)           # the devices not handed out are skipped, the row says so
+            raise
+
+    def _submit_all(self, workers: "_DaemonPool") -> None:
+        fleet = self.fleet
         for task in self.tasks:
             with self._lock:
                 if self.ended:                   # closed while starting: the rest never runs
@@ -425,8 +440,10 @@ class _Run:
     def waitable(self) -> List[cf.Future]:
         """The futures a consumer waits on: of the pending tasks, those
         handed to a worker and not cancelled (a cancelled one is a close()
-        under way; end() counts it)."""
-        return [t.future for t in self._snapshot() if t.future is not None and not t.future.cancelled()]
+        under way; end() counts it), and `stop`, which end() completes."""
+        futures = [t.future for t in self._snapshot() if t.future is not None and not t.future.cancelled()]
+        futures.append(self.stop)
+        return futures
 
     def wait_timeout(self) -> float:
         """How long the consumer may wait for a completion before a deadline
@@ -596,6 +613,8 @@ class _Run:
             skipped = len(self.pending)
             ok = sum(1 for r in self.done if r.ok)
             self._close_store_row(ok, len(self.done) - ok, skipped, interrupted and skipped > 0)
+        if self.stop.cancel():                   # wakes a consumer waiting on the run's futures
+            self.stop.set_running_or_notify_cancel()
         self.fleet._forget(self)
 
 
@@ -648,7 +667,7 @@ class Results:
                 time.sleep(0.05)
                 continue
             done, _ = cf.wait(futures, timeout=run.wait_timeout(), return_when=cf.FIRST_COMPLETED)
-            _finish_all(run, [run.by_future[f] for f in done])
+            _finish_all(run, [run.by_future[f] for f in done if f in run.by_future])   # not `stop`
 
     def __aiter__(self) -> AsyncIterator[DeviceResult]:
         return self._aiter()
@@ -682,7 +701,7 @@ class Results:
                     af = wrapped[f] = asyncio.wrap_future(f, loop=loop)
                 waiting[af] = f
             done, _ = await asyncio.wait(waiting, timeout=run.wait_timeout(), return_when=asyncio.FIRST_COMPLETED)
-            ready = [run.by_future[waiting[af]] for af in done]
+            ready = [run.by_future[waiting[af]] for af in done if waiting[af] in run.by_future]   # not `stop`
             if ready:
                 # finish() builds the result and writes the store: SQLite, off the loop
                 await loop.run_in_executor(None, _finish_all, run, ready)

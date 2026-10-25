@@ -296,7 +296,8 @@ def test_the_worker_pool_runs_daemon_threads_with_future_semantics():
     held = [p.submit(gate.wait, 5) for _ in range(2)]            # both workers busy
     queued = [p.submit(lambda: "late") for _ in range(3)]        # no third worker: queued
     boom = p.submit(lambda: 1 / 0)
-    assert wait_for(lambda: len(p.threads) == 2) and all(t.daemon for t in p.threads)
+    assert wait_for(lambda: all(f.running() for f in held))      # both in a worker's hands
+    assert len(p.threads) == 2 and all(t.daemon for t in p.threads)
     assert queued[0].cancel()                                    # a queued call cancelled before a worker reaches it
     p.shutdown(wait=False, cancel_futures=True)                  # the rest of the queue cancelled, and notified
     done, _ = cf.wait(queued + [boom], timeout=1)
@@ -641,6 +642,72 @@ def test_iterating_after_close_ends_instead_of_hanging_async(monkeypatch):
     finally:
         release.set()
     assert [r.device for r in got] == ["10.0.0.1"] and got[0].ok
+
+
+def test_a_close_from_another_thread_wakes_the_consumer_at_once(monkeypatch):
+    """The consumer waits on the devices in flight; a watchdog's close() must
+    not leave it waiting until the wedged device's budget runs out."""
+    release, started = threading.Event(), threading.Event()
+    install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2"}))
+    try:
+        fleet = Fleet(HOSTS, transport="junos", user="u", workers=2, session_timeout=5, command_timeout=5, retries=0)
+        res = fleet.show("show version")
+        assert started.wait(2)
+        t0 = time.monotonic()
+        threading.Timer(0.3, fleet.close).start()
+        got = list(res)                                   # the two that answered; the close ends the wait
+        elapsed = time.monotonic() - t0
+        assert 0.3 <= elapsed < 1.5, f"{elapsed:.1f}s: the consumer slept through the close"
+        assert sorted(r.device for r in got) == ["10.0.0.1", "10.0.0.3"] and all(r.ok for r in got)
+    finally:
+        release.set()
+
+
+def test_a_close_from_another_thread_wakes_an_async_consumer_at_once(monkeypatch):
+    release, started = threading.Event(), threading.Event()
+    install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2"}))
+
+    async def main():
+        fleet = Fleet(HOSTS, transport="junos", user="u", workers=2, session_timeout=5, command_timeout=5, retries=0)
+        res = fleet.show("show version")
+        assert started.wait(2)
+        t0 = time.monotonic()
+        threading.Timer(0.3, fleet.close).start()
+        got = [r async for r in res]
+        return got, time.monotonic() - t0
+
+    try:
+        got, elapsed = asyncio.run(main())
+    finally:
+        release.set()
+    assert 0.3 <= elapsed < 1.5, f"{elapsed:.1f}s: the consumer slept through the close"
+    assert sorted(r.device for r in got) == ["10.0.0.1", "10.0.0.3"]
+
+
+def test_a_worker_thread_the_system_refuses_ends_the_run_instead_of_hanging(monkeypatch, tmp_path):
+    """`ulimit -u` or memory pressure: Thread.start() raises. That is the
+    caller's error, said at once; the run is recorded as skipped, the pool
+    counts no dead thread, and the Fleet is usable once threads can start."""
+    install(monkeypatch, show=echo)
+    refuse = [True]
+    real_start = threading.Thread.start
+
+    def start(self):
+        if refuse[0] and self.name.startswith("hssh-fleet-"):
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    path = tmp_path / "runs.db"
+    with Fleet(HOSTS, transport="junos", user="u", store=str(path)) as fleet:
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            fleet.show("show version")
+        run, = rows(path, "SELECT * FROM runs")
+        assert run["finished"] is not None and (run["ok"], run["skipped"], run["interrupted"]) == (0, 3, 1)
+        assert fleet._workers.threads == []                          # no dead thread counted
+        refuse[0] = False
+        got = list(fleet.show("show version"))                       # not BUSY: the failed run was ended
+        assert len(got) == 3 and all(r.ok for r in got)
+        assert all(t.is_alive() for t in fleet._workers.threads)
 
 
 def test_close_with_a_grace_yields_the_device_that_finished_inside_it(monkeypatch, tmp_path):
