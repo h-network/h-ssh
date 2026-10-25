@@ -313,7 +313,6 @@ def test_a_failed_connect_closes_the_client(monkeypatch):
 
 # --- #45: every wait in exec is bounded ----------------------------------------
 
-import threading
 import time as _time
 
 

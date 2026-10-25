@@ -31,3 +31,63 @@ jobs:
           pip install -q -e '.[dev]'
       - name: Unit suite (no devices needed)
         run: python -m pytest -q
+
+  # Mistakes the suite cannot see: a name that does not exist on a path no
+  # test walks, a redefinition, a syntax error in a module nothing imports.
+  lint:
+    runs-on: ubuntu-latest
+    container: python:3.12
+    steps:
+      - name: Check out ${{ github.ref }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git init -q .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Undefined names, redefinitions, syntax errors
+        run: |
+          pip install -q ruff
+          ruff check --select E9,F63,F7,F82,F821,F823,F811 h-app/hssh h-app/tests
+
+  # What a user gets: the package built from a clean tree (issue #1 was
+  # exactly this breaking), the two entry points, the CLI starting and
+  # ending a refused connection as a failed device, and the installer.
+  install:
+    runs-on: ubuntu-latest
+    container: python:3.12
+    steps:
+      - name: Check out ${{ github.ref }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git init -q .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: A clean install, as pip gives it
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q .
+          /tmp/venv/bin/h-ssh --list-vendors
+          /tmp/venv/bin/h-ssh --help >/dev/null
+          /tmp/venv/bin/h-ssh-store --help >/dev/null
+          # a port that refuses the connection is a failed device: exit 1, a summary line, no traceback
+          rc=0
+          /tmp/venv/bin/h-ssh --no-store --user u --target x:127.0.0.1:junos --session-timeout 1 --retries 0 \
+              -sC "show version" >/tmp/out 2>/tmp/err || rc=$?
+          test "$rc" -eq 1
+          grep -q '^\[h-ssh\] {' /tmp/err
+          ! grep -q Traceback /tmp/err
+      - name: The installer, from this checkout
+        run: |
+          git checkout -q -B ci-head                      # a branch for pip to clone; the tree does not change
+          H_SSH_REPO="file://$PWD" H_SSH_REF=ci-head H_SSH_HOME=/tmp/h-ssh-home H_SSH_BIN=/tmp/h-ssh-bin sh install.sh
+          /tmp/h-ssh-bin/h-ssh --list-vendors
+          /tmp/h-ssh-bin/h-ssh-store --help >/dev/null
+          H_SSH_HOME=/tmp/h-ssh-home H_SSH_BIN=/tmp/h-ssh-bin sh install.sh --uninstall
+          test ! -e /tmp/h-ssh-bin/h-ssh
+          test ! -e /tmp/h-ssh-home/venv
