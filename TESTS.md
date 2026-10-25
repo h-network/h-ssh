@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 867/867 passed
+## Unit Tests — 874/874 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
 the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
@@ -55,6 +55,7 @@ telnet runs against a scripted server on localhost.
 | test_safety.py | 22 | SafetyGate rate limit, cooldown, flock (one yield: an `OSError` in the body propagates), corrupt-file handling |
 | test_structured.py | 8 | `--structured` bindings and fallback, the same shortcut resolving per vendor, every shipped binding well-formed, the capability being the registry's and not module attribute presence |
 | test_telnet.py | 45 | the telnet transport on a scripted fake server: readers raise on timeout/EOF, failed login detected, silent console gets one Enter, `configure exclusive`, anchored error match, commit outcome unknown, a commit that drops the session still ok, the dry run's diff committed only if it shows again, best-effort cleanup |
+| test_store_hardening.py | 7 | the store under load and misfortune: two runs creating one fresh file at the same instant both start (the WAL switch waits out the other's lock, gives up on the clock), `synchronous=NORMAL` and one commit per device result, a store that fails mid-run is said as it happens and counted at the end with exit 4 while every reply is still shown, a store file deleted under the run is detected (exit 4, never a silent 0), a device failure and a store loss both in the summary, the workers hint for a fleet of more than four waves |
 | test_store.py | 19 | the result store, always on: `./h-ssh.db` in the current directory unless `--store`, `HSSH_STORE` or `store =` in the config says otherwise (that precedence), `--no-store` keeps nothing, a directory that cannot be written is no run (exit 2, nothing sent), the reader looks where the run wrote; a 0600 file with the two tables, one row per command kept as it came (hashes included: a snapshot to restore from), a batch per command, a commit history as JSON, a retry replacing its row, runs found by id, unique prefix or as the last; the `h-ssh-store` reader (runs, failed, output, grep, field, diff, history, slowest, and what it refuses); through the CLI: a show run with its run row, a batch, `HSSH_STORE`, an unusable path refusing the run before any device, a dry-run edit's payload and verdict |
 | test_time_bounds.py | 11 | #66: `--session-timeout` and `--workers` bound everything that touches a device, the pre-flight included; a router that accepts TCP and then says nothing costs the session timeout, not a library default |
 | test_transport_consistency.py | 8 | #67: the transports agree on what a password means, an edit's verdict comes from the reply as well as the exit status, a delete of what is not there is not a failure, the open-file limit is checked before it bites |

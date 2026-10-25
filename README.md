@@ -545,7 +545,16 @@ about, the whole command line, who ran it and from where, and the counts. Everyt
 came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
 a `show configuration` keeps its hashes. The file is created 0600, opened and its tables made before
 the first device: a store that cannot be written is no run (exit 2, nothing sent), because a run
-nobody can look up afterwards is not worth having.
+nobody can look up afterwards is not worth having. A store that fails during the run (the disk
+fills, someone deletes or replaces the file) does not stop the devices' replies from being shown; the
+loss is said as it happens, counted at the end with its reason, and the run exits 4. A file
+overwritten in place (same inode) is the one case that goes unnoticed.
+
+Writes are one transaction per device result, in WAL mode with `synchronous=NORMAL`: a row costs
+about a tenth of a millisecond, a 250-device run adds a few tens of milliseconds, the file never
+corrupts and every commit survives the process dying; only a power cut can lose the last commits.
+Two h-ssh runs may write one store at the same time, including two that create it at the same
+instant; a writer waits up to ten seconds for the other's commit before it gives up.
 
 The store holds output and nothing else: no parsing, no normalising, no per-command schema — what is
 done with the replies is the reader's business. `h-ssh-store` is the reader that ships; it looks where
@@ -601,7 +610,7 @@ attempts per device against accounts that may lock out. Those stop at one.
 One unreachable device in a three-device lab run, at default settings: **28s** before, **8s** now —
 a single timeout rather than three plus backoff.
 
-`--workers` is honoured literally, up to 256, within the open-file limit: an in-flight NETCONF session costs about six descriptors, so the soft limit (`ulimit -n`) is raised towards the hard one when it is short, which needs no privilege, and only what is still short lowers the workers, with one warning naming the limit and the number run. The vendor calls block, so each in-flight device holds
+`--workers` defaults to 8; when the fleet is more than four waves of workers the banner says so with a hint (`Hint: 250 devices at 8 workers is 32 waves; --workers 64 would be 4`), since the workers spread over routers and each router still sees one session. It is honoured literally, up to 256, within the open-file limit: an in-flight NETCONF session costs about six descriptors, so the soft limit (`ulimit -n`) is raised towards the hard one when it is short, which needs no privilege, and only what is still short lowers the workers, with one warning naming the limit and the number run. The vendor calls block, so each in-flight device holds
 a thread; h-ssh sizes the executor to `--workers` rather than leaving it at asyncio's default of
 `min(32, cpu+4)`, which on a 2-vCPU jump host is **6 threads no matter what you asked for** — and a
 device stuck in a 30s connect timeout holds one of those six the whole time.
@@ -641,7 +650,7 @@ A request h-ssh refuses before touching the device (bad arguments, a missing con
 
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a second attempt on the same host while one is in flight is refused rather than doubled up, and a failure cools it before anything else can try. The mark lives in memory; only cooldowns reach the file, so a crashed process blocks nothing in the next run.
 
-Exit codes: `0` success (also when the operator answers N) · `1` a device failed (also a failed `--show-diff` preview, or an audit write failure in an edit mode) · `2` usage error, a transport that cannot honour the request, or a pre-flight that found a device unreachable · `3` nothing failed but the safety gate skipped a device, so not everything ran (the verdict line says how many) · `130` interrupted. A run that reaches its devices also prints a structured summary to stderr (a usage error, a failed pre-flight or an N at the prompt exit before it):
+Exit codes: `0` success (also when the operator answers N) · `1` a device failed (also a failed `--show-diff` preview, or an audit write failure in an edit mode) · `2` usage error, a transport that cannot honour the request, or a pre-flight that found a device unreachable · `3` nothing failed but the safety gate skipped a device, so not everything ran (the verdict line says how many) · `4` the store could not keep some or all of the results (a disk that filled, a file deleted or replaced under the run): the replies were shown, a `WARNING` says how many of how many were not kept and why, the summary carries `not_kept`, and the run's record is incomplete; `4` wins over `1` and `3`, the summary's `fail` still says what failed · `130` interrupted. A run that reaches its devices also prints a structured summary to stderr (a usage error, a failed pre-flight or an N at the prompt exit before it):
 
 ```
 [h-ssh] {"targets": 3, "ok": 2, "fail": 1, "skipped": 0, "elapsed_ms": 812, "mode": "show"}
@@ -859,7 +868,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (867 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (874 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
