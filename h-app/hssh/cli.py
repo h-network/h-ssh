@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .core import (
-    Target, load_devices_csv, load_config, get_config_path,
+    Target, load_devices_csv, load_config, get_config_path, parse_bare_target,
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, parse_jobs, resolve_target_port, check_unique,
@@ -299,19 +299,21 @@ def target_spec(t: Target) -> str:
     return f"{spec}:{t.port}" if t.port is not None else spec
 
 
-def build_confirm_command(user, target_specs, devices: str, transport: str) -> str:
+def build_confirm_command(user, target_specs, devices: str, transport: str, bare=()) -> str:
     """The command that confirms this run's commit-confirmed.
 
     Rebuilt from the run's own arguments, so it reaches the same devices as
-    the same user, started the same way: the inline --target specs as typed
-    (a job's edit targets, rebuilt), or else the inventory file. --transport
-    is kept only when it names a transport that can confirm a commit.
+    the same user, started the same way: the targets as typed (bare ones
+    stay bare, --target ones keep the flag; a job's edit targets, rebuilt),
+    or else the inventory file. --transport is kept only when it names a
+    transport that can confirm a commit.
     """
     cmd = [shlex.quote(confirm_program()) + ' -eC "commit"']
     if user:
         cmd.append("--user " + shlex.quote(user))
     if target_specs:
-        cmd.extend("--target " + shlex.quote(spec) for spec in target_specs)
+        cmd.extend(shlex.quote(spec) if spec in bare else "--target " + shlex.quote(spec)
+                   for spec in target_specs)
     else:
         cmd.append("--devices " + shlex.quote(devices))
     if "commit_confirmed" in drivers.get(transport).supports:
@@ -415,7 +417,7 @@ async def main() -> int:
                         help="Return structured data where the vendor supports it "
                              "(junos NETCONF); falls back to text elsewhere")
     parser.add_argument("--user", type=str,
-                        help="Username (or HSSH_USER env var, or 'user' in ~/.h-ssh/config)")
+                        help="Username (or HSSH_USER, or 'user' in ~/.h-ssh/config; default: the name you are logged in as)")
     parser.add_argument("--config", type=str,
                         help="Config file with defaults (default: ~/.h-ssh/config)")
 
@@ -480,6 +482,10 @@ async def main() -> int:
     parser.add_argument("--target", type=str, action="append",
                         help="Inline target as name:host:vendor:port, an IPv6 host in brackets "
                              "(repeatable, vendor defaults to --transport)")
+    parser.add_argument("hosts", nargs="*", metavar="HOST",
+                        help="Targets typed bare, before or between the flags: a host alone (a device named "
+                             "after itself, on --transport) or name:host[:vendor][:port] as for --target; an IPv6 "
+                             "host in brackets. With any target given, the inventory file is not read")
 
     # Output
     parser.add_argument("--json", action="store_true",
@@ -504,9 +510,13 @@ async def main() -> int:
                         default=os.environ.get("HSSH_SAFETY_FILE"),
                         help="Safety gate JSON file for per-device rate limiting and cooldown")
 
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()
     if not args.verbose:
         _quiet_transport_logs()
+    # A host typed bare is an inline target like any --target; from here on
+    # only args.target is looked at, bare_hosts remembers which were bare.
+    bare_hosts = list(args.hosts)
+    args.target = (bare_hosts + list(args.target or [])) or None
     args.batch_commands = None   # an inline batch, only a run file sets it
     args.jobs_data = None        # job entries from a run file
 
@@ -645,7 +655,8 @@ async def main() -> int:
         # --transport (or the config file's), the same for every form.
         if args.target:
             try:
-                targets = [parse_inline_target(spec, default_vendor=args.transport) for spec in args.target]
+                targets = [parse_bare_target(spec, default_vendor=args.transport) if spec in bare_hosts
+                           else parse_inline_target(spec, default_vendor=args.transport) for spec in args.target]
             except ValueError as e:
                 print(f"ERROR: {e}", file=sys.stderr)
                 return 2
@@ -875,17 +886,9 @@ async def main() -> int:
     show_progress = not (json_mode or raw_mode)
 
     if not user:
-        if not _tty(sys.stdin):
-            print("ERROR: No username provided and stdin is not a TTY. "
-                  "Use --user, HSSH_USER, or set 'user' in %s." % get_config_path(),
-                  file=sys.stderr)
-            return 2
-        default_user = getpass.getuser()
-        try:
-            user = _ask(f"Username [{default_user}]: ") or default_user
-        except PromptClosed:
-            print("ERROR: no username given at the prompt; nothing was sent.", file=sys.stderr)
-            return 2
+        # Like ssh: no --user, no HSSH_USER, no `user` in the config file
+        # means the name you are logged in as, with no question asked.
+        user = getpass.getuser()
 
     if passwd == "" and not _tty(sys.stdin):
         # A pipeline whose secret lookup came back empty: refused, since the
@@ -1594,7 +1597,7 @@ async def main() -> int:
             print(" " * 15 + "DON'T FORGET TO CONFIRM THE COMMIT!")
             print("=" * 70)
             print(f"Run this command to confirm within {args.commit_confirmed} minutes:")
-            print("  " + build_confirm_command(user, specs, args.devices, args.transport))
+            print("  " + build_confirm_command(user, specs, args.devices, args.transport, bare=bare_hosts))
             print("\nOr the changes will automatically rollback!")
             print("=" * 70)
             print("")

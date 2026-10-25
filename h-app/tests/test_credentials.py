@@ -94,12 +94,17 @@ def test_ctrl_d_at_the_password_prompt_is_one_line_and_exit_2(monkeypatch, capsy
     assert rc == 2 and "no password given at the prompt" in err and "Traceback" not in err and seen == {}
 
 
-def test_the_username_prompt_goes_to_stderr_and_ctrl_d_is_exit_2(monkeypatch, capsys):
-    rc, out, err, seen = run(monkeypatch, capsys, [], tty=True, env={"HSSH_PASSWORD": "s3"}, stdin_lines=["eve"])
-    assert rc == 0 and seen == {"user": "eve", "passwd": "s3"}
-    assert "Username [" in err and "Username [" not in out     # the question never lands in redirected output
+def test_no_user_means_the_name_you_are_logged_in_as(monkeypatch, capsys):
+    """Like ssh: no --user, no HSSH_USER, no `user` in the config file, and no
+    question either; the system username is taken, on a terminal or not."""
+    import getpass
+    me = getpass.getuser()
     rc, out, err, seen = run(monkeypatch, capsys, [], tty=True, env={"HSSH_PASSWORD": "s3"}, stdin_lines=[])
-    assert rc == 2 and "no username given at the prompt" in err and "Traceback" not in err and seen == {}
+    assert rc == 0 and seen == {"user": me, "passwd": "s3"} and "Username" not in err + out
+    rc, out, err, seen = run(monkeypatch, capsys, [], tty=False, env={"HSSH_PASSWORD": "s3"})
+    assert rc == 0 and seen["user"] == me
+    rc, out, err, seen = run(monkeypatch, capsys, [], tty=False, env={"HSSH_PASSWORD": "s3", "HSSH_USER": "eve"})
+    assert rc == 0 and seen["user"] == "eve"                      # the variable still wins over the system name
 
 
 def test_a_prompt_gives_ctrl_c_back_to_python(monkeypatch):

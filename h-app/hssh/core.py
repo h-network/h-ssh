@@ -206,6 +206,22 @@ def load_config(path: str = None) -> Dict[str, str]:
 _BRACKETED_HOST = re.compile(r"^([^:]+):\[([^\]]+)\](?::(.*))?$")
 
 
+def parse_bare_target(spec: str, default_vendor: str = "ssh") -> Target:
+    """A target typed bare on the command line. A host alone (`10.0.0.1`,
+    `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on
+    default_vendor; a word with a separator is the --target form,
+    NAME:HOST[:VENDOR][:PORT], and parses as one."""
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("Invalid target: an empty word")
+    if spec.startswith("[") and spec.endswith("]") and ":" in spec:
+        host = spec[1:-1]
+        return Target(name=host, host=host, vendor=default_vendor)
+    if ":" not in spec:
+        return Target(name=spec, host=spec, vendor=default_vendor)
+    return parse_inline_target(spec, default_vendor=default_vendor)
+
+
 def parse_inline_target(spec: str, default_vendor: str = "ssh") -> Target:
     """Parse inline target string: NAME:HOST[:VENDOR][:PORT] or NAME:HOST[:PORT][:VENDOR].
 

@@ -40,7 +40,7 @@ lands in a JSONL audit trail.
 ## How it works
 
 ```
-  devices.csv / --target / --job              per device, up to --workers at once
+  hosts / devices.csv / --job                 per device, up to --workers at once
   ──────────────────────────────────           ─────────────────────────────────────
                     │                          ┌─ junos    PyEZ over NETCONF (830)
                     ▼                          │           show/edit → PyEZ NETCONF
@@ -102,16 +102,20 @@ The checkout's `./h-app/h-ssh.py` is the same CLI without installing, on an inte
 ## Quick start
 
 ```bash
-# show command across two routers, inline targets (the password is asked for; keys and agents need nothing)
-h-ssh --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
+# a show on two routers typed bare: the host is the name, --transport the driver; you are the user
+# you are logged in as, the password is asked for (keys and agents need nothing)
+h-ssh --transport junos 10.0.1.1 10.0.1.2 -sC bgp
+
+# the same, named, the vendor on the target, as another user
+h-ssh --user admin -sC bgp R1:10.0.1.1:junos R2:10.0.1.2:junos
 
 # ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows)
 h-ssh --user admin --json -sC "show version" --devices h-app/devices.csv
 
 # compare one command's output across the fleet
-h-ssh --user admin -sC bgp --diff --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
+h-ssh -sC bgp --diff R1:10.0.1.1:junos R2:10.0.1.2:junos
 
-# config change — look before you leap (no --target/--devices: the inventory is ~/.h-ssh/devices.csv, or ./devices.csv)
+# config change — look before you leap (no host typed: the inventory is ~/.h-ssh/devices.csv, or ./devices.csv)
 h-ssh --user admin -eC "set system ntp server 10.0.0.1" --dry-run
 h-ssh --user admin -eC "set system ntp server 10.0.0.1" -y
 
@@ -119,17 +123,17 @@ h-ssh --user admin -eC "set system ntp server 10.0.0.1" -y
 h-ssh --user admin -eB configs/all.set --commit-confirmed 10 -y
 
 # several commands per device, one connection
-h-ssh --user admin --batch commands.txt --target R1:10.0.1.1:junos
+h-ssh --batch commands.txt R1:10.0.1.1:junos
 
 # a console server still speaking telnet
-h-ssh --user admin -sC "show version" --target SW1:10.0.0.1:5000:telnet-ios
+h-ssh -sC "show version" SW1:10.0.0.1:5000:telnet-ios
 
 # every run is kept in ./h-ssh.db, as the devices answered; read it back
 h-ssh-store runs
 h-ssh-store output R1
 ```
 
-Targets are `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints); an IPv6 host goes in brackets, `R1:[2001:db8::1]:junos`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device.Each device is listed once: the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
+Targets are typed bare on the command line, before or between the flags. A host alone (`10.0.1.1`, `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on `--transport`; `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` name it (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints), an IPv6 host in brackets, `R1:[2001:db8::1]:junos`. `--target SPEC` is the same thing as a flag (repeatable; it wants the name). With any target typed the inventory file is not read; without one it is `--devices`, else `~/.h-ssh/devices.csv`, else `./devices.csv`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device.Each device is listed once: the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
 
 **A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` on the target to get NETCONF, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
@@ -407,11 +411,11 @@ transport = openssh
 
 Precedence is flag → config file → built-in default. A value given on the command line always wins;
 only the credentials have an environment step: `--user` falls back to `HSSH_USER`, then the file's
-`user`, then the prompt, which offers your system username so Enter accepts it; the password has no
-flag and no file entry: `HSSH_PASSWORD` when set, else the prompt.
+`user`, then the name you are logged in as, like ssh; the password has no flag and no file entry:
+`HSSH_PASSWORD` when set, else the prompt.
 
-`transport` is the vendor for targets that don't declare one — `name,ip` inventory rows, a bare
-`--target R1:10.0.1.1`, or a job entry without a vendor. The example above runs those through the
+`transport` is the vendor for targets that don't declare one — `name,ip` inventory rows, a target
+without one (`10.0.1.1`, `R1:10.0.1.1`), or a job entry without a vendor. The example above runs those through the
 system `ssh` binary; a vendor on the target itself always wins.
 
 `session_timeout` is the one worth setting. It defaults to 30s, which is how long every unreachable
@@ -855,7 +859,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (857 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (867 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
