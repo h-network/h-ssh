@@ -22,6 +22,7 @@ xml or json as the device was asked for; a commit history is json.
 """
 
 import argparse
+import csv
 import datetime as _dt
 import difflib
 import json
@@ -470,6 +471,34 @@ def cmd_slowest(store: Store, args) -> int:
     return 0
 
 
+EXPORT_FIELDS = ("run_id", "device", "seq", "host", "vendor", "command", "ts", "ok", "duration_ms",
+                 "error", "format", "output")
+
+
+def cmd_export(store: Store, args) -> int:
+    """The rows as they are, for a spreadsheet or a notebook: CSV (Excel opens
+    it; a multi-line reply stays one quoted cell) or JSON Lines, one object a
+    row. One run (default: the last) or --all; --out writes a file."""
+    run_id = None if args.all else store.resolve_run(args.run)
+    rows = store.results(run_id=run_id, device=args.device, command=args.command)
+    out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
+    try:
+        if args.format == "csv":
+            writer = csv.writer(out)
+            writer.writerow(EXPORT_FIELDS)
+            for r in rows:
+                writer.writerow([r[f] for f in EXPORT_FIELDS])
+        else:
+            for r in rows:
+                out.write(json.dumps({f: r[f] for f in EXPORT_FIELDS}, ensure_ascii=False) + "\n")
+    finally:
+        if args.out:
+            out.close()
+    if args.out:
+        print(f"{len(rows)} rows written to {args.out}", file=sys.stderr)
+    return 0 if rows else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="h-ssh-store",
                                 description="Read what h-ssh --store kept: runs, failures, outputs, diffs.")
@@ -515,6 +544,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("run", nargs="?")
     s.add_argument("--last", type=int, default=20)
     s.set_defaults(fn=cmd_slowest)
+    s = sub.add_parser("export", help="the rows of a run (default: the last) or of the whole store, as CSV or JSON Lines")
+    s.add_argument("run", nargs="?", help="run id or a unique prefix; default: the last run")
+    s.add_argument("--all", action="store_true", help="every run in the store")
+    s.add_argument("--device")
+    s.add_argument("--command", help="only results of exactly this command")
+    s.add_argument("--format", choices=("csv", "jsonl"), default="csv")
+    s.add_argument("--out", help="write to this file instead of stdout")
+    s.set_defaults(fn=cmd_export)
     return p
 
 

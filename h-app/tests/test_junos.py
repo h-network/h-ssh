@@ -19,7 +19,7 @@ class FakeDevice:
         self.params = params
         self.timeout = None
         self.opened = False
-        self.closed = False
+        self._closed = False
         self.cli_calls = []
         FakeDevice.instances.append(self)
 
@@ -29,7 +29,15 @@ class FakeDevice:
         self.opened = True
 
     def close(self):
-        self.closed = True
+        self._closed = True
+
+    @property
+    def closed(self):
+        # The transport closes sessions beside the work (a helper thread per
+        # close); looking at the flag first waits for the closes in flight,
+        # so a test sees the state a run's end sees.
+        netconf.wait_for_closes()
+        return self._closed
 
     def cli(self, cmd, warning=True):
         self.cli_calls.append(cmd)
@@ -600,3 +608,27 @@ def test_load_ignores_statement_not_found_and_nothing_else():
     load = [c for c in cfg().calls if c[0] == "load"][0]
     assert load[2]["ignore_warning"] == "statement not found"
     assert netconf.IGNORED_LOAD_WARNINGS == "statement not found"
+
+
+def test_the_session_close_is_not_on_the_callers_clock(monkeypatch):
+    """<close-session> and its acknowledgement are ~100 ms of waiting on the
+    device per session. A show returns as soon as the reply is in; the close
+    runs beside the work, and wait_for_closes() joins what is in flight."""
+    import threading
+    import time as _time
+
+    class SlowClose(FakeDevice):
+        def close(self):
+            _time.sleep(0.3)
+            super().close()
+
+    monkeypatch.setattr(netconf, "JunosDevice", SlowClose)
+    FakeDevice.instances.clear()
+    t = _time.perf_counter()
+    assert netconf.show("10.0.0.1", "u", "p", "show version", session_timeout=5, command_timeout=5) == "output of show version"
+    assert _time.perf_counter() - t < 0.25              # not held for the 0.3 s close
+    dev = FakeDevice.instances[0]
+    assert not dev._closed                              # still closing, in its helper thread
+    assert netconf.wait_for_closes(timeout=2.0) == 0    # joined
+    assert dev._closed
+    assert not any(th.name == "hssh-netconf-close" and th.is_alive() for th in threading.enumerate())

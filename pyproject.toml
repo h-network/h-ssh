@@ -26,6 +26,7 @@ all = []
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "ruff>=0.5",
 ]
 
 [project.scripts]
@@ -48,7 +49,7 @@ where = ["h-app"]
 include = ["hssh*"]
 
 [tool.setuptools.package-data]
-hssh = ["dialects/*.json"]
+hssh = ["dialects/*.json", "profiles/*.txt"]
 
 [tool.pytest.ini_options]
 pythonpath = ["h-app"]

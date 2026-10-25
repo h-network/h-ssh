@@ -12,6 +12,7 @@ import types
 import pytest
 
 from hssh import cli, drivers
+from hssh import store as store_module
 from hssh.store import Store, StoreError, main as store_main, new_run_id
 
 SHOW = {"device": "r1", "host": "10.0.0.1", "vendor": "junos@ssh", "ok": True, "duration_ms": 120,
@@ -195,6 +196,30 @@ def test_grep_field_diff_history_slowest(tmp_path, capsys):
     rc, out, _ = reader(capsys, path, "slowest", "--last", "2")
     lines = out.splitlines()
     assert rc == 0 and lines[1].split()[:2] == ["5000", "r2"] and len(lines) == 3
+
+
+def test_export_csv_and_jsonl(tmp_path, capsys):
+    """The rows as they are: CSV with a header (the batch's two commands are two
+    rows, a failure keeps its error), JSON Lines with the same keys, --all for
+    the whole store, --out to a file, filters, exit 1 when nothing matches."""
+    import csv
+    r1, r2, r3 = filled(tmp_path / "s.db")
+    rc, out, err = reader(capsys, tmp_path / "s.db", "export", r1)
+    assert rc == 0
+    rows = list(csv.DictReader(out.splitlines()))
+    assert [r["device"] for r in rows] == ["r1", "r2"] and rows[0]["output"].startswith("Hostname: r1")
+    assert rows[1]["ok"] == "0" and rows[1]["error"] == "ERROR: connect timed out"
+    assert list(rows[0]) == list(store_module.EXPORT_FIELDS)
+    rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--all", "--format", "jsonl")
+    lines = [json.loads(ln) for ln in out.splitlines()]
+    assert rc == 0 and len(lines) == 5 and {ln["run_id"] for ln in lines} == {r1, r2, r3}
+    assert [ln["seq"] for ln in lines if ln["run_id"] == r2] == [0, 1]           # the batch: one row per command
+    target = tmp_path / "rows.csv"
+    rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--all", "--device", "r1", "--out", str(target))
+    assert rc == 0 and out == "" and "4 rows written to" in err
+    assert len(list(csv.DictReader(target.read_text().splitlines()))) == 4     # r1: a show, two batch rows, a history
+    rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--all", "--device", "nobody")
+    assert rc == 1 and out.strip() == ",".join(store_module.EXPORT_FIELDS)     # a header and nothing else
 
 
 def test_the_reader_looks_where_the_run_wrote(tmp_path, capsys, monkeypatch):

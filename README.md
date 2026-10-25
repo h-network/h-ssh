@@ -124,6 +124,7 @@ h-ssh --user admin -eB configs/all.set --commit-confirmed 10 -y
 
 # several commands per device, one connection
 h-ssh --batch commands.txt R1:10.0.1.1:junos
+h-ssh --profile junos-health R1:10.0.1.1:junos     # a named command set, yours or shipped (--list-profiles)
 
 # watch: the same read every 30 s, every tick kept in the store, only what changed is printed
 h-ssh -sC "show bgp summary" --every 30 R1:10.0.1.1:junos R2:10.0.1.2:junos
@@ -170,6 +171,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 | `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
 | `-eB` | Edit broadcast | One config file applied to all targets |
 | `--batch` | Batch | Several show commands from a file, one connection per device |
+| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt`, or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
@@ -595,6 +597,7 @@ the run wrote (`--store PATH`, `HSSH_STORE`, the config file's `store`, else `./
 | `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ |
 | `history DEVICE [--command C] [--last N]` | every stored result for a device, newest first |
 | `slowest [RUN] [--last N]` | the slowest results, of a run or overall |
+| `export [RUN] [--all] [--device D] [--command C] [--format csv\|jsonl] [--out FILE]` | the rows as they are, for a spreadsheet or a notebook: CSV (a multi-line reply is one quoted cell) or JSON Lines; one run (default: the last) or the whole store. The file itself is plain SQLite, so `pandas.read_sql("SELECT * FROM results", sqlite3.connect("h-ssh.db"))` works as well |
 
 A run is named by its id or any unique prefix of it (`20261024-1730` when only one run started then).
 Anything else is a `sqlite3 runs.db` query away: the schema is two tables, documented at the top of
@@ -893,7 +896,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (879 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (886 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
