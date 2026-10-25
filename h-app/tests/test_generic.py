@@ -672,3 +672,45 @@ def test_the_runner_reaches_a_junos_dry_run_over_ssh_through_the_registry(shell)
         dry_run=True, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=1)
     assert ok is True and "DRY-RUN" in out and "+  host-name test;" in out
     assert shells[0].typed[-2:] == ["rollback 0", "exit"]
+
+
+def test_the_pin_files_are_parsed_once_per_process_not_per_connection(home, monkeypatch):
+    """A 250-device fleet re-parsed its 250-line pin file for every
+    connection, under the lock: 250 × 13 ms in a row, growing with the
+    square of the fleet. The files are parsed once and shared until they
+    change; a pin this process adds is in the shared copy already."""
+    from hssh.transports import ssh as T
+    pins = pin_file(home)
+    pins.parent.mkdir(mode=0o700, exist_ok=True)
+    key = paramiko.ECDSAKey.generate()
+    seed = paramiko.HostKeys()
+    seed.add("10.0.0.1", key.get_name(), key)
+    seed.save(str(pins))
+    parses = []
+    real_load = paramiko.HostKeys.load
+    monkeypatch.setattr(paramiko.HostKeys, "load", lambda self, path: parses.append(path) or real_load(self, path))
+    T._PINS.clear()
+
+    clients = [paramiko.SSHClient() for _ in range(5)]
+    for c in clients:
+        T._load_pins(c, str(pins))
+    assert parses == [str(pins)]                                           # once, not five times (no ~/.ssh/known_hosts here)
+    assert all(c.get_host_keys().lookup("10.0.0.1") for c in clients)      # and every client has the pins
+
+    key2 = paramiko.ECDSAKey.generate()
+    T._PinPolicy(str(pins)).missing_host_key(clients[0], "10.0.0.2", key2)  # pins under the lock: one merge parse
+    seen = len(parses)
+    late = paramiko.SSHClient()
+    T._load_pins(late, str(pins))
+    assert len(parses) == seen and late.get_host_keys().lookup("10.0.0.2")   # the shared copy already has it
+
+    other = paramiko.HostKeys()                                             # another process pins 10.0.0.3
+    other.load(str(pins))
+    key3 = paramiko.ECDSAKey.generate()
+    other.add("10.0.0.3", key3.get_name(), key3)
+    other.save(str(pins))
+    os.utime(pins, ns=(1, 1))                                               # whatever the clock says, the file changed
+    seen = len(parses)
+    fresh = paramiko.SSHClient()
+    T._load_pins(fresh, str(pins))
+    assert len(parses) == seen + 1 and fresh.get_host_keys().lookup("10.0.0.3")

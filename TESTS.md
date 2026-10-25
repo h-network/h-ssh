@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 868/868 passed
+## Unit Tests — 869/869 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
 the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
@@ -38,7 +38,7 @@ telnet runs against a scripted server on localhost.
 | test_error_classification.py | 29 | #65: a failure the same call cannot fix is reported once, in words that say what happened; a device the operator interrupted while it was still being connected to is interrupted, not failed |
 | test_fail_closed.py | 13 | #64: a run finds out before the first device that it cannot do its job — an audit or run log that cannot be written, a safety file that cannot be kept, a device without its set file, a device listed twice or under two names |
 | test_format.py | 21 | `--format json\|xml` through `rpc()`/`rpc_batch()`, refusal on other transports and on edits, `--json`/`--raw`/`-v`/`--diff` shapes |
-| test_generic.py | 43 | the paramiko transport (`hssh/transports/ssh.py`): host keys pinned in `~/.h-ssh/known_hosts` (0600) under a file lock, `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure, reads and the exit status bounded by the command timeout, a reply the CLI refuses at exit 0, the Junos and IOS-shaped dialect edits and confirms on a fake shell channel, EOS `\| json` |
+| test_generic.py | 44 | the paramiko transport (`hssh/transports/ssh.py`): host keys pinned in `~/.h-ssh/known_hosts` (0600) under a file lock, the known_hosts files parsed once per process and shared until they change (a pin this process adds is in the shared copy), `HSSH_HOST_KEY_POLICY`, changed key refused, parallel first contacts, exit status → failure, reads and the exit status bounded by the command timeout, a reply the CLI refuses at exit 0, the Junos and IOS-shaped dialect edits and confirms on a fake shell channel, EOS `\| json` |
 | test_input_validation.py | 34 | #62: wrong input is refused with a named reason before anything runs — numeric flags and config keys out of range, ports, BOM inventories, a `--config` that is not a file, `--save-output` on a file, a closed stdout, whitespace commands, unknown job keys, lines without `=`, wide CSV rows, a target that still says `arista` |
 | test_job_pool.py | 4 | #57: a job's entries share one NETCONF session per device |
 | test_job.py | 20 | `--job` files and stdin, `default_vendor`, same device twice (entries carried with their results) |
