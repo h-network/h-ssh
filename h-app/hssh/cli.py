@@ -1478,6 +1478,7 @@ async def main() -> int:
     if job_entries:
         pool.close_all(shutdown=False)   # the run is over: every session closed cleanly, in parallel
         pool.disable()
+    _drain_closes()
 
     # Write structured JSONL log. It holds the same payloads, replies and
     # diffs as the audit log, so it gets the same redaction and file mode.
@@ -1635,6 +1636,18 @@ async def main() -> int:
     return 3 if skipped or not_run else 0   # 3: nothing failed, but not everything ran
 
 
+def _drain_closes(timeout: float = 1.0) -> None:
+    """Sessions are closed beside the work; before the run reports, wait
+    for the closes still in flight (the junos transport has them, if it
+    was loaded at all)."""
+    mod = sys.modules.get("hssh.transports.netconf")
+    if mod is not None:
+        try:
+            mod.wait_for_closes(timeout)
+        except Exception:
+            pass
+
+
 def _quiet_transport_logs() -> None:
     """paramiko logs a full traceback at ERROR from its transport thread when
     a device closes the connection mid-handshake; with no logging configured
@@ -1681,4 +1694,5 @@ def main_sync() -> None:
             pool.close_all()        # a job run that ended early (Ctrl-C, a crash) leaves no session open
         except Exception:
             pass
+        _drain_closes(0.5)
     sys.exit(rc)
