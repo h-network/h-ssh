@@ -21,22 +21,31 @@ def test_every_registered_driver_is_backed_by_its_module(name):
     assert contract.violations(driver, _own(driver)) == []
 
 
-@pytest.mark.parametrize("name", ["junos@netconf", "none@ssh", "none@openssh"])
+@pytest.mark.parametrize("name", ["junos@netconf"])
 def test_a_module_serving_one_driver_declares_everything_it_has(name):
-    """The shared telnet module serves four dialects and offers more than most
-    of them may use (until #83); the other modules must not be under-declared,
-    or the runner would refuse what the module can do."""
+    """The telnet, paramiko and openssh modules serve several dialects and
+    offer more than most of them may use; a module behind one driver must not
+    be under-declared, or the runner would refuse what the module can do."""
     driver = drivers.get(name)
     has = {c for c in METHOD_CAPABILITIES if callable(getattr(_own(driver), c, None))}
     assert has == driver.supports & METHOD_CAPABILITIES
 
 
-def test_telnet_dialects_declare_no_more_than_the_module_has():
-    mod = importlib.import_module("hssh.vendors.telnet")
-    for driver in drivers.DRIVERS.values():
-        if driver.transport is drivers.TELNET:
-            for cap in driver.supports & METHOD_CAPABILITIES:
-                assert callable(getattr(mod, cap, None)), f"{driver.name}: {cap}"
+def test_shared_modules_offer_what_every_dialect_on_them_declares():
+    """A module serving several drivers has every function any of them
+    declares, and each function it has is declared by at least one of them:
+    under-declared on all of them, the runner would refuse what the module
+    can do."""
+    for transport in (drivers.TELNET, drivers.SSH, drivers.OPENSSH):
+        mod = importlib.import_module(transport.module)
+        declared = set()
+        for driver in drivers.DRIVERS.values():
+            if driver.transport is transport:
+                for cap in driver.supports & METHOD_CAPABILITIES:
+                    assert callable(getattr(mod, cap, None)), f"{driver.name}: {cap}"
+                declared |= driver.supports & METHOD_CAPABILITIES
+        has = {c for c in METHOD_CAPABILITIES if callable(getattr(mod, c, None))}
+        assert has == declared, transport.name
 
 
 def test_a_declared_capability_the_module_lacks_is_a_violation():

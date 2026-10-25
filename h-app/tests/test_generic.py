@@ -423,3 +423,252 @@ def test_a_batch_marks_the_refused_command_and_keeps_the_rest(exits_with):
     bad = generic.show_batch("10.0.0.1", "u", "p", ["uptime"], 5, 10)
     assert bad == [{"command": "uptime", "ok": False,
                     "error": "'uptime' was refused by the device: error: unknown command: uptime"}]
+
+
+# --- #83: a dialect's edits and confirms go through the CLI engine on a shell channel ---
+
+import socket
+
+from hssh.drivers import results as R
+from hssh.errors import NotAppliedError, NothingToConfirmError
+
+
+class FakeShell:
+    """What invoke_shell() hands back: a paramiko-shaped channel playing a
+    device CLI from a script. Each typed line is echoed like a tty and then
+    answered; recv() hands out the queued bytes or, with nothing queued,
+    times out as paramiko's does."""
+
+    def __init__(self, banner, reply):
+        self.queue = bytearray(banner.encode())
+        self.reply = reply          # typed line -> what the device prints after the echo
+        self.typed = []
+        self.timeout = None
+        self.closed = False
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def recv(self, n):
+        if not self.queue:
+            _time.sleep(min(self.timeout or 0, 0.01))
+            raise socket.timeout()
+        chunk, self.queue = bytes(self.queue[:n]), self.queue[n:]
+        return chunk
+
+    def sendall(self, data):
+        for line in data.decode().splitlines():
+            self.typed.append(line)
+            self.queue += (line + self.reply(line)).encode()
+
+    def close(self):
+        self.closed = True
+
+
+JUNOS_BANNER = "--- JUNOS 23.4R2.13 Kernel 64-bit  JNPR-12.1-20240711.ae2a6ee_buil\r\nlab@r1> "
+EDIT = "\r\n[edit]\r\nlab@r1# "
+PENDING = "0   2026-10-22 08:00:00 UTC by lab via cli commit confirmed, rollback in 5mins"
+CLEAN = "0   2026-10-22 08:00:00 UTC by lab via cli"
+LOCKED = ("\r\nerror: configuration database locked by:\r\n"
+          "  admin terminal p0 (pid 1234) on since 2026-10-22 08:00:00 UTC, idle 00:01:02\r\n"
+          "      exclusive\r\n\r\nlab@r1> ")
+
+
+def junos_cli(lock="\r\nEntering configuration mode" + EDIT, commit="\r\ncommit complete" + EDIT,
+              history=PENDING):
+    """A Junos CLI at `lab@r1> `: the reply to each typed line."""
+    def reply(line):
+        if line == "configure exclusive":
+            return lock
+        if line.startswith("set "):
+            return EDIT
+        if line == "show | compare":
+            return "\r\n[edit system]\r\n+  host-name test;" + EDIT
+        if line == "commit" or line.startswith("commit "):
+            return commit
+        if line == "rollback 0":
+            return "\r\nload complete" + EDIT
+        if line == "exit":
+            return "\r\nExiting configuration mode\r\n\r\nlab@r1> "
+        if line == "show system commit":
+            return f"\r\n{history}\r\n1   2026-10-21 17:30:00 UTC by lab via cli\r\nlab@r1> "
+        return "\r\nsyntax error, expecting <command>." + EDIT
+    return reply
+
+
+def ios_cli(line):
+    """An IOS CLI at `Router#`."""
+    if line == "configure terminal":
+        return "\r\nRouter(config)#"
+    if line == "end":
+        return "\r\nRouter#"
+    return "\r\nRouter(config)#"
+
+
+class ShellClient(ExitClient):
+    """ExitClient with a shell: invoke_shell() opens the scripted CLI."""
+    banner = ""
+    reply = None
+    shells = None      # every shell this class opened, for the wire
+
+    def invoke_shell(self, **kw):
+        shell = FakeShell(type(self).banner, type(self).reply)
+        shell.terminal = kw
+        type(self).shells.append(shell)
+        return shell
+
+
+@pytest.fixture
+def shell(monkeypatch):
+    """Install a client whose shell plays the scripted CLI; returns the list its shells land in."""
+    def install(banner, reply):
+        shells = []
+        cls = type("Client", (ShellClient,), {"banner": banner, "reply": staticmethod(reply), "shells": shells})
+        monkeypatch.setattr(generic, "paramiko", FakeParamiko(cls))
+        return shells
+    return install
+
+
+class NeverConnects:
+    def __init__(self, *a, **k):
+        raise AssertionError("connected although the request was refused before any device I/O")
+
+
+@pytest.fixture
+def no_connection(monkeypatch):
+    monkeypatch.setattr(generic, "paramiko", FakeParamiko(NeverConnects))
+
+
+def test_a_junos_edit_over_ssh_commits_through_the_cli_engine_on_a_shell(shell):
+    shells = shell(JUNOS_BANNER, junos_cli())
+    result = generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
+    assert isinstance(result, R.EditResult) and result.status == "committed"
+    assert "+  host-name test;" in result.diff and result.startswith("COMMIT OK\n\nDIFF:\n")
+    (sh,) = shells
+    assert sh.typed == ["configure exclusive", "set system host-name test", "show | compare", "commit", "exit"]
+    assert sh.terminal == {"term": "vt100", "width": 511, "height": 1000}
+    assert sh.closed
+
+
+def test_a_junos_dry_run_over_ssh_shows_the_diff_and_rolls_the_candidate_back(shell):
+    shells = shell(JUNOS_BANNER, junos_cli())
+    result = generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10,
+                          vendor_hint="junos@ssh", dry_run=True)
+    assert result.status == "dry-run" and "+  host-name test;" in result.diff
+    assert shells[0].typed[-2:] == ["rollback 0", "exit"] and "commit" not in shells[0].typed
+
+
+def test_a_junos_commit_confirmed_over_ssh_arms_the_timer(shell):
+    shells = shell(JUNOS_BANNER, junos_cli())
+    result = generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10,
+                          vendor_hint="junos@ssh", commit_confirmed=5)
+    assert result.status == "confirmed" and result.minutes == 5 and result.pending
+    assert "commit confirmed 5" in shells[0].typed
+
+
+def test_a_refused_lock_is_not_applied_and_nothing_more_is_sent(shell):
+    shells = shell(JUNOS_BANNER, junos_cli(lock=LOCKED))
+    with pytest.raises(NotAppliedError, match="Failed to lock config: error: configuration database locked"):
+        generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
+    assert shells[0].typed == ["configure exclusive"] and shells[0].closed
+
+
+def test_a_refused_commit_is_failed_and_the_candidate_discarded(shell):
+    shells = shell(JUNOS_BANNER, junos_cli(commit="\r\nerror: configuration check-out failed" + EDIT))
+    with pytest.raises(RuntimeError, match="Commit failed: error: configuration check-out failed"):
+        generic.edit("10.0.0.1", "lab", "p", "set system host-name test\n", 5, 10, vendor_hint="junos@ssh")
+    assert shells[0].typed[-3:] == ["commit", "rollback 0", "exit"]
+
+
+def test_a_commit_line_in_a_junos_payload_is_refused_before_connecting(no_connection):
+    with pytest.raises(ValueError, match="'commit' is not configuration"):
+        generic.edit("10.0.0.1", "lab", "p", "set system host-name test\ncommit\n", 5, 10, vendor_hint="junos@ssh")
+
+
+def test_confirm_over_ssh_commits_the_pending_commit_confirmed(shell):
+    shells = shell(JUNOS_BANNER, junos_cli())
+    result = generic.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh")
+    assert isinstance(result, R.EditResult) and result.status == "confirmed-ok"
+    assert shells[0].typed == ["show system commit", "configure exclusive", "commit", "exit"]
+    generic.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh", comment="ok")
+    assert shells[1].typed[2] == 'commit comment "ok"'
+
+
+def test_confirm_with_nothing_pending_sends_only_the_history_read(shell):
+    shells = shell(JUNOS_BANNER, junos_cli(history=CLEAN))
+    with pytest.raises(NothingToConfirmError, match="nothing to confirm"):
+        generic.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh")
+    assert shells[0].typed == ["show system commit"]
+
+
+def test_confirm_is_only_for_a_junos_dialect(no_connection):
+    with pytest.raises(ValueError, match="confirm is only for a Junos dialect, not ios@ssh; nothing was sent"):
+        generic.confirm("10.0.0.1", "u", "p", 5, 10, vendor_hint="ios@ssh")
+    with pytest.raises(ValueError, match="not ssh; nothing was sent"):
+        generic.confirm("10.0.0.1", "u", "p", 5, 10, vendor_hint="ssh")
+
+
+@pytest.mark.parametrize("hint", ["ios@ssh", "nxos@ssh", "eos@ssh"])
+def test_an_ios_shaped_edit_over_ssh_types_the_lines_in_config_mode(shell, hint):
+    shells = shell("\r\nRouter#", ios_cli)
+    result = generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint=hint)
+    assert result == "(config applied)" and result.status == "applied"
+    assert shells[0].typed == ["configure terminal", "hostname x", "end"]
+
+
+def test_an_ios_shaped_dialect_refuses_a_dry_run_before_connecting(no_connection):
+    with pytest.raises(ValueError, match="not supported by ios@ssh; nothing was sent"):
+        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ios@ssh", dry_run=True)
+    with pytest.raises(ValueError, match="not supported by nxos@ssh"):
+        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="nxos@ssh", commit_confirmed=5)
+
+
+def test_eos_show_structured_asks_the_exec_channel_for_json(exits_with):
+    exits_with(0, stdout=b'{"modelName": "DCS-7050SX3", "sent": "%s"}\n')
+    data = generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
+    assert data == {"modelName": "DCS-7050SX3", "sent": "show version | json"}
+    exits_with(0, stdout=b"Arista DCS-7050SX3\n(%s)\n")
+    with pytest.raises(RuntimeError, match=r"'show version \| json' did not return JSON: 'Arista DCS-7050SX3'"):
+        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
+    exits_with(0, stdout=b"%% Invalid input (%s)\n")
+    with pytest.raises(RuntimeError, match="was refused by the device: % Invalid input"):
+        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="eos@ssh")
+
+
+def test_show_structured_is_refused_on_any_other_dialect(no_connection):
+    with pytest.raises(ValueError, match="--structured is not supported by junos@ssh; nothing was sent"):
+        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10, vendor_hint="junos@ssh")
+    with pytest.raises(ValueError, match="--structured is not supported by ssh; nothing was sent"):
+        generic.show_structured("10.0.0.1", "u", "p", "show version", 5, 10)
+
+
+def test_a_show_is_refused_by_the_dialects_own_rule(exits_with):
+    """The Junos CLI says "syntax error, expecting <command>" with no "error:"
+    in front: a refusal for junos@ssh, output for the none dialect, which
+    knows only "error:" and "% "."""
+    exits_with(0, stdout=b"syntax error, expecting <command>: %s\n")
+    with pytest.raises(RuntimeError, match="'show versionx' was refused by the device: syntax error, expecting"):
+        generic.show("10.0.0.1", "u", "p", "show versionx", 5, 10, vendor_hint="junos@ssh")
+    assert "syntax error" in generic.show("10.0.0.1", "u", "p", "show versionx", 5, 10, vendor_hint="ssh")
+    assert generic.show_batch("10.0.0.1", "u", "p", ["show versionx"], 5, 10, vendor_hint="junos@ssh")[0]["ok"] is False
+    assert generic.show_batch("10.0.0.1", "u", "p", ["show versionx"], 5, 10)[0]["ok"] is True
+
+
+def test_the_none_dialect_refuses_a_dry_run_and_a_diff_check(no_connection):
+    with pytest.raises(ValueError, match="not supported by ssh; nothing was sent to the device"):
+        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ssh", dry_run=True)
+    with pytest.raises(ValueError, match="not supported by ssh; nothing was sent to the device"):
+        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, expected_diff="+ x")
+    with pytest.raises(ValueError, match="commit_confirmed is not supported by the 'ssh' transport"):
+        generic.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, commit_confirmed=5, dry_run=True)
+
+
+def test_the_runner_reaches_a_junos_dry_run_over_ssh_through_the_registry(shell):
+    shells = shell(JUNOS_BANNER, junos_cli())
+    name, ok, out, _ = runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "junos@ssh"), transport="junos@ssh", mode="edit-cmd",
+        show_cmd=None, edit_cmd="set system host-name test", config_dir=None, broadcast_file=None,
+        user="lab", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=True, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=1)
+    assert ok is True and "DRY-RUN" in out and "+  host-name test;" in out
+    assert shells[0].typed[-2:] == ["rollback 0", "exit"]

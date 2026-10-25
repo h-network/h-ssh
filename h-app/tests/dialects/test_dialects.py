@@ -197,9 +197,9 @@ def test_telnet_maps_its_hints_to_dialects():
     assert telnet.PROMPT_PATTERNS["junos"] is dialects.junos.CLI.prompt
 
 
-def test_telnet_learns_the_prompt_from_the_dialects_shape():
-    j, i = dialects.junos.CLI, dialects.ios.CLI
-    learned = telnet._learn_prompt("welcome\nlab@r1.example> ", j.prompt, j)
+def test_the_cli_engine_learns_the_prompt_from_the_dialects_shape():
+    from hssh.transports.cli import Cli
+    learned = Cli(None, dialects.junos.DIALECT, 5)._learn_prompt("welcome\nlab@r1.example> ")
     assert learned.search("lab@r1.example# ") and not learned.search("other@r1.example# ")
-    learned = telnet._learn_prompt("Router#", i.prompt, i)
+    learned = Cli(None, dialects.ios.DIALECT, 5)._learn_prompt("Router#")
     assert learned.search("Router(config-if)#") and not learned.search("Switch#")

@@ -1,26 +1,41 @@
-"""Dependency-free SSH transport that drives the OpenSSH client binary.
+"""Dependency-free SSH transport that drives the OpenSSH client binary, in the
+dialect the vendor_hint names (none for the plain `openssh` driver).
 
 Exists for hosts where third-party packages cannot be installed: jump hosts
 with no package index, no ensurepip, and no root. Everything here is stdlib
 plus the `ssh` binary, which is already present wherever operators log in.
 
+Shows, and the none dialect's edits, run on an exec: one `ssh host cmd` per
+command, its exit status and its reply checked (a non-zero status is a
+failure, not output, and so is a reply the dialect's CLI opens with a
+refusal). Multiple commands reuse one TCP connection and one authentication
+via OpenSSH connection multiplexing (ControlMaster), so batch mode keeps
+per-command output cleanly separated instead of parsing one merged stream.
+A dialect's edits and confirms (junos@openssh, ios@openssh, nxos@openssh,
+eos@openssh) go through the CLI engine (hssh.transports.cli) on a pty shell:
+`ssh -tt host` with its stdin and stdout piped, because a candidate
+configuration, its lock, a diff and a rollback timer need one session that
+stays in configuration mode. eos@openssh's structured reads ask the exec for
+`<cmd> | json`.
+
 Key auth needs nothing but subprocess. Password auth goes through SSH_ASKPASS:
 OpenSSH refuses to read a password from a pipe, so the password is handed to a
 helper that OpenSSH execs on its own, over a channel the session never touches.
+That holds on the pty shell too: ssh has authenticated through askpass before
+the engine reads its first byte.
 
-The obvious alternative — running ssh on a PTY and answering whatever looks
-like a prompt — is unsafe and was removed. Auth prompts and device output share
-one stream there, so output that happens to end in "...password:" matches the
-prompt pattern and the password gets typed into the live session, echoed back,
-and recorded in the device's command accounting. There is no pattern that
-reliably separates the two, which is why the channel has to be separate.
-
-Multiple commands reuse one TCP connection and one authentication via OpenSSH
-connection multiplexing (ControlMaster), so batch mode keeps per-command
-output cleanly separated instead of parsing one merged stream.
+The obvious alternative — running ssh on a local PTY and answering whatever
+looks like a password prompt — is unsafe and was removed. Auth prompts and
+device output share one stream there, so output that happens to end in
+"...password:" matches the prompt pattern and the password gets typed into the
+live session, echoed back, and recorded in the device's command accounting.
+There is no pattern that reliably separates the two, which is why the channel
+has to be separate.
 """
 
+import json
 import os
+import select
 import shlex
 import shutil
 import stat
@@ -29,8 +44,12 @@ import tempfile
 import time
 from typing import List, Optional
 
+from .. import drivers
 from ..core import refusal_line, refused_reply
+from ..dialects.base import Dialect
 from ..drivers import results as R
+from ..errors import NotAppliedError
+from ..transports.cli import Cli, edit_policy, refuse_commit_lines
 
 AVAILABLE = shutil.which("ssh") is not None
 
@@ -62,6 +81,17 @@ def _openssh_version() -> tuple:
     import re
     m = re.search(r"OpenSSH_(\d+)\.(\d+)", banner)
     return (int(m.group(1)), int(m.group(2))) if m else ()
+
+
+def _dialect(vendor_hint: Optional[str]) -> Dialect:
+    """The dialect behind a vendor_hint: junos@openssh is junos, ios@openssh
+    is ios, plain openssh (and None, and a name the registry does not know)
+    is none. The hint is the shim-era way to name a dialect; #84 hands the
+    object in."""
+    try:
+        return drivers.get(vendor_hint or "openssh").dialect
+    except ValueError:
+        return drivers.NONE
 
 
 class _AskPass:
@@ -161,6 +191,10 @@ _SESSION_UP = ("Authenticated to ", "Entering interactive session", "master sess
 _CHATTER = ("debug", "OpenSSH_", "Authenticated to ", "Transferred: ", "Bytes per second: ",
             "Warning: Permanently added ")
 _POLL = 0.2
+# How long ssh on a pty gets to end on its own once its stdin is closed or
+# SIGTERM is sent, and how long an EOF on its stdout gets to become an exit
+# status with a reason in the log.
+_EXIT_GRACE = 2.0
 
 
 class _Result:
@@ -191,6 +225,13 @@ def _read(path: str) -> str:
             return fh.read()
     except OSError:
         return ""
+
+
+def _unlink(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _exec(host: str, user: str, askpass, cmd: str,
@@ -296,9 +337,156 @@ def _format(cmd: str, proc) -> str:
     return "\n".join(block)
 
 
+class ProcessChannel:
+    """The ssh binary on a forced remote pty (`ssh -tt`) as the CLI engine's
+    Channel. recv(n, timeout) raises TimeoutError when nothing arrived in
+    time and ConnectionError when the link failed; an empty read is the peer
+    closing, which the engine reports. When ssh itself ended the session,
+    its own account of why, from the -E log (a refused password, a rejected
+    key, a host key that changed), is the error, not a bare "connection
+    closed"."""
+
+    def __init__(self, proc, host: str, log_path: str, argv: List[str]):
+        self.proc = proc
+        self.host = host
+        self.log_path = log_path
+        self.argv = argv
+        self.closed = False
+        self._log = None          # the log as it stood when the channel was closed
+
+    @classmethod
+    def open(cls, host: str, user: str, askpass, session_timeout: int,
+             port: Optional[int]) -> "ProcessChannel":
+        """Start `ssh -tt` to the device with stdin and stdout piped. ssh
+        authenticates before the engine reads a byte, through askpass with a
+        password; -v to the -E log says how far it got. The terminal is
+        vt100, as the paramiko shell asks for, so the device dresses its
+        output the same way on both transports."""
+        fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
+        os.close(fd)
+        argv = (["ssh", "-tt", "-v", "-E", log_path]
+                + _base_opts(session_timeout, port, None, askpass.passwd is not None)
+                + ["--", "%s@%s" % (user, host) if user else host])
+        env = askpass.env
+        env["TERM"] = "vt100"
+        try:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, env=env, bufsize=0)
+        except OSError as exc:
+            _unlink(log_path)
+            raise RuntimeError("SSH transport failed: %s" % exc) from exc
+        return cls(proc, host, log_path, argv)
+
+    def recv(self, n: int, timeout: float) -> bytes:
+        try:
+            ready, _, _ = select.select([self.proc.stdout], [], [], max(0.0, timeout))
+        except (OSError, ValueError) as e:            # the pipe is closed
+            raise ConnectionError(f"connection lost: {e}") from e
+        if not ready:
+            raise TimeoutError(f"nothing from {self.host} within {timeout:.1f}s")
+        try:
+            data = os.read(self.proc.stdout.fileno(), n)
+        except OSError as e:
+            raise ConnectionError(f"connection lost: {e}") from e
+        if data:
+            return data
+        why = self._ended()
+        if why:
+            raise ConnectionError(why)
+        return b""
+
+    def _ended(self) -> Optional[str]:
+        """Why ssh's stdout closed, in OpenSSH's words, when ssh exited other
+        than cleanly; None for a clean exit, which is the device ending the
+        session, and for a process that has not exited yet."""
+        try:
+            self.proc.wait(timeout=_EXIT_GRACE)
+        except subprocess.TimeoutExpired:
+            return None
+        if self.proc.returncode == 0:
+            return None
+        log = _read(self.log_path)
+        return _describe_failure(self.host, _Result(self.argv, self.proc.returncode, "", "",
+                                                    _own_lines(log), log))
+
+    def send(self, data: bytes) -> None:
+        view = memoryview(data)
+        try:
+            while view:
+                view = view[self.proc.stdin.write(view):]
+            self.proc.stdin.flush()
+        except (OSError, ValueError) as e:            # BrokenPipeError: ssh is gone
+            raise ConnectionError(f"connection lost: {e}") from e
+
+    def log(self) -> str:
+        """ssh's -v log: the file while the session lives, what it held when
+        the channel was closed."""
+        return _read(self.log_path) if self._log is None else self._log
+
+    def close(self) -> None:
+        """End the session. With stdin closed ssh sends EOF and ends with the
+        remote shell; one that is still there gets SIGTERM, and SIGKILL after
+        a short grace. The log file goes with it."""
+        if self.closed:
+            return
+        self.closed = True
+        proc = self.proc
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=_EXIT_GRACE / 4)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=_EXIT_GRACE)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+        self._log = _read(self.log_path)
+        _unlink(self.log_path)
+
+
+def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout: int,
+                   port: Optional[int], dialect: Dialect):
+    """(channel, session): a CLI session at the device's own prompt on the
+    pty of a fresh `ssh -tt`; the caller closes both (closing the channel
+    ends the process). The askpass helper lives only until the prompt is
+    seen: ssh has authenticated by then. login() has session_timeout for the
+    connect, the authentication and the banner together; when that runs out
+    before ssh got a session the error says how far ssh came, as the exec
+    path's does, and otherwise which line the device stopped at."""
+    if not AVAILABLE:
+        raise RuntimeError("no 'ssh' binary found on PATH.")
+    with _AskPass(passwd) as askpass:
+        channel = ProcessChannel.open(host, user, askpass, session_timeout, port)
+        session = Cli(channel, dialect, session_timeout)
+        try:
+            session.login(user, passwd)
+        except BaseException as exc:
+            log = channel.log()
+            channel.close()
+            if isinstance(exc, NotAppliedError) and not any(marker in log for marker in _SESSION_UP):
+                raise RuntimeError("no SSH session to %s within %ds: %s"
+                                   % (host, session_timeout, _phase(log))) from exc
+            raise
+    return channel, session
+
+
 def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[str],
                   session_timeout: int, command_timeout: int,
-                  port: Optional[int] = None, edit: bool = False) -> str:
+                  port: Optional[int] = None, edit: bool = False,
+                  dialect: Optional[Dialect] = None) -> str:
+    """One exec per command. The reply counts as well as the exit status: a
+    CLI that answers "error: ..." or "% ..." (or whatever the dialect's
+    `refused` says) and exits 0 has refused the line (M6), and the edit stops
+    there; a show whose reply opens that way got no answer."""
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
@@ -316,11 +504,8 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
                     raise RuntimeError("SSH transport failed: %s" % exc)
                 if proc.returncode != 0:
                     raise RuntimeError(_describe_failure(host, proc))
-                # The reply counts as well as the exit status: a CLI that
-                # answers "error: ..." or "% ..." and exits 0 has refused the
-                # line (M6); a show whose reply opens that way got no answer.
-                refused = (refusal_line(proc.stderr, proc.stdout) if edit
-                           else refused_reply(proc.stderr, proc.stdout))
+                refused = (refusal_line(proc.stderr, proc.stdout, dialect=dialect) if edit
+                           else refused_reply(proc.stderr, proc.stdout, dialect=dialect))
                 if refused:
                     raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
                 outputs.append(_format(cmd, proc))
@@ -353,25 +538,56 @@ def _close_master(host: str, user: str, control_path: Optional[str],
 
 def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
          command_timeout: int, port: int = None, vendor_hint: str = None) -> str:
-    """Execute a show command via the OpenSSH client."""
+    """One show command on an exec; a reply the dialect's CLI opens with a
+    refusal is a failure, not output."""
     return _run_commands(host, user, passwd, [cmd], session_timeout,
-                         command_timeout, port=port)
+                         command_timeout, port=port, dialect=_dialect(vendor_hint))
 
 
 def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
          command_timeout: int, commit_confirmed: int = None, port: int = None,
-         vendor_hint: str = None) -> str:
-    """Execute configuration commands via the OpenSSH client."""
-    if commit_confirmed:
-        # Junos gets this from NETCONF, where the rollback timer is part of the
-        # commit RPC. There is no vendor-neutral equivalent over a raw exec
-        # channel, and pretending otherwise would remove the safety net.
-        raise RuntimeError(
-            "--commit-confirmed is not supported by the 'openssh' transport; "
-            "use the 'junos' transport for confirmed commits")
-    commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
-    return _run_commands(host, user, passwd, commands, session_timeout,
-                         command_timeout, port=port, edit=True)
+         vendor_hint: str = None, dry_run: bool = False,
+         expected_diff: Optional[str] = None) -> R.EditResult:
+    """Push configuration.
+
+    The none dialect (the plain `openssh` driver) runs each line as its own
+    exec and applies what it is given: a rollback timer has no equivalent
+    there, so asking for one is refused, not dropped, and so are a dry run
+    and a diff check. A dialect's edit goes through the CLI engine on a pty
+    shell: Junos gets configure exclusive, the lines, show | compare and a
+    commit (confirmed with a timer, or rollback 0 for a dry run, or only if
+    the diff is still what the dry run showed); an IOS-shaped dialect gets
+    configure terminal, the lines, end, and refuses dry_run, commit_confirmed
+    and expected_diff before anything is sent.
+    """
+    d = _dialect(vendor_hint)
+    if d is drivers.NONE:
+        if commit_confirmed:
+            # Junos gets this from NETCONF, where the rollback timer is part of the
+            # commit RPC. There is no vendor-neutral equivalent over a raw exec
+            # channel, and pretending otherwise would remove the safety net.
+            raise RuntimeError(
+                "--commit-confirmed is not supported by the 'openssh' transport; "
+                "use the 'junos' transport for confirmed commits")
+        edit_policy(d, vendor_hint or "openssh", dry_run, None, expected_diff)
+        commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
+        return _run_commands(host, user, passwd, commands, session_timeout,
+                             command_timeout, port=port, edit=True, dialect=d)
+    if d.cli is None:
+        raise ValueError(f"{vendor_hint}: the {d.title} dialect has no CLI to type at; "
+                         "nothing was sent to the device")
+    edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
+    if d.cli.has_candidate:
+        refuse_commit_lines(payload)
+    channel, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    try:
+        if d.cli.has_candidate:
+            return session.edit_candidate(payload, dry_run=dry_run, confirmed_minutes=commit_confirmed or 0,
+                                          expected_diff=expected_diff)
+        return session.edit_lines(payload)
+    finally:
+        session.close()
+        channel.close()
 
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
@@ -381,6 +597,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
+    d = _dialect(vendor_hint)
     tmpdir = tempfile.mkdtemp(prefix="hssh-")
     control_path = os.path.join(tmpdir, "cm")
     try:
@@ -390,7 +607,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                 try:
                     proc = _exec(host, user, askpass, cmd, session_timeout,
                                  command_timeout, port, control_path)
-                    refused = refused_reply(proc.stderr, proc.stdout) if proc.returncode == 0 else None
+                    refused = refused_reply(proc.stderr, proc.stdout, dialect=d) if proc.returncode == 0 else None
                     if proc.returncode != 0:
                         results.append({"command": cmd, "ok": False,
                                         "error": _describe_failure(host, proc)})
@@ -405,6 +622,58 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
             return R.BatchResult(results)
     finally:
         _close_master(host, user, control_path, tmpdir, session_timeout, port)
+
+
+def confirm(host: str, user: str, passwd: str, session_timeout: int, command_timeout: int,
+            port: int = None, vendor_hint: str = "junos@openssh",
+            comment: Optional[str] = None) -> R.EditResult:
+    """Confirm a pending commit-confirmed on a Junos device through the
+    OpenSSH client: `show system commit` must show one waiting, then
+    configure exclusive, a bare `commit` (`commit comment "…"` with a
+    comment), exit. Only a dialect with a candidate and a commit history has
+    anything to confirm."""
+    d = _dialect(vendor_hint)
+    if d.cli is None or not d.cli.has_candidate or d.commit_pending is None:
+        raise ValueError(f"confirm is only for a Junos dialect, not {vendor_hint}; nothing was sent")
+    channel, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    try:
+        return session.confirm(command_timeout, comment)
+    finally:
+        session.close()
+        channel.close()
+
+
+def show_structured(host: str, user: str, passwd: str, cmd: str,
+                    session_timeout: int, command_timeout: int,
+                    port: int = None, vendor_hint: str = None,
+                    binding: Optional[dict] = None):
+    """A command's own JSON, for a dialect whose CLI renders one: EOS answers
+    `<cmd> | json` with the data its text would show, so an exec runs that
+    and the reply is parsed. `binding` is the field map the NETCONF driver
+    needs and EOS does not: accepted for the shared signature, ignored. Any
+    other dialect refuses before anything is sent."""
+    d = _dialect(vendor_hint)
+    if d is not drivers.EOS:
+        raise ValueError(f"--structured is not supported by {vendor_hint or 'openssh'}; "
+                         "nothing was sent to the device")
+    if not AVAILABLE:
+        raise RuntimeError("no 'ssh' binary found on PATH.")
+    full = f"{cmd} | json"
+    with _AskPass(passwd) as askpass:
+        try:
+            proc = _exec(host, user, askpass, full, session_timeout, command_timeout, port, None)
+        except OSError as exc:
+            raise RuntimeError("SSH transport failed: %s" % exc)
+    if proc.returncode != 0:
+        raise RuntimeError(_describe_failure(host, proc))
+    refused = refused_reply(proc.stderr, proc.stdout, dialect=d)
+    if refused:
+        raise RuntimeError("'%s' was refused by the device: %s" % (full, refused))
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        first = next((ln.strip() for ln in proc.stdout.splitlines() if ln.strip()), "")
+        raise RuntimeError(f"'{full}' did not return JSON: {first!r}") from None
 
 
 def ssh_command_line(host: str, user: str, cmd: str, session_timeout: int = 8,

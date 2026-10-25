@@ -1,4 +1,14 @@
-"""Generic SSH implementation using Paramiko.
+"""The paramiko transport: SSH to any device, in the dialect the vendor_hint
+names (none for the plain `ssh` driver).
+
+Shows, and the none dialect's edits, run on an exec channel: one exec_command
+per command, its exit status checked the way the openssh transport checks the
+ssh binary's (a non-zero status is a failure, not output) and its reply read
+for the dialect's refusal. A dialect's edits and confirms (junos@ssh, ios@ssh,
+nxos@ssh, eos@ssh) go through the CLI engine (hssh.transports.cli) on a shell
+channel: a candidate configuration, its lock, a diff and a rollback timer need
+one session that stays in configuration mode. eos@ssh's structured reads ask
+the exec channel for `<cmd> | json`.
 
 Host keys follow the same HSSH_HOST_KEY_POLICY as the openssh transport. The
 default, accept-new, trusts a host on first contact and pins its key in
@@ -6,12 +16,10 @@ default, accept-new, trusts a host on first contact and pins its key in
 credential is sent. ~/.ssh/known_hosts is read as well, never written: paramiko
 saves by rewriting the whole file, which would flatten the comments, markers
 and hashed entries OpenSSH keeps there.
-
-A command's exit status is checked the way the openssh transport checks the
-ssh binary's: a non-zero status is a failure, not output.
 """
 
 import fcntl
+import json
 import socket
 import time
 import os
@@ -19,8 +27,11 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
+from .. import drivers
 from ..core import refusal_line, refused_reply
+from ..dialects.base import Dialect
 from ..drivers import results as R
+from ..transports.cli import Cli, edit_policy, refuse_commit_lines
 
 try:
     import paramiko
@@ -32,6 +43,16 @@ except ImportError:
 # different hosts at once must take turns, and re-read before writing, or
 # the last one to save would drop the others' pins.
 _PIN_LOCK = threading.Lock()
+
+
+def _dialect(vendor_hint: Optional[str]) -> Dialect:
+    """The dialect behind a vendor_hint: junos@ssh is junos, ios@ssh is ios,
+    plain ssh (and None, and a name the registry does not know) is none. The
+    hint is the shim-era way to name a dialect; #84 hands the object in."""
+    try:
+        return drivers.get(vendor_hint or "ssh").dialect
+    except ValueError:
+        return drivers.NONE
 
 
 def _known_hosts() -> str:
@@ -227,32 +248,159 @@ def _format(cmd: str, out: str, err: str) -> str:
     return "\n".join(block)
 
 
+class ShellChannel:
+    """A paramiko shell channel as the CLI engine's Channel: recv(n, timeout)
+    raises TimeoutError when nothing arrived in time and ConnectionError when
+    the channel failed; an empty read is the peer closing, which the engine
+    reports."""
+
+    def __init__(self, chan):
+        self.chan = chan
+
+    def recv(self, n: int, timeout: float) -> bytes:
+        self.chan.settimeout(timeout)
+        try:
+            return self.chan.recv(n)
+        except TimeoutError:          # socket.timeout since Python 3.10
+            raise
+        except (OSError, paramiko.SSHException) as e:
+            raise ConnectionError(f"connection lost: {e}") from e
+
+    def send(self, data: bytes) -> None:
+        self.chan.sendall(data)
+
+    def close(self) -> None:
+        try:
+            self.chan.close()
+        except Exception:
+            pass
+
+
+def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout: int,
+                   port: Optional[int], dialect: Dialect):
+    """(client, session): a CLI session at the device's own prompt on a shell
+    channel of a fresh connection; the caller closes both. The terminal is
+    wide so the device never wraps the echo of a long line, which the engine
+    must recognise as the echo. There is no login dialogue over SSH: login()
+    reads the banner up to the prompt and learns this device's own."""
+    client = _connect(host, user, passwd, session_timeout, port)
+    try:
+        chan = client.invoke_shell(term="vt100", width=511, height=1000)
+        session = Cli(ShellChannel(chan), dialect, session_timeout)
+        session.login(user, passwd)
+    except BaseException:
+        client.close()
+        raise
+    return client, session
+
+
 def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
          command_timeout: int, port: int = None, vendor_hint: str = None) -> str:
-    """Execute a show command via SSH."""
-    return _run_commands(host, user, passwd, [cmd], session_timeout, command_timeout, port=port)
+    """One show command on an exec channel; a reply the dialect's CLI opens
+    with a refusal is a failure, not output."""
+    return _run_commands(host, user, passwd, [cmd], session_timeout, command_timeout, port=port,
+                         dialect=_dialect(vendor_hint))
 
 
 def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
          command_timeout: int, commit_confirmed: int = None, port: int = None,
-         vendor_hint: str = None) -> str:
-    """Execute configuration commands via SSH. A rollback timer has no
-    equivalent over an exec channel: asking for one is refused, not dropped."""
-    if commit_confirmed is not None:
-        raise ValueError("commit_confirmed is not supported by the 'ssh' transport; "
+         vendor_hint: str = None, dry_run: bool = False,
+         expected_diff: Optional[str] = None) -> R.EditResult:
+    """Push configuration.
+
+    The none dialect (the plain `ssh` driver) runs each line as its own exec
+    command and applies what it is given: a rollback timer has no equivalent
+    there, so asking for one is refused, not dropped, and so are a dry run
+    and a diff check. A dialect's edit goes through the CLI engine on a shell
+    channel: Junos gets configure exclusive, the lines, show | compare and a
+    commit (confirmed with a timer, or rollback 0 for a dry run, or only if
+    the diff is still what the dry run showed); an IOS-shaped dialect gets
+    configure terminal, the lines, end, and refuses dry_run, commit_confirmed
+    and expected_diff before anything is sent.
+    """
+    d = _dialect(vendor_hint)
+    if d is drivers.NONE:
+        if commit_confirmed is not None:
+            raise ValueError("commit_confirmed is not supported by the 'ssh' transport; "
+                             "nothing was sent to the device")
+        edit_policy(d, vendor_hint or "ssh", dry_run, None, expected_diff)
+        commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
+        return _run_commands(host, user, passwd, commands, session_timeout, command_timeout, port=port,
+                             edit=True, dialect=d)
+    if d.cli is None:
+        raise ValueError(f"{vendor_hint}: the {d.title} dialect has no CLI to type at; "
                          "nothing was sent to the device")
-    commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
-    return _run_commands(host, user, passwd, commands, session_timeout, command_timeout, port=port,
-                         edit=True)
+    edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
+    if d.cli.has_candidate:
+        refuse_commit_lines(payload)
+    client, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    try:
+        if d.cli.has_candidate:
+            return session.edit_candidate(payload, dry_run=dry_run, confirmed_minutes=commit_confirmed or 0,
+                                          expected_diff=expected_diff)
+        return session.edit_lines(payload)
+    finally:
+        session.close()
+        client.close()
+
+
+def confirm(host: str, user: str, passwd: str, session_timeout: int, command_timeout: int,
+            port: int = None, vendor_hint: str = "junos@ssh",
+            comment: Optional[str] = None) -> R.EditResult:
+    """Confirm a pending commit-confirmed on a Junos device over SSH: `show
+    system commit` must show one waiting, then configure exclusive, a bare
+    `commit` (`commit comment "…"` with a comment), exit. Only a dialect with
+    a candidate and a commit history has anything to confirm."""
+    d = _dialect(vendor_hint)
+    if d.cli is None or not d.cli.has_candidate or d.commit_pending is None:
+        raise ValueError(f"confirm is only for a Junos dialect, not {vendor_hint}; nothing was sent")
+    client, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    try:
+        return session.confirm(command_timeout, comment)
+    finally:
+        session.close()
+        client.close()
+
+
+def show_structured(host: str, user: str, passwd: str, cmd: str,
+                    session_timeout: int, command_timeout: int,
+                    port: int = None, vendor_hint: str = None,
+                    binding: Optional[dict] = None):
+    """A command's own JSON, for a dialect whose CLI renders one: EOS answers
+    `<cmd> | json` with the data its text would show, so the exec channel runs
+    that and the reply is parsed. `binding` is the field map the NETCONF
+    driver needs and EOS does not: accepted for the shared signature, ignored.
+    Any other dialect refuses before anything is sent."""
+    d = _dialect(vendor_hint)
+    if d is not drivers.EOS:
+        raise ValueError(f"--structured is not supported by {vendor_hint or 'ssh'}; "
+                         "nothing was sent to the device")
+    full = f"{cmd} | json"
+    client = _connect(host, user, passwd, session_timeout, port)
+    try:
+        rc, out, err = _exec(client, full, command_timeout)
+    finally:
+        client.close()
+    if rc > 0:
+        raise RuntimeError(_describe_failure(full, rc, out, err))
+    refused = refused_reply(err, out, dialect=d)
+    if refused:
+        raise RuntimeError("'%s' was refused by the device: %s" % (full, refused))
+    try:
+        return json.loads(out)
+    except ValueError:
+        first = next((ln.strip() for ln in out.splitlines() if ln.strip()), "")
+        raise RuntimeError(f"'{full}' did not return JSON: {first!r}") from None
 
 
 def _run_commands(host: str, user: str, passwd: str, commands: List[str],
                   session_timeout: int, command_timeout: int, port: int = None,
-                  edit: bool = False) -> str:
+                  edit: bool = False, dialect: Optional[Dialect] = None) -> str:
     """Execute commands via SSH on any device. The reply is read as well as
-    the exit status: a CLI that answers "error: ..." or "% ..." and exits 0
-    has refused the line, and the edit stops there; a show whose reply opens
-    that way got no answer, and is failed rather than reported as output."""
+    the exit status: a CLI that answers "error: ..." or "% ..." (or whatever
+    the dialect's `refused` says) and exits 0 has refused the line, and the
+    edit stops there; a show whose reply opens that way got no answer, and is
+    failed rather than reported as output."""
     client = _connect(host, user, passwd, session_timeout, port)
 
     try:
@@ -263,7 +411,8 @@ def _run_commands(host: str, user: str, passwd: str, commands: List[str],
             # a failure; some network OSes never send one.
             if rc > 0:
                 raise RuntimeError(_describe_failure(cmd, rc, out, err))
-            refused = refusal_line(err, out) if edit else refused_reply(err, out)
+            refused = (refusal_line(err, out, dialect=dialect) if edit
+                       else refused_reply(err, out, dialect=dialect))
             if refused:
                 raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
             outputs.append(_format(cmd, out, err))
@@ -277,13 +426,14 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
                port: int = None, vendor_hint: str = None) -> List[dict]:
     """Execute multiple commands on a single SSH connection."""
+    d = _dialect(vendor_hint)
     client = _connect(host, user, passwd, session_timeout, port)
     try:
         results = []
         for cmd in cmds:
             try:
                 rc, out, err = _exec(client, cmd, command_timeout)
-                refused = refused_reply(err, out) if rc <= 0 else None
+                refused = refused_reply(err, out, dialect=d) if rc <= 0 else None
                 if rc > 0:
                     results.append({"command": cmd, "ok": False,
                                     "error": _describe_failure(cmd, rc, out, err)})
