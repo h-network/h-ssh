@@ -955,6 +955,13 @@ async def main() -> int:
         if batch_cmds:
             print(f"Batch: {len(batch_cmds)} commands from {args.batch or 'the run file'}")
         print(f"Targets: {len(targets)}")
+        devices = len({(t.host, t.port) for t in targets})     # a job lists one device in several entries
+        waves = -(-devices // args.workers)
+        if waves > 4 and args.workers < 64 and not fd_note:
+            # Workers stay at 8 by default; a fleet run is told what it costs
+            # (not when the open-file limit just lowered them: that WARNING said why).
+            print(f"Hint: {devices} devices at {args.workers} workers is {waves} waves; --workers 64 would be "
+                  f"{-(-devices // 64)} (one session per router either way)")
 
     # One unit of work per job entry, or per target. The entry (None outside
     # job mode) travels with its result, so a job that names one device in
@@ -1074,7 +1081,8 @@ async def main() -> int:
     json_results = []
     run_start = time.time()
     store_run = None
-    store_warned = False
+    store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
+    store_reason = None
     if store is not None:
         try:
             about = ("\n".join(batch_cmds) if batch_cmds else
@@ -1351,13 +1359,22 @@ async def main() -> int:
             sent = json.dumps([resolve_command(c, t.vendor) for c in batch_cmds]) if batch_cmds else ""
 
         if store_run is not None:
+            store_tried += 1
             try:
                 store.add_entry(store_run, entry, sent,
                                 fmt=args.format if dev_mode in ("show", "show-batch") else "text")
+                # SQLite writes into a deleted or replaced file without a
+                # word; one stat per result says so as it happens, not at the end.
+                gone = store.still_there() if store_reason is None else None
             except Exception as e:
-                if not store_warned:
-                    print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
-                    store_warned = True
+                store_lost += 1
+                gone = str(e)
+            if gone is not None and store_reason is None:
+                # The run goes on, the results are still shown; the loss is
+                # counted and said once more, with the exit code, at the end.
+                store_reason = gone
+                print(f"WARNING: store {store.path}: {gone}; the run goes on, its results are shown but not kept",
+                      file=sys.stderr)
 
         # Audit logging for operations
         if args.audit_log:
@@ -1607,22 +1624,37 @@ async def main() -> int:
     elapsed_ms = int((time.time() - run_start) * 1000)
     ok_count = len(json_results) - failures - skipped - interrupted_connects
     stderr_mode = "batch" if mode == "show-batch" else ("job" if mode == "job" else mode.split("-")[0])
+    not_kept = 0
+    if store_run is not None:
+        gone = store.still_there()
+        if gone is not None:              # SQLite kept writing into the void; nothing of this run is on disk
+            not_kept, store_reason = store_tried, gone
+        else:
+            not_kept = store_lost
     summary = json.dumps({
         "targets": len(json_results) + not_run,
         "ok": ok_count,
         "fail": failures,
         "skipped": skipped + not_run,
         **({"interrupted": interrupted_connects} if interrupted else {}),
+        **({"not_kept": not_kept} if not_kept else {}),
         "elapsed_ms": elapsed_ms,
         "mode": stderr_mode,
     })
     print(f"[h-ssh] {summary}", file=sys.stderr)
 
     if store_run is not None:
-        try:
-            store.finish_run(store_run, ok_count, failures, skipped + not_run, interrupted)
-        except Exception as e:
-            print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
+        # The run row is closed when any result was kept; with nothing kept
+        # it stays open (`?/?` in `h-ssh-store runs`), a true record of a run
+        # that could not keep its results.
+        if not_kept < store_tried or store_tried == 0:
+            try:
+                store.finish_run(store_run, ok_count, failures, skipped + not_run, interrupted)
+            except Exception as e:
+                print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
+        if not_kept:
+            print(f"WARNING: store {store.path}: {not_kept} of {store_tried} results were not kept: {store_reason}",
+                  file=sys.stderr)
     if store is not None:
         store.close()
 
@@ -1631,6 +1663,8 @@ async def main() -> int:
 
     if interrupted:
         return 130  # 128 + SIGINT, the shell convention
+    if not_kept:
+        return 4    # the run's record is incomplete: results were not kept (before 1 and 3; `fail` is in the summary)
     if failures:
         return 1
     return 3 if skipped or not_run else 0   # 3: nothing failed, but not everything ran

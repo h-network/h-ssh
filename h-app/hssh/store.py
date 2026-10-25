@@ -27,16 +27,20 @@ import difflib
 import json
 import os
 import pathlib
+import random
 import re
 import secrets
 import sqlite3
 import stat
 import sys
+import time
 from typing import Iterable, List, Optional
 
 ENV_VAR = "HSSH_STORE"
 DEFAULT = "h-ssh.db"          # in the directory h-ssh runs from: the evidence sits with the job
 CONFIG_KEY = "store"          # `store = PATH` in ~/.h-ssh/config
+BUSY_TIMEOUT = 10.0           # seconds a write waits for another h-ssh writing the same file
+WAL_SWITCH_TIMEOUT = 5.0      # seconds the first run on a new file may wait to switch it to WAL
 
 
 def where(flag: Optional[str] = None, config: Optional[dict] = None) -> str:
@@ -82,6 +86,34 @@ CREATE INDEX IF NOT EXISTS results_command ON results(command);
 """
 
 
+def _identity(path: str):
+    """What makes the file at `path` this file: device and inode; None if nothing is there."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _wal(conn, timeout: float = WAL_SWITCH_TIMEOUT) -> None:
+    """Put the file in WAL mode, once. Switching needs an exclusive lock and
+    SQLite does not wait for it (no busy handler for this pragma), so two
+    runs creating the same store at the same instant raced and one refused
+    to start with 'database is locked'. A file already in WAL mode needs
+    nothing; a fresh one is switched, waiting out the other run."""
+    if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+        return
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.005 + random.random() * 0.03)
+
+
 def _now() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -116,13 +148,34 @@ class Store:
         else:
             self._create_private(path)
             try:
-                self.conn = sqlite3.connect(path)
-                self.conn.execute("PRAGMA journal_mode=WAL")
+                # Not pinned to the opening thread: a library caller may open a
+                # store here and write it from the thread that consumes the results.
+                # One writer at a time is still the rule; the CLI writes from its
+                # main thread only, Fleet from the iterating thread only.
+                self.conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT, check_same_thread=False)
+                _wal(self.conn)
+                # WAL with synchronous=NORMAL: every commit is safe against the
+                # process dying, the file never corrupts, and only a power cut
+                # can lose the last commits. FULL fsynced every row: 1.2 ms a
+                # row, a tenth of that now, and a fleet run writes thousands.
+                self.conn.execute("PRAGMA synchronous=NORMAL")
                 self.conn.executescript(SCHEMA)
                 self.conn.commit()
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         self.conn.row_factory = sqlite3.Row
+        self.identity = _identity(path)
+
+    def still_there(self) -> Optional[str]:
+        """None while the path still leads to the file this store opened, else
+        why not. SQLite goes on writing to a deleted or replaced file without
+        a word, so a run asks before it says its results are kept."""
+        now = _identity(self.path)
+        if now is None:
+            return "the store file was deleted during the run"
+        if now != self.identity:
+            return "the store file was replaced during the run"
+        return None
 
     @staticmethod
     def _create_private(path: str) -> None:
@@ -167,43 +220,49 @@ class Store:
             duration_ms: Optional[int] = None, error: Optional[str] = None,
             output: Optional[str] = None, fmt: str = "text", host: Optional[str] = None,
             vendor: Optional[str] = None, ts: Optional[str] = None) -> None:
-        """One command's row. A second result for the same (run, device,
-        seq) replaces the first: a retry's verdict is the one that stands."""
+        """One command's row, committed. A second result for the same (run,
+        device, seq) replaces the first: a retry's verdict is the one that
+        stands."""
         with self.conn:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO results (run_id, device, seq, host, vendor, command, ts, ok, "
-                "duration_ms, error, format, output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, device, seq, host, vendor, command, ts or _now(), 1 if ok else 0,
-                 duration_ms, error, fmt, output))
+            self._row(run_id, device, seq, command, ok, duration_ms, error, output, fmt, host, vendor, ts)
+
+    def _row(self, run_id, device, seq, command, ok, duration_ms, error, output, fmt, host, vendor, ts=None) -> None:
+        """One row inside the caller's transaction."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO results (run_id, device, seq, host, vendor, command, ts, ok, "
+            "duration_ms, error, format, output) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, device, seq, host, vendor, command, ts or _now(), 1 if ok else 0,
+             duration_ms, error, fmt, output))
 
     def add_entry(self, run_id: str, entry: dict, command: str, fmt: str = "text") -> int:
         """The rows of one device's result as the CLI builds it (`entry`: the
         --json record): a batch is one row per command in its order; anything
         else one row, with `command` what was sent (the resolved show, the
         edit payload, `rollback N`, `show system commit`) and the output the
-        reply, the diff, or the commit history as JSON. Returns the rows
-        written."""
+        reply, the diff, or the commit history as JSON. One transaction per
+        device result, however many rows. Returns the rows written."""
         device, host, vendor = entry["device"], entry.get("host"), entry.get("vendor")
         duration = entry.get("duration_ms")
-        if "commands" in entry and isinstance(entry["commands"], list) and entry["commands"]:
-            for seq, cr in enumerate(entry["commands"]):
-                out = cr.get("output")
-                self.add(run_id, device, seq, cr.get("command", ""), bool(cr.get("ok")),
-                         duration if seq == 0 else None, cr.get("error"),
-                         out if isinstance(out, str) or out is None else json.dumps(out),
-                         fmt if isinstance(out, str) else "json", host, vendor)
-            return len(entry["commands"])
-        if "commits" in entry:
-            output = json.dumps(entry["commits"]) if entry.get("ok") else None
-            self.add(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
-                     output, "json", host, vendor)
+        with self.conn:
+            if "commands" in entry and isinstance(entry["commands"], list) and entry["commands"]:
+                for seq, cr in enumerate(entry["commands"]):
+                    out = cr.get("output")
+                    self._row(run_id, device, seq, cr.get("command", ""), bool(cr.get("ok")),
+                              duration if seq == 0 else None, cr.get("error"),
+                              out if isinstance(out, str) or out is None else json.dumps(out),
+                              fmt if isinstance(out, str) else "json", host, vendor)
+                return len(entry["commands"])
+            if "commits" in entry:
+                output = json.dumps(entry["commits"]) if entry.get("ok") else None
+                self._row(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+                          output, "json", host, vendor)
+                return 1
+            output = entry.get("output")
+            if output is not None and not isinstance(output, str):
+                output, fmt = json.dumps(output), "json"
+            self._row(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+                      output, fmt, host, vendor)
             return 1
-        output = entry.get("output")
-        if output is not None and not isinstance(output, str):
-            output, fmt = json.dumps(output), "json"
-        self.add(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
-                 output, fmt, host, vendor)
-        return 1
 
     def finish_run(self, run_id: str, ok: int, failed: int, skipped: int, interrupted: bool = False) -> None:
         with self.conn:
