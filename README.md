@@ -58,19 +58,34 @@ On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session
 
 ## Install
 
-```bash
-git clone …/h-ssh.git && cd h-ssh
-python3 -m venv .venv && . .venv/bin/activate
+One line, no package manager. It needs `python3` 3.10 or newer with its venv module (Debian/Ubuntu:
+`sudo apt install python3-venv`) and `git`:
 
-pip install -e .                  # core (paramiko) — SSH + telnet
-                                  # nothing installable? the openssh transport
-                                  # runs straight from the checkout, no deps
-pip install -e '.[junos]'         # + junos-eznc (NETCONF config)
-pip install -e '.[all]'           # + both
-pip install -e '.[dev]'           # + pytest, both vendor libs
+```bash
+curl -fsSL https://raw.githubusercontent.com/h-network/h-ssh/develop/install.sh | sh
+h-ssh --list-vendors
 ```
 
-Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/h-ssh.py` works uninstalled too.
+The installer puts h-ssh in a Python environment of its own, `~/.h-ssh/venv`, with every transport
+(paramiko and PyEZ come with it), and links `h-ssh` and `h-ssh-store` into `~/.local/bin`. It touches
+nothing else: your config, inventory and stores live next to it under `~/.h-ssh`. Running the same line
+again upgrades; `H_SSH_REF=v1.0.0` in front of it picks a tag or branch; `sh install.sh --uninstall`
+removes the environment and the two links. Read the script first if you like: it is sixty lines of
+POSIX sh and does what this paragraph says.
+
+If you already use [pipx](https://pipx.pypa.io) or [uv](https://docs.astral.sh/uv/), the same thing in
+their words: `pipx install git+https://github.com/h-network/h-ssh.git` or
+`uv tool install git+https://github.com/h-network/h-ssh.git`.
+
+For working on h-ssh itself:
+
+```bash
+git clone https://github.com/h-network/h-ssh.git && cd h-ssh
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e '.[dev]'           # the package, editable, plus pytest
+```
+
+The checkout's `./h-app/h-ssh.py` works uninstalled too.
 
 ## Quick start
 
@@ -78,7 +93,7 @@ Requires Python 3.10+. Installs an `h-ssh` entry point; the checkout's `./h-app/
 # show command across two routers, inline targets
 ./h-app/h-ssh.py --user admin -sC bgp --target R1:10.0.1.1:junos --target R2:10.0.1.2:junos
 
-# ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows: needs `.[junos]` and a password)
+# ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows)
 ./h-app/h-ssh.py --user admin --json -sC "show version" --devices h-app/devices.csv
 
 # compare one command's output across the fleet
