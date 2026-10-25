@@ -10,6 +10,11 @@ import types
 from pathlib import Path
 import pytest
 
+# The password reaches the CLI the way a pipeline hands it over: in the
+# environment. There is no --password flag; one would put it in `ps`, the
+# shell history and every stored command line.
+ENV = {**os.environ, "HSSH_PASSWORD": "test"}
+
 
 def test_cli_show_batch_error_handling(tmp_path):
     """When a device fails in show-batch mode, CLI must not crash with JSONDecodeError."""
@@ -23,9 +28,10 @@ def test_cli_show_batch_error_handling(tmp_path):
 
     res = subprocess.run(
         [sys.executable, str(hssh), "--devices", str(devices), "--batch", str(batch_file),
-         "--user", "test", "--password", "test", "--json", "--session-timeout", "1"],
+         "--user", "test", "--json", "--session-timeout", "1"],
         capture_output=True,
         text=True,
+        env=ENV,
     )
     # Must exit cleanly without an unhandled traceback
     assert "JSONDecodeError" not in res.stderr
@@ -47,9 +53,10 @@ def test_cli_junos_set_syntax_guard_rejects_bypass(tmp_path):
     # Multi-line bypass: line 1 starts with 'set', line 2 is 'reboot'
     res = subprocess.run(
         [sys.executable, str(hssh), "--devices", str(devices), "-eC", "set system host-name CR1\nreboot",
-         "--user", "test", "--password", "test"],
+         "--user", "test"],
         capture_output=True,
         text=True,
+        env=ENV,
     )
     assert res.returncode == 2
     assert "only accepts 'set ...' commands" in res.stderr or "invalid Junos set command" in res.stderr
@@ -67,9 +74,10 @@ def test_cli_junos_set_syntax_guard_broadcast(tmp_path):
 
     res = subprocess.run(
         [sys.executable, str(hssh), "--devices", str(devices), "-eB", str(bad_broadcast),
-         "--user", "test", "--password", "test"],
+         "--user", "test"],
         capture_output=True,
         text=True,
+        env=ENV,
     )
     assert res.returncode == 2
     assert "only accepts 'set ...' commands" in res.stderr
@@ -89,9 +97,10 @@ def test_cli_junos_job_syntax_guard(tmp_path):
     hssh = Path(__file__).resolve().parent.parent / "h-ssh.py"
 
     res = subprocess.run(
-        [sys.executable, str(hssh), "--job", str(job_file), "--user", "test", "--password", "test"],
+        [sys.executable, str(hssh), "--job", str(job_file), "--user", "test"],
         capture_output=True,
         text=True,
+        env=ENV,
     )
     assert res.returncode == 2
     assert "only accepts set-style commands" in res.stderr
@@ -107,9 +116,10 @@ def test_cli_audit_logging_preflight_abort(tmp_path):
 
     res = subprocess.run(
         [sys.executable, str(hssh), "--devices", str(devices), "-eC", "uptime", "-y",
-         "--user", "test", "--password", "test", "--audit-log", str(audit_file)],
+         "--user", "test", "--audit-log", str(audit_file)],
         capture_output=True,
         text=True,
+        env=ENV,
     )
     assert res.returncode == 2
     assert audit_file.exists()
@@ -132,9 +142,10 @@ def test_cli_opt_in_safety_gate_no_file(tmp_path):
 
     res = subprocess.run(
         [sys.executable, str(hssh), "--devices", str(devices), "-sC", "uptime",
-         "--user", "test", "--password", "test", "--session-timeout", "1", "--json"],
+         "--user", "test", "--session-timeout", "1", "--json"],
         capture_output=True,
         text=True,
+        env=ENV,
     )
     # Output should not contain rate limiting error
     assert "rate limited" not in res.stdout
@@ -151,10 +162,11 @@ def test_cli_audit_show_has_no_diff(tmp_path):
 
     res = subprocess.run(
         [sys.executable, str(hssh), "--devices", str(devices), "-sC", "show version",
-         "--user", "test", "--password", "test", "--session-timeout", "1",
+         "--user", "test", "--session-timeout", "1",
          "--audit-log", str(audit_file)],
         capture_output=True,
         text=True,
+        env=ENV,
     )
     if audit_file.exists() and audit_file.stat().st_size > 0:
         lines = audit_file.read_text().splitlines()
@@ -169,7 +181,7 @@ def _cli(*extra, tmp_path):
     devices.write_text("CR1,10.0.1.1,junos\n")
     hssh = Path(__file__).resolve().parent.parent / "h-ssh.py"
     return subprocess.run([sys.executable, str(hssh), "--devices", str(devices), "--user", "test",
-                           "--password", "test", *extra], capture_output=True, text=True)
+                           *extra], capture_output=True, text=True, env=ENV)
 
 
 def test_cli_rollback_number_range_is_a_usage_error(tmp_path):
@@ -212,8 +224,8 @@ def _main(monkeypatch, capsys, *argv):
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True))
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "test",
-                                      "--password", "test", "-y", *argv])
+    monkeypatch.setenv("HSSH_PASSWORD", "test")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "test", "-y", *argv])
     rc = asyncio.run(cli.main())
     return rc, capsys.readouterr().err, sent
 

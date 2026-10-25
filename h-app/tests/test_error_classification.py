@@ -198,6 +198,7 @@ def _cli_env(monkeypatch, driver):
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
 
 
 def test_ctrl_c_during_a_connect_is_interrupted_not_failed(monkeypatch, capsys, tmp_path):
@@ -209,7 +210,7 @@ def test_ctrl_c_during_a_connect_is_interrupted_not_failed(monkeypatch, capsys, 
         raise NotAppliedError("NETCONF connect failed: connect to %s:830 timed out after 10s" % host)
     _cli_env(monkeypatch, types.SimpleNamespace(AVAILABLE=True, show=show))
     log = tmp_path / "run.jsonl"
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
                                       "--target", "R1:10.0.0.1:junos", "--target", "R2:10.0.0.2:junos",
                                       "--workers", "1", "-sC", "show version", "--log", str(log)])
     rc = _main_cancelled_after(0.3)
@@ -229,7 +230,7 @@ def test_ctrl_c_after_the_session_was_up_keeps_a_real_failure(monkeypatch, capsy
         time.sleep(0.8)
         raise RuntimeError("RpcTimeoutError(host: %s, cmd: get-software-information, timeout: 20)" % host)
     _cli_env(monkeypatch, types.SimpleNamespace(AVAILABLE=True, show=show))
-    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "--password", "p",
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
                                       "--target", "R1:10.0.0.1:junos", "--workers", "1", "--retries", "0",
                                       "-sC", "show version"])
     rc = _main_cancelled_after(0.3)

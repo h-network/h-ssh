@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 844/844 passed
+## Unit Tests — 853/853 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
 the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
@@ -31,7 +31,8 @@ telnet runs against a scripted server on localhost.
 | test_cli_edit_output.py | 39 | default-mode verdict + diff for edits, the commit-confirmed reminder, `--show-diff` preview → prompt → commit and the abort paths, confirm hint from `sys.argv[0]` and job targets, a job naming one device twice, `--log` 0600 + redacted, a malformed target as a usage error |
 | test_cli_junos_safety.py | 12 | Junos set-syntax guard (also through `--transport junos`), show-batch error handling, `--rollback`/`--comment`/`--show-diff`/`--commit-status`/`--format` usage errors |
 | test_cli_runfile.py | 26 | #60: `--run FILE` in YAML or JSON — every key a flag, the command line wins, no credential in the file, relative paths against the file, an edit from a file needs a timer or a dry run, YAML without PyYAML is a clear error |
-| test_config.py | 25 | `~/.h-ssh/config`, precedence flag → env → file → default, `transport` reaching undeclared targets (flag, file, inline/CSV/job forms, declared vendor wins) |
+| test_config.py | 25 | `~/.h-ssh/config`, precedence flag → env → file → default, a credential line refused with exit 2 (never read, never ignored), `transport` reaching undeclared targets (flag, file, inline/CSV/job forms, declared vendor wins) |
+| test_credentials.py | 9 | no `--password` flag: `HSSH_PASSWORD` for a pipeline (set but empty refuses the run), the prompt by hand (Enter skips to keys, Ctrl-D is one line and exit 2, the first Ctrl-C ends the run), the variable set by hand means no prompt, the username question goes to the terminal, `--help` says where the password comes from |
 | test_core.py | 34 | targets (incl. `NAME:[v6]:vendor:port`), CSV inventory, device names that stay inside their directory, the one set-file reader (inline `#` kept), shortcut resolution, job parsing, the pre-flight banner rule, the retired `arista` line |
 | test_error_classification.py | 29 | #65: a failure the same call cannot fix is reported once, in words that say what happened; a device the operator interrupted while it was still being connected to is interrupted, not failed |
 | test_fail_closed.py | 13 | #64: a run finds out before the first device that it cannot do its job — an audit or run log that cannot be written, a safety file that cannot be kept, a device without its set file, a device listed twice or under two names |

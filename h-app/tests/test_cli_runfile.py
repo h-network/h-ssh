@@ -44,8 +44,8 @@ def run(monkeypatch, capsys, tmp_path, argv, driver=None):
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull,
-                                      "--password", "p", *argv])
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull, *argv])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
     return rc, out, err, drv
@@ -270,8 +270,10 @@ def test_jobs_and_job_flag_are_two_lists(monkeypatch, capsys, tmp_path):
 
 
 def test_the_password_still_comes_from_the_prompt_or_the_environment(monkeypatch, capsys, tmp_path):
-    """With no --password, no HSSH_PASSWORD and no terminal, a run file runs
-    key-auth style with no password; nothing in the file can change that."""
+    """With no HSSH_PASSWORD and no terminal, a run file runs key-auth style
+    with no password; nothing in the file can change that. There is no third
+    source: --password is not a flag, so argparse refuses it before anything
+    is read or sent."""
     f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nshow: show version\njson: true\n")
     seen = {}
 
@@ -289,6 +291,15 @@ def test_the_password_still_comes_from_the_prompt_or_the_environment(monkeypatch
     out, err = capsys.readouterr()
     assert rc == 0, err
     assert seen["passwd"] is None
+
+    seen.clear()
+    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull, "--run", f,
+                                      "--password", "hunter2"])
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(cli.main())
+    err = capsys.readouterr().err
+    assert exc.value.code == 2 and "unrecognized arguments: --password" in err
+    assert seen == {}
 
 
 # --- the run file meets #62's ceilings and port checks, and #64's --allow-missing ----

@@ -149,14 +149,18 @@ def test_workers_actually_run_in_parallel(tmp_path):
                        "".join("R%02d,10.0.0.%d,openssh\n" % (i, i + 1) for i in range(24)))
 
     env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ["PATH"])
+    env.pop("HSSH_PASSWORD", None)   # no password: keys would do, and the stub never asks
     hssh = os.path.join(os.path.dirname(__file__), "..", "h-ssh.py")
 
     start = time.time()
-    subprocess.run([sys.executable, hssh, "--devices", str(devices), "--user", "x",
-                    "--password", "", "-sC", "show version", "--raw", "--workers", "24"],
-                   capture_output=True, text=True, timeout=120, env=env)
+    proc = subprocess.run([sys.executable, hssh, "--devices", str(devices), "--user", "x",
+                           "-sC", "show version", "--raw", "--workers", "24"],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, env=env)
     elapsed = time.time() - start
 
+    # The timing means nothing unless the run completed: an early exit is fast too.
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.count("ok") == 24, proc.stdout
     # 24 devices x 1s. One batch is ~1s; a capped pool needs two or more.
     assert elapsed < 2.0, "24 workers took %.1fs, so they did not run concurrently" % elapsed
 

@@ -143,8 +143,9 @@ def run_cli(monkeypatch, capsys, fake, *argv):
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
     monkeypatch.delenv("HSSH_AUDIT_LOG", raising=False)
     monkeypatch.delenv("HSSH_SAFETY_FILE", raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
-                                      "--password", "p", "--retries", "0", *argv])
+                                      "--retries", "0", *argv])
     rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
     return rc, out, err

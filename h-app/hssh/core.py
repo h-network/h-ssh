@@ -162,6 +162,9 @@ def get_config_path() -> Path:
     return Path.home() / ".h-ssh" / "config"
 
 
+CONFIG_CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
+
+
 def load_config(path: str = None) -> Dict[str, str]:
     """Read 'key = value' defaults. Missing file is not an error.
 
@@ -188,6 +191,12 @@ def load_config(path: str = None) -> Dict[str, str]:
         key, value = line.split("=", 1)
         key = key.strip().lower().replace("-", "_")
         value = value.strip().strip('"').strip("'")
+        if key in CONFIG_CREDENTIAL_KEYS:
+            # Refused, not ignored: a password left in a world-readable file
+            # is the harm, and a run that quietly went on to key auth would
+            # hide it. The run file says the same (hssh.runfile).
+            raise ValueError(f"line {n}: '{key}' is not allowed, a config file never carries a "
+                             "credential: use HSSH_PASSWORD or the prompt")
         if key and value:
             config[key] = value
     return config
