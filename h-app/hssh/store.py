@@ -209,13 +209,24 @@ class Store:
         """Record that a run started; its row is completed by finish_run().
         `command` is what the run was about (the show, the batch, the edit);
         `argv` the command line as typed."""
-        run_id = run_id or new_run_id()
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO runs (run_id, started, mode, command, argv, user, origin, version, targets) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (run_id, _now(), mode, command, " ".join(argv), user, origin, version, targets))
-        return run_id
+        # The id's four hex digits keep two runs of the same second apart
+        # almost always; when they do not (one in 65536), take another id
+        # rather than fail the run. An id the caller chose is theirs to keep
+        # unique, so that one is not replaced.
+        for attempt in range(8):
+            candidate = run_id or new_run_id()
+            try:
+                with self.conn:
+                    self.conn.execute(
+                        "INSERT INTO runs (run_id, started, mode, command, argv, user, origin, version, targets) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (candidate, _now(), mode, command, " ".join(argv), user, origin, version, targets))
+            except sqlite3.IntegrityError:
+                if run_id is not None or attempt == 7:
+                    raise
+                continue
+            return candidate
+        raise AssertionError("unreachable")
 
     def add(self, run_id: str, device: str, seq: int, command: str, ok: bool,
             duration_ms: Optional[int] = None, error: Optional[str] = None,
