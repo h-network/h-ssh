@@ -311,6 +311,23 @@ def test_a_failed_connect_closes_the_client(monkeypatch):
         ssh.show("10.0.0.1", "u", "wrong", "show version", 5, 10)
     assert closes == [1]
 
+
+def test_every_phase_of_the_connect_has_the_session_timeout_the_channel_open_too(monkeypatch):
+    """paramiko gives connect, banner, auth and the channel open each their
+    own clock; the last one defaults to an hour. A device that authenticates
+    and then never answers the shell's channel open held a worker that long."""
+    seen = {}
+
+    class Recording(paramiko.SSHClient):
+        def connect(self, **kw):
+            seen.update(kw)
+
+        def exec_command(self, cmd, timeout=None, **kw):
+            return exec_result(b"ok")
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(Recording))
+    ssh.show("10.0.0.1", "u", "p", "show version", 7, 10)
+    assert (seen["timeout"], seen["banner_timeout"], seen["auth_timeout"], seen["channel_timeout"]) == (7.0, 7.0, 7.0, 7.0)
+
 # --- #45: every wait in exec is bounded ----------------------------------------
 
 import time as _time
