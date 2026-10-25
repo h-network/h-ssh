@@ -13,14 +13,18 @@ retry budget with its classification (a failure the same call cannot fix is
 tried once, a command that is not a read is sent once), the typed result.
 A device that fails is a result with `ok` False and the failure in `error`,
 never an exception out of the loop. At most `workers` devices are in flight
-at once. A transport call that has not returned within its own timeouts
-plus GRACE_SECONDS is reported as a failed result and its thread left to
-finish by itself, so one wedged device cannot hold the run. Sessions are
-pooled for the Fleet's lifetime (one NETCONF session per device however
-many commands) and closed on exit. With `store=`, every result is kept in
-the result store the way the CLI keeps it, written from the thread that
-iterates. The library reads no environment variable and no config file:
-what it is given is what it uses.
+at once, `workers` lowered to what the open-file limit carries. A transport
+call that has not returned within its own timeouts plus GRACE_SECONDS is
+reported as a failed result and its thread left to finish by itself, so one
+wedged device cannot hold the run. One run at a time per Fleet: a second
+show() or batch() while devices of the first are still in flight is refused,
+because two runs on one Fleet would queue on the pool's per-router locks and
+the time bound would then fail honest devices. Sessions are pooled for the
+Fleet's lifetime (one NETCONF session per device however many commands) and
+closed on exit. With `store=`, every result is kept in the result store the
+way the CLI keeps it, written from the thread that iterates (from a worker
+thread of the event loop, under `async for`). The library reads no
+environment variable and no config file: what it is given is what it uses.
 
 Reads only, `show` and `batch`. An edit has gates the CLI applies before
 the runner is called (the set-syntax guard, the pre-flight check, the
@@ -29,6 +33,7 @@ question); those stay with the CLI and the transports' own edit()/begin().
 
 import asyncio
 import concurrent.futures as cf
+import concurrent.futures.thread as _cf_thread
 import datetime as _dt
 import getpass
 import json
@@ -40,7 +45,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterable, Iterator, List, Optional, Union
 
-from . import drivers, pool
+from . import drivers, limits, pool
 from .core import Target, check_unique, load_devices_csv, parse_bare_target
 from .drivers import results as R
 from .runner import RunResult, _backoff, run_for_target
@@ -48,8 +53,7 @@ from .store import Store
 
 __all__ = ["Fleet", "Results", "DeviceResult", "MAX_WORKERS", "GRACE_SECONDS", "FORMATS"]
 
-# The CLI's ceiling: an in-flight device is a thread, and on openssh a process.
-MAX_WORKERS = 256
+MAX_WORKERS = limits.MAX_WORKERS
 # Past the transports' own timeouts (session set-up, the commands, the
 # retries' backoff) before a call that has not returned is given up on.
 GRACE_SECONDS = 10
@@ -94,14 +98,43 @@ def _pool_release() -> None:
             pool.disable()
 
 
+def _unhold_exit(executor: cf.ThreadPoolExecutor) -> None:
+    """Let the interpreter exit without waiting for this executor's threads.
+    Best effort, through private tables, guarded: concurrent.futures joins
+    every worker at exit (its thread -> queue table), and threading then
+    joins every non-daemon thread by its state lock; both are left without
+    ours. Measured on CPython 3.12, a script that gave up on a wedged
+    device exits at once; on 3.13 the second table no longer exists and
+    the interpreter still waits for the thread, as it does when either
+    step fails for any other reason. Nothing here stops the wedged call
+    itself, or promises anything about what it was doing."""
+    try:
+        threads = list(executor._threads)
+        for t in threads:
+            _cf_thread._threads_queues.pop(t, None)
+        locks = getattr(threading, "_shutdown_locks", None)
+        if locks is not None:
+            for t in threads:
+                lock = getattr(t, "_tstate_lock", None)
+                if lock is not None:
+                    locks.discard(lock)
+    except Exception:
+        pass
+
+
 def _as_targets(spec, transport: str) -> List[Target]:
     """Targets from what the caller gave: a Target; a bare host (a device
     named after itself on `transport`) or a name:host[:vendor][:port]
     string, as the CLI takes them; a pathlib.Path to a CSV inventory; or a
-    list of any of those. A str on its own is an inventory file."""
+    list of any of those. A str on its own that names an existing file is
+    the inventory; any other str on its own is one target."""
     if isinstance(spec, Target):
         return [spec]
-    if isinstance(spec, (str, os.PathLike)):
+    if isinstance(spec, str):
+        if os.path.isfile(spec):
+            return load_devices_csv(spec, default_vendor=transport)
+        return [parse_bare_target(spec, default_vendor=transport)]
+    if isinstance(spec, os.PathLike):
         return load_devices_csv(os.fspath(spec), default_vendor=transport)
     targets: List[Target] = []
     for item in spec:
@@ -126,10 +159,24 @@ def _check_int(name: str, value, low: int, high: Optional[int] = None) -> int:
     return value
 
 
-def _check_seconds(name: str, value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise ValueError(f"{name} must be a number of seconds above 0, not {value!r}")
-    return value
+def _connect_factor(target: Target) -> int:
+    """How many session_timeouts the session set-up may take, worst case.
+    The NETCONF transport runs the whole of it against one deadline (#66).
+    The paramiko transport gives the TCP connect, the SSH banner and the
+    authentication each the full timeout (hssh/transports/ssh.py, _connect),
+    the OpenSSH client its ConnectTimeout and then the session clock, and
+    the telnet login a handful of reads each bounded by it: three covers
+    them."""
+    return 1 if drivers.get(target.vendor).transport.name == "netconf" else 3
+
+
+def _budget(fleet: "Fleet", target: Target, commands: int) -> float:
+    """Seconds after which a device's call is given up on: what the
+    transport promises to return within, every attempt and the backoff
+    between them, plus GRACE_SECONDS."""
+    attempts = fleet.retries + 1
+    per_attempt = _connect_factor(target) * fleet.session_timeout + fleet.command_timeout * commands
+    return attempts * per_attempt + sum(_backoff(i) for i in range(1, attempts)) + GRACE_SECONDS
 
 
 def _reply(text: str, command: Optional[str]) -> str:
@@ -196,10 +243,11 @@ class DeviceResult:
 
 
 class _Task:
-    __slots__ = ("target", "future", "started")
+    __slots__ = ("target", "future", "started", "budget")
 
-    def __init__(self, target: Target):
+    def __init__(self, target: Target, budget: float):
         self.target = target
+        self.budget = budget
         self.future: Optional[cf.Future] = None
         self.started: Optional[float] = None    # set by the worker thread when it picks the task up
 
@@ -207,41 +255,50 @@ class _Task:
 class _Run:
     """One show or batch across the fleet: its tasks, what came back, and the
     store rows it writes. Everything here but `work` runs on the thread
-    that iterates; `work` is what the worker threads run."""
+    that consumes (the one iterating, or a worker of the event loop under
+    `async for`); `work` is what the Fleet's worker threads run."""
 
     def __init__(self, fleet: "Fleet", mode: str, command, fmt: str):
         self.fleet = fleet
         self.mode = mode                 # "show" or "show-batch", the runner's and the store's names
         self.command = command           # the command, or the list for a batch
         self.fmt = fmt
-        self.tasks = [_Task(t) for t in fleet.targets]
+        self.commands = len(command) if mode == "show-batch" else 1
+        self.attempts = fleet.retries + 1
+        self.tasks = [_Task(t, _budget(fleet, t, self.commands)) for t in fleet.targets]
         self.pending: List[_Task] = list(self.tasks)
         self.done: List[DeviceResult] = []
         self.by_future: dict = {}
         self.store_run = None
         self.ended = False
         self.warned = False
-        self.attempts = fleet.retries + 1
-        commands = len(command) if mode == "show-batch" else 1
-        # What the transports promise to return within, worst case, plus grace.
-        self.budget = (self.attempts * (fleet.session_timeout + fleet.command_timeout * commands)
-                       + sum(_backoff(i) for i in range(1, self.attempts)) + GRACE_SECONDS)
 
     # --- on the calling thread ----------------------------------------------
 
     def start(self) -> None:
+        """Admit the run (one at a time per Fleet), open its store row, hand
+        every device to the workers. Nothing is sent before the store row
+        exists: a store that cannot be written is no run."""
         fleet = self.fleet
-        batch = self.mode == "show-batch"
-        if fleet._store is not None:
-            # Before the first device is touched: a store that cannot be written is no run.
-            argv = ["Fleet.batch", *self.command] if batch else ["Fleet.show", self.command]
-            about = "\n".join(self.command) if batch else self.command
-            self.store_run = fleet._store.begin_run(self.mode, argv, fleet.user, len(self.tasks), _version(),
-                                                    origin=socket.gethostname(), command=about)
-        executor = fleet._engine(self)
+        fleet._admit(self)
+        try:
+            if fleet._store is not None:
+                batch = self.mode == "show-batch"
+                argv = ["Fleet.batch", *self.command] if batch else ["Fleet.show", self.command]
+                about = "\n".join(self.command) if batch else self.command
+                self.store_run = fleet._store.begin_run(self.mode, argv, fleet.user, len(self.tasks), _version(),
+                                                        origin=socket.gethostname(), command=about)
+            executor = fleet._engine()
+        except BaseException:
+            self.ended = True
+            fleet._forget(self)
+            raise
         for task in self.tasks:
             task.future = executor.submit(self.work, task)
             self.by_future[task.future] = task
+            # Runs once the future's state is set, so a task counted as stuck
+            # (see _given_up) is always let go of when its call returns.
+            task.future.add_done_callback(lambda f, task=task: fleet._stuck.discard(task))
 
     # --- on a worker thread -------------------------------------------------
 
@@ -262,8 +319,6 @@ class _Run:
             # The runner reports every failure as a result; this is the way
             # out for one it did not expect, so the device still gets a verdict.
             return _failed(t, self.mode, f"{type(e).__name__}: {e}", int((time.monotonic() - task.started) * 1000))
-        finally:
-            fleet._stuck.discard(task)
 
     # --- on the consuming thread --------------------------------------------
 
@@ -274,15 +329,17 @@ class _Run:
         now = time.monotonic()
         soonest = None
         for task in self.pending:
-            left = _POLL_SECONDS if task.started is None else task.started + self.budget - now
+            left = _POLL_SECONDS if task.started is None else task.started + task.budget - now
             soonest = left if soonest is None else min(soonest, left)
         return max(0.0, soonest or 0.0)
 
     def overdue(self) -> List[_Task]:
-        """Tasks to give up on: past their budget, or never going to start
-        because every worker thread is held by a call that has not returned."""
+        """Tasks to give up on: cancelled (the Fleet closed before they
+        started), past their budget, or never going to start because every
+        worker thread is held by a call that has not returned."""
         now = time.monotonic()
-        due = [t for t in self.pending if t.started is not None and now >= t.started + self.budget]
+        due = [t for t in self.pending
+               if t.future.cancelled() or (t.started is not None and now >= t.started + t.budget)]
         if len(self.fleet._stuck) >= self.fleet.workers:
             for t in self.pending:
                 # cancel() is False once a thread has picked the task up: then it gets its deadline
@@ -293,6 +350,20 @@ class _Run:
     def finish(self, task: _Task) -> DeviceResult:
         """One task's outcome as the result the caller gets, recorded in the
         store on this thread; the run's store row is closed with the last."""
+        result = self._finish(task)
+        if not self.pending:
+            self.end(interrupted=False)
+        return result
+
+    def settle(self) -> None:
+        """Finish, without waiting, every pending task whose call has
+        returned: a result nobody iterated for is still a result, and a
+        store row."""
+        for task in list(self.pending):
+            if task.future.done() and not task.future.cancelled():
+                self._finish(task)
+
+    def _finish(self, task: _Task) -> DeviceResult:
         self.pending.remove(task)
         if task.future.done() and not task.future.cancelled():
             try:
@@ -303,26 +374,30 @@ class _Run:
         else:
             result = self._given_up(task)
         self.done.append(result)
-        self._record(result)
-        if not self.pending:
-            self.end(interrupted=False)
+        if not self.ended:               # after the run ended its store row is closed: nothing more is written
+            self._record(result)
         return result
 
     def _given_up(self, task: _Task) -> DeviceResult:
         fleet = self.fleet
         if task.started is None:
             ms = 0
-            error = (f"not started: every worker thread ({fleet.workers}) is held by a call to a device "
-                     "that has not returned")
+            if self.ended:
+                error = "not started: the Fleet was closed"
+            else:
+                error = (f"not started: every worker thread ({fleet.workers}) is held by a call to a device "
+                         "that has not returned")
         else:
             fleet._stuck.add(task)
             if task.future.done():          # it returned just now: not stuck after all
                 fleet._stuck.discard(task)
             ms = int((time.monotonic() - task.started) * 1000)
-            each = f"session_timeout {fleet.session_timeout:g}s + command_timeout {fleet.command_timeout:g}s"
+            factor = _connect_factor(task.target)
+            each = (f"{factor} x " if factor > 1 else "") + f"session_timeout {fleet.session_timeout}s"
+            each += f" + command_timeout {fleet.command_timeout}s"
             if self.mode == "show-batch":
-                each += f" x {len(self.command)} commands"
-            error = (f"no result within {self.budget:g}s ({self.attempts} attempt(s) at {each}, plus "
+                each += f" x {self.commands} commands"
+            error = (f"no result within {task.budget:g}s ({self.attempts} attempt(s) at {each}, plus "
                      f"{GRACE_SECONDS:g}s): the transport call has not returned")
         return self._result(task.target, _failed(task.target, self.mode, error, ms))
 
@@ -354,11 +429,14 @@ class _Run:
             self._warn(e)
 
     def end(self, interrupted: bool) -> None:
-        """The run is over, complete or not: what has not started is
-        cancelled, and the store's run row gets its counts. What is still
-        in flight finishes on its own thread; nothing waits for it."""
+        """The run is over, complete or not. What has returned by now is a
+        result (and a store row); what has not started is cancelled and
+        counted as skipped; what is in flight finishes on its own thread
+        and is reported if someone still iterates, but no longer recorded.
+        The store's run row gets the counts."""
         if self.ended:
             return
+        self.settle()
         self.ended = True
         for task in self.pending:
             task.future.cancel()
@@ -366,7 +444,8 @@ class _Run:
         if self.store_run is not None:
             ok = sum(1 for r in self.done if r.ok)
             try:
-                self.fleet._store.finish_run(self.store_run, ok, len(self.done) - ok, len(self.pending), interrupted)
+                self.fleet._store.finish_run(self.store_run, ok, len(self.done) - ok, len(self.pending),
+                                             interrupted and bool(self.pending))
             except Exception as e:
                 self._warn(e)
 
@@ -376,11 +455,18 @@ class _Run:
             warnings.warn(f"store {self.fleet._store.path}: {e}", RuntimeWarning, stacklevel=4)
 
 
+def _finish_all(run: _Run, tasks: List[_Task]) -> None:
+    for task in tasks:
+        if task in run.pending:
+            run.finish(task)
+
+
 class Results:
     """One show's or batch's results, as the devices finish. Iterate with
-    `for` (it blocks for the next device) or `async for`. Iterating again
-    replays what has come back, then waits for the rest. `to_dicts()` waits
-    for every device and returns the results as plain data."""
+    `for` (it blocks for the next device) or `async for` (the store writes
+    run off the event loop). Iterating again replays what has come back,
+    then waits for the rest. `to_dicts()` waits for every device and
+    returns the results as plain data."""
 
     def __init__(self, run: _Run):
         self._run = run
@@ -396,15 +482,11 @@ class Results:
                 return
             due = run.overdue()
             if due:
-                for task in due:
-                    run.finish(task)
+                _finish_all(run, due)
                 continue
             done, _ = cf.wait([t.future for t in run.pending], timeout=run.wait_timeout(),
                               return_when=cf.FIRST_COMPLETED)
-            for future in done:
-                task = run.by_future[future]
-                if task in run.pending:
-                    run.finish(task)
+            _finish_all(run, [run.by_future[f] for f in done])
 
     def __aiter__(self) -> AsyncIterator[DeviceResult]:
         return self._aiter()
@@ -422,8 +504,7 @@ class Results:
                 return
             due = run.overdue()
             if due:
-                for task in due:
-                    run.finish(task)
+                await loop.run_in_executor(None, _finish_all, run, due)
                 continue
             waiting = {}
             for task in run.pending:
@@ -432,10 +513,10 @@ class Results:
                     af = wrapped[task] = asyncio.wrap_future(task.future, loop=loop)
                 waiting[af] = task
             done, _ = await asyncio.wait(waiting, timeout=run.wait_timeout(), return_when=asyncio.FIRST_COMPLETED)
-            for af in done:
-                task = waiting[af]
-                if task in run.pending:
-                    run.finish(task)
+            ready = [waiting[af] for af in done]
+            if ready:
+                # finish() builds the result and writes the store: SQLite, off the loop
+                await loop.run_in_executor(None, _finish_all, run, ready)
 
     def to_dicts(self) -> List[dict]:
         """Every device's result as a dict (see DeviceResult.to_dict), in
@@ -453,18 +534,33 @@ class Fleet:
     that iterates, with no thread in sight. See the module docstring.
 
     `targets`: bare hosts, name:host[:vendor][:port] strings, Target
-    objects, pathlib.Paths to CSV inventories, or one inventory path as a
-    str; a name or host listed twice is refused here, before anything runs.
-    `transport`: the vendor for a target that names none. `user`: None is
-    the login name. `passwd`: None is keys or an agent. `workers`: devices
-    in flight at once. `session_timeout`, `command_timeout`: seconds, as
-    the CLI's flags. `retries`: attempts after the first, for failures the
+    objects, pathlib.Paths to CSV inventories, or one str (an existing file
+    is the inventory, anything else one target); a name or host listed
+    twice is refused here, before anything runs. `transport`: the vendor
+    for a target that names none. `user`: None is the login name. `passwd`:
+    None is keys or an agent; an empty string is refused, since the
+    transports do not agree on what it means. `workers`: devices in flight
+    at once, lowered to what the open-file limit carries (a RuntimeWarning
+    says so). `session_timeout`, `command_timeout`: whole seconds, as the
+    CLI's flags. `retries`: attempts after the first, for failures the
     runner's classification allows. `store`: a path, or an open Store, to
-    keep every result in; a path the Fleet opens it closes on exit."""
+    keep every result in; a path the Fleet opens it closes on exit.
+
+    One run at a time: a second show() or batch() while devices of the
+    previous run are still in flight raises RuntimeError; a previous run
+    whose devices have all returned is wrapped up first (its results stay
+    readable). close(), or leaving the `with` block: a run left unfinished
+    is recorded as interrupted, with every device that had returned as a
+    result and the rest as skipped; devices not yet started are not
+    started; the sessions close (one still in use closes when its call
+    returns); a store this Fleet opened is closed. Nothing waits on a
+    device: a call that never returns keeps its thread, and best effort is
+    made (CPython 3.12 and before) to let the interpreter exit without
+    waiting for it."""
 
     def __init__(self, targets, transport: str = "ssh", user: Optional[str] = None,
-                 passwd: Optional[str] = None, workers: int = 32, session_timeout=30,
-                 command_timeout=60, retries: int = 0, store: Union[None, str, os.PathLike, Store] = None):
+                 passwd: Optional[str] = None, workers: int = 32, session_timeout: int = 30,
+                 command_timeout: int = 60, retries: int = 0, store: Union[None, str, os.PathLike, Store] = None):
         self.transport = transport
         found = _as_targets(targets, transport)
         if not found:
@@ -479,21 +575,25 @@ class Fleet:
             except Exception as e:       # no login name to be had (a bare container): say so
                 raise ValueError(f"user: the login name could not be determined ({e}); pass user=") from e
         self.user = user
+        if passwd is not None and not isinstance(passwd, str):
+            raise TypeError(f"passwd must be a str or None, not {type(passwd).__name__}")
+        if passwd == "":
+            raise ValueError("passwd: empty; pass None for keys or an agent")
         self._passwd = passwd
-        self.workers = _check_int("workers", workers, 1, MAX_WORKERS)
-        self.session_timeout = _check_seconds("session_timeout", session_timeout)
-        self.command_timeout = _check_seconds("command_timeout", command_timeout)
+        self.workers = _check_int("workers", workers, 1, limits.MAX_WORKERS)
+        self.session_timeout = _check_int("session_timeout", session_timeout, 1)
+        self.command_timeout = _check_int("command_timeout", command_timeout, 1)
         self.retries = _check_int("retries", retries, 0)
         if isinstance(store, Store) or store is None:
             self._store, self._owns_store = store, False
         else:
             self._store, self._owns_store = Store(os.fspath(store)), True
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._executor: Optional[cf.ThreadPoolExecutor] = None
         self._owns_pool = False
         self._closed = False
-        self._runs: set = set()      # started and not yet ended
-        self._stuck: set = set()     # tasks whose transport call never returned, holding a thread each
+        self._run: Optional[_Run] = None   # the run in progress, if any
+        self._stuck: set = set()           # tasks whose call never returned, holding a worker thread each
 
     # --- reads --------------------------------------------------------------
 
@@ -502,67 +602,98 @@ class Fleet:
         iterate the Results for what they said. `fmt` "json" or "xml" asks
         for the router's own data (NETCONF only; refused elsewhere as that
         device's failure, nothing sent)."""
-        if not isinstance(command, str) or not command.strip():
-            raise ValueError("show needs a command")
-        return self._start("show", command, fmt)
+        run = self._prepare("show", command, fmt)
+        run.start()
+        return Results(run)
 
     def batch(self, commands: Iterable[str], fmt: str = "text") -> Results:
         """Several commands on every device, each device on one session;
         every result carries one answer per command, in this order."""
-        if isinstance(commands, str):
-            raise TypeError("batch takes a list of commands; show() takes one")
-        cmds = list(commands)
-        if not cmds or any(not isinstance(c, str) or not c.strip() for c in cmds):
-            raise ValueError("batch needs commands, none of them empty")
-        return self._start("show-batch", cmds, fmt)
+        run = self._prepare("show-batch", commands, fmt)
+        run.start()
+        return Results(run)
 
-    def show_async(self, command: str, fmt: str = "text") -> Results:
-        """The same run as show(), for `async for`."""
-        return self.show(command, fmt)
+    async def show_async(self, command: str, fmt: str = "text") -> AsyncIterator[DeviceResult]:
+        """show() for asyncio code: `async for r in fleet.show_async(cmd)`.
+        The run starts on the first step, and what could block the loop
+        (the store's run row, the host name, every store write) runs on a
+        worker of the loop instead."""
+        async for r in self._run_async(self._prepare("show", command, fmt)):
+            yield r
 
-    def batch_async(self, commands: Iterable[str], fmt: str = "text") -> Results:
-        """The same run as batch(), for `async for`."""
-        return self.batch(commands, fmt)
+    async def batch_async(self, commands: Iterable[str], fmt: str = "text") -> AsyncIterator[DeviceResult]:
+        """batch() for asyncio code, as show_async()."""
+        async for r in self._run_async(self._prepare("show-batch", commands, fmt)):
+            yield r
 
-    def _start(self, mode: str, command, fmt: str) -> Results:
+    async def _run_async(self, run: _Run) -> AsyncIterator[DeviceResult]:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, run.start)
+        async for r in Results(run):
+            yield r
+
+    def _prepare(self, mode: str, command, fmt: str) -> _Run:
+        if mode == "show":
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError("show needs a command")
+        else:
+            if isinstance(command, str):
+                raise TypeError("batch takes a list of commands; show() takes one")
+            command = list(command)
+            if not command or any(not isinstance(c, str) or not c.strip() for c in command):
+                raise ValueError("batch needs commands, none of them empty")
         if fmt not in FORMATS:
             raise ValueError(f"fmt must be one of {', '.join(FORMATS)}, not {fmt!r}")
         if self._closed:
             raise RuntimeError("this Fleet is closed")
-        run = _Run(self, mode, command, fmt)
-        run.start()
-        return Results(run)
+        return _Run(self, mode, command, fmt)
 
     # --- lifetime -----------------------------------------------------------
 
-    def _engine(self, run: _Run) -> cf.ThreadPoolExecutor:
+    def _admit(self, run: _Run) -> None:
+        """One run at a time. A previous run whose calls have all returned is
+        wrapped up here (its results stay readable); one with a device
+        still in flight refuses the new one."""
         with self._lock:
             if self._closed:
                 raise RuntimeError("this Fleet is closed")
+            current = self._run
+            if current is not None:
+                current.settle()
+                if current.pending:
+                    raise RuntimeError("a run is still in progress on this Fleet: iterate it to the end, or close()")
+                current.end(interrupted=False)
+            self._run = run
+
+    def _engine(self) -> cf.ThreadPoolExecutor:
+        with self._lock:
             if self._executor is None:
-                self._executor = cf.ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="hssh-fleet")
+                fitted, note = limits.fit_workers_to_open_files(self.workers)
+                if note:
+                    warnings.warn(note, RuntimeWarning, stacklevel=4)
+                self.workers = fitted
+                self._executor = cf.ThreadPoolExecutor(max_workers=fitted, thread_name_prefix="hssh-fleet")
                 self._owns_pool = _pool_acquire()
-            self._runs.add(run)
             return self._executor
 
     def _forget(self, run: _Run) -> None:
         with self._lock:
-            self._runs.discard(run)
+            if self._run is run:
+                self._run = None
 
     def close(self) -> None:
-        """Done with the fleet: devices not yet started are not started, a run
-        left unfinished is recorded as interrupted, the sessions close (one
-        still in use closes when its call returns), the executor is let go,
-        and a store this Fleet opened is closed. Nothing waits on a device."""
+        """Done with the fleet; see the class docstring for what that means
+        for a run still going."""
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            runs, executor, owns_pool = list(self._runs), self._executor, self._owns_pool
-        for run in runs:
+            run, executor, owns_pool = self._run, self._executor, self._owns_pool
+        if run is not None:
             run.end(interrupted=True)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+            _unhold_exit(executor)
             if owns_pool:
                 _pool_release()
         if self._owns_store and self._store is not None:

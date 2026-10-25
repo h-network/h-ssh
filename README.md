@@ -761,27 +761,43 @@ with Fleet(["10.0.1.1", "10.0.1.2", "cr3:10.0.1.3:junos"], transport="junos", us
 
 `Fleet(targets, transport="ssh", user=None, passwd=None, workers=32, session_timeout=30, command_timeout=60,
 retries=0, store=None)` takes targets as the CLI does: bare hosts (a device named after its host, on
-`transport`), `name:host[:vendor][:port]`, `Target` objects, a `pathlib.Path` to a CSV inventory, or the
-inventory path as a plain string; a name or host listed twice is refused before anything runs. `user=None`
-is the name you are logged in as, `passwd=None` means keys or an agent. The library reads no environment
-variable and no config file; that is the CLI's job. What it does for you:
+`transport`), `name:host[:vendor][:port]`, `Target` objects, a `pathlib.Path` to a CSV inventory, or one
+string (an existing file is the inventory, anything else one target); a name or host listed twice is refused
+before anything runs. `user=None` is the name you are logged in as; `passwd=None` means keys or an agent, and
+an empty string is refused, since the transports do not agree on what it means. The timeouts are whole
+seconds, as the CLI's flags. The library reads no environment variable and no config file; that is the
+CLI's job. What it does for you:
 
-- threads talk to the devices, `workers` at a time; you iterate on your own thread and get one `DeviceResult`
-  per device in the order they finish: `device`, `host`, `vendor`, `ok`, `output`, `error`, `duration_ms`,
-  `ts`, `command`, and for a batch `commands` (one entry per command, in the batch's order); `result` is the
-  driver's typed answer and `text` the runner's full report;
+- threads talk to the devices, `workers` at a time (lowered to what the open-file limit carries, with a
+  `RuntimeWarning` saying so); you iterate on your own thread and get one `DeviceResult` per device in the
+  order they finish: `device`, `host`, `vendor`, `ok`, `output`, `error`, `duration_ms`, `ts`, `command`, and
+  for a batch `commands` (one entry per command, in the batch's order); `result` is the driver's typed answer
+  and `text` the runner's full report;
 - a failure is a value (`ok` False, the failure in one line in `error`), never an exception out of the loop,
   and the other devices still run;
-- every device gets the runner's run: `session_timeout` and `command_timeout` as the CLI's flags, `retries`
-  with the same classification (a failure the same call cannot fix — unreachable, refused, authentication —
-  is tried once; a command that is not a read is sent once). A transport call that has not returned within
-  those bounds plus 10 s is reported as that device's failure and its thread left to finish on its own, so
-  one wedged device cannot hold the run (it does hold one worker until it returns);
+- every device gets the runner's run: `session_timeout` and `command_timeout`, `retries` with the same
+  classification (a failure the same call cannot fix — unreachable, refused, authentication — is tried once;
+  a command that is not a read is sent once). A transport call that has not returned within those bounds
+  (the SSH and telnet transports may spend up to three session timeouts on the set-up, since connect, banner
+  and authentication each get one; NETCONF has one deadline for all of it) plus 10 s is reported as that
+  device's failure and its thread left to finish on its own, so one wedged device cannot hold the run; it
+  does hold one worker until it returns, and when every worker is held the devices still queued are failed
+  at once rather than waited for;
+- one run at a time: a second `show()` or `batch()` while devices of the previous run are still in flight
+  raises `RuntimeError` (two runs would queue on the pool's per-router locks, and the time bound would then
+  fail honest devices); a previous run whose devices have all returned is wrapped up first and stays readable;
 - one session per device, pooled for the Fleet's lifetime however many commands you run, closed when the
-  `with` block ends (`close()` otherwise);
+  `with` block ends (`close()` otherwise). `close()` promises this much: a run left unfinished is recorded as
+  interrupted, with every device that had returned as a result and the rest as skipped; devices not yet
+  started are not started; a session still in use closes when its call returns; iterating the results of a
+  closed Fleet ends, the devices never started reading `not started: the Fleet was closed`. It does not wait
+  on any device: a call that never returns keeps its thread, and on CPython 3.12 and before the interpreter
+  is, best effort, let exit without waiting for it (on 3.13 it still waits);
 - `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
   command line `Fleet.show show bgp summary`; one result row per device, per command for a batch), written
-  from the thread that iterates; a run you broke out of is recorded as interrupted when the Fleet closes;
+  from the thread that iterates and, under `async for`, from a worker of the event loop, so SQLite never
+  blocks it; `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`)
+  that start the run on their first step;
 - `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only; on another
   transport that is the device's failure, nothing sent); `to_dicts()` is JSON-serialisable, in the shape of
   the CLI's `--json` records.
@@ -914,6 +930,7 @@ h-ssh/
 │   │   ├── cli.py           # argument parsing + orchestration
 │   │   ├── runner.py        # concurrent execution engine
 │   │   ├── fleet.py         # Fleet: show/batch across the fleet from a script, results as values, pooled sessions, the store
+│   │   ├── limits.py        # the worker ceiling and the open-file limit the workers must fit under
 │   │   ├── pool.py          # opt-in session pool for library use
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
@@ -953,7 +970,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (907 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (915 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
