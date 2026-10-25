@@ -237,7 +237,25 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     return f"{kind} for {where}" + (f": {text}" if text else "")
 
 
+_CLOSES: "set[threading.Thread]" = set()
+_CLOSES_LOCK = threading.Lock()
+
+
 def _close(dev) -> None:
+    """Close the session beside the work, not on the worker's clock.
+
+    <close-session> and its acknowledgement are ~100 ms of waiting on the
+    device, a quarter of what a show costs per device; a worker used to
+    spend it before moving to its next device. A helper thread waits
+    instead, the device still sees a clean NETCONF close, and
+    wait_for_closes() at the end of a run joins what is still in flight."""
+    t = threading.Thread(target=_close_now, args=(dev,), name="hssh-netconf-close", daemon=True)
+    with _CLOSES_LOCK:
+        _CLOSES.add(t)
+    t.start()
+
+
+def _close_now(dev) -> None:
     try:
         dev.timeout = SHORT_TIMEOUT
         dev.close()
@@ -248,6 +266,21 @@ def _close(dev) -> None:
             dev._conn._session.close()
         except Exception:
             pass
+    finally:
+        with _CLOSES_LOCK:
+            _CLOSES.discard(threading.current_thread())
+
+
+def wait_for_closes(timeout: float = 1.0) -> int:
+    """Wait for the session closes still in flight, `timeout` seconds in
+    all. Returns how many had not finished by then; their transports go
+    away with the process, and the device drops the session on the EOF."""
+    deadline = time.monotonic() + timeout
+    with _CLOSES_LOCK:
+        pending = list(_CLOSES)
+    for t in pending:
+        t.join(max(0.0, deadline - time.monotonic()))
+    return sum(1 for t in pending if t.is_alive())
 
 
 def _alive(dev, idle: float) -> bool:
