@@ -157,6 +157,17 @@ def resolve_workers(requested: int) -> int:
 MAX_SECONDS = 86400
 
 
+def _seconds_arg(text: str) -> float:
+    """--every SECONDS: one second or more; fractions are allowed."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"--every takes seconds, not {text!r}")
+    if not value >= 1:
+        raise argparse.ArgumentTypeError(f"--every takes 1 second or more, not {text}")
+    return value
+
+
 def _ranged_int(low: int, high: Optional[int], what: str):
     """An argparse type: an integer within [low, high], or one line naming the
     range. The value a flag accepts is the value a config file accepts, so
@@ -472,6 +483,11 @@ async def main() -> int:
                         help="Skip confirmation prompt for edit operations")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed output for all operations")
+    parser.add_argument("--every", type=_seconds_arg, metavar="SECONDS", default=None,
+                        help="Watch: run the same reads again every SECONDS after the previous tick and print, per "
+                             "tick, what changed since the one before (reads only, the store on); until Ctrl-C or --times")
+    parser.add_argument("--times", type=_ranged_int(1, None, "--times"), default=None,
+                        help="With --every: stop after this many ticks")
     parser.add_argument("--diff", action="store_true",
                         help="Compare output across devices (show modes only, first device is baseline)")
     parser.add_argument("--raw", action="store_true",
@@ -905,6 +921,20 @@ async def main() -> int:
     raw_mode = args.raw
     # Progress chatter only. Edit pre-flight and confirmation stay visible.
     show_progress = not (json_mode or raw_mode)
+
+    if args.times is not None and args.every is None:
+        print("ERROR: --times goes with --every.", file=sys.stderr)
+        return 2
+    if args.every is not None:
+        if mode not in ("show", "show-batch"):
+            print("ERROR: --every watches reads (-sC, --batch, --profile), not edits, rollbacks, commit status or jobs.",
+                  file=sys.stderr)
+            return 2
+        if store is None:
+            print("ERROR: --every compares every tick with the one before through the store; drop --no-store "
+                  "or name a --store.", file=sys.stderr)
+            return 2
+        show_progress = False      # a watch prints one line per tick and what changed, not every device every time
 
     if not user:
         # Like ssh: no --user, no HSSH_USER, no `user` in the config file
@@ -1456,7 +1486,7 @@ async def main() -> int:
                 # stdout stays device output only, so failures go to stderr.
                 print(f"{name}: ERROR: {res.error}" if res.error is not None else f"{name}: failed", file=sys.stderr)
 
-        if not json_mode and not raw_mode:
+        if show_progress:                 # the per-device verdict line; a --every tick prints its changes instead
             timestamp = datetime.now().strftime("%H:%M:%S")
             if mode == "show-batch":
                 cmd_results = res.result.to_list() if isinstance(res.result, R.BatchResult) else None
@@ -1612,7 +1642,7 @@ async def main() -> int:
                 verdict += ", nothing applied"
         else:
             verdict = "Done. All devices OK."
-        if not raw_mode:
+        if not raw_mode and args.every is None:
             print("")
             if failures or skipped or not_run or not interrupted:
                 print(verdict)
@@ -1676,6 +1706,12 @@ async def main() -> int:
         if not_kept:
             print(f"WARNING: store {store.path}: {not_kept} of {store_tried} results were not kept: {store_reason}",
                   file=sys.stderr)
+        if args.every is not None:
+            _WATCH["tick"] += 1
+            _watch_report(store, store_run, _WATCH["previous"], _WATCH["tick"], ok_count, failures)
+            _WATCH["previous"] = store_run
+            _WATCH["every"] = args.every
+            _WATCH["again"] = not interrupted and (args.times is None or _WATCH["tick"] < args.times)
     if store is not None:
         store.close()
 
@@ -1690,6 +1726,45 @@ async def main() -> int:
         return 1
     return 3 if skipped or not_run else 0   # 3: nothing failed, but not everything ran
 
+
+# --every: the watch's state between ticks. main() runs one tick and leaves
+# `again` for main_sync(), which sleeps and runs the next.
+_WATCH = {"tick": 0, "previous": None, "again": False, "every": None}
+
+
+def _watch_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _watch_report(store, run_id: str, previous: Optional[str], tick: int, ok: int, failed: int) -> None:
+    """One line per tick and, for every device whose reply changed since the
+    tick before, the difference: the thing a watch is for. Every tick is a
+    run in the store, so `h-ssh-store diff` can go back to any two of them."""
+    stamp = time.strftime("%H:%M:%S")
+    if previous is None:
+        print(f"tick {tick} {stamp}: {ok} OK, {failed} failed; baseline kept as run {run_id}", flush=True)
+        return
+    before = {(r["device"], r["seq"]): r for r in store.results(run_id=previous)}
+    changed = []
+    for r in store.results(run_id=run_id):
+        p = before.get((r["device"], r["seq"]))
+        if p is None or (p["ok"], p["output"], p["error"]) != (r["ok"], r["output"], r["error"]):
+            changed.append((r, p))
+    print(f"tick {tick} {stamp}: {ok} OK, {failed} failed, {len(changed)} changed", flush=True)
+    for r, p in changed:
+        command = (r["command"] or "").strip().splitlines()[0] if (r["command"] or "").strip() else ""
+        head = f"--- {r['device']}: {command[:60]}"
+        if p is None:
+            print(f"{head}: new")
+            continue
+        if r["ok"] != p["ok"]:
+            error = (r["error"] or "").strip().splitlines()[0] if r["error"] else ""
+            head += f": {'OK' if p['ok'] else 'FAIL'} -> {'OK' if r['ok'] else 'FAIL'}" + (f" ({error})" if error else "")
+        print(head)
+        a, b = (p["output"] or "").splitlines(), (r["output"] or "").splitlines()
+        for line in difflib.unified_diff(a, b, fromfile=p["ts"][:19], tofile=r["ts"][:19], lineterm="", n=1):
+            print("  " + line)
+    sys.stdout.flush()
 
 def _drain_closes(timeout: float = 1.0) -> None:
     """Sessions are closed beside the work; before the run reports, wait
@@ -1731,13 +1806,19 @@ def _stdout_gone() -> None:
 def main_sync() -> None:
     """Synchronous entry point for console_scripts and h-ssh.py."""
     rc = 0
+    _WATCH.update(tick=0, previous=None, again=False, every=None)
     try:
         rc = asyncio.run(main())
+        while _WATCH["again"]:      # --every: the tick left word that another follows
+            _WATCH["again"] = False
+            _watch_sleep(_WATCH["every"])
+            rc = asyncio.run(main())
         sys.stdout.flush()          # a reader that left shows up here, not at interpreter exit
     except KeyboardInterrupt:
         # Ctrl-C is a normal way to stop a fleet run; a stack trace is not a
         # useful thing to print at someone who already knows what they did.
-        print("\nInterrupted.", file=sys.stderr)
+        ticks = _WATCH["tick"]
+        print("\nInterrupted." + (f" {ticks} tick(s) kept in the store." if ticks else ""), file=sys.stderr)
         rc = 130
     except BrokenPipeError:
         # `h-ssh ... | head`: the reader has what it wanted. Not an error of

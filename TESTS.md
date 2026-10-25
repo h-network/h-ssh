@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 882/882 passed
+## Unit Tests — 886/886 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/84-entry-points`, 2026-10-24, with
 the dialect / transport / driver split of #80–#84 complete). The standalone review of `develop` (18
@@ -25,6 +25,7 @@ telnet runs against a scripted server on localhost.
 | drivers/test_contract.py | 22 | #80: every registered driver's `supports` is backed by its module's signatures (`violations()`); a module serving one driver declares everything it has, shared modules offer what every dialect on them declares; a stub that falls short is named, `*args` satisfies the contract |
 | drivers/test_registry.py | 15 | #80: `dialect@transport` names with today's names as aliases, the retired `arista` line, what each transport says of itself, `supports` per driver, every driver resolving to its transport's module, stand-ins in `drivers.MODULES`, default ports and install hints from the transport, the CLI taking a canonical target |
 | drivers/test_results.py | 37 | #82: `EditResult`, `BatchResult` and `CommitStatus` still the text or list they were, `RunResult` unpacking as the old tuple with `.result` and `.error`, parsing that never changes the text, pickle and copy |
+| test_watch.py | 4 | `--every SECONDS [--times N]`: every tick a run in the store, one line per tick and the unified diff for every device whose reply changed since the tick before (a device that fails shows `OK -> FAIL`), no per-device chatter, the summary line once per tick; Ctrl-C between ticks says how many ticks are kept (exit 130); refused with `--times` alone, `--no-store`, an edit, or under one second |
 | transports/test_cli.py | 21 | #83: the CLI engine (`hssh/transports/cli.py`) on an in-memory channel — login, learning the prompt, paging, candidate and lines edits, confirm, a refusal read past its redraw |
 | test_entry_points.py | 19 | #84: a driver from an `hssh.drivers` entry point loads after the built-ins and `SOURCES` names the entry point (or the distribution); a broken one is listed by name and the rest still load; a taken name or alias, an object that is not a `Driver`, a driver listed twice refuse the whole entry point; `--list-vendors` shows the row and the broken line; the contract and the runner take the driver, a stand-in in `drivers.MODULES` does its work; h-ssh's own `builtin` entry point is never loaded twice; `pyproject.toml` declares it |
 | test_audit.py | 32 | JSONL audit trail, 0600 whatever the umask, redaction (text, XML and JSON values; the type words stay), `secure_append`/`secure_write` refusing a planted symlink or FIFO, graceful failure |
