@@ -81,9 +81,12 @@ class _PinPolicy:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 keys = client.get_host_keys()
-                keys.load(self.path)  # merge what other workers pinned meanwhile
+                keys.load(self.path)  # merge what other processes pinned meanwhile
                 keys.add(hostname, key.get_name(), key)
                 keys.save(self.path)
+                # `keys` is the process's shared copy of the file (see
+                # _parsed); it now matches what was just written.
+                _PINS[self.path] = (_signature(self.path), keys)
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
@@ -98,23 +101,55 @@ class _RejectPolicy:
             "HSSH_HOST_KEY_POLICY=yes." % hostname)
 
 
+# The known_hosts files, parsed once per process and shared by every
+# connection until the file changes. Parsing is ~50 µs a line; done again for
+# every connection, under the lock, a 250-device fleet spent 250 × 13 ms in
+# a row on its own pin file, and the cost grew with the square of the fleet.
+_PINS: dict = {}            # path -> (signature, HostKeys)
+
+
+def _signature(path: str):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _parsed(path: str) -> "paramiko.HostKeys":
+    """The file's keys, parsed once and shared until the file changes; a
+    missing file is no keys. Caller holds _PIN_LOCK."""
+    signature = _signature(path)
+    cached = _PINS.get(path)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    keys = paramiko.HostKeys()
+    if signature is not None:
+        keys.load(path)
+    _PINS[path] = (signature, keys)
+    return keys
+
+
 def _load_pins(client, known_hosts: str) -> None:
     """~/.ssh/known_hosts (read only) and h-ssh's own pin file. A line that
     cannot be parsed is a refusal, not a skip: the pin it was meant to hold
     is unknown, and retrying the file cannot change it."""
     system = str(Path.home() / ".ssh" / "known_hosts")
-    for path, load in ((system, client.load_system_host_keys),
-                       (known_hosts, lambda: client.load_host_keys(known_hosts))):
+    for path in (system, known_hosts):
         try:
-            if path == known_hosts:
-                with _PIN_LOCK:
-                    load()
-            else:
-                load()
+            with _PIN_LOCK:
+                keys = _parsed(path)
         except (paramiko.hostkeys.InvalidHostKey, paramiko.SSHException, ValueError) as exc:
             line = getattr(exc, "line", None)
             shown = f": {line.strip()!r}" if isinstance(line, str) and line.strip() else ""
             raise ValueError(f"{path}: malformed known_hosts line{shown}; fix or remove it") from exc
+        # What load_system_host_keys()/load_host_keys() would have filled,
+        # without parsing the file for this client alone.
+        if path == known_hosts:
+            client._host_keys = keys
+            client._host_keys_filename = known_hosts
+        else:
+            client._system_host_keys = keys
 
 
 def _host_key_policy(known_hosts: str):
