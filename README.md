@@ -125,6 +125,9 @@ h-ssh --user admin -eB configs/all.set --commit-confirmed 10 -y
 # several commands per device, one connection
 h-ssh --batch commands.txt R1:10.0.1.1:junos
 
+# watch: the same read every 30 s, every tick kept in the store, only what changed is printed
+h-ssh -sC "show bgp summary" --every 30 R1:10.0.1.1:junos R2:10.0.1.2:junos
+
 # a console server still speaking telnet
 h-ssh -sC "show version" SW1:10.0.0.1:5000:telnet-ios
 
@@ -190,6 +193,28 @@ An entry may also carry `"port": 830` to override the target's port. A job with 
 
 A device may appear in more than one entry. Its entries run one after another, in file order, so a
 show listed after an edit sees the edit, and each is audited with its own mode and payload.
+
+### Watching: `--every`
+
+`--every SECONDS` runs the same read again, SECONDS after the previous tick finished, until Ctrl-C or
+`--times N`. Reads only (`-sC`, `--batch`, `--profile`), and the store must be on: every tick is a run
+in the store, and the ticks are compared through it. The screen gets one line per tick and, for every
+device whose reply changed since the tick before, the difference:
+
+```
+tick 1 14:02:10: 250 OK, 0 failed; baseline kept as run 20261025-140210-3f1a
+tick 2 14:02:43: 250 OK, 0 failed, 1 changed
+--- cr17: show bgp summary
+  --- 2026-10-25T14:02:10
+  +++ 2026-10-25T14:02:43
+  @@ -3,2 +3,2 @@
+  -10.9.9.8  65000  Establ
+  +10.9.9.8  65000  Active
+```
+
+A device that fails on a tick shows as `OK -> FAIL (reason)`. The structured summary line still goes to
+stderr once per tick, and any two ticks can be compared later with `h-ssh-store diff DEVICE RUN_A RUN_B`.
+Ctrl-C between ticks stops the watch and says how many ticks are kept.
 
 ## Transports
 
@@ -868,7 +893,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (875 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (879 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
