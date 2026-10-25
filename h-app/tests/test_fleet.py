@@ -147,7 +147,7 @@ def test_workers_are_fitted_to_the_open_file_limit(monkeypatch):
     # the module the Fleet reads is the CLI's rule, moved
     from hssh import cli
     assert limits.MAX_WORKERS == cli.MAX_WORKERS == 256
-    assert limits.fit_workers_to_open_files(4) == cli.fit_workers_to_open_files(4)
+    assert cli.fit_workers_to_open_files is limits.fit_workers_to_open_files      # one copy, the CLI's is it
     install(monkeypatch, show=show)
     monkeypatch.setattr(fleet_mod.limits, "fit_workers_to_open_files",      # a machine short of descriptors
                         lambda workers: (2, f"the open-file limit of 44 (ulimit -n) carries 2 workers at ~6 "
