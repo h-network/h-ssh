@@ -760,19 +760,22 @@ with Fleet(["10.0.1.1", "10.0.1.2", "cr3:10.0.1.3:junos"], transport="junos", us
 ```
 
 `Fleet(targets, transport="ssh", user=None, passwd=None, workers=32, session_timeout=30, command_timeout=60,
-retries=0, store=None)` takes targets as the CLI does: bare hosts (a device named after its host, on
+retries=2, store=None)` takes targets as the CLI does: bare hosts (a device named after its host, on
 `transport`), `name:host[:vendor][:port]`, `Target` objects, a `pathlib.Path` to a CSV inventory, or one
-string (an existing file is the inventory, anything else one target); a name or host listed twice is refused
-before anything runs. `user=None` is the name you are logged in as; `passwd=None` means keys or an agent, and
-an empty string is refused, since the transports do not agree on what it means. The timeouts are whole
-seconds, as the CLI's flags. The library reads no environment variable and no config file; that is the
-CLI's job. What it does for you:
+string (an existing file is the inventory; a string that reads as a path, with a separator or a
+`.csv`/`.yaml`/`.yml`/`.json` suffix, but is not there is refused, so a mistyped inventory path never
+becomes a device; anything else is one target); a name or host listed twice is refused before anything
+runs. `user=None` is the name you are logged in as; `passwd=None` means keys or an agent, and an empty
+string is refused, since the transports do not agree on what it means. The timeouts are whole seconds and
+`retries` the attempts after the first, with the CLI's defaults (`--retries 2`): one engine, one behaviour.
+The library reads no environment variable and no config file; that is the CLI's job. What it does for you:
 
-- threads talk to the devices, `workers` at a time (lowered to what the open-file limit carries, with a
-  `RuntimeWarning` saying so); you iterate on your own thread and get one `DeviceResult` per device in the
-  order they finish: `device`, `host`, `vendor`, `ok`, `output`, `error`, `duration_ms`, `ts`, `command`, and
-  for a batch `commands` (one entry per command, in the batch's order); `result` is the driver's typed answer
-  and `text` the runner's full report;
+- threads talk to the devices, `workers` at a time, lowered to what the open-file limit carries (the process's
+  soft `RLIMIT_NOFILE` is raised towards the hard one first, as the CLI does; a `RuntimeWarning` says when
+  fewer run); you iterate on your own thread and get one `DeviceResult` per device in the order they finish:
+  `device`, `host`, `vendor`, `ok`, `output`, `error`, `duration_ms`, `ts`, `command`, and for a batch
+  `commands` (one entry per command, in the batch's order); `result` is the driver's typed answer and `text`
+  the runner's full report;
 - a failure is a value (`ok` False, the failure in one line in `error`), never an exception out of the loop,
   and the other devices still run;
 - every device gets the runner's run: `session_timeout` and `command_timeout`, `retries` with the same
@@ -780,24 +783,32 @@ CLI's job. What it does for you:
   a command that is not a read is sent once). A transport call that has not returned within those bounds
   (the SSH and telnet transports may spend up to three session timeouts on the set-up, since connect, banner
   and authentication each get one; NETCONF has one deadline for all of it) plus 10 s is reported as that
-  device's failure and its thread left to finish on its own, so one wedged device cannot hold the run; it
-  does hold one worker until it returns, and when every worker is held the devices still queued are failed
-  at once rather than waited for;
+  device's failure and its thread left to finish on its own, so one wedged device cannot hold the run. It
+  does hold one worker until it returns: when every worker is held, the devices still queued are failed at
+  once rather than waited for, and a later run on the same Fleet fails that device at once (`the previous
+  call to this device has not returned`) instead of queueing another call behind it. The worker threads are
+  daemon threads, so a call that never returns keeps its thread and never the interpreter's exit;
 - one run at a time: a second `show()` or `batch()` while devices of the previous run are still in flight
   raises `RuntimeError` (two runs would queue on the pool's per-router locks, and the time bound would then
   fail honest devices); a previous run whose devices have all returned is wrapped up first and stays readable;
-- one session per device, pooled for the Fleet's lifetime however many commands you run, closed when the
-  `with` block ends (`close()` otherwise). `close()` promises this much: a run left unfinished is recorded as
-  interrupted, with every device that had returned as a result and the rest as skipped; devices not yet
-  started are not started; a session still in use closes when its call returns; iterating the results of a
-  closed Fleet ends, the devices never started reading `not started: the Fleet was closed`. It does not wait
-  on any device: a call that never returns keeps its thread, and on CPython 3.12 and before the interpreter
-  is, best effort, let exit without waiting for it (on 3.13 it still waits);
+- one session per device, pooled for the Fleet's lifetime however many commands you run. The pool is
+  process-wide: the last Fleet to close turns it off only if a Fleet turned it on; a pool you enabled
+  yourself is used and left on;
+- `close(wait=0)`, or leaving the `with` block, promises this much: devices not yet started are not started;
+  the devices a worker is talking to get `wait` seconds to answer (a Ctrl-C handler may pass a few), and what
+  returned by then is a result and a store row; the run is recorded as interrupted with the rest as skipped;
+  iterating its results afterwards gives what was done by then and nothing more (a call that returns later is
+  dropped, its row says skipped), so the store and the script agree. A store this Fleet opened is closed, and
+  the sessions close (one still in use closes when its call returns). `async with Fleet(...)` and `aclose()`
+  do the same off the event loop;
 - `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
   command line `Fleet.show show bgp summary`; one result row per device, per command for a batch), written
   from the thread that iterates and, under `async for`, from a worker of the event loop, so SQLite never
   blocks it; `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`)
-  that start the run on their first step;
+  that start the run on their first step. What the store could not keep is counted, never raised: a write
+  that fails is said once as a `RuntimeWarning` and the run goes on; at the end `res.not_kept` says how many
+  results were not kept and `res.store_error` why (a store file deleted or replaced under the run means every
+  result of it, and its run row is left open, as the CLI does);
 - `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only; on another
   transport that is the device's failure, nothing sent); `to_dicts()` is JSON-serialisable, in the shape of
   the CLI's `--json` records.
@@ -970,7 +981,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (915 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (921 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

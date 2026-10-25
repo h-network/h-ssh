@@ -2,6 +2,7 @@
 script, results as values in completion order, no thread in sight. Every
 device here is a fake driver in drivers.MODULES; nothing is contacted."""
 import asyncio
+import concurrent.futures as cf
 import getpass
 import json
 import os
@@ -34,6 +35,7 @@ def clean_pool():
         pool.close_all()
         pool.disable()
         fleet_mod._POOL_FLEETS = 0
+        fleet_mod._POOL_WAS_OFF = False
         for k in pool.POOL.stats:
             pool.POOL.stats[k] = 0
     reset()
@@ -108,12 +110,15 @@ def test_results_arrive_in_completion_order_and_all_arrive(monkeypatch):
 def test_at_most_workers_devices_are_in_flight_at_once(monkeypatch):
     state = {"now": 0, "peak": 0}
     guard = threading.Lock()
+    gate = threading.Barrier(3, timeout=5)     # the first three calls are inside together, whatever the scheduler does
 
     def show(host, user, passwd, cmd, *a, **kw):
         with guard:
             state["now"] += 1
             state["peak"] = max(state["peak"], state["now"])
-        time.sleep(0.05)
+        if host in ("10.0.1.1", "10.0.1.2", "10.0.1.3"):
+            gate.wait()
+        time.sleep(0.02)
         with guard:
             state["now"] -= 1
         return "ok"
@@ -122,8 +127,8 @@ def test_at_most_workers_devices_are_in_flight_at_once(monkeypatch):
     hosts = [f"10.0.1.{i}" for i in range(1, 10)]
     with Fleet(hosts, transport="junos", user="u", workers=3) as fleet:
         got = list(fleet.show("show version"))
-    assert len(got) == 9 and all(r.ok for r in got)
-    assert 2 <= state["peak"] <= 3
+    assert len(got) == 9 and all(r.ok for r in got), [r.error for r in got if not r.ok]
+    assert state["peak"] == 3
 
 
 def test_workers_are_fitted_to_the_open_file_limit(monkeypatch):
@@ -184,7 +189,7 @@ def test_retries_follow_the_runners_classification(monkeypatch):
         return "fine"
 
     install(monkeypatch, show=show)
-    with Fleet(HOSTS, transport="junos", user="u", retries=2) as fleet:
+    with Fleet(HOSTS, transport="junos", user="u") as fleet:               # retries=2, the CLI's default
         got = {r.device: r for r in fleet.show("show version")}
     assert got["10.0.0.1"].ok and calls["10.0.0.1"] == 3
     assert not got["10.0.0.2"].ok and calls["10.0.0.2"] == 1
@@ -202,7 +207,7 @@ def test_a_hanging_transport_ends_as_a_failed_result_within_the_bound(monkeypatc
     install(monkeypatch, show=holding(release, hosts={"10.0.0.2"}))
     try:
         started = time.monotonic()
-        with Fleet(HOSTS, transport="junos", user="u", session_timeout=1, command_timeout=1) as fleet:
+        with Fleet(HOSTS, transport="junos", user="u", session_timeout=1, command_timeout=1, retries=0) as fleet:
             got = {r.device: r for r in fleet.show("show version")}
             elapsed = time.monotonic() - started
             assert elapsed < 4, f"{elapsed:.1f}s: the run waited for the hung device"
@@ -212,9 +217,9 @@ def test_a_hanging_transport_ends_as_a_failed_result_within_the_bound(monkeypatc
                                   "plus 0.2s): the transport call has not returned")
             assert hung.duration_ms >= 2200
             assert got["10.0.0.1"].ok and got["10.0.0.3"].ok
-            assert len(fleet._stuck) == 1                 # the held worker is known
+            assert fleet._stuck_count() == 1              # the held worker is known
             release.set()                                 # the call returns: the worker is free again
-            assert wait_for(lambda: not fleet._stuck)
+            assert wait_for(lambda: fleet._stuck_count() == 0)
     finally:
         release.set()
 
@@ -232,7 +237,8 @@ def test_with_every_worker_held_the_queue_is_failed_at_once_not_waited_for(monke
     install(monkeypatch, show=show)
     try:
         started = time.monotonic()
-        with Fleet(HOSTS, transport="junos", user="u", workers=1, session_timeout=1, command_timeout=1) as fleet:
+        with Fleet(HOSTS, transport="junos", user="u", workers=1, session_timeout=1, command_timeout=1,
+                   retries=0) as fleet:
             got = list(fleet.show("show version"))
         elapsed = time.monotonic() - started
         assert elapsed < 4, f"{elapsed:.1f}s"
@@ -242,6 +248,34 @@ def test_with_every_worker_held_the_queue_is_failed_at_once_not_waited_for(monke
         assert seen == ["10.0.0.1"]                                   # the others were never sent
     finally:
         release.set()
+
+
+def test_a_wedged_device_does_not_poison_later_runs(monkeypatch):
+    """A monitoring loop on one Fleet with one device that never answers:
+    the call that never returned holds its worker (and, in real life, the
+    pool's lock for that router); a later run does not queue another call
+    behind it, it fails that device at once and runs the rest in full."""
+    monkeypatch.setattr(fleet_mod, "GRACE_SECONDS", 0.1)
+    never = threading.Event()
+    install(monkeypatch, show=holding(never, hosts={"10.0.0.9"}))
+    hosts = [f"10.0.0.{i}" for i in range(1, 10)]
+    try:
+        with Fleet(hosts, transport="junos", user="u", workers=2, session_timeout=1, command_timeout=1,
+                   retries=0) as fleet:
+            for n in range(1, 4):
+                t0 = time.monotonic()
+                got = {r.device: r for r in fleet.show("show version")}
+                elapsed = time.monotonic() - t0
+                bad = {d: r.error for d, r in got.items() if not r.ok}
+                assert len(got) == 9 and list(bad) == ["10.0.0.9"], (n, bad)
+                if n == 1:
+                    assert bad["10.0.0.9"].startswith("no result within 2.1s") and elapsed >= 2.1
+                else:
+                    assert bad["10.0.0.9"] == "the previous call to this device has not returned"
+                    assert elapsed < 1.5, f"run {n}: {elapsed:.1f}s"
+                assert fleet._stuck_count() == 1
+    finally:
+        never.set()
 
 
 def test_the_budget_counts_the_transports_connect_phases():
@@ -256,11 +290,31 @@ def test_the_budget_counts_the_transports_connect_phases():
     fleet.close()
 
 
+def test_the_worker_pool_runs_daemon_threads_with_future_semantics():
+    gate = threading.Event()
+    p = fleet_mod._DaemonPool(2)
+    held = [p.submit(gate.wait, 5) for _ in range(2)]            # both workers busy
+    queued = [p.submit(lambda: "late") for _ in range(3)]        # no third worker: queued
+    boom = p.submit(lambda: 1 / 0)
+    assert wait_for(lambda: len(p.threads) == 2) and all(t.daemon for t in p.threads)
+    assert queued[0].cancel()                                    # a queued call cancelled before a worker reaches it
+    p.shutdown(wait=False, cancel_futures=True)                  # the rest of the queue cancelled, and notified
+    done, _ = cf.wait(queued + [boom], timeout=1)
+    assert done == set(queued + [boom]) and all(f.cancelled() for f in queued + [boom])
+    gate.set()
+    assert all(f.result(timeout=2) is True for f in held)        # what was running finishes on its own
+    with pytest.raises(RuntimeError, match="shut down"):
+        p.submit(lambda: None)
+    p.shutdown(wait=True)                                        # joins the idle workers
+    assert wait_for(lambda: not any(t.is_alive() for t in p.threads))
+    q = fleet_mod._DaemonPool(1)
+    assert isinstance(q.submit(lambda: 1 / 0).exception(timeout=2), ZeroDivisionError)
+    q.shutdown(wait=True)
+
+
 def test_a_script_that_gave_up_on_a_wedged_device_can_exit(tmp_path):
-    """close() leaves a wedged call its thread but, best effort, not the
-    interpreter's exit: on CPython 3.12 and before the script ends when it
-    is done, not when the device call would have. 3.13 has no table to
-    take the thread out of, so there it still waits (and must still end)."""
+    """close() leaves a wedged call its thread, a daemon thread: the script
+    ends when it is done, not when the device call would have."""
     script = tmp_path / "gaveup.py"
     script.write_text(
         "import sys, time, types\n"
@@ -271,7 +325,8 @@ def test_a_script_that_gave_up_on_a_wedged_device_can_exit(tmp_path):
         "    time.sleep(5)\n"
         "    return 'late'\n"
         "drivers.MODULES['junos@netconf'] = types.SimpleNamespace(AVAILABLE=True, show=show)\n"
-        "with Fleet(['10.0.0.1'], transport='junos', user='u', session_timeout=1, command_timeout=1) as fleet:\n"
+        "with Fleet(['10.0.0.1'], transport='junos', user='u', session_timeout=1, command_timeout=1,\n"
+        "           retries=0) as fleet:\n"
         "    r, = fleet.show('show version')\n"
         "    print(r.ok, r.error, flush=True)\n")
     env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(hssh.__file__))}
@@ -280,10 +335,7 @@ def test_a_script_that_gave_up_on_a_wedged_device_can_exit(tmp_path):
     elapsed = time.monotonic() - started
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.startswith("False no result within 2.1s")
-    if hasattr(threading, "_shutdown_locks"):
-        assert elapsed < 4.0, f"{elapsed:.1f}s: the interpreter waited for the wedged thread"
-    else:
-        assert elapsed < 12.0
+    assert elapsed < 4.0, f"{elapsed:.1f}s: the interpreter waited for the wedged thread"
 
 
 # --- batch, async, data -------------------------------------------------------------
@@ -365,8 +417,9 @@ def test_batch_async_and_a_cancelled_consumer_leave_the_run_intact(monkeypatch, 
         consumer.cancel()                                    # the caller gives up waiting
         with pytest.raises(asyncio.CancelledError):
             await consumer
+        held = next(t for t in fleet._run.tasks if t.target.host == "10.0.0.3")
         release.set()
-        await asyncio.sleep(0.2)                             # the held device returns on its own thread
+        await asyncio.wrap_future(held.future)               # the held device returns on its own thread
         # the run is intact: it wraps up with every device's result, and the next run may start
         rest = [r async for r in fleet.batch_async(["show c"])]
         return got, rest
@@ -412,6 +465,25 @@ def test_async_keeps_sqlite_and_the_host_name_off_the_event_loop(monkeypatch, tm
         assert threads and loop_thread not in threads, key
     run, = rows(tmp_path / "runs.db", "SELECT * FROM runs")
     assert run["origin"] == "elsewhere" and run["ok"] == 3
+
+
+def test_async_with_closes_off_the_event_loop(monkeypatch):
+    install(monkeypatch, show=echo)
+    closed_on = []
+    real_close = Fleet.close
+    monkeypatch.setattr(Fleet, "close",
+                        lambda self, wait=0: closed_on.append(threading.get_ident()) or real_close(self, wait))
+
+    async def main():
+        loop_thread = threading.get_ident()
+        async with Fleet(HOSTS, transport="junos", user="u") as fleet:
+            got = [r async for r in fleet.show_async("show version")]
+        assert fleet._closed
+        return loop_thread, got
+
+    loop_thread, got = asyncio.run(main())
+    assert sorted(r.device for r in got) == HOSTS
+    assert closed_on and loop_thread not in closed_on          # close() ran on a worker of the loop
 
 
 def test_to_dicts_is_json_serialisable_and_shaped_like_the_cli_record(monkeypatch):
@@ -489,6 +561,36 @@ def test_one_run_at_a_time(monkeypatch):
         release.set()
 
 
+def test_close_from_another_thread_during_iteration_is_safe(monkeypatch, tmp_path):
+    """A watchdog closing the Fleet while the consumer iterates, with a store
+    (SQLite lets the GIL go on every row): the run's lock keeps the two
+    threads consistent, close() runs every one of its steps, and nothing
+    leaks: the workers are down, the pool is off, the store is closed."""
+    install(monkeypatch, show=lambda host, user, passwd, cmd, *a, **kw: "x" * 2000)
+    hosts = [f"10.0.{i // 250}.{i % 250}" for i in range(40)]
+    path = tmp_path / "runs.db"
+    closer_errors = []
+    monkeypatch.setattr(threading, "excepthook",
+                        lambda a: closer_errors.append(f"{a.exc_type.__name__}: {a.exc_value}"))
+    rounds, t_end = 0, time.monotonic() + 1.0
+    while time.monotonic() < t_end or rounds < 10:
+        fleet = Fleet(hosts, transport="junos", user="u", workers=8, store=str(path))
+        res = fleet.show("show version")
+        timer = threading.Timer(0.0005 * (rounds % 12), fleet.close)
+        timer.start()
+        got = list(res)                                      # never raises: what came before the close
+        timer.join()
+        assert not closer_errors, closer_errors
+        assert fleet._closed and fleet._workers._down
+        assert not pool.POOL.enabled and pool.live() == 0 and fleet_mod._POOL_FLEETS == 0
+        with pytest.raises(sqlite3.ProgrammingError):        # the store this Fleet opened is closed
+            fleet._store.conn.execute("SELECT 1")
+        assert len(got) == len(res._run.done) <= 40
+        rounds += 1
+    assert rounds >= 10
+    assert all(r["finished"] is not None for r in rows(path, "SELECT finished FROM runs"))
+
+
 def test_iterating_after_close_ends_instead_of_hanging(monkeypatch, tmp_path):
     release, started = threading.Event(), threading.Event()
     install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2", "10.0.0.3"}))
@@ -500,16 +602,16 @@ def test_iterating_after_close_ends_instead_of_hanging(monkeypatch, tmp_path):
                 assert r.device == "10.0.0.1" and r.ok
                 break                                    # one answer was enough
             assert started.wait(2)                       # 10.0.0.2 is in flight, 10.0.0.3 still queued
+            held = next(t for t in fleet._run.tasks if t.target.host == "10.0.0.2")
         release.set()                                    # the in-flight call returns after the close
+        assert wait_for(lambda: held.future.done())      # a late answer: dropped, as its row says
         t0 = time.monotonic()
         with warnings.catch_warnings():
             warnings.simplefilter("error")               # nothing may be written to the closed store
-            got = {d["device"]: d for d in res.to_dicts()}
+            got = res.to_dicts()
             replay = list(res)
-        assert time.monotonic() - t0 < 2, "iterating a closed Fleet's results hung"
-        assert set(got) == set(HOSTS) and len(replay) == 3
-        assert got["10.0.0.1"]["ok"] and got["10.0.0.2"]["ok"]
-        assert not got["10.0.0.3"]["ok"] and got["10.0.0.3"]["error"] == "not started: the Fleet was closed"
+        assert time.monotonic() - t0 < 1, "iterating a closed Fleet's results hung"
+        assert [d["device"] for d in got] == ["10.0.0.1"] and got[0]["ok"] and len(replay) == 1
         run, = rows(path, "SELECT * FROM runs")
         assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (1, 0, 2, 1)
         assert [r["device"] for r in rows(path, "SELECT * FROM results")] == ["10.0.0.1"]
@@ -530,16 +632,35 @@ def test_iterating_after_close_ends_instead_of_hanging_async(monkeypatch):
             assert started.wait(2)
         release.set()
         t0 = time.monotonic()
-        got = {r.device: r async for r in res}
-        assert time.monotonic() - t0 < 2, "iterating a closed Fleet's results hung"
+        got = [r async for r in res]
+        assert time.monotonic() - t0 < 1, "iterating a closed Fleet's results hung"
         return got
 
     try:
         got = asyncio.run(main())
     finally:
         release.set()
-    assert set(got) == set(HOSTS) and got["10.0.0.1"].ok and got["10.0.0.2"].ok
-    assert got["10.0.0.3"].error == "not started: the Fleet was closed"
+    assert [r.device for r in got] == ["10.0.0.1"] and got[0].ok
+
+
+def test_close_with_a_grace_yields_the_device_that_finished_inside_it(monkeypatch, tmp_path):
+    release, started = threading.Event(), threading.Event()
+    install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2", "10.0.0.3"}))
+    path = tmp_path / "runs.db"
+    fleet = Fleet(HOSTS, transport="junos", user="u", workers=1, store=str(path))
+    res = fleet.show("show version")
+    for r in res:
+        break
+    assert started.wait(2)                                   # 10.0.0.2 in flight, 10.0.0.3 queued
+    threading.Timer(0.3, release.set).start()
+    t0 = time.monotonic()
+    fleet.close(wait=3)                                      # a Ctrl-C handler giving the devices a moment
+    assert 0.25 <= time.monotonic() - t0 < 2                 # waited for the answer, not for the whole grace
+    got = {d["device"]: d for d in res.to_dicts()}
+    assert set(got) == {"10.0.0.1", "10.0.0.2"} and all(d["ok"] for d in got.values())
+    run, = rows(path, "SELECT * FROM runs")
+    assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (2, 0, 1, 1)
+    assert sorted(r["device"] for r in rows(path, "SELECT * FROM results")) == ["10.0.0.1", "10.0.0.2"]
 
 
 def test_close_keeps_the_results_of_devices_that_finished_unconsumed(monkeypatch, tmp_path):
@@ -573,8 +694,9 @@ def test_the_store_gets_the_run_row_and_one_row_per_result(monkeypatch, tmp_path
     install(monkeypatch, show=show)
     path = tmp_path / "runs.db"
     with Fleet(HOSTS, transport="junos", user="lab", store=str(path)) as fleet:
-        got = list(fleet.show("show version"))
-    assert len(got) == 3
+        res = fleet.show("show version")
+        got = list(res)
+    assert len(got) == 3 and res.not_kept == 0 and res.store_error is None
     run, = rows(path, "SELECT * FROM runs")
     assert run["mode"] == "show" and run["argv"] == "Fleet.show show version" and run["command"] == "show version"
     assert run["user"] == "lab" and run["origin"] == socket.gethostname() and run["version"] == hssh.__version__
@@ -589,6 +711,51 @@ def test_the_store_gets_the_run_row_and_one_row_per_result(monkeypatch, tmp_path
     assert got_rows["10.0.0.2"]["ok"] == 0 and got_rows["10.0.0.2"]["output"] is None
     assert got_rows["10.0.0.2"]["error"] == "connect to 10.0.0.2 port 830: Connection timed out"
     assert writers == {threading.get_ident()}            # written from the iterating thread, never a worker
+
+
+def test_store_loss_is_counted_and_said_but_never_raised(monkeypatch, tmp_path):
+    install(monkeypatch, show=echo)
+    real_add = Store.add_entry
+
+    def add_entry(self, run_id, entry, *a, **kw):
+        if entry["device"] == "10.0.0.2":
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_add(self, run_id, entry, *a, **kw)
+
+    monkeypatch.setattr(Store, "add_entry", add_entry)
+    path = tmp_path / "runs.db"
+    with Fleet(HOSTS, transport="junos", user="u", store=str(path)) as fleet:
+        res = fleet.show("show version")
+        with pytest.warns(RuntimeWarning) as said:
+            got = list(res)                                  # every device's result still comes through
+    assert sorted(r.device for r in got) == HOSTS and all(r.ok for r in got)
+    assert res.not_kept == 1 and res.store_error == "disk I/O error"
+    messages = [str(w.message) for w in said]
+    assert messages == [f"store {path}: disk I/O error; the run goes on, its results are shown but not kept",
+                        f"store {path}: 1 of 3 results were not kept: disk I/O error"]
+    run, = rows(path, "SELECT * FROM runs")
+    assert run["finished"] is not None and (run["ok"], run["failed"]) == (3, 0)
+    assert sorted(r["device"] for r in rows(path, "SELECT * FROM results")) == ["10.0.0.1", "10.0.0.3"]
+
+    # the file deleted under the run: SQLite writes on without a word, so nothing of the run was kept
+    monkeypatch.setattr(Store, "add_entry", real_add)
+    finished = []
+    monkeypatch.setattr(Store, "finish_run", lambda self, *a, **kw: finished.append(a))
+    release = threading.Event()
+    install(monkeypatch, show=holding(release, hosts={"10.0.0.2", "10.0.0.3"}))
+    gone = tmp_path / "gone.db"
+    try:
+        with Fleet(HOSTS, transport="junos", user="u", store=str(gone)) as fleet:
+            res = fleet.show("show version")
+            with pytest.warns(RuntimeWarning, match="3 of 3 results were not kept: the store file was deleted during the run"):
+                for r in res:
+                    if r.device == "10.0.0.1":
+                        os.remove(gone)
+                        release.set()
+    finally:
+        release.set()
+    assert res.not_kept == 3 and res.store_error == "the store file was deleted during the run"
+    assert finished == []                                    # nothing kept: the run row is not closed
 
 
 def test_a_batch_is_one_row_per_command_and_an_open_store_is_left_open(monkeypatch, tmp_path):
@@ -657,11 +824,15 @@ def test_two_fleets_share_the_pool_and_a_callers_pool_is_left_alone(monkeypatch)
     a.close()
     assert pool.POOL.enabled                                 # b still runs on it
     b.close()
-    assert not pool.POOL.enabled
+    assert not pool.POOL.enabled                             # a Fleet turned it on: the last one turns it off
     pool.enable()                                            # the caller's own pool
     with Fleet(HOSTS, transport="junos", user="u") as fleet:
         list(fleet.show("show version"))
-    assert pool.POOL.enabled
+    assert pool.POOL.enabled                                 # never turned off by a Fleet
+    with Fleet(HOSTS, transport="junos", user="u") as fleet:
+        list(fleet.show("show version"))
+        pool.disable()                                       # the caller changes their mind mid-way
+    assert not pool.POOL.enabled
 
 
 def test_a_netconf_fleet_logs_in_once_per_device(monkeypatch):
@@ -695,11 +866,14 @@ def test_targets_in_every_form_are_accepted(monkeypatch, tmp_path):
     assert len(fleet) == 7
     with fleet:
         assert sorted(r.device for r in fleet.show("show version")) == sorted(t.name for t in fleet.targets)
-    # one string: an existing file is the inventory, anything else is one target
+    # one string: an existing file is the inventory, a path that is not there is refused, anything else one target
     assert [t.name for t in Fleet(str(csv), user="u").targets] == ["R9", "R8"]
     assert Fleet(str(csv), user="u").targets[1].vendor == "ssh"                          # the default transport
     assert Fleet("10.0.0.1", user="u").targets == (Target(name="10.0.0.1", host="10.0.0.1", vendor="ssh"),)
     assert Fleet("cr1:10.0.0.1:junos", user="u").targets == (Target(name="cr1", host="10.0.0.1", vendor="junos"),)
+    for mistyped in ("nowhere.csv", "inv/devices", "fleet.yaml", "core.yml", "devices.json"):
+        with pytest.raises(ValueError, match=f"no inventory file at '{mistyped}'"):
+            Fleet(mistyped, user="u")
     assert Fleet(Target(name="one", host="10.0.0.1"), user="u").targets[0].name == "one"
     with pytest.raises(FileNotFoundError):
         Fleet(Path("nowhere.csv"), user="u")                                             # a Path is always a file
@@ -761,7 +935,7 @@ def test_user_defaults_to_the_login_name_and_the_environment_is_not_read(monkeyp
     monkeypatch.setenv("HSSH_USER", "someone-else")
     monkeypatch.setenv("HSSH_PASSWORD", "not-this")
     with Fleet(["R1:10.0.0.1:830:junos"]) as fleet:
-        assert fleet.user == getpass.getuser()
+        assert fleet.user == getpass.getuser() and fleet.retries == 2      # the CLI's defaults
         list(fleet.show("show version"))
     assert seen == [(getpass.getuser(), None, "junos@netconf", 830)]
     with Fleet(["10.0.0.1"], transport="junos", user="admin", passwd="s3cret") as fleet:
