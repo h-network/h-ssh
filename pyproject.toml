@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,15 +11,21 @@ license = "PolyForm-Noncommercial-1.0.0"
 requires-python = ">=3.10"
 dependencies = [
     "paramiko",
+    "junos-eznc",
 ]
 
+[project.urls]
+Homepage = "https://github.com/h-network/h-ssh"
+Issues = "https://github.com/h-network/h-ssh/issues"
+
 [project.optional-dependencies]
-junos = ["junos-eznc"]
-all = ["junos-eznc"]
+# Every transport installs with the package; these two names stay valid for
+# the install lines that used them.
+junos = []
+all = []
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
-    "junos-eznc",
 ]
 
 [project.scripts]

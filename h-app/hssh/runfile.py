@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from .core import check_port
 
-try:  # PyYAML comes with the junos extra; a JSON run file needs nothing
+try:  # PyYAML comes along with junos-eznc; a JSON run file needs nothing
     import yaml
 except ImportError:  # pragma: no cover - exercised through monkeypatching
     yaml = None
