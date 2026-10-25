@@ -14,7 +14,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hssh import cli, vendors
-from hssh.cli import build_confirm_command, format_edit_result, preview_diff
+from hssh.cli import build_confirm_command, format_edit_result
+from hssh.drivers.results import EditResult, as_edit
 
 HEADER = "DEVICE: R1\nHOST:   10.0.0.1\nMODE:   edit-cmd\nVENDOR: junos\n\n"
 DIFF = "DIFF:\n[edit system]\n+   host-name R1-new;\n"
@@ -246,10 +247,15 @@ def answer(monkeypatch, reply):
     monkeypatch.setattr(builtins, "input", lambda prompt="": reply() if callable(reply) else reply)
 
 
-def test_preview_diff_is_the_text_under_the_marker():
-    assert preview_diff(HEADER + "DRY-RUN: commit check passed, nothing committed\n\n" + DIFF) == \
-        "[edit system]\n+   host-name R1-new;"
-    assert preview_diff(HEADER + "NO CHANGES\n") == ""
+def test_the_preview_diff_is_a_field_of_the_edit_result():
+    """--show-diff commits each diff only if the device produces it again; the
+    diff is EditResult.diff, no longer read back out of the text (#82)."""
+    body = DIFF[len("DIFF:\n"):]
+    r = as_edit("DRY-RUN: commit check passed, nothing committed\n\n" + DIFF)
+    assert r.status == "dry-run" and r.diff == body == "[edit system]\n+   host-name R1-new;\n"
+    assert as_edit("NO CHANGES").diff == "" and as_edit("NO CHANGES").status == "no-changes"
+    assert as_edit("ROLLBACK 2: COMMIT CONFIRMED (5 minutes)\n\n" + DIFF) == \
+        EditResult("confirmed", diff=body, minutes=5, label="ROLLBACK 2: ")
 
 
 def test_show_diff_commits_the_diff_it_showed(monkeypatch, capsys, tmp_path):

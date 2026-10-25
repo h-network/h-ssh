@@ -6,13 +6,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 from .errors import NotAppliedError
 from .audit import secure_write
 from .core import Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
 from . import drivers
+from .drivers import results as R
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 3]  # seconds between attempt 1->2, 2->3
@@ -143,6 +144,43 @@ def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, **kwargs):
 def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
     """Call fn until it succeeds, up to max_attempts. Permanent failures stop at one."""
     return _retry_loop(fn, name, quiet, max_attempts, lambda e: True, *args, **kwargs)
+
+
+class RunResult(tuple):
+    """What one target's run came to. It is the (name, ok, text, duration_ms)
+    tuple it always was, compared, hashed, serialised and unpacked as one;
+    `result` is the driver's typed answer (an EditResult, BatchResult or
+    CommitStatus, a show's text or data) and `error` the failure in one line
+    (what follows the last "ERROR:" in the text), so nothing has to be read
+    back out of the text."""
+
+    def __new__(cls, name: str, ok: bool, text: str, duration_ms: int, result: Any = None,
+                error: Optional[str] = None):
+        self = super().__new__(cls, (name, ok, text, duration_ms))
+        self.result = result
+        self.error = error
+        return self
+
+    def __getnewargs__(self):
+        return (self[0], self[1], self[2], self[3], self.result, self.error)
+
+    name = property(lambda self: self[0])
+    ok = property(lambda self: self[1])
+    text = property(lambda self: self[2])
+    duration_ms = property(lambda self: self[3])
+
+    def __repr__(self):
+        return (f"RunResult(name={self[0]!r}, ok={self[1]!r}, duration_ms={self[3]!r}, "
+                f"result={type(self.result).__name__ if self.result is not None else None}, error={self.error!r})")
+
+
+def error_line(text: str) -> Optional[str]:
+    """The failure as the CLI always read it: what follows the last line
+    starting with "ERROR:", stripped; None when there is no such line."""
+    for ln in reversed(text.splitlines()):
+        if ln.startswith("ERROR:"):
+            return ln[len("ERROR:"):].strip()
+    return None
 
 
 class Bound(NamedTuple):
@@ -279,7 +317,7 @@ def _run_for_target_sync(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
-) -> Tuple[str, bool, str, int]:
+) -> RunResult:
     """
     Execute task on a single target device (internal sync implementation).
     Returns: (device_name, success, output_text, duration_ms)
@@ -295,7 +333,7 @@ def _run_for_target_sync(
         if not allowed:
             duration_ms = int((time.time() - start_time) * 1000)
             err_out = f"DEVICE: {name}\nHOST:   {host}\nMODE:   {mode}\nVENDOR: {vendor}\n\nERROR: safety gate blocked: {reason}\n"
-            return name, False, err_out, duration_ms
+            return RunResult(name, False, err_out, duration_ms, error=error_line(err_out))
 
     if not quiet:
         _say(f"{name:16s} STARTED")
@@ -308,6 +346,7 @@ def _run_for_target_sync(
     output.append(f"MODE:   {mode}")
     output.append(f"VENDOR: {vendor}")
     output.append("")
+    typed = None   # the driver's answer, typed, for RunResult.result
 
     try:
         if mode == "show":
@@ -332,6 +371,7 @@ def _run_for_target_sync(
                 data = _with_retry(_rpc_call(b), name, quiet, max_attempts,
                                    host, user, passwd, show_cmd, session_timeout, command_timeout,
                                    port=t.port, vendor_hint=b.hint, fmt=fmt)
+                typed = data
                 result = data if fmt == "xml" else json.dumps(data, indent=2)
             elif structured and "show_structured" in b.caps:
                 # A driver without show_structured (ssh, openssh, telnet)
@@ -341,6 +381,7 @@ def _run_for_target_sync(
                                    session_timeout, command_timeout,
                                    port=t.port, vendor_hint=b.hint,
                                    binding=structured_binding)
+                typed = data
                 result = json.dumps(data, indent=2, default=str)
             else:
                 if not read and not quiet:
@@ -348,6 +389,8 @@ def _run_for_target_sync(
                 result = _with_retry(b.mod.show, name, quiet, attempts,
                                      host, user, passwd, show_cmd, session_timeout, command_timeout,
                                      port=t.port, vendor_hint=b.hint)
+            if typed is None:
+                typed = result
             output.append(result.rstrip())
 
         elif mode == "edit-cmd":
@@ -371,7 +414,8 @@ def _run_for_target_sync(
                                      host, user, passwd, payload, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
                                      expected_diff)
-            output.append(result.rstrip())
+            typed = R.as_edit(result)
+            output.append(typed.rstrip())
 
         elif mode == "edit-dir":
             if not config_dir:
@@ -383,7 +427,8 @@ def _run_for_target_sync(
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
                                  expected_diff)
-            output.append(result.rstrip())
+            typed = R.as_edit(result)
+            output.append(typed.rstrip())
 
         elif mode == "edit-broadcast":
             if not broadcast_file:
@@ -393,20 +438,23 @@ def _run_for_target_sync(
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
                                  expected_diff)
-            output.append(result.rstrip())
+            typed = R.as_edit(result)
+            output.append(typed.rstrip())
 
         elif mode == "commit-status":
             if "commit_status" not in b.caps:
                 raise ValueError(f"--commit-status is not supported by the '{vendor}' transport")
             if dry_run:
                 # A dry run contacts no device, for a read too.
+                typed = R.CommitStatus()
                 output.append("DRY-RUN commit-status (no session opened)")
                 output.append(json.dumps([]))
             else:
                 entries = _with_retry(b.mod.commit_status, name, quiet, max_attempts,
                                       host, user, passwd, session_timeout, command_timeout,
                                       port=t.port, vendor_hint=b.hint)
-                output.append(json.dumps(entries))
+                typed = R.as_commits(entries)
+                output.append(json.dumps(typed.to_list()))
 
         elif mode == "rollback":
             if rollback is None:
@@ -415,7 +463,8 @@ def _run_for_target_sync(
                                      host, user, passwd, rollback, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
                                      expected_diff)
-            output.append(result.rstrip())
+            typed = R.as_edit(result)
+            output.append(typed.rstrip())
 
         elif mode == "show-batch":
             if batch_cmds and not all(b.dialect.is_read(c) for c in batch_cmds):
@@ -432,14 +481,14 @@ def _run_for_target_sync(
                 cmd_results = _with_retry(b.mod.show_batch, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
                                           port=t.port, vendor_hint=b.hint)
-            all_ok = all(r["ok"] for r in cmd_results)
-            result_json = json.dumps(cmd_results)
+            batch = R.as_batch(cmd_results)
+            result_json = json.dumps(batch.to_list())
             duration_ms = int((time.time() - start_time) * 1000)
             if save_dir:
                 secure_write(str(path_inside(save_dir, f"{name}.json")), result_json)
             if safety_gate is not None:
                 safety_gate.release_device(host)
-            return name, all_ok, result_json, duration_ms
+            return RunResult(name, batch.ok, result_json, duration_ms, result=batch, error=batch.first_error)
 
         else:
             raise ValueError(f"Unknown mode: {mode}")
@@ -452,7 +501,7 @@ def _run_for_target_sync(
 
         if safety_gate is not None:
             safety_gate.release_device(host)
-        return name, True, final_out, duration_ms
+        return RunResult(name, True, final_out, duration_ms, result=typed)
 
     except Exception as e:
         if safety_gate is not None:
@@ -468,7 +517,7 @@ def _run_for_target_sync(
         duration_ms = int((time.time() - start_time) * 1000)
         if save_dir:
             secure_write(str(path_inside(save_dir, f"{name}.output")), final_out)
-        return name, False, final_out, duration_ms
+        return RunResult(name, False, final_out, duration_ms, error=error_line(final_out))
 
 
 def run_for_target(
@@ -497,7 +546,7 @@ def run_for_target(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
-) -> Tuple[str, bool, str, int]:
+) -> RunResult:
     """
     Synchronous public API for library users. `expected_diff` is the diff a
     dry run showed; an edit or rollback is then committed only if the device
@@ -549,7 +598,7 @@ async def run_for_target_async(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
-) -> Tuple[str, bool, str, int]:
+) -> RunResult:
     """
     Async public API. Offloads the sync vendor calls to a thread.
     Returns: (device_name, success, output_text, duration_ms)

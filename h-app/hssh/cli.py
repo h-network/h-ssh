@@ -27,7 +27,8 @@ from .core import (
 
     path_inside,
 )
-from .runner import run_for_target_async, is_connect_failure
+from .runner import run_for_target_async, is_connect_failure, RunResult, error_line
+from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from .safety import SafetyGate
 from . import pool
@@ -273,13 +274,6 @@ def build_confirm_command(user, target_specs, devices: str, transport: str) -> s
     if "commit_confirmed" in drivers.get(transport).supports:
         cmd.append("--transport " + transport)
     return " ".join(cmd)
-
-
-def preview_diff(out_text: str) -> str:
-    """The diff a --show-diff dry run printed, as the commit must find it
-    again: the text under DIFF:, or "" when the preview said NO CHANGES."""
-    _, found, diff = strip_result_header(out_text).partition("DIFF:\n")
-    return diff if found else ""
 
 
 def get_default_devices_path() -> str:
@@ -1073,7 +1067,12 @@ async def main() -> int:
                                         started=mark)
         else:
             result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark)
-        return (i, *result)
+        if not isinstance(result, RunResult):
+            # A stand-in runner that still returns the bare tuple: the error is
+            # read from its text, as it always was.
+            name, ok, text, ms = result
+            result = RunResult(name, ok, text, ms, error=None if ok else error_line(text))
+        return i, result
 
     # --show-diff: every target's diff first, one question, then the real
     # run, which commits each diff only if the device produces it again.
@@ -1085,14 +1084,19 @@ async def main() -> int:
         previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units))]
         preview_failed = []
         for coro in asyncio.as_completed(previews):
-            i, name, ok, out_text, _ = await coro
+            i, res = await coro
+            name, ok, out_text = res.name, res.ok, res.text
             if _tty(sys.stdout):
                 out_text = terminal_safe(out_text)
             # stdout stays the JSON array in --json mode; the previews go to stderr
             print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=sys.stderr if json_mode else sys.stdout)
             print(out_text.rstrip(), file=sys.stderr if json_mode else sys.stdout)
             if ok:
-                expected[i] = preview_diff(out_text)
+                # The diff the commit must find again; "" when the preview said
+                # NO CHANGES. On a terminal it is the diff as shown, control
+                # sequences stripped, as it always was.
+                diff = res.result.diff if isinstance(res.result, R.EditResult) else ""
+                expected[i] = terminal_safe(diff) if _tty(sys.stdout) else diff
             else:
                 preview_failed.append(name)
             if args.audit_log:
@@ -1156,7 +1160,8 @@ async def main() -> int:
                 if not task.cancelled():
                     yield task.result()
 
-    async for i, name, ok, out_text, duration_ms in _completed():
+    async for i, res in _completed():
+        name, ok, out_text, duration_ms = res
         if screen:
             out_text = terminal_safe(out_text)
         t, je = units[i]
@@ -1171,10 +1176,7 @@ async def main() -> int:
         }
 
         if mode == "commit-status":
-            try:   # the runner's device header comes first; the data is the last line
-                entry["commits"] = json.loads(out_text.strip().splitlines()[-1]) if ok else []
-            except (json.JSONDecodeError, ValueError, TypeError, IndexError):
-                entry["commits"] = []
+            entry["commits"] = res.result.to_list() if ok and isinstance(res.result, R.CommitStatus) else []
             if ok and not json_mode:
                 print(f"\n{name}:")
                 for c in entry["commits"]:
@@ -1182,18 +1184,9 @@ async def main() -> int:
                     note = f"  {c['comment']}" if c.get("comment") else ""
                     print(f"  {c['seq']:>2}  {c['time']}  by {c['user']} via {c['client']}{pending}{note}")
             if not ok:
-                for ln in reversed(out_text.splitlines()):
-                    if ln.startswith("ERROR:"):
-                        entry["error"] = ln[len("ERROR:"):].strip()
-                        break
-                else:
-                    entry["error"] = out_text.strip() or "unknown error"
+                entry["error"] = res.error if res.error is not None else (out_text.strip() or "unknown error")
         elif mode == "show-batch":
-            cmd_results = None
-            try:
-                cmd_results = json.loads(out_text)
-            except (json.JSONDecodeError, ValueError, TypeError):
-                cmd_results = None
+            cmd_results = res.result.to_list() if isinstance(res.result, R.BatchResult) else None
 
             if isinstance(cmd_results, list):
                 for cr in cmd_results:
@@ -1210,12 +1203,7 @@ async def main() -> int:
                         entry["error"] = "unknown error"
             else:
                 entry["commands"] = []
-                for ln in reversed(out_text.splitlines()):
-                    if ln.startswith("ERROR:"):
-                        entry["error"] = ln[len("ERROR:"):].strip()
-                        break
-                else:
-                    entry["error"] = out_text.strip() or "unknown error"
+                entry["error"] = res.error if res.error is not None else (out_text.strip() or "unknown error")
         elif ok:
             # Resolved per target, so a shortcut can differ device to device.
             resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
@@ -1229,12 +1217,7 @@ async def main() -> int:
                 except (json.JSONDecodeError, ValueError, TypeError):
                     pass  # a driver that handed back something else: keep it as text
         else:
-            for ln in reversed(out_text.splitlines()):
-                if ln.startswith("ERROR:"):
-                    entry["error"] = ln[len("ERROR:"):].strip()
-                    break
-            else:
-                entry["error"] = "unknown error"
+            entry["error"] = res.error if res.error is not None else "unknown error"
         if i in inflight and not ok and is_connect_failure(entry.get("error", "")):
             # Ctrl-C came while this device was still being connected to; the
             # connect ran out on its own afterwards. Nothing reached the
@@ -1303,11 +1286,7 @@ async def main() -> int:
 
         if raw_mode:
             if mode == "show-batch":
-                cmd_results = None
-                try:
-                    cmd_results = json.loads(out_text)
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    cmd_results = None
+                cmd_results = res.result.to_list() if isinstance(res.result, R.BatchResult) else None
 
                 if isinstance(cmd_results, list):
                     print(f"{name}:")
@@ -1318,9 +1297,7 @@ async def main() -> int:
                             print(f"{name}: {cr.get('command')}: {cr.get('error')}", file=sys.stderr)
                     print()
                 else:
-                    detail = next((ln for ln in out_text.splitlines()
-                                   if ln.startswith("ERROR:")), "failed")
-                    print(f"{name}: {detail}", file=sys.stderr)
+                    print(f"{name}: ERROR: {res.error}" if res.error is not None else f"{name}: failed", file=sys.stderr)
             elif ok:
                 resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
                 print(f"{name}:")
@@ -1328,18 +1305,12 @@ async def main() -> int:
                 print()
             else:
                 # stdout stays device output only, so failures go to stderr.
-                detail = next((ln for ln in out_text.splitlines()
-                               if ln.startswith("ERROR:")), "failed")
-                print(f"{name}: {detail}", file=sys.stderr)
+                print(f"{name}: ERROR: {res.error}" if res.error is not None else f"{name}: failed", file=sys.stderr)
 
         if not json_mode and not raw_mode:
             timestamp = datetime.now().strftime("%H:%M:%S")
             if mode == "show-batch":
-                cmd_results = None
-                try:
-                    cmd_results = json.loads(out_text)
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    cmd_results = None
+                cmd_results = res.result.to_list() if isinstance(res.result, R.BatchResult) else None
 
                 if isinstance(cmd_results, list):
                     ok_count = sum(1 for r in cmd_results if r.get("ok"))
@@ -1370,11 +1341,8 @@ async def main() -> int:
                         print(f"\n--- Output from {name} ---")
                         print(out_text)
                         print(f"--- End of {name} ---\n")
-                    elif not ok:
-                        for ln in reversed(out_text.splitlines()):
-                            if ln.startswith("ERROR:"):
-                                print(f"  {ln}")
-                                break
+                    elif not ok and res.error is not None:
+                        print(f"  ERROR: {res.error}")
             else:
                 status = "OK" if ok else ("INTERRUPTED" if entry.get("interrupted") else "FAIL")
                 print(f"[{timestamp}] {name:16s} {status}")
@@ -1385,11 +1353,8 @@ async def main() -> int:
                     print(f"--- End of {name} ---\n")
                 elif ok and (dev_mode.startswith("edit") or dev_mode == "rollback"):
                     print(format_edit_result(out_text))
-                elif not ok:
-                    for ln in reversed(out_text.splitlines()):
-                        if ln.startswith("ERROR:"):
-                            print(f"  {ln}")
-                            break
+                elif not ok and res.error is not None:
+                    print(f"  ERROR: {res.error}")
 
         if not ok:
             if entry.get("error", "").startswith("safety gate blocked"):
