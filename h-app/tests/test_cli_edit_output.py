@@ -1,5 +1,6 @@
 """Default-mode output for edits, the commit-confirmed reminder, the
---show-diff flow, a job that names one device twice, and the --log file."""
+--show-diff flow, a job that names one device twice (and the file
+--save-output keeps of each entry), and the --log file."""
 import asyncio
 import builtins
 import json
@@ -211,6 +212,80 @@ def test_job_entries_for_one_host_take_turns_at_the_safety_gate(monkeypatch, cap
     assert rc == 0
     assert [c[2] for c in driver.calls] == ["show version", "show chassis hardware"]
     assert all(e["ok"] for e in json.loads(out)) and '"skipped": 0' in err
+
+
+class EchoDriver(JobDriver):
+    """Answers a show with the command and the host, so a saved file says
+    which entry it holds; a command in `fail` is refused instead."""
+
+    def __init__(self, fail=()):
+        super().__init__()
+        self.fail = fail
+
+    def show(self, host, user, passwd, cmd, *a, **kw):
+        self.calls.append(("show", host, cmd))
+        if cmd in self.fail:
+            raise RuntimeError(f"syntax error: {cmd}")
+        return f"{cmd} on {host}\n"
+
+
+def test_save_output_keeps_a_file_for_every_job_entry(monkeypatch, capsys, tmp_path):
+    """Every result went to <name>.output, so a job that named R1 three times
+    kept only its last entry (#116). The first keeps R1.output, the later
+    ones are R1.2.output and R1.3.output, counted per device in file order;
+    a job that names each device once keeps the old names."""
+    save = tmp_path / "out"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show chassis alarms"},
+    ], "--json", "--save-output", str(save), driver=EchoDriver())
+    assert rc == 0, err
+    saved = {p.name: p.read_text() for p in save.iterdir()}
+    assert sorted(saved) == ["R1.2.output", "R1.3.output", "R1.output", "R2.output"]
+    assert saved["R1.output"].endswith("\n\nshow version on 10.0.0.1\n")
+    assert saved["R1.2.output"].endswith("\n\nshow interfaces terse on 10.0.0.1\n")
+    assert saved["R1.3.output"].endswith("\n\nshow chassis alarms on 10.0.0.1\n")
+    assert saved["R2.output"].endswith("\n\nshow version on 10.0.0.2\n")
+    once = tmp_path / "once"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R2:10.0.0.2:junos", "edit": "set system host-name R2-new"},
+    ], "--json", "-y", "--save-output", str(once), driver=EchoDriver())
+    assert rc == 0, err
+    assert sorted(p.name for p in once.iterdir()) == ["R1.output", "R2.output"]
+
+
+def test_a_failed_job_entry_saves_its_error_in_its_own_file(monkeypatch, capsys, tmp_path):
+    """The error goes to the entry's file as before, no longer over the file
+    of the device's entry before it."""
+    save = tmp_path / "out"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show bogus"},
+    ], "--json", "--save-output", str(save), driver=EchoDriver(fail={"show bogus"}))
+    assert rc == 1
+    assert (save / "R1.output").read_text().endswith("\n\nshow version on 10.0.0.1\n")
+    assert (save / "R1.2.output").read_text().endswith("\n\nERROR: syntax error: show bogus\n")
+
+
+def test_a_job_entry_saved_over_another_devices_file_is_refused(monkeypatch, capsys, tmp_path):
+    """R1's second entry is saved as R1.2.output, which is also the file of a
+    device named R1.2: one result would replace the other. Refused before
+    anything is sent; without --save-output the job runs."""
+    job = [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1.2:10.0.0.2:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
+    ]
+    save = tmp_path / "out"
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--json", "--save-output", str(save),
+                                   driver=EchoDriver())
+    assert rc == 2 and driver.calls == [] and not any(save.iterdir())
+    assert "R1.2 and R1's entry 2 would both be saved as R1.2.output" in err and "Nothing was sent" in err
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--json", driver=EchoDriver())
+    assert rc == 0 and len(driver.calls) == 3
 
 
 # --- --show-diff: what is committed is what was shown ----------------------------

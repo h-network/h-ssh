@@ -194,7 +194,11 @@ An entry may also carry `"port": 830` to override the target's port. A job with 
 `y/N` unless `-y` is given, and the question goes to stdout, so a `--json` run wants `-y`.
 
 A device may appear in more than one entry. Its entries run one after another, in file order, so a
-show listed after an edit sees the edit, and each is audited with its own mode and payload.
+show listed after an edit sees the edit, and each is audited with its own mode and payload. With
+`--save-output DIR` each entry is saved to a file of its own: the device's first entry keeps
+`DIR/<name>.output`, its later ones go to `DIR/<name>.2.output`, `DIR/<name>.3.output` and so on, in
+file order. A job that would put two results in one file that way (a device named `R1.2` beside a
+second `R1` entry) is refused before anything is sent (exit 2).
 
 ### Watching: `--every`
 
@@ -982,7 +986,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (926 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (930 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

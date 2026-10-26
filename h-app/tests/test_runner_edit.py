@@ -378,6 +378,27 @@ def test_save_output_files_are_0600_and_raw(monkeypatch, tmp_path):
     f = save / "R1.output"
     assert ok and oct(f.stat().st_mode & 0o777) == "0o600" and "$6$HASH" in f.read_text()
 
+def test_save_output_gives_a_later_entry_for_the_same_device_a_file_of_its_own(monkeypatch, tmp_path):
+    """seq is a job entry's place among its device's entries (#116): 0 keeps
+    R1.output, 1 saves to R1.2.output and 2 to R1.3.output, an error too."""
+    def show(host, user, passwd, cmd, *a, **kw):
+        if cmd == "show bogus":
+            raise RuntimeError("syntax error: show bogus")
+        return f"{cmd} on {host}\n"
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True, show=show))
+    save = tmp_path / "out"
+    for seq, cmd in ((0, "show version"), (1, "show interfaces terse"), (2, "show bogus")):
+        runner.run_for_target(
+            t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
+            show_cmd=cmd, edit_cmd=None, config_dir=None, broadcast_file=None,
+            user="u", passwd="p", session_timeout=5, command_timeout=30,
+            dry_run=False, commit_confirmed=None, save_dir=str(save), quiet=True, max_attempts=1, seq=seq)
+    saved = {p.name: p.read_text() for p in save.iterdir()}
+    assert sorted(saved) == ["R1.2.output", "R1.3.output", "R1.output"]
+    assert saved["R1.output"].endswith("\n\nshow version on 10.0.0.1\n")
+    assert saved["R1.2.output"].endswith("\n\nshow interfaces terse on 10.0.0.1\n")
+    assert saved["R1.3.output"].endswith("\n\nERROR: syntax error: show bogus\n")
+
 # --- #44: a show that acts on the device is sent once --------------------------
 
 def _show_mod(calls, fail_times=2):

@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 926/926 passed
+## Unit Tests — 930/930 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/fleet`, 2026-10-25, with the dialect /
 transport / driver split of #80–#84 complete, the store hardening and the `Fleet` library API). The standalone review of `develop` (18
@@ -30,7 +30,7 @@ telnet runs against a scripted server on localhost.
 | test_entry_points.py | 19 | #84: a driver from an `hssh.drivers` entry point loads after the built-ins and `SOURCES` names the entry point (or the distribution); a broken one is listed by name and the rest still load; a taken name or alias, an object that is not a `Driver`, a driver listed twice refuse the whole entry point; `--list-vendors` shows the row and the broken line; the contract and the runner take the driver, a stand-in in `drivers.MODULES` does its work; h-ssh's own `builtin` entry point is never loaded twice; `pyproject.toml` declares it |
 | test_audit.py | 32 | JSONL audit trail, 0600 whatever the umask, redaction (text, XML and JSON values; the type words stay), `secure_append`/`secure_write` refusing a planted symlink or FIFO, graceful failure |
 | test_bare_hosts.py | 10 | targets typed bare on the command line: a host alone is a device named after itself on `--transport` (an IPv6 host in brackets), `name:host[:vendor][:port]` works bare, before or between the flags, adds up with `--target`, and silences the inventory file; `--target` itself stays strict; a device twice is refused as before; `--help` shows `HOST`; a bare host's confirm hint stays bare |
-| test_cli_edit_output.py | 39 | default-mode verdict + diff for edits, the commit-confirmed reminder, `--show-diff` preview → prompt → commit and the abort paths, confirm hint from `sys.argv[0]` and job targets, a job naming one device twice, `--log` 0600 + redacted, a malformed target as a usage error |
+| test_cli_edit_output.py | 42 | default-mode verdict + diff for edits, the commit-confirmed reminder, `--show-diff` preview → prompt → commit and the abort paths, confirm hint from `sys.argv[0]` and job targets, a job naming one device twice, `--log` 0600 + redacted, a malformed target as a usage error; #116: `--save-output` keeps a file per job entry (`R1.output`, `R1.2.output`, `R1.3.output`, counted per device in file order; a job naming each device once keeps the old names; a failed entry's error in its own file), a job whose entry would be saved over another device's file (`R1.2` beside a second `R1`) refused before anything is sent |
 | test_cli_junos_safety.py | 12 | Junos set-syntax guard (also through `--transport junos`), show-batch error handling, `--rollback`/`--comment`/`--show-diff`/`--commit-status`/`--format` usage errors |
 | test_cli_runfile.py | 26 | #60: `--run FILE` in YAML or JSON — every key a flag, the command line wins, no credential in the file, relative paths against the file, an edit from a file needs a timer or a dry run, YAML without PyYAML is a clear error |
 | test_config.py | 25 | `~/.h-ssh/config`, precedence flag → env → file → default, a credential line refused with exit 2 (never read, never ignored), `transport` reaching undeclared targets (flag, file, inline/CSV/job forms, declared vendor wins) |
@@ -54,7 +54,7 @@ telnet runs against a scripted server on localhost.
 | test_raw.py | 10 | `--raw` output contract and the JSON output shape |
 | test_retry.py | 42 | failure classification (PyEZ connect phase by its prefix, `invalid` narrowed, a rejected command permanent), backoff, the attempt budget, workers clamped and really parallel, edits retried only on `NotAppliedError` |
 | test_rpc.py | 19 | `rpc()`: CLI-command translation, RPC name + args, JSON/XML, never re-sending non-reads, `rpc_batch()`, `commit_status()` (pending only on the latest commit) |
-| test_runner_edit.py | 33 | runner policy by the driver's `supports`: dry-run and commit-confirmed refusals, retry rule, confirm, rollback mode, comments, commit-status mode, `-eD`/`-eB` load the same lines, no resolver call |
+| test_runner_edit.py | 34 | runner policy by the driver's `supports`: dry-run and commit-confirmed refusals, retry rule, confirm, rollback mode, comments, commit-status mode, `-eD`/`-eB` load the same lines, no resolver call; #116: `seq` saves a later entry for the same device to `R1.2.output`, `R1.3.output`, a failure too |
 | test_safety.py | 22 | SafetyGate rate limit, cooldown, flock (one yield: an `OSError` in the body propagates), corrupt-file handling |
 | test_structured.py | 8 | `--structured` bindings and fallback, the same shortcut resolving per vendor, every shipped binding well-formed, the capability being the registry's and not module attribute presence |
 | test_telnet.py | 45 | the telnet transport on a scripted fake server: readers raise on timeout/EOF, failed login detected, silent console gets one Enter, `configure exclusive`, anchored error match, commit outcome unknown, a commit that drops the session still ok, the dry run's diff committed only if it shows again, best-effort cleanup |

@@ -28,7 +28,7 @@ from .core import (
 
     path_inside,
 )
-from .runner import run_for_target_async, is_connect_failure, RunResult, error_line
+from .runner import run_for_target_async, is_connect_failure, RunResult, error_line, save_name
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
@@ -516,7 +516,9 @@ async def main() -> int:
                         help="Show output as the router's own JSON or XML reply, through its RPC "
                              "translation of the command (junos only; default: text)")
     parser.add_argument("--save-output", type=str,
-                        help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted)")
+                        help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted): "
+                             "NAME.output, or NAME.json for a batch; a job's later entries for one device go to "
+                             "NAME.2.output, NAME.3.output, ... in file order")
     parser.add_argument("--log", type=str,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
     parser.add_argument("--store", type=str,
@@ -1018,6 +1020,25 @@ async def main() -> int:
     # job mode) travels with its result, so a job that names one device in
     # two entries never has the second read as the first.
     units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
+    # A job may name one device in several entries: seq counts them per
+    # device in file order, 0 for the first, and with --save-output each is
+    # saved to a file of its own (R1.output, R1.2.output, R1.3.output, ...).
+    seq_of, counted = [], {}
+    for t, je in units:
+        seq_of.append(counted.get(t.name, 0))
+        counted[t.name] = seq_of[-1] + 1
+    if save_dir and job_entries:
+        # R1's second entry is R1.2.output, which is also the file of a
+        # device named R1.2: one result would replace the other.
+        saved_as = {}
+        for (t, _), seq in zip(units, seq_of):
+            whose = f"{t.name}'s entry {seq + 1}" if seq else t.name
+            fname = save_name(t.name, seq)
+            if fname in saved_as:
+                print(f"ERROR: --save-output: {saved_as[fname]} and {whose} would both be saved as {fname}; "
+                      "rename one of the devices. Nothing was sent.", file=sys.stderr)
+                return 2
+            saved_as[fname] = whose
 
     def _audit_aborted(error):
         """One audit line per unit for a run the operator did not confirm."""
@@ -1156,7 +1177,7 @@ async def main() -> int:
         return host_locks.setdefault(host, asyncio.Lock())
 
     async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
-                           started=None):
+                           started=None, seq=0):
         async with _host_lock(t.host), sem:
             if started is not None:
                 started()        # from here on the device may be touched
@@ -1213,6 +1234,7 @@ async def main() -> int:
                 structured_binding=binding,
                 fmt=args.format,
                 expected_diff=expected_diff,
+                seq=seq,
             )
 
     started = set()      # unit indices whose device may already be in play
@@ -1225,7 +1247,7 @@ async def main() -> int:
         mark = lambda: started.add(i)
         if je is not None:
             result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
-                                        started=mark)
+                                        started=mark, seq=seq_of[i])
         else:
             result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark)
         if not isinstance(result, RunResult):
