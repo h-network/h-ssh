@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hssh import cli, drivers
 from hssh.errors import NotAppliedError
 from hssh.runner import is_connect_failure, is_permanent_failure
-from hssh.transports import netconf, openssh
+from hssh.transports import netconf, openssh, ssh
 
 
 # --- H1: the pre-flight runs like the run ------------------------------------------
@@ -68,7 +68,8 @@ def test_a_probe_that_fails_once_is_tried_again_before_the_device_is_called_unre
 
 # --- H3: the junos session set-up has one deadline ---------------------------------
 
-def _silent_listener():
+def _silent_listener(greeting=b""):
+    """Accepts, says `greeting` (nothing by default), and then nothing."""
     srv = socket.socket()
     srv.bind(("127.0.0.1", 0))
     srv.listen(5)
@@ -79,6 +80,7 @@ def _silent_listener():
                 conn, _ = srv.accept()
             except OSError:
                 return
+            conn.sendall(greeting)
             time.sleep(60)
     threading.Thread(target=run, daemon=True).start()
     return srv, srv.getsockname()[1]
@@ -125,6 +127,85 @@ def test_a_router_that_accepts_tcp_and_says_nothing_costs_the_session_timeout():
         elapsed = time.monotonic() - started
         assert elapsed < 3.5, f"{elapsed:.1f}s: paramiko's 15 s banner timeout won"
         assert netconf._DEADLINE.at is None
+    finally:
+        srv.close()
+
+
+# --- #114 G4: the banner, then a key exchange that does not finish ---------------
+
+BANNER = b"SSH-2.0-OpenSSH_9.6\r\n"
+
+
+def _banner_then_close():
+    """Says the banner, reads what the client sends (its own banner and its
+    key exchange init), and closes."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def run():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            conn.sendall(BANNER)
+            conn.settimeout(0.3)
+            try:
+                while conn.recv(65536):
+                    pass
+            except OSError:
+                pass
+            conn.close()
+    threading.Thread(target=run, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
+def test_a_key_exchange_that_never_finishes_costs_the_session_timeout_and_says_so(monkeypatch, tmp_path):
+    """The ssh transport said 'No existing session', which no marker knows,
+    so it was retried twice; above 15 s it was an empty EOFError at
+    paramiko's 15 s, and the FAIL line and the --json error were empty."""
+    pytest.importorskip("paramiko")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    srv, port = _silent_listener(BANNER)
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError) as failed:
+            ssh._connect("127.0.0.1", "u", "p", 1, port)
+        elapsed = time.monotonic() - started
+    finally:
+        srv.close()
+    assert str(failed.value) == "no SSH session to 127.0.0.1 within 1s: the banner came, but key exchange did not finish"
+    assert elapsed < 3, f"{elapsed:.1f}s"
+    assert is_connect_failure(failed.value) and is_permanent_failure(failed.value)
+
+
+def test_a_server_that_closes_in_the_key_exchange_is_named_and_still_retried(monkeypatch, tmp_path):
+    """An empty EOFError too: retried with nothing in the RETRY line's
+    parentheses. A drop may pass, so it is still retried."""
+    pytest.importorskip("paramiko")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    srv, port = _banner_then_close()
+    try:
+        with pytest.raises(RuntimeError, match=r"^127\.0\.0\.1 dropped the session before login after \d+\.\ds "
+                                               r"\(the banner came, but key exchange did not finish\)$") as failed:
+            ssh._connect("127.0.0.1", "u", "p", 10, port)
+    finally:
+        srv.close()
+    assert is_connect_failure(failed.value) and not is_permanent_failure(failed.value)
+
+
+def test_a_router_that_sends_the_banner_and_then_nothing_is_named_on_junos_too():
+    """PyEZ rendered paramiko's bare EOFError as `ConnectError for HOST:PORT`
+    with nothing after it."""
+    pytest.importorskip("jnpr.junos")
+    srv, port = _silent_listener(BANNER)
+    try:
+        started = time.monotonic()
+        with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: no SSH session to 127\.0\.0\.1:{port} "
+                                                  r"within 2s: the banner came, but key exchange did not finish$"):
+            netconf._open("127.0.0.1", "u", "p", 2, 30, port)
+        assert time.monotonic() - started < 3.5
     finally:
         srv.close()
 

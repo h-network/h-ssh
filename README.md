@@ -54,7 +54,7 @@ lands in a JSONL audit trail.
                     └──────────── every edit ──────────────────┴──▶ --audit-log (JSONL)
 ```
 
-On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted. With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT`, `connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns (sshd busy, or filtered)`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts, so a router that accepts TCP and then says nothing costs what you asked for. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted, the file read as the `ssh` transport reads it: its `@cert-authority` lines are passed over, and a key it marks `@revoked` is refused (`host key verification failed for HOST:PORT: its key is marked @revoked in FILE`). With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT`, `connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns (sshd busy, or filtered)`, `no SSH session to HOST:PORT within Ns: the banner came, but key exchange did not finish`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts, so a router that accepts TCP and then says nothing costs what you asked for. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
 
 ## Install
 
@@ -294,7 +294,26 @@ Host keys are pinned on first contact in `~/.h-ssh/known_hosts` (created 0600), 
 `~/.ssh/known_hosts` is honoured too. The policy is the same `HSSH_HOST_KEY_POLICY` the `openssh`
 transport reads: `accept-new` (default) pins an unknown host, `yes` refuses one, `no` only warns.
 A host whose key has changed is refused under every policy, before any credential is sent — after
-a re-image, remove its line from `~/.h-ssh/known_hosts`.
+a re-image, remove its line from `~/.h-ssh/known_hosts` — and so is a key `~/.ssh/known_hosts` marks
+`@revoked`. Its `@cert-authority` lines are passed over: paramiko cannot check a host certificate, so
+a host known only through its CA is an unknown host here (`accept-new` pins its key; the `openssh`
+transport checks the certificate). A pin is written to a new file renamed over the old one, with the
+old one's mode and group and its other lines byte for byte, under a file lock a reading run waits for,
+and the host is looked up again under that lock: a host another run pinned meanwhile is checked
+against that pin, never pinned over. Another run's lock is waited for as long as that run keeps
+pinning, since every pin changes the file; one held for `--session-timeout` with the file unchanged (a
+run stopped with Ctrl-Z in the middle of a pin) fails the device, not retried, with
+`~/.h-ssh/known_hosts is locked by another h-ssh run`, and the devices queued behind it fail with it
+rather than wait again. A line of `~/.h-ssh/known_hosts` that holds no pin — too few fields, a key
+that is not base64 or not a key of its type, a key type paramiko does not know, a hashed name that is
+not `|1|salt|hash`, a marker — is not dropped, which would pin that host again on trust: the
+connection is refused before anything is sent, naming the file, the line number and the line. In
+`~/.ssh/known_hosts` such a line is passed over, as OpenSSH passes it over, and so is a marker OpenSSH
+does not have; an `@revoked` line that cannot be read is refused the same way, so a revocation is
+never dropped. The key exchange gets `--session-timeout`, not paramiko's fixed 15 s; one that has not
+finished by then is `no SSH session to HOST within Ns: the banner came, but key exchange did not
+finish`, as on `openssh`, and is not retried; a server that drops the session there is named the same
+way and retried.
 
 ### `openssh` — for hosts where you cannot install anything
 
@@ -657,9 +676,9 @@ classified before anything is retried:
 
 | Failure | Behaviour |
 |---|---|
-| Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh` and `telnet*` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker) |
+| Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh` and `telnet*` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker); a key exchange that `--session-timeout` ran out on after the banner is not, on `ssh` either (`no SSH session to HOST within Ns: the banner came, but key exchange did not finish`) |
 | Authentication, host key, rejected command (and an unresolvable name on `junos`/`openssh`) | fail immediately |
-| The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
+| The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a pin file another h-ssh run keeps locked (`ssh`: `~/.h-ssh/known_hosts is locked by another h-ssh run`), a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
 | Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2) |
 
 The split is whether a connection was established. A connect-phase failure has already spent the
@@ -713,7 +732,7 @@ ones (`--safety-file`, `--audit-log`, `--log`) apply to every mode once given.
 | Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, one line as each device finishes, appended with the same 0600 mode and secret redaction as the audit trail, and probed before the first device like the audit log |
 | Result store | *(always on)* `./h-ssh.db`; `--store PATH`, `HSSH_STORE`, `store =` in the config; `--no-store` | Every command's reply in one SQLite file, as the device gave it, one row per command per device plus a row per run; 0600, nothing redacted (it is a snapshot to restore from); opened before the first device, so a store that cannot be written is no run (exit 2). Read with `h-ssh-store` (see [The result store](#the-result-store)) |
 
-A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it) does not start a cooldown; only failures against the device do.
+A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it, a pin file another h-ssh run holds locked) does not start a cooldown; only failures against the device do.
 
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a second attempt on the same host while one is in flight is refused rather than doubled up, and a failure cools it before anything else can try. The mark lives in memory; only cooldowns reach the file, so a crashed process blocks nothing in the next run.
 
@@ -1035,7 +1054,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1043 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1079 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

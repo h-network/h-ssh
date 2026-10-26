@@ -6,6 +6,12 @@ class NotAppliedError(RuntimeError):
     was sent (connect/auth/lock). Safe to retry even for an edit."""
 
 
+class LocalError(RuntimeError):
+    """Refused on this machine before anything reached the device: a pin
+    file another h-ssh run holds locked. The device did nothing to earn a
+    safety-gate cooldown, and the same attempt again meets the same refusal."""
+
+
 class NothingToConfirmError(RuntimeError):
     """A confirm was asked of a device with no commit-confirmed waiting: the
     timer expired (the change is already gone) or it was confirmed before.

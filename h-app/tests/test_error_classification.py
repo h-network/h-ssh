@@ -23,7 +23,7 @@ from hssh.transports import netconf, ssh
     "No authentication methods available for u@10.0.0.1: no password was given and no key was found in ~/.ssh or from an agent.",
     "ssh exit 255: hostname contains invalid characters",
     "ssh exit 255: remote username contains invalid characters",
-    "/home/x/.h-ssh/known_hosts: malformed known_hosts line: 'r1 ssh-rsa not-base64!!'; fix or remove it",
+    "/home/x/.h-ssh/known_hosts: malformed known_hosts line 1: 'r1 ssh-rsa not-base64!!' (the key is not base64); fix or remove it",
     "NETCONF connect failed: PyEZ does not accept host '2001:db8::1': Invalid 'host' value",
     "NETCONF connect failed: connection refused by 10.0.0.1:830 (nothing listening, or no route)",
     "NETCONF connect failed: 10.0.0.1:830 is not an SSH server: the banner is not text",
@@ -110,6 +110,17 @@ def _pyez(kind, cause=None, orig=None):
      "cannot resolve 10.0.0.1"),
     (_pyez("ConnectError", orig=SSHError("Negotiation failed: Incompatible ssh peer (no acceptable kex algorithm)")), 0.4,
      "SSH negotiation with 10.0.0.1:830 failed: Incompatible ssh peer (no acceptable kex algorithm)"),
+    # #114 G4: the banner came and the key exchange did not finish, by the deadline or a drop
+    (_pyez("ConnectError", orig=SSHError("Negotiation failed: the banner came, but key exchange did not finish")), 10.0,
+     "no SSH session to 10.0.0.1:830 within 10s: the banner came, but key exchange did not finish"),
+    (_pyez("ConnectRefusedError", SSHError("Negotiation failed: the banner came, but key exchange did not finish")), 0.2,
+     "10.0.0.1:830 dropped the session before login after 0.2s (the banner came, but key exchange did not finish)"),
+    # #114 G2: HSSH_NETCONF_HOSTKEY=yes reads ~/.ssh/known_hosts as the ssh transport does
+    (_pyez("ConnectError", orig=_Ctx("its key is marked @revoked in /h/.ssh/known_hosts")), 0.3,
+     "host key verification failed for 10.0.0.1:830: its key is marked @revoked in /h/.ssh/known_hosts; nothing was sent"),
+    (_pyez("ConnectError", orig=ValueError("/h/.ssh/known_hosts: malformed known_hosts line 2: '@revoked *' "
+                                           "(expected host, key type and key); fix or remove it")), 0.0,
+     "/h/.ssh/known_hosts: malformed known_hosts line 2: '@revoked *' (expected host, key type and key); fix or remove it"),
 ])
 def test_connect_reason_reads_the_exception_pyez_was_handling(exc, elapsed, expect):
     assert netconf._connect_reason(exc, "10.0.0.1", "u", 830, 10, elapsed) == expect
@@ -158,14 +169,16 @@ def test_a_malformed_known_hosts_line_is_refused_before_connecting(monkeypatch, 
     paramiko = pytest.importorskip("paramiko")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(os.path, "expanduser", lambda p: p.replace("~", str(tmp_path)))
-    (tmp_path / ".ssh").mkdir(mode=0o700)
-    (tmp_path / ".ssh" / "known_hosts").write_text("r1 ssh-ed25519 not-base64!!\n")
+    (tmp_path / ".h-ssh").mkdir(mode=0o700)
+    (tmp_path / ".h-ssh" / "known_hosts").write_text("r1 ssh-ed25519 not-base64!!\n")
     connected = []
     monkeypatch.setattr(paramiko.SSHClient, "connect", lambda self, **kw: connected.append(kw))
-    with pytest.raises(ValueError, match=r"\.ssh/known_hosts: malformed known_hosts line: 'r1 ssh-ed25519 not-base64!!'; fix or remove it"):
+    with pytest.raises(ValueError, match=r"\.h-ssh/known_hosts: malformed known_hosts line 1: 'r1 ssh-ed25519 not-base64!!' "
+                                         r"\(the key is not base64\); fix or remove it"):
         ssh._connect("10.0.0.1", "u", "p", 5, None)
     assert connected == []
-    assert is_permanent_failure(ValueError("x: malformed known_hosts line: 'r1'; fix or remove it"))
+    assert is_permanent_failure(ValueError("x: malformed known_hosts line 1: 'r1' (expected host, key type and key); "
+                                           "fix or remove it"))
 
 
 def test_no_credential_at_all_is_said_in_words(monkeypatch, tmp_path):
