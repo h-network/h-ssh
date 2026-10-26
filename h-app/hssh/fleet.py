@@ -259,8 +259,10 @@ def _budget(fleet: "Fleet", target: Target, commands: int) -> float:
 def _reply(text: str, command: Optional[str]) -> str:
     """Just what the device said. The text transports open a reply with the
     command as `$ cmd` (framing --raw drops too); it goes only when it is
-    exactly the command sent, so output that starts with '$ ' survives."""
-    lines = text.splitlines()
+    exactly the command sent, so output that starts with '$ ' survives.
+    Split on "\n" alone, as the CLI does: splitlines() also breaks on CR,
+    NEL, VT, FF and the Unicode separators, and the join made each an LF."""
+    lines = text.split("\n")
     if lines and command and lines[0] == f"$ {command}":
         lines = lines[1:]
     return "\n".join(lines).strip("\n")
@@ -540,7 +542,9 @@ class _Run:
                                 run.duration_ms, ts, commands=commands, run=run)
         output = run.result if run.ok else None
         if isinstance(output, str):
-            output = _reply(output, self.command)
+            # Without its trailing whitespace, as the runner frames a show's
+            # reply for the CLI's record: one reply, one row, whoever wrote it.
+            output = _reply(output.rstrip(), self.command)
         return DeviceResult(t.name, t.host, t.vendor, run.ok, self.command, output, error,
                             run.duration_ms, ts, run=run)
 

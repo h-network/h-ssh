@@ -269,6 +269,40 @@ def test_export_csv_and_jsonl(tmp_path, capsys):
     assert rc == 1 and out.strip() == ",".join(store_module.EXPORT_FIELDS)     # a header and nothing else
 
 
+def test_the_reader_shows_a_terminal_no_escape_sequences_and_a_pipe_the_rows_as_kept(tmp_path, monkeypatch, capsys):
+    """The rows are the replies as they came (#111), so `h-ssh-store output`
+    on a terminal wrote a device's OSC retitle and clear-screen to it, which
+    h-ssh itself never shows. On a terminal the reader takes out what the
+    terminal would act on, wherever it prints a row's text; a pipe and
+    `export --out` get the rows as they were kept."""
+    evil = "\x1b]0;pwned-title\x07desc \x1b[2J\x1b[31mred\x1b[0m \x9b2Jgone"
+    path = tmp_path / "runs.db"
+    s = Store(str(path))
+    a = s.begin_run("show", ["-sC", "show version"], "u", 3, "0", run_id="20261026-100000-aaaa")
+    s.add(a, "R1", 0, "show version", True, 1, None, f"Hostname: R1\n{evil}\nModel: vmx")
+    s.add(a, "R2", 0, "show version", False, 1, f"refused: {evil}")
+    s.add(a, "R3", 0, "show version", True, 1, None, json.dumps({"descr": evil}), fmt="json")
+    b = s.begin_run("show", ["-sC", "show version"], "u", 1, "0", run_id="20261026-110000-bbbb")
+    s.add(b, "R1", 0, "show version", True, 1, None, f"Hostname: R1\n{evil}\nModel: mx")
+    s.close()
+    for tty, seen in ((True, "desc red gone"), (False, evil)):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: tty)
+        for argv in (("output", "R1", a), ("output", "R2", a), ("grep", "desc", "--device", "R1"),
+                     ("field", "descr"), ("failed", a), ("diff", "R1", a, b), ("export", a)):
+            _, out, err = reader(capsys, path, *argv)
+            assert seen in out + err, argv
+            if tty:
+                assert not any(c in out + err for c in "\x1b\x07\x9b"), argv
+        _, out, _ = reader(capsys, path, "export", a, "--format", "jsonl")
+        assert json.loads(out.splitlines()[0])["output"] == f"Hostname: R1\n{seen}\nModel: vmx"
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    rc, out, _ = reader(capsys, path, "diff", "R1", a, b)             # each diff line on a screen line
+    assert rc == 1 and "-Model: vmx\n+Model: mx\n" in out
+    rc, out, err = reader(capsys, path, "export", a, "--out", str(tmp_path / "rows.csv"))
+    assert rc == 0 and out == "" and evil in (tmp_path / "rows.csv").read_text()   # a file is not a terminal
+
+
 def test_the_reader_looks_where_the_run_wrote(tmp_path, capsys, monkeypatch):
     """--store, else HSSH_STORE, else the config file's `store`, else h-ssh.db here."""
     from hssh import core
@@ -402,6 +436,23 @@ def test_the_row_is_the_reply_as_it_came_whether_stdout_is_a_terminal_or_a_pipe(
             assert not any(c in out for c in ("\x1b", "\x07", "\x85", "\x0b", "\x0c")), where
         else:
             assert "\x1b[31m red\x1b[0m\x07 bell" in out, where
+
+
+def test_a_crlf_reply_keeps_its_line_endings_in_the_row_and_on_raw_to_a_pipe(tmp_path, monkeypatch, capsys):
+    """An exec channel that ends its lines with CRLF (an IOS-shaped device)
+    came out LF in the record and on --raw, from a splitlines(). The reply's
+    own line endings are kept; only the line end after its last line goes,
+    with the runner's framing."""
+    reply = "interface Gi0/1\r\n description uplink\r\n shutdown\r\n"
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: reply)
+    monkeypatch.setitem(drivers.MODULES, "ios@ssh", fake)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    path = tmp_path / "runs.db"
+    rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(path), "--target", "R1:10.0.0.1:ios@ssh",
+                                                 "-sC", "show running-config interface Gi0/1", "--raw"], fake=fake)
+    assert rc == 0, err
+    assert out == "R1:\ninterface Gi0/1\r\n description uplink\r\n shutdown\n\n"
+    assert rows(path, "SELECT output FROM results")[0]["output"] == "interface Gi0/1\r\n description uplink\r\n shutdown"
 
 
 def test_the_store_env_var_names_the_file(tmp_path, monkeypatch, capsys):

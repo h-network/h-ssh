@@ -36,6 +36,7 @@ from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .store import Store, StoreError, ENV_VAR as STORE_ENV, DEFAULT as STORE_DEFAULT, where as store_where
+from .screen import terminal_safe, is_terminal as _tty
 from . import __version__
 from . import drivers
 
@@ -60,24 +61,6 @@ def list_vendors_lines():
 
 
 _RESULT_HEADER_KEYS = ("DEVICE:", "HOST:", "MODE:", "VENDOR:")
-
-
-# What a terminal would act on rather than show: C0 controls other than tab
-# and newline, DEL, C1 controls, and every ESC sequence (CSI, OSC, the rest).
-_TERMINAL_CONTROLS = re.compile(
-    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"   # CSI (7- or 8-bit) … final byte
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC … BEL or ST
-    r"|\x1b[@-Z\\-_]"                    # two-byte ESC sequences
-    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
-
-
-def terminal_safe(text: str) -> str:
-    """Device output as it may be shown on the operator's terminal: a device
-    (or a description field) cannot repaint, hide or retitle anything.
-    Files keep the raw bytes; this is for the screen only."""
-    if not text:
-        return text
-    return _TERMINAL_CONTROLS.sub("", text)
 
 
 def strip_result_header(out_text: str, command: str = None) -> str:
@@ -216,15 +199,6 @@ def _ask(prompt: str, secret: bool = False) -> str:
     finally:
         if previous is not None:
             signal.signal(signal.SIGINT, previous)
-
-
-def _tty(stream) -> bool:
-    """Is this a terminal? False for a closed or absent stream (`>&-` leaves
-    sys.stdout as None) instead of a traceback."""
-    try:
-        return bool(stream is not None and stream.isatty())
-    except (AttributeError, ValueError, OSError):
-        return False
 
 
 class _Parser(argparse.ArgumentParser):
@@ -1023,9 +997,12 @@ async def main() -> int:
     units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
     # Each entry keeps its own store row: seq counts up per device in file
     # order (a batch's commands do the same), so a device a job names twice
-    # does not have its first row replaced by its second.
+    # does not have its first row replaced by its second. It moves on by one
+    # an entry because a job entry is one row (a show or an edit); an entry
+    # that wrote several rows would have to move it on by as many.
     seq_of, counted = [], {}
     for t, je in units:
+        assert je is None or je.mode in ("show", "edit-cmd"), f"job entry mode {je.mode!r}: seq counts one row an entry"
         seq_of.append(counted.get(t.name, 0))
         counted[t.name] = seq_of[-1] + 1
 

@@ -572,13 +572,16 @@ second table, `runs`, has one row per invocation: when it started and finished, 
 about, the whole command line, who ran it and from where, and the counts. Everything is kept as it
 came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
 a `show configuration` keeps its hashes; escape sequences and control characters are taken out of
-what a terminal is shown, never out of the record (the store, `--log` and `--json` hold the same
-bytes whether the run was started from a terminal or a pipe). The file is created 0600, opened and
-its tables made before the first device: a store that cannot be written is no run (exit 2, nothing
-sent), because a run nobody can look up afterwards is not worth having. A store that fails during
-the run (the disk fills, someone deletes or replaces the file) does not stop the devices' replies
-from being shown; the loss is said as it happens, counted at the end with its reason, and the run
-exits 4. A file overwritten in place (same inode) is the one case that goes unnoticed.
+what a terminal is shown, by `h-ssh` and by `h-ssh-store` alike, never out of the record: the store,
+`--log` and `--json` hold the same bytes whether the run was started from a terminal or a pipe, the
+reply's own line endings included (a device that ends its lines with CRLF keeps them there and on
+`--raw` to a pipe), and `h-ssh-store` hands a pipe or an `export --out` file the rows as they were
+kept. The file is created 0600, opened and its tables made before the first device: a store that
+cannot be written is no run (exit 2, nothing sent), because a run nobody can look up afterwards is
+not worth having. A store that fails during the run (the disk fills, someone deletes or replaces the
+file) does not stop the devices' replies from being shown; the loss is said as it happens, counted at
+the end with its reason, and the run exits 4. A file overwritten in place (same inode) is the one
+case that goes unnoticed.
 
 Writes are one transaction per device result, in WAL mode with `synchronous=NORMAL`: a row costs
 about a tenth of a millisecond, a 250-device run adds a few tens of milliseconds, the file never
@@ -985,7 +988,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (931 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (936 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

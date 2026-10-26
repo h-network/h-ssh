@@ -189,6 +189,49 @@ def test_a_store_opened_by_a_relative_path_is_still_itself_after_a_chdir(tmp_pat
     st.close()
 
 
+def test_a_dot_dot_after_a_symlinked_directory_is_the_file_sqlite_opened(tmp_path, monkeypatch, capsys):
+    """abspath() takes `link/..` away as text, where the kernel and SQLite go
+    up from wherever the link leads: the identity was bound to a file that
+    was not there, and a run that kept its row in real/x.db said the store
+    had been deleted (exit 4, the run row left open). The path is joined to
+    the directory, not normalised, and a directory a new store needs is made
+    where the kernel will look for it."""
+    (tmp_path / "real" / "sub").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "real" / "sub")
+    monkeypatch.chdir(tmp_path)
+    rc, out, err = run_cli(monkeypatch, capsys, ["--store", "link/../x.db", "--target", "R1:10.0.0.1:junos",
+                                                 "-sC", "show version"])
+    assert rc == 0 and "WARNING" not in err, err
+    run, = rows(tmp_path / "real" / "x.db", "SELECT * FROM runs")
+    assert run["finished"] is not None and len(rows(tmp_path / "real" / "x.db", "SELECT * FROM results")) == 1
+    assert not (tmp_path / "x.db").exists()
+    st = Store("link/../new/y.db")
+    assert st.still_there() is None and (tmp_path / "real" / "new" / "y.db").is_file()
+    assert not (tmp_path / "new").exists()
+    st.close()
+
+
+def test_a_store_in_a_directory_that_was_removed_is_refused_with_the_reason(tmp_path, monkeypatch, capsys):
+    """Binding the identity asked for the current directory before the reader
+    looked for the file, and a removed directory has none: a traceback where
+    the reader says no run is kept there. A run started there was a
+    traceback too; it is refused with the reason, exit 2, nothing sent."""
+    import types
+    from hssh import core
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    monkeypatch.delenv("HSSH_STORE", raising=False)
+    monkeypatch.setattr(core, "get_config_path", lambda: tmp_path / "no-config")
+    assert S.main(["runs"]) == 2
+    assert "no store at h-ssh.db: no run has been kept here" in capsys.readouterr()[1]
+    sent = []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: sent.append(a) or "x")
+    rc, out, err = run_cli(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "show version"], fake=fake)
+    assert rc == 2 and "ERROR: store h-ssh.db: No such file or directory; " in err and sent == []
+
+
 def test_a_device_failure_and_a_store_loss_both_show_and_exit_4(tmp_path, monkeypatch, capsys):
     import types
     db = tmp_path / "both.db"

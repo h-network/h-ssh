@@ -38,6 +38,8 @@ import sys
 import time
 from typing import Iterable, List, Optional
 
+from .screen import is_terminal, terminal_safe
+
 ENV_VAR = "HSSH_STORE"
 DEFAULT = "h-ssh.db"          # in the directory h-ssh runs from: the evidence sits with the job
 CONFIG_KEY = "store"          # `store = PATH` in ~/.h-ssh/config
@@ -138,20 +140,25 @@ class Store:
 
     def __init__(self, path: str, readonly: bool = False):
         self.path = path
+        if readonly and not os.path.exists(path):
+            raise StoreError(f"no store at {path}: no run has been kept here "
+                             f"(--store PATH or {ENV_VAR} for another file)")
         # Bound now: a library script that opens "h-ssh.db" and chdirs later
-        # still has the same file. Messages keep the path as given.
-        self.abspath = os.path.abspath(path)
+        # still has the same file. Joined to the directory, not normalised:
+        # abspath() takes `link/..` away as text, where the kernel (and SQLite)
+        # go up from wherever the link leads. Messages keep the path as given.
+        try:
+            self.abspath = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+        except OSError as e:                # the directory h-ssh runs from was removed
+            raise StoreError(f"{path}: {e.strerror or e}") from e
         if readonly:
-            if not os.path.exists(path):
-                raise StoreError(f"no store at {path}: no run has been kept here "
-                                 f"(--store PATH or {ENV_VAR} for another file)")
             uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
             try:
                 self.conn = sqlite3.connect(uri, uri=True)
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         else:
-            self._create_private(path)
+            self._create_private(path, self.abspath)
             try:
                 # Not pinned to the opening thread: a library caller may open a
                 # store here and write it from the thread that consumes the results.
@@ -183,10 +190,11 @@ class Store:
         return None
 
     @staticmethod
-    def _create_private(path: str) -> None:
+    def _create_private(path: str, bound: str) -> None:
         """The file is made 0600 before SQLite ever opens it, and must be a
-        regular file (no following a planted symlink into another file)."""
-        directory = os.path.dirname(os.path.abspath(path))
+        regular file (no following a planted symlink into another file). Its
+        directory is made from the bound path, where the kernel will look."""
+        directory = os.path.dirname(bound)
         try:
             os.makedirs(directory, mode=0o700, exist_ok=True)
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
@@ -256,10 +264,11 @@ class Store:
         else one row, with `command` what was sent (the resolved show, the
         edit payload, `rollback N`, `show system commit`) and the output the
         reply, the diff, or the commit history as JSON. `seq` is the first
-        row's: 0, or the entry's place among its device's entries in a job,
-        so a device the job names twice keeps both rows (a batch's commands
-        follow at seq + 1, ...). One transaction per device result, however
-        many rows. Returns the rows written."""
+        row's (a batch's commands follow at seq + 1, ...): 0, or in a job that
+        names one device in several entries, the entry's place among them,
+        which is enough because a job entry is one row (a show or an edit).
+        One transaction per device result, however many rows. Returns the
+        rows written."""
         device, host, vendor = entry["device"], entry.get("host"), entry.get("vendor")
         duration = entry.get("duration_ms")
         with self.conn:
@@ -368,6 +377,13 @@ def _store_path(args) -> str:
     return where(args.store, config)
 
 
+def _shown_on(stream):
+    """How the reader prints stored text to `stream`: on a terminal, what the
+    terminal would act on is taken out, as h-ssh does with a reply; a pipe or
+    a file gets the bytes as they were kept."""
+    return terminal_safe if is_terminal(stream) else (lambda text: text)
+
+
 def _table(rows: Iterable[Iterable[str]], head: Iterable[str]) -> List[str]:
     rows = [tuple(str(c) for c in r) for r in rows]
     head = tuple(head)
@@ -397,7 +413,9 @@ def cmd_runs(store: Store, args) -> int:
 
 def cmd_failed(store: Store, args) -> int:
     run_id = store.resolve_run(args.run)
-    rows = [(r["device"], r["seq"], _short_cmd(r["command"]), (r["error"] or "").strip().splitlines()[0] if r["error"] else "-")
+    shown = _shown_on(sys.stdout)
+    rows = [(r["device"], r["seq"], _short_cmd(r["command"]),
+             shown((r["error"] or "").strip().splitlines()[0]) if r["error"] else "-")
             for r in store.results(run_id=run_id, ok=False)]
     print(f"run {run_id}: {len(rows)} failed")
     if rows:
@@ -409,9 +427,10 @@ def cmd_output(store: Store, args) -> int:
     run_id = store.resolve_run(args.run)
     row = store.output(run_id, args.device, args.seq)
     if row["output"] is not None:
-        sys.stdout.write(row["output"] if row["output"].endswith("\n") else row["output"] + "\n")
+        text = _shown_on(sys.stdout)(row["output"])
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
     if not row["ok"]:
-        print(f"ERROR: {row['error'] or 'failed'}", file=sys.stderr)
+        print(f"ERROR: {_shown_on(sys.stderr)(row['error'] or 'failed')}", file=sys.stderr)
         return 1
     return 0
 
@@ -422,12 +441,13 @@ def cmd_grep(store: Store, args) -> int:
     except re.error as e:
         raise StoreError(f"bad pattern {args.pattern!r}: {e}")
     run_id = store.resolve_run(args.run) if args.run else None
+    shown = _shown_on(sys.stdout)
     hits = 0
     for r in store.results(run_id=run_id, device=args.device, command=args.command, ok=True):
         for line in (r["output"] or "").splitlines():
             if pattern.search(line):
                 hits += 1
-                print(f"{r['run_id']}  {r['device']}  {_short_cmd(r['command'], 32)}: {line.rstrip()}")
+                print(f"{r['run_id']}  {r['device']}  {_short_cmd(r['command'], 32)}: {shown(line.rstrip())}")
     return 0 if hits else 1
 
 
@@ -449,6 +469,7 @@ def cmd_field(store: Store, args) -> int:
     """A dotted path into a JSON reply (a `--format json` show, or a commit
     history): the device's own structure, read, not parsed."""
     run_id = store.resolve_run(args.run) if args.run else None
+    as_shown = _shown_on(sys.stdout)
     shown = 0
     for r in store.results(run_id=run_id, device=args.device, command=args.command, ok=True):
         if r["format"] != "json" or not r["output"]:
@@ -462,7 +483,7 @@ def cmd_field(store: Store, args) -> int:
             continue
         shown += 1
         text = value if isinstance(value, str) else json.dumps(value)
-        print(f"{r['run_id']}  {r['device']}  {args.path} = {text}")
+        print(f"{r['run_id']}  {r['device']}  {args.path} = {as_shown(text)}")
     return 0 if shown else 1
 
 
@@ -471,6 +492,11 @@ def cmd_diff(store: Store, args) -> int:
     ra, rb = store.output(a, args.device, args.seq), store.output(b, args.device, args.seq)
     la, lb = (ra["output"] or "").splitlines(keepends=True), (rb["output"] or "").splitlines(keepends=True)
     diff = list(difflib.unified_diff(la, lb, fromfile=f"{args.device} {a}", tofile=f"{args.device} {b}"))
+    if is_terminal(sys.stdout):
+        # What the terminal would act on taken out, and each diff line on a
+        # screen line of its own: VT, FF and NEL end a line here and go with
+        # the rest, and a reply's last line has no newline of its own.
+        diff = [ln if ln.endswith("\n") else ln + "\n" for ln in map(terminal_safe, diff)]
     sys.stdout.writelines(diff)
     if diff and not diff[-1].endswith("\n"):
         print()
@@ -502,19 +528,25 @@ EXPORT_FIELDS = ("run_id", "device", "seq", "host", "vendor", "command", "ts", "
 def cmd_export(store: Store, args) -> int:
     """The rows as they are, for a spreadsheet or a notebook: CSV (Excel opens
     it; a multi-line reply stays one quoted cell) or JSON Lines, one object a
-    row. One run (default: the last) or --all; --out writes a file."""
+    row. One run (default: the last) or --all; --out writes a file. Printed
+    to a terminal, the text is shown as `output` shows it."""
     run_id = None if args.all else store.resolve_run(args.run)
     rows = store.results(run_id=run_id, device=args.device, command=args.command)
     out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
+    shown = _shown_on(out)
+
+    def cells(r):
+        return [shown(r[f]) if isinstance(r[f], str) else r[f] for f in EXPORT_FIELDS]
+
     try:
         if args.format == "csv":
             writer = csv.writer(out)
             writer.writerow(EXPORT_FIELDS)
             for r in rows:
-                writer.writerow([r[f] for f in EXPORT_FIELDS])
+                writer.writerow(cells(r))
         else:
             for r in rows:
-                out.write(json.dumps({f: r[f] for f in EXPORT_FIELDS}, ensure_ascii=False) + "\n")
+                out.write(json.dumps(dict(zip(EXPORT_FIELDS, cells(r))), ensure_ascii=False) + "\n")
     finally:
         if args.out:
             out.close()

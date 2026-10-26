@@ -845,6 +845,34 @@ def test_a_batch_is_one_row_per_command_and_an_open_store_is_left_open(monkeypat
     store.close()
 
 
+def test_one_reply_is_the_same_row_whether_fleet_or_the_cli_kept_it(monkeypatch, tmp_path, capsys):
+    """Fleet still joined the reply's splitlines(), which the CLI no longer
+    does (#111): CR, NEL, VT, FF and U+2028/9 became LF in a Fleet row and
+    stayed in a CLI row, so `h-ssh-store diff` between the two said the
+    device had changed when it had not. A show and a batch's commands alike."""
+    from tests.test_store import run_cli
+    reply = ("interface Gi0/1\r\n description \x1b[31muplink\x1b[0m\x07\r\n"
+             "nel\x85vt\x0bff\x0cls\u2028ps\u2029end\r\n shutdown \r\n")
+    fake = install(monkeypatch, show=lambda *a, **kw: reply,
+                   show_batch=lambda host, user, passwd, cmds, *a, **kw:
+                   [{"command": c, "ok": True, "output": f"$ {c}\n{reply}"} for c in cmds])
+    with Fleet(["R1:10.0.0.1:junos"], user="u", store=str(tmp_path / "fleet.db")) as fleet:
+        assert all(r.ok for r in fleet.show("show version"))
+        assert all(r.ok for r in fleet.batch(["show version", "show route"]))
+    batch = tmp_path / "batch.txt"
+    batch.write_text("show version\nshow route\n")
+    for argv in (["-sC", "show version"], ["--batch", str(batch)]):
+        rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(tmp_path / "cli.db"),
+                                                     "--target", "R1:10.0.0.1:junos", *argv], fake=fake)
+        assert rc == 0, err
+    sql = ("SELECT runs.mode, seq, results.command, format, output FROM results JOIN runs USING (run_id) "
+           "ORDER BY runs.rowid, seq")
+    kept = rows(tmp_path / "fleet.db", sql)
+    assert kept == rows(tmp_path / "cli.db", sql) and [r["mode"] for r in kept] == ["show", "show-batch", "show-batch"]
+    assert kept[0]["output"] == reply.rstrip()                    # a show: framed without its trailing whitespace
+    assert kept[1]["output"] == kept[2]["output"] == reply.rstrip("\n")   # a batch's command: the echo dropped
+
+
 def test_a_run_the_caller_never_finished_is_recorded_as_interrupted(monkeypatch, tmp_path):
     release, started = threading.Event(), threading.Event()
     install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2", "10.0.0.3"}))
