@@ -2,9 +2,12 @@
 shipped ones; --list-profiles shows both; a profile is run exactly like --batch."""
 
 import asyncio
+import errno
 import os
+import shutil
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -87,3 +90,158 @@ def test_list_profiles_shows_yours_and_the_shipped_ones(home, monkeypatch, capsy
     assert rc == 0
     assert out.index("yours (") < out.index("core ") < out.index("shipped (") < out.index("junos-health")
     assert "  8 commands  Junos health" in out and " 10 commands  Junos snapshot" in out and "1 commands  core routers" in out
+
+
+def test_a_profile_that_is_not_utf8_is_said_so_and_still_listed(home, monkeypatch, capsys):
+    """#110: a Latin-1 accent in a comment was a UnicodeDecodeError traceback
+    on --profile and --batch, and on --list-profiles through describe(); on
+    `--profile nope` the codec error came out instead of the "no profile" line."""
+    mine = home / ".h-ssh" / "profiles"
+    mine.mkdir(parents=True)
+    latin = mine / "latin.txt"
+    latin.write_bytes("# caf\xe9 routers\nshow version\n".encode("latin-1"))
+    (mine / "core.txt").write_text("# core routers\nshow bgp summary\n")
+    rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "latin", "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and "Traceback" not in err
+    assert f"ERROR reading profile 'latin' ({latin}): not UTF-8 text" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["--batch", str(latin), "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and f"ERROR reading batch file '{latin}': not UTF-8 text" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "nope", "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and "ERROR: no profile 'nope'" in err and "codec" not in err
+    assert profiles.describe(latin) == (None, "not UTF-8 text")
+    assert [(n, c) for n, _, c, _ in profiles.listing()][:2] == [("core", 1), ("latin", None)]
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--list-profiles"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 0 and "  1 commands  core routers" in out and "  unreadable  not UTF-8 text" in out
+    assert out.index("core ") < out.index("latin ") < out.index("shipped (")
+
+
+def test_a_profile_without_read_permission_is_said_so_and_still_listed(home, monkeypatch, capsys):
+    """The same for a file the user may not read: a PermissionError traceback
+    before. Root may read a mode-000 file, and CI runs as root, so there the
+    read is refused as it is for anyone else rather than the test skipped
+    (#110 review: skipped there, it left the OSError handlers untested on CI)."""
+    mine = home / ".h-ssh" / "profiles"
+    mine.mkdir(parents=True)
+    locked = mine / "locked.txt"
+    locked.write_text("# locked\nshow version\n")
+    locked.chmod(0)
+    if os.access(locked, os.R_OK):
+        read_text = Path.read_text
+
+        def refused(self, *a, **kw):
+            if self == locked:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(self))
+            return read_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", refused)
+    try:
+        rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "locked", "R1:10.0.0.1:junos"])
+        assert rc == 2 and seen == [] and "Traceback" not in err
+        assert f"ERROR reading profile 'locked' ({locked}): Permission denied" in err
+        rc, out, err, seen = run(monkeypatch, capsys, ["--batch", str(locked), "R1:10.0.0.1:junos"])
+        assert rc == 2 and seen == [] and f"ERROR reading batch file '{locked}': Permission denied" in err
+        rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "nope", "R1:10.0.0.1:junos"])
+        assert rc == 2 and "ERROR: no profile 'nope'" in err and "locked" in err
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--list-profiles"])
+        rc = asyncio.run(cli.main())
+        out, err = capsys.readouterr()
+        assert rc == 0 and "  unreadable  Permission denied" in out and "locked" in out
+    finally:
+        locked.chmod(0o600)
+
+
+@pytest.mark.parametrize("pathlib", ["as this Python has it", "as newer Pythons have it"])
+def test_a_profile_or_batch_behind_a_directory_that_may_not_be_read_is_said_so(home, monkeypatch, capsys, pathlib):
+    """The same behind a directory that may not be searched or read, where
+    the check that the file is there raised before it was ever opened; and
+    on a Python whose Path.is_file() says False there instead of raising,
+    as newer ones do, where it was 'not found' (#110 review)."""
+    if pathlib == "as newer Pythons have it":
+        monkeypatch.setattr(Path, "is_file", lambda self, **kw: os.path.isfile(self))
+        monkeypatch.setattr(Path, "is_dir", lambda self, **kw: os.path.isdir(self))
+    shut = home / "shut"
+    shut.mkdir()
+    batch = shut / "cmds.txt"
+    batch.write_text("show version\n")
+    mine = home / ".h-ssh" / "profiles"
+    mine.mkdir(parents=True)
+    (mine / "core.txt").write_text("show version\n")
+    shut.chmod(0)
+    mine.chmod(0)
+    try:
+        if os.access(shut, os.X_OK):
+            pytest.skip("a mode-000 directory is searchable here (root)")
+        rc, out, err, seen = run(monkeypatch, capsys, ["--batch", str(batch), "R1:10.0.0.1:junos"])
+        assert rc == 2 and seen == [] and f"ERROR reading batch file '{batch}': Permission denied" in err
+        rc, out, err, seen = run(monkeypatch, capsys, ["--profile", str(batch), "R1:10.0.0.1:junos"])
+        assert rc == 2 and seen == [] and f"ERROR reading profile '{batch}' ({batch}): Permission denied" in err
+        rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "core", "R1:10.0.0.1:junos"])
+        assert rc == 2 and seen == [] and f"ERROR reading profile 'core' ({mine / 'core.txt'}): Permission denied" in err
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--list-profiles"])
+        rc = asyncio.run(cli.main())
+        out, err = capsys.readouterr()
+        assert rc == 2 and f"ERROR reading {mine}: Permission denied" in err
+    finally:
+        shut.chmod(0o700)
+        mine.chmod(0o700)
+
+
+def test_a_link_that_loops_is_said_so_and_never_hides_the_other_profiles(home, monkeypatch, capsys):
+    """#110 review: an entry of ~/.h-ssh/profiles that cannot be looked at (a
+    link that loops, or one into a directory that may not be searched) made
+    --list-profiles exit 2 with nothing listed, and `--profile nope` name
+    that file instead of saying there is no such profile. It is listed as
+    unreadable, with the reason; named by --profile or --batch it is said so;
+    a profiles directory that loops is said so. A loop needs no permissions,
+    so this runs as root too, as CI does."""
+    mine = home / ".h-ssh" / "profiles"
+    mine.mkdir(parents=True)
+    (mine / "core.txt").write_text("# core routers\nshow bgp summary\n")
+    loop = mine / "loop.txt"
+    loop.symlink_to(loop.name)
+    why = os.strerror(errno.ELOOP)
+    assert [r for r in profiles.listing() if r[1] == "yours"] == [("core", "yours", 1, "core routers"),
+                                                                  ("loop", "yours", None, why)]
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--list-profiles"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 0 and err == "" and "  1 commands  core routers" in out and f"  unreadable  {why}" in out
+    assert out.index("core ") < out.index("loop ") < out.index("shipped (") < out.index("junos-health")
+    rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "nope", "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and "ERROR: no profile 'nope'" in err and "(have: core, loop, junos-health" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "loop", "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and f"ERROR reading profile 'loop' ({loop}): {why}" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["--batch", str(loop), "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and f"ERROR reading batch file '{loop}': {why}" in err
+    shutil.rmtree(mine)
+    mine.symlink_to(mine.name)
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--list-profiles"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 2 and out == "" and f"ERROR reading {mine}: {why}" in err
+
+
+def test_a_profile_under_format_is_reads_only(home, monkeypatch, capsys):
+    """#110: `-sC "request system reboot" --format json` was refused before any
+    I/O; a profile with such a line went whole to rpc_batch, on every router."""
+    calls = []
+
+    def rpc_batch(host, user, passwd, cmds, *a, **kw):
+        calls.append((host, list(cmds)))
+        return [{"command": c, "ok": True, "output": {}} for c in cmds]
+
+    # a module is believed on the functions it has: rpc() is what says "--format works here"
+    fake = types.SimpleNamespace(AVAILABLE=True, rpc_batch=rpc_batch, rpc=lambda *a, **kw: {})
+    mine = home / ".h-ssh" / "profiles"
+    mine.mkdir(parents=True)
+    (mine / "reboot.txt").write_text("# a read, then not\nshow version\nrequest system reboot\n")
+    (mine / "reads.txt").write_text("show version\nshow route summary\n")
+    for fmt in ("json", "xml"):
+        rc, out, err, _ = run(monkeypatch, capsys, ["--profile", "reboot", "--format", fmt, "R1:10.0.0.1:junos"], fake=fake)
+        assert rc == 2 and calls == [], err
+        assert f"ERROR: --format {fmt} runs reads only (show …, get-*); 'request system reboot' would act on " \
+               "the device with no confirmation. Nothing was sent." in err
+    rc, out, err, _ = run(monkeypatch, capsys, ["--profile", "reads", "--format", "json", "R1:10.0.0.1:junos"], fake=fake)
+    assert rc == 0 and calls == [("10.0.0.1", ["show version", "show route summary"])], err
