@@ -219,8 +219,10 @@ tick 2 14:02:43: 250 OK, 0 failed, 1 changed
 A device that fails on a tick shows as `OK -> FAIL (reason)`. A tick the store could not keep in full
 says so on its line, in the warning's words: `baseline not kept (N of M results were not kept: why)` in
 place of the baseline's run id, `; N of M results were not kept: why` after a later tick's count; what
-the store lost is still compared, as the tick got it. The structured summary line still goes to stderr
-once per tick, and any two ticks can be compared later with `h-ssh-store diff DEVICE RUN_A RUN_B`.
+the store lost is still compared, as the tick got it. With `--diff` every tick also prints how each
+device's reply differs from the first device's, as a single run does. The structured summary line
+still goes to stderr once per tick, and any two ticks can be compared later with
+`h-ssh-store diff DEVICE RUN_A RUN_B`.
 Ctrl-C between ticks stops the watch and says how many ticks are kept, and how many were not kept in
 full. The exit code is the worst tick's, in this order: `130` > `4` > `2` > `1` > `3` > `0`. A device
 that failed on one tick is exit `1` however clean the ticks after it, and a tick that cannot start ends
