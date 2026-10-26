@@ -37,6 +37,7 @@ from .. import drivers
 from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
+from ..errors import LocalError
 from .cli import Cli, edit_policy, refuse_commit_lines
 
 try:
@@ -173,7 +174,7 @@ def _locked(path: str, op: int, timeout: float) -> int:
                         seen, deadline = current, time.monotonic() + timeout
                     elif time.monotonic() >= deadline or (path in _GAVE_UP and _GAVE_UP[path] == current):
                         _GAVE_UP[path] = current
-                        raise RuntimeError(f"{path} is locked by another h-ssh run (one stopped with Ctrl-Z "
+                        raise LocalError(f"{path} is locked by another h-ssh run (one stopped with Ctrl-Z "
                                            "while it pinned?); resume or end it") from None
                     time.sleep(pause)
                     pause = min(pause * 2, 0.05)

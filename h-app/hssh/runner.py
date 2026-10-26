@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, NamedTuple, Optional, Tuple
 
-from .errors import NotAppliedError
+from .errors import LocalError, NotAppliedError
 from .audit import secure_write
 from .core import Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
@@ -102,8 +102,9 @@ def is_connect_failure(exc_or_text) -> bool:
 
 
 def _is_local_error(exc) -> bool:
-    """True for failures raised before any device I/O: validation and missing files."""
-    return isinstance(exc, (ValueError, FileNotFoundError))
+    """True for failures raised before any device I/O: validation, missing
+    files, and refusals made on this machine (a pin file another run holds)."""
+    return isinstance(exc, (ValueError, FileNotFoundError, LocalError))
 
 
 def _say(text: str) -> None:

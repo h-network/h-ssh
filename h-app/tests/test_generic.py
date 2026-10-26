@@ -963,6 +963,89 @@ def test_the_workers_queued_behind_a_stopped_run_give_up_with_the_first_not_one_
     assert [line.split()[0] for line in pins.read_text().splitlines()] == ["10.0.0.1", "10.0.0.3", "10.0.0.2"]
 
 
+def test_a_pin_file_another_run_keeps_locked_starts_no_cooldown(offline, home, tmp_path):
+    """The lock is this machine's problem, not the device's: under
+    --safety-file it failed the device with a 120 s cooldown, kept in the
+    safety file, so the rerun the message asks for was refused too."""
+    from hssh.safety import SafetyGate
+    pins = _pins_with(home, _key_line("10.0.0.1", offline.server_key))       # pinned already: only a read
+    ssh._PINS.clear()
+    safety = tmp_path / "safety.json"
+
+    def run():
+        return runner.run_for_target(
+            t=Target("R1", "10.0.0.1", "ssh"), transport="ssh", mode="show", show_cmd="show version",
+            edit_cmd=None, config_dir=None, broadcast_file=None, user="u", passwd="p",
+            session_timeout=1, command_timeout=30, dry_run=False, commit_confirmed=None,
+            save_dir=None, quiet=True, max_attempts=3, safety_gate=SafetyGate(safety_file=str(safety)))
+    with open(pins, "r+") as stopped:
+        fcntl.flock(stopped, fcntl.LOCK_EX)                                   # a run stopped with Ctrl-Z mid-pin
+        _, ok, out, _ = run()
+    assert ok is False and "is locked by another h-ssh run" in out
+    _, ok, out, _ = run()                                                     # the stopped run ended: run again
+    assert ok, out
+
+
+def test_a_give_up_does_not_fail_waits_once_the_stopped_run_has_resumed_and_pinned(home):
+    """The memo of a given-up wait is the file as it was then: once the
+    stopped run resumes and pins (the file changes) and goes straight on to
+    its next pin, a wait that meets that lock waits for it, not fails."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    stopped = open(pins, "r+")
+    fcntl.flock(stopped, fcntl.LOCK_EX)
+    with pytest.raises(RuntimeError, match="locked by another h-ssh run"):
+        ssh._PinPolicy(str(pins), 0.5).missing_host_key(paramiko.SSHClient(), "10.0.0.8", key)
+    held = _another_run_pins(pins, "10.0.0.2", key, stopped, goes_on=True)   # resumed: pins, then its next pin
+    out = []
+
+    def pin():
+        try:
+            ssh._PinPolicy(str(pins), 0.5).missing_host_key(paramiko.SSHClient(), "10.0.0.9", key)
+            out.append(None)
+        except Exception as e:
+            out.append(str(e))
+    waiter = threading.Thread(target=pin, daemon=True)
+    waiter.start()
+    _time.sleep(0.3)
+    fcntl.flock(held, fcntl.LOCK_UN)
+    held.close()
+    waiter.join(5)
+    assert out == [None]
+
+
+def test_a_run_that_pinned_and_then_stopped_is_given_up_on_a_session_timeout_after_its_pin(home):
+    """The wait starts again at each change of the file; a holder that
+    pinned and then stopped in its next pin is given up on a session
+    timeout after that change, not waited for without end."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    held = open(pins, "r+")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    out = []
+
+    def pin():
+        started = _time.monotonic()
+        try:
+            ssh._PinPolicy(str(pins), 1.0).missing_host_key(paramiko.SSHClient(), "10.0.0.9", key)
+            out.append((_time.monotonic() - started, None))
+        except Exception as e:
+            out.append((_time.monotonic() - started, str(e)))
+    waiter = threading.Thread(target=pin, daemon=True)
+    waiter.start()
+    _time.sleep(0.3)
+    held = _another_run_pins(pins, "10.0.0.2", key, held, goes_on=True)      # pins, then stops in its next pin
+    try:
+        waiter.join(5)
+        assert out, "still waiting 5 s after the holder stopped"
+        took, error = out[0]
+        assert error and "locked by another h-ssh run" in error and 1.1 < took < 3.0, out
+    finally:
+        held.close()
+
+
 def test_a_host_another_run_pins_during_this_handshake_is_checked_against_that_pin(offline, home, monkeypatch):
     """G1: the pin policy merged the file and then add()ed the key this
     server presented, over a pin another run had written since this one
