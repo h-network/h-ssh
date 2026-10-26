@@ -79,11 +79,19 @@ def strip_result_header(out_text: str, command: str = None) -> str:
         i += 1
     if i and i < len(lines) and not lines[i].strip():
         i += 1
+    return strip_echo("\n".join(lines[i:]), command)
+
+
+def strip_echo(text: str, command: str = None) -> str:
+    """One command's reply without the '$ cmd' echo a text transport opens
+    it with. A batch's replies have no runner header to lose, so a reply
+    that opens like one ('MODE: active-standby') keeps that line."""
+    lines = text.split("\n")
     # Only drop the echo when it is exactly the command we sent, so device
     # output that happens to start with '$ ' survives intact.
-    if command and i < len(lines) and lines[i] == "$ %s" % command:
-        i += 1
-    return "\n".join(lines[i:]).strip("\n")
+    if command and lines[0] == "$ %s" % command:
+        lines = lines[1:]
+    return "\n".join(lines).strip("\n")
 
 
 def document_text(output) -> str:
@@ -1234,17 +1242,16 @@ async def main() -> int:
         for coro in asyncio.as_completed(previews):
             i, res = await coro
             name, ok, out_text = res.name, res.ok, res.text
-            if _tty(sys.stdout):
-                out_text = terminal_safe(out_text)
-            # stdout stays the JSON array in --json mode; the previews go to stderr
-            print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=sys.stderr if json_mode else sys.stdout)
-            print(out_text.rstrip(), file=sys.stderr if json_mode else sys.stdout)
+            # stdout stays the JSON array in --json mode; the previews go to
+            # stderr, sanitised when that stream is a terminal. What is kept
+            # (the diff the commit must find again, the audit entry) is the reply.
+            stream = sys.stderr if json_mode else sys.stdout
+            print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=stream)
+            print((terminal_safe(out_text) if _tty(stream) else out_text).rstrip(), file=stream)
             if ok:
-                # The diff the commit must find again; "" when the preview said
-                # NO CHANGES. On a terminal it is the diff as shown, control
-                # sequences stripped, as it always was.
-                diff = res.result.diff if isinstance(res.result, R.EditResult) else ""
-                expected[i] = terminal_safe(diff) if _tty(sys.stdout) else diff
+                # The diff the commit must find again, as the device gave it;
+                # "" when the preview said NO CHANGES.
+                expected[i] = res.result.diff if isinstance(res.result, R.EditResult) else ""
             else:
                 preview_failed.append(name)
             if args.audit_log:
@@ -1345,7 +1352,7 @@ async def main() -> int:
                 for cr in cmd_results:
                     # Only text carries the echo; a --format json reply is data.
                     if cr.get("ok") and isinstance(cr.get("output"), str):
-                        cr["output"] = strip_result_header(cr["output"], cr["command"])
+                        cr["output"] = strip_echo(cr["output"], cr["command"])
                 entry["commands"] = cmd_results
                 if not ok:
                     for cr in cmd_results:
@@ -1463,7 +1470,7 @@ async def main() -> int:
                     print(f"{name}:")
                     for cr in cmd_results:
                         if cr.get("ok"):
-                            print(_screen(strip_result_header(document_text(cr["output"]), cr["command"])))
+                            print(_screen(strip_echo(document_text(cr["output"]), cr["command"])))
                         else:
                             print(f"{name}: {cr.get('command')}: {cr.get('error')}", file=sys.stderr)
                     print()
@@ -1585,7 +1592,9 @@ async def main() -> int:
     if json_mode:
         print(json.dumps(json_results, indent=2))
     else:
-        # Print diff output
+        # Print diff output, sanitised a line at a time: the diff is of the
+        # replies as they came, where VT, FF and NEL end a line, and taken out
+        # of the whole text they would run a removed line into the one before.
         if args.diff and mode in ["show", "show-batch"]:
             ok_results = [r for r in json_results if r["ok"]]
             if len(ok_results) >= 2:
@@ -1598,8 +1607,8 @@ async def main() -> int:
                         if diff_text == "(identical)":
                             print(f"    (identical)\n")
                         else:
-                            for ln in _screen(diff_text).splitlines():
-                                print(f"    {ln}")
+                            for ln in diff_text.splitlines():
+                                print(f"    {_screen(ln)}")
                             print()
                     elif mode == "show-batch":
                         print(f"  {baseline_name} vs {other['device']}:")
@@ -1608,8 +1617,8 @@ async def main() -> int:
                             if cd["diff"] == "(identical)":
                                 print(f"      (identical)")
                             else:
-                                for ln in _screen(cd["diff"]).splitlines():
-                                    print(f"      {ln}")
+                                for ln in cd["diff"].splitlines():
+                                    print(f"      {_screen(ln)}")
                         print()
                 print("--- End diff ---")
 

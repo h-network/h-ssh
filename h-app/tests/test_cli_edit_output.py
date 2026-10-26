@@ -281,6 +281,33 @@ def test_show_diff_refuses_a_diff_that_changed_after_the_preview(monkeypatch, ca
     assert [c["dry_run"] for c in driver.calls] == [True, False]
 
 
+def test_show_diff_commits_and_audits_alike_whether_stdout_is_a_terminal_or_a_pipe(monkeypatch, capsys, tmp_path):
+    """On a terminal the diff the commit had to find again was the sanitised
+    one, which a device that put an escape sequence in its diff never gives
+    again: 'diff changed since preview; nothing committed'. The preview's
+    audit entry was the sanitised text too. Both are the reply as it came
+    (#111); only the preview as printed is sanitised, for the stream it is
+    printed on: with --json, stderr."""
+    payload = "set interfaces ge-0/0/0 description \x1b[31mred"
+    for tty in (False, True):
+        answer(monkeypatch, "y")
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+        audit = tmp_path / f"audit-{tty}.jsonl"
+        driver = PreviewDriver()
+        rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", payload, "--show-diff", "--audit-log", str(audit)],
+                               driver=driver)
+        assert rc == 0 and "COMMIT OK" in out, (tty, out)
+        assert driver.calls[1]["expected_diff"] == driver.diff_of(payload)
+        preview = json.loads(audit.read_text().splitlines()[0])
+        assert preview["dry_run"] is True and driver.diff_of(payload) in preview["diff"], tty
+        assert ("\x1b" in out) is not tty
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)          # --json | jq, the previews on a terminal
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", payload, "--show-diff", "-y", "--json"],
+                           driver=PreviewDriver())
+    assert rc == 0 and "description red" in err and "\x1b" not in err
+
+
 def test_a_config_file_edited_after_the_preview_changes_nothing(monkeypatch, capsys, tmp_path):
     """-eD/-eB are read once, after the guard, and that text is what the
     preview, the commit and the audit log all see (#44): a rewrite while the
@@ -526,3 +553,102 @@ def test_output_shown_on_a_terminal_has_its_escape_sequences_removed(monkeypatch
     driver = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "Hostname: R1\x1b[2J\x1b]0;owned\x07\nModel: vmx\n")
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-sC", "show version", "--raw"], driver=driver)
     assert rc == 0 and "\x1b" not in out and "Hostname: R1" in out and "Model: vmx" in out
+
+
+def test_a_diff_on_a_terminal_keeps_each_diff_line_on_a_line_of_its_own(monkeypatch, capsys, tmp_path):
+    """--diff is made from the replies as they came (#111), where VT, FF and
+    NEL end a line. The whole diff was then sanitised for a terminal: the
+    line end went with the rest, and a removed line ran into the context
+    line before it (' vt-ff', unchanged to the eye). Each diff line is
+    sanitised on its own, so a terminal is shown the lines a pipe gets."""
+    replies = {"10.0.0.1": "line1\nvt\x0bff\nnel\x85old\nend\n", "10.0.0.2": "line1\nvt\x0bgg\nnel\x85new\nend\n"}
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show x\n")
+    driver = types.SimpleNamespace(
+        AVAILABLE=True, show=lambda host, *a, **kw: replies[host],
+        show_batch=lambda host, user, passwd, cmds, *a, **kw: [{"command": c, "ok": True, "output": replies[host]}
+                                                             for c in cmds])
+    for argv in (["-sC", "show x"], ["--batch", str(batch)]):
+        block = {}
+        for tty in (False, True):
+            monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+            rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--target", "R2:10.0.0.2:junos", "--workers", "1",
+                                                                   *argv, "--diff"], driver=driver)
+            assert rc == 0, err
+            block[tty] = out[out.index("--- Diff"):out.index("--- End diff")]
+        assert block[True] == block[False], argv
+        assert {"vt", "-ff", "+gg", "nel", "-old", "+new"} <= {ln.strip() for ln in block[True].splitlines()}, argv
+
+
+EVIL = "\x1b]0;owned\x07desc \x1b[2J\x1b[31mred\x1b[0m\x07 \x9b2Jgone"
+
+
+class EvilDriver:
+    """A junos fake whose every reply carries an OSC retitle, a clear-screen,
+    colour, BEL and an 8-bit CSI; a show's first line changes call by call.
+    With `fail`, a batch is refused whole, in the same words."""
+    AVAILABLE = True
+
+    def __init__(self, fail=False):
+        self.calls, self.fail = 0, fail
+
+    def show(self, host, *a, **kw):
+        self.calls += 1
+        return f"uptime {self.calls} on {host}\n{EVIL}\n"
+
+    def show_batch(self, host, user, passwd, cmds, *a, **kw):
+        if self.fail:
+            raise RuntimeError(f"refused by the device: {EVIL}")
+        return [{"command": c, "ok": True, "output": f"{c} on {host}\n{EVIL}"} for c in cmds]
+
+    def edit(self, *a, **kw):
+        return f"COMMIT OK\n\nDIFF:\n[edit system]\n+   host-name {EVIL};"
+
+
+R2 = ["--target", "R2:10.0.0.2:junos", "--workers", "1"]
+SCREENS = {
+    "show -v": ["-sC", "show version", "-v"],
+    "show --raw": ["-sC", "show version", "--raw"],
+    "batch --raw": ["--batch", "BATCH", "--raw"],
+    "batch -v": ["--batch", "BATCH", "-v"],
+    "failed batch -v": ["--batch", "BATCH", "-v", "--retries", "0"],
+    "edit verdict": ["-y", "-eC", "set system host-name x"],
+    "--diff": [*R2, "-sC", "show version", "--diff"],
+    "--batch --diff": [*R2, "--batch", "BATCH", "--diff"],
+    "--every tick": ["--every", "5", "--times", "2", "-sC", "show version"],
+    "--show-diff preview": ["-eC", f"set system host-name {EVIL}", "--show-diff"],
+}
+
+
+@pytest.mark.parametrize("shape", SCREENS)
+def test_a_reply_reaches_a_terminal_without_what_it_would_act_on_and_a_pipe_as_it_came(shape, monkeypatch,
+                                                                                        capsys, tmp_path):
+    """Every place h-ssh prints a reply (#47): stdout a terminal gets no ESC,
+    BEL or 8-bit CSI, stdout a pipe gets the reply byte for byte. The record
+    is the reply as it came (#111) and each print sanitises for itself, so a
+    print that forgets puts the device's escape sequences on the screen."""
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\nshow route\n")
+    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull, "--user", "u",
+                                      "--target", "R1:10.0.0.1:junos",
+                                      *[str(batch) if a == "BATCH" else a for a in SCREENS[shape]]])
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(cli, "_watch_sleep", lambda seconds: None)
+    for tty in (True, False):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+        if shape == "--show-diff preview":
+            answer(monkeypatch, "n")                          # the preview alone, nothing committed
+        monkeypatch.setattr(cli, "check_reachability", _reachable)
+        driver = PreviewDriver() if shape == "--show-diff preview" else EvilDriver(fail=shape == "failed batch -v")
+        monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
+        with pytest.raises(SystemExit) as e:
+            cli.main_sync()
+        out, err = capsys.readouterr()
+        assert e.value.code == (1 if shape == "failed batch -v" else 0), err
+        assert "desc" in out and "gone" in out, (shape, tty)
+        if tty:
+            assert not any(c in out for c in "\x1b\x07\x9b"), shape
+        else:
+            assert EVIL in out, shape

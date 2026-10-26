@@ -173,8 +173,9 @@ def test_a_store_deleted_during_the_run_is_said_not_silently_lost(tmp_path, monk
 def test_a_store_opened_by_a_relative_path_is_still_itself_after_a_chdir(tmp_path, monkeypatch):
     """still_there() stat'ed the path as given, so a library script that opened
     Store("h-ssh.db") and chdir'ed later was told the file was deleted: every
-    result not kept, the run row left open, the file untouched. The identity
-    is bound to the absolute path at open; messages keep the path as given."""
+    result not kept, the run row left open, the file untouched. The store
+    looks the file up in the directory it held open at the open; messages
+    keep the path as given."""
     monkeypatch.chdir(tmp_path)
     st = Store("h-ssh.db")
     run = st.begin_run("show", ["t"], "u", 1, "0")
@@ -193,9 +194,9 @@ def test_a_dot_dot_after_a_symlinked_directory_is_the_file_sqlite_opened(tmp_pat
     """abspath() takes `link/..` away as text, where the kernel and SQLite go
     up from wherever the link leads: the identity was bound to a file that
     was not there, and a run that kept its row in real/x.db said the store
-    had been deleted (exit 4, the run row left open). The path is joined to
-    the directory, not normalised, and a directory a new store needs is made
-    where the kernel will look for it."""
+    had been deleted (exit 4, the run row left open). The directory is
+    opened and made as the path names it, not normalised, so it is the one
+    the kernel and SQLite went to."""
     (tmp_path / "real" / "sub").mkdir(parents=True)
     (tmp_path / "link").symlink_to(tmp_path / "real" / "sub")
     monkeypatch.chdir(tmp_path)
@@ -211,11 +212,79 @@ def test_a_dot_dot_after_a_symlinked_directory_is_the_file_sqlite_opened(tmp_pat
     st.close()
 
 
+def test_a_job_directory_renamed_during_the_run_is_not_a_lost_store(tmp_path, monkeypatch, capsys):
+    """The identity was bound to a path string, so `mv customer-x
+    customer-x-done` while a run was in flight read as a deletion: exit 4,
+    every result not kept, the run row left open, with every row in
+    customer-x-done/h-ssh.db. The store holds its directory open and looks
+    the file up in it by name: a rename above it loses nothing, and a
+    deletion or a replacement is still said."""
+    import types
+    job = tmp_path / "customer-x"
+    job.mkdir()
+    monkeypatch.chdir(job)
+
+    def show(host, *a, **kw):
+        if job.exists():
+            job.rename(tmp_path / "customer-x-done")
+        return f"Hostname: {host}\n"
+
+    rc, out, err = run_cli(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "show version"],
+                           fake=types.SimpleNamespace(AVAILABLE=True, show=show))
+    assert rc == 0 and "WARNING" not in err, err
+    db = tmp_path / "customer-x-done" / "h-ssh.db"
+    run, = rows(db, "SELECT * FROM runs")
+    assert run["finished"] is not None and len(rows(db, "SELECT * FROM results")) == 1
+    st = Store(str(tmp_path / "customer-x-done" / "lib.db"))          # an absolute path: the same
+    archived = tmp_path / "archived"
+    (tmp_path / "customer-x-done").rename(archived)
+    assert st.still_there() is None
+    os.replace(archived / "h-ssh.db", archived / "lib.db")             # another file in its place
+    assert st.still_there() == "the store file was replaced during the run"
+    os.unlink(archived / "lib.db")
+    assert st.still_there() == "the store file was deleted during the run"
+    st.close()
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="names the open files through /proc")
+def test_a_store_lets_go_of_the_directory_it_holds_when_closed_or_dropped(tmp_path):
+    """still_there() looks the file up in its directory, which the store
+    holds open. A watch opens a store every tick: close() lets the directory
+    go (asked again, a closed store looks by the path, not through a dead fd),
+    and so does a store a script drops without closing it."""
+    import gc
+    here = os.path.realpath(tmp_path)
+
+    def held():                                          # what this process has open under tmp_path
+        names = []
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                names.append(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:
+                pass
+        return sorted(n for n in names if n == here or n.startswith(here + os.sep))
+
+    gc.collect()
+    stores = [Store(str(tmp_path / f"s{i}.db")) for i in range(3)]
+    assert held().count(here) == 3                       # each store holds the directory
+    for st in stores:
+        st.close()
+    assert held() == []                                  # still referenced: close() let go
+    assert [st.still_there() for st in stores] == [None] * 3          # asked after: by the path, not a dead fd
+    st = Store(str(tmp_path / "dropped.db"))
+    st.conn.close()
+    assert held() == [here]
+    del st, stores
+    gc.collect()
+    assert held() == []
+
+
 def test_a_store_in_a_directory_that_was_removed_is_refused_with_the_reason(tmp_path, monkeypatch, capsys):
-    """Binding the identity asked for the current directory before the reader
-    looked for the file, and a removed directory has none: a traceback where
-    the reader says no run is kept there. A run started there was a
-    traceback too; it is refused with the reason, exit 2, nothing sent."""
+    """A reader started in a directory that was removed met a traceback (the
+    current directory asked for before the file was looked for) where it
+    says no run is kept there, and a run started there was a traceback too.
+    Both say why instead: the reader's `no store at`, the run's exit 2 with
+    nothing sent."""
     import types
     from hssh import core
     gone = tmp_path / "gone"

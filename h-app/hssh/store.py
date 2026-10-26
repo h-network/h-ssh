@@ -36,6 +36,7 @@ import sqlite3
 import stat
 import sys
 import time
+import weakref
 from typing import Iterable, List, Optional
 
 from .screen import is_terminal, terminal_safe
@@ -90,13 +91,34 @@ CREATE INDEX IF NOT EXISTS results_command ON results(command);
 """
 
 
-def _identity(path: str):
-    """What makes the file at `path` this file: device and inode; None if nothing is there."""
+def _identity(path: str, dir_fd: Optional[int] = None):
+    """What makes the file at `path` this file: device and inode; None if nothing is there.
+    With `dir_fd`, `path` is a name in that directory."""
     try:
-        st = os.stat(path)
+        st = os.stat(path, dir_fd=dir_fd)
     except OSError:
         return None
     return (st.st_dev, st.st_ino)
+
+
+# A directory held for still_there(). O_PATH (Linux) needs no read permission
+# on it, only the search permission the path to the file needs anyway.
+_DIRECTORY = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0)
+
+
+def _hold_directory(path: str):
+    """(the file's name, an fd on the directory `path` names it in): what the
+    file is looked up by. (path, None) when the directory cannot be opened:
+    the file is then looked up by the path as given."""
+    try:
+        return os.path.basename(path), os.open(os.path.dirname(path) or ".", _DIRECTORY)
+    except OSError:
+        return path, None
+
+
+def _let_go(fd: Optional[int]) -> None:
+    if fd is not None:
+        os.close(fd)
 
 
 def _wal(conn, timeout: float = WAL_SWITCH_TIMEOUT) -> None:
@@ -140,25 +162,17 @@ class Store:
 
     def __init__(self, path: str, readonly: bool = False):
         self.path = path
-        if readonly and not os.path.exists(path):
-            raise StoreError(f"no store at {path}: no run has been kept here "
-                             f"(--store PATH or {ENV_VAR} for another file)")
-        # Bound now: a library script that opens "h-ssh.db" and chdirs later
-        # still has the same file. Joined to the directory, not normalised:
-        # abspath() takes `link/..` away as text, where the kernel (and SQLite)
-        # go up from wherever the link leads. Messages keep the path as given.
-        try:
-            self.abspath = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
-        except OSError as e:                # the directory h-ssh runs from was removed
-            raise StoreError(f"{path}: {e.strerror or e}") from e
         if readonly:
+            if not os.path.exists(path):
+                raise StoreError(f"no store at {path}: no run has been kept here "
+                                 f"(--store PATH or {ENV_VAR} for another file)")
             uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
             try:
                 self.conn = sqlite3.connect(uri, uri=True)
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         else:
-            self._create_private(path, self.abspath)
+            self._create_private(path)
             try:
                 # Not pinned to the opening thread: a library caller may open a
                 # store here and write it from the thread that consumes the results.
@@ -176,13 +190,21 @@ class Store:
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         self.conn.row_factory = sqlite3.Row
-        self.identity = _identity(self.abspath)
+        # The file is looked up by its name in its directory, which is held
+        # open from here: a library script that chdirs, a `..` after a
+        # symlinked directory and a job directory renamed during the run all
+        # still lead to the file SQLite opened; a path string would not.
+        # Messages keep the path as given.
+        self._where = _hold_directory(path)
+        self._release_dir = weakref.finalize(self, _let_go, self._where[1])
+        self.identity = _identity(*self._where)
 
     def still_there(self) -> Optional[str]:
-        """None while the path still leads to the file this store opened, else
-        why not. SQLite goes on writing to a deleted or replaced file without
-        a word, so a run asks before it says its results are kept."""
-        now = _identity(self.abspath)
+        """None while the file this store opened is still where it was opened
+        (its name in its directory), else why not. SQLite goes on writing to a
+        deleted or replaced file without a word, so a run asks before it says
+        its results are kept."""
+        now = _identity(*self._where)
         if now is None:
             return "the store file was deleted during the run"
         if now != self.identity:
@@ -190,13 +212,16 @@ class Store:
         return None
 
     @staticmethod
-    def _create_private(path: str, bound: str) -> None:
+    def _create_private(path: str) -> None:
         """The file is made 0600 before SQLite ever opens it, and must be a
         regular file (no following a planted symlink into another file). Its
-        directory is made from the bound path, where the kernel will look."""
-        directory = os.path.dirname(bound)
+        directory is made from the path as given, not normalised: abspath()
+        takes `link/..` away as text, where the kernel (and SQLite) go up from
+        wherever the link leads."""
+        directory = os.path.dirname(path)
         try:
-            os.makedirs(directory, mode=0o700, exist_ok=True)
+            if directory:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(path, flags, 0o600)
         except OSError as e:
@@ -212,6 +237,8 @@ class Store:
             self.conn.close()
         except sqlite3.Error:
             pass
+        self._where = (self.path, None)         # once closed, the fd's number may be another file's
+        self._release_dir()
 
     # --- writing ------------------------------------------------------------
 
