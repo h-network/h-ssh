@@ -53,7 +53,8 @@ def run(vendor, mode="show", **kw):
 
 # --- loading -------------------------------------------------------------------
 
-def test_an_entry_point_adds_its_driver_after_the_builtins(registry):
+def test_an_entry_point_adds_its_driver_after_the_builtins(registry, installed):
+    drivers.load([])                 # the built-ins alone, whatever this machine has installed
     before = dict(drivers.DRIVERS)
     aliases = dict(drivers.ALIASES)
     drivers.load([DUMMY])
@@ -155,12 +156,13 @@ def test_the_installed_entry_points_never_include_hsshs_own(registry, monkeypatc
         assert drivers.SOURCES["dummy@ssh"] == "entry point dummy (tests.fixtures.hssh_dummy:DRIVERS)"
 
 
-def test_load_with_no_argument_is_the_builtins_and_nothing_broken():
+def test_load_with_no_argument_is_the_builtins_and_what_is_installed(registry, installed):
     drivers.load()
     assert drivers.BROKEN == {}
-    assert len(drivers.DRIVERS) == 16
-    assert set(drivers.DRIVERS) == BUILTIN_NAMES
-    assert set(drivers.SOURCES.values()) == {"built-in"}
+    assert BUILTIN_NAMES <= set(drivers.DRIVERS)                   # a subset, not the total
+    assert installed <= set(drivers.DRIVERS) - BUILTIN_NAMES
+    assert {drivers.SOURCES[n] for n in BUILTIN_NAMES} == {"built-in"}
+    assert all(drivers.SOURCES[n] != "built-in" for n in set(drivers.DRIVERS) - BUILTIN_NAMES)
 
 
 def test_pyproject_declares_the_builtins_as_the_first_entry_point():
@@ -191,7 +193,8 @@ def test_list_vendors_shows_the_driver_with_its_source_and_the_broken_entry_poin
     assert re.fullmatch(r"dummy@ssh\s+-\s+ssh\s+dummy\s+text\s+show show_batch\s+"
                         r"entry point dummy \(tests\.fixtures\.hssh_dummy:DRIVERS\)", lines[-2]), lines[-2]
     assert lines[-1] == f"broken entry point 'broken': {BROKEN_WHY}"
-    assert len(lines) == 1 + 16 + 1 + 1
+    assert len(lines) == 1 + len(drivers.DRIVERS) + 1          # the header, a row per driver, the broken line
+    assert all(any(ln.startswith(f"{name}  ") for ln in lines[1:-1]) for name in BUILTIN_NAMES)
     assert "Traceback" not in out
 
 

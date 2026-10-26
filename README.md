@@ -137,7 +137,7 @@ h-ssh-store runs
 h-ssh-store output R1
 ```
 
-Targets are typed bare on the command line, before or between the flags. A host alone (`10.0.1.1`, `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on `--transport`; `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` name it (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints), an IPv6 host in brackets, `R1:[2001:db8::1]:junos`. `--target SPEC` is the same thing as a flag (repeatable; it wants the name). With any target typed the inventory file is not read; without one it is `--devices`, else `~/.h-ssh/devices.csv`, else `./devices.csv`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device.Each device is listed once: the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
+Targets are typed bare on the command line, before or between the flags. A host alone (`10.0.1.1`, `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on `--transport`; `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` name it (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints), an IPv6 host in brackets, `R1:[2001:db8::1]:junos`. `--target SPEC` is the same thing as a flag (repeatable; it wants the name). With any target typed the inventory file is not read; without one it is `--devices`, else `~/.h-ssh/devices.csv`, else `./devices.csv`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device. Each device is listed once, a device being its host and the port its transport uses, written or not (`R1:10.0.0.1:junos` and `R2:10.0.0.1:830:junos` are one router): the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
 
 **A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` on the target to get NETCONF, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
@@ -166,12 +166,12 @@ A password means the same on every transport: it is the credential, and no `~/.s
 
 | Flag | Mode | What it does |
 |---|---|---|
-| `-sC` | Show | Run a show/display command (or a template name). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` |
-| `-eC` | Edit command | Apply one config line to every target |
+| `-sC` | Show | Run a show/display command (or a template name): one line of text, so a line break or another control character in it is refused (exit 2). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` (exit 2, nothing sent) |
+| `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL) is refused (exit 2) |
 | `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
 | `-eB` | Edit broadcast | One config file applied to all targets |
-| `--batch` | Batch | Several show commands from a file, one connection per device |
-| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt`, or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description |
+| `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
+| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt`, or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
@@ -190,7 +190,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json -y   # the job is on stdin, so an edit cannot be confirmed there
 ```
 
-An entry may also carry `"port": 830` to override the target's port. A job with an edit entry asks the usual
+An entry may also carry `"port": 830` to override the target's port. A `show` is one line of text and an `edit` has no control character but its line breaks, as for `-sC` and `-eC`. A job with an edit entry asks the usual
 `y/N` unless `-y` is given, and the question goes to stdout, so a `--json` run wants `-y`.
 
 A device may appear in more than one entry. Its entries run one after another, in file order, so a
@@ -331,7 +331,7 @@ and nothing about connections; `hssh/dialects/ios.py` and `none.py` are the smal
 | `name` | the half of a driver name before the `@` (`ios` in `ios@ssh`), and the stem of the operator's shortcut file |
 | `title`, `description` | the name as printed to the operator, and one line on the dialect |
 | `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. Every text transport reads replies with it: a show whose reply opens with such a line is a failure, not output, and an edit stops at the line that got one. A dialect on `ssh`, `openssh` or `telnet` must have one |
-| `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*` |
+| `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*`; a command with a line break in it is never a read, whatever the dialect says |
 | `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
 | `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt). `None`: the dialect shows over those transports but cannot edit |
 | `commit_pending` | a regex whose group 1 is the minutes left on a pending commit-confirmed, as `show system commit` prints them; `-eC commit` confirms only when it finds one |
@@ -531,7 +531,7 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
 | `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure |
-| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string |
+| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2) |
 
 A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
 no traceback, and whatever had landed stands. paramiko's transport thread logs a full traceback when
@@ -810,11 +810,12 @@ The library reads no environment variable and no config file; that is the CLI's 
   that fails is said once as a `RuntimeWarning` and the run goes on; at the end `res.not_kept` says how many
   results were not kept and `res.store_error` why (a store file deleted or replaced under the run means every
   result of it, and its run row is left open, as the CLI does);
-- `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only; on another
-  transport that is the device's failure, nothing sent); `to_dicts()` is JSON-serialisable, in the shape of
-  the CLI's `--json` records.
+- `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only, and reads
+  only: on another transport, or for a command that is not a read, that is the device's failure, nothing
+  sent); `to_dicts()` is JSON-serialisable, in the shape of the CLI's `--json` records.
 
-Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's). Edits keep their gates
+Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's), one line of text: a line
+break or another control character in it is a `ValueError` before anything runs. Edits keep their gates
 in the CLI (the set-syntax guard, the pre-flight check, the question) and in the transports' own
 `edit()`/`begin()` below.
 
@@ -982,7 +983,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (926 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (951 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

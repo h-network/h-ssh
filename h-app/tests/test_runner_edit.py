@@ -426,6 +426,71 @@ def test_format_refuses_an_rpc_that_is_not_a_read(monkeypatch):
     assert ok and calls == [("rpc", "get-system-uptime-information")]
 
 
+def test_a_string_with_a_line_break_is_never_a_read(monkeypatch):
+    """#110: `show version\\nrequest system reboot` was a read by its first
+    line and re-sent on a timeout; the exec channel runs every line each
+    time. The runner holds this whatever the dialect says."""
+    calls = []
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls), "show version\nrequest system reboot")
+    assert not ok and calls == ["show version\nrequest system reboot"] and "timed out" in out
+    calls = []
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls), "show version\rshow route")
+    assert not ok and calls == ["show version\rshow route"]
+
+
+def _batch_mod(calls, fail_times=2):
+    class Mod:
+        AVAILABLE = True
+
+        @staticmethod
+        def show_batch(host, user, passwd, cmds, st, ct, port=None, vendor_hint=None):
+            calls.append(list(cmds))
+            if len(calls) <= fail_times:
+                raise RuntimeError("RpcTimeoutError: timed out")
+            return [{"command": c, "ok": True, "output": "ok"} for c in cmds]
+
+        @staticmethod
+        def rpc(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, fmt="json", args=None):
+            raise AssertionError("a batch goes to rpc_batch")       # and rpc() is what grants the capability
+
+        @staticmethod
+        def rpc_batch(host, user, passwd, cmds, st, ct, port=None, vendor_hint=None, fmt="json"):
+            calls.append(("rpc", list(cmds)))
+            return [{"command": c, "ok": True, "output": {}} for c in cmds]
+    return Mod
+
+
+def _batch(monkeypatch, mod, cmds, fmt="text"):
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", mod)
+    return runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show-batch",
+        show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3, fmt=fmt,
+        batch_cmds=cmds)
+
+
+def test_a_batch_is_retried_unless_a_line_acts_on_the_device(monkeypatch):
+    calls = []
+    _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls), ["show version", "show route summary"])
+    assert ok and calls == [["show version", "show route summary"]] * 3
+    calls = []
+    _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls), ["show version", "request system reboot"])
+    assert not ok and calls == [["show version", "request system reboot"]]
+    calls = []
+    _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls), ["show version", "show route\nrequest system reboot"])
+    assert not ok and calls == [["show version", "show route\nrequest system reboot"]]      # #110: a line break is never a read
+
+
+def test_format_refuses_a_batch_with_a_line_that_is_not_a_read(monkeypatch):
+    """#110: the show gate, for the list: a `request …` line went whole to rpc_batch."""
+    calls = []
+    _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls, fail_times=0), ["show version", "request system reboot"], fmt="json")
+    assert not ok and calls == [] and "runs reads only" in out and "'request system reboot'" in out
+    _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls, fail_times=0), ["show version", "get-system-uptime-information"], fmt="xml")
+    assert ok and calls == [("rpc", ["show version", "get-system-uptime-information"])]
+
+
 def test_is_read_command():
     """The default read rule now lives with the dialects; every dialect uses it today."""
     from hssh import dialects

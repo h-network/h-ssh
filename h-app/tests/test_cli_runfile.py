@@ -352,3 +352,11 @@ def test_a_verbose_batch_still_shows_the_command_echo_and_a_tuple_runner_still_w
     monkeypatch.setattr(cli, "run_for_target_async", bare_tuple)
     rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--user", "u", "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
     assert rc == 1 and "ERROR: no luck" in out
+
+
+def test_a_command_of_the_run_file_is_one_line_of_text(monkeypatch, capsys, tmp_path):
+    """#110: YAML can fold two lines into one string; that string is not a command."""
+    f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\ncommands:\n  - show version\n  - \"show route\\nrequest system reboot\"\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+    assert rc == 2 and drv.batches == []
+    assert f"ERROR: run file '{f}' commands: a line break in 'show route\\nrequest system reboot'; a command is one line of text." in err

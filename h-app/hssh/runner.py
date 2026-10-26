@@ -291,6 +291,20 @@ def _rpc_call(b: Bound, batch=False):
     return fn
 
 
+def is_read(dialect, command: str) -> bool:
+    """The dialect's read rule, except that a string with a line break is
+    never a read: the exec channel hands every line to the shell, so a
+    retry would run all of them again. The CLI's --format gate asks this too."""
+    return "\n" not in command and "\r" not in command and dialect.is_read(command)
+
+
+def reads_only(fmt: str, command: str) -> str:
+    """The refusal of a command that is not a read under --format, which
+    turns the text into an RPC and sends it with no gate at all."""
+    return (f"--format {fmt} runs reads only (show …, get-*); {command!r} would act on "
+            "the device with no confirmation. Nothing was sent.")
+
+
 def _run_for_target_sync(
     t: Target,
     transport: str,
@@ -356,15 +370,13 @@ def _run_for_target_sync(
             # neighbor`) is sent once: a timeout after it must not mean two
             # more reboots. --format turns the text into an RPC and sends it
             # with no gate at all, so there it is refused outright.
-            read = b.dialect.is_read(show_cmd)
+            read = is_read(b.dialect, show_cmd)
             attempts = max_attempts if read else 1
             if dry_run:
                 result = f"DRY-RUN show: {show_cmd}"
             elif fmt != "text":
                 if not read:
-                    raise ValueError(
-                        f"--format {fmt} runs reads only (show …, get-*); {show_cmd!r} would act on "
-                        "the device with no confirmation. Nothing was sent.")
+                    raise ValueError(reads_only(fmt, show_cmd))
                 # The router's own JSON or XML for the command, through its
                 # RPC translation. Only the NETCONF driver can do that; a
                 # transport that cannot refuses here, before any device I/O.
@@ -467,13 +479,19 @@ def _run_for_target_sync(
             output.append(typed.rstrip())
 
         elif mode == "show-batch":
-            if batch_cmds and not all(b.dialect.is_read(c) for c in batch_cmds):
-                max_attempts = 1
             if not batch_cmds:
                 raise ValueError("No batch commands provided.")
+            # The show rule, for the list: one line that acts on the device
+            # makes the whole batch a single attempt, and under --format it
+            # is refused outright, before any I/O.
+            acting = [c for c in batch_cmds if not is_read(b.dialect, c)]
+            if acting:
+                max_attempts = 1
             if dry_run:
                 cmd_results = [{"command": c, "ok": True, "output": f"DRY-RUN show: {c}"} for c in batch_cmds]
             elif fmt != "text":
+                if acting:
+                    raise ValueError(reads_only(fmt, acting[0]))
                 cmd_results = _with_retry(_rpc_call(b, batch=True), name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
                                           port=t.port, vendor_hint=b.hint, fmt=fmt)

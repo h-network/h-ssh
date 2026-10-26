@@ -7,7 +7,9 @@ comment line is the description --list-profiles shows.
     h-ssh --list-profiles
 """
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+from .core import read_failure
 
 SHIPPED_DIR = Path(__file__).parent / "profiles"
 
@@ -32,17 +34,24 @@ def profile_path(name: str) -> Path:
                      f"a profile is a batch file, one command per line")
 
 
-def describe(path: Path) -> Tuple[int, str]:
-    """(number of commands, the description): the first `#` line, or the first command."""
-    lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines()]
+def describe(path: Path) -> Tuple[Optional[int], str]:
+    """(number of commands, the description): the first `#` line, or the first
+    command. A file that cannot be read (not UTF-8, no permission) is
+    (None, why), so the listing still comes out and says so."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        return None, read_failure(e)
+    lines = [ln.strip() for ln in text.splitlines()]
     commands = [ln for ln in lines if ln and not ln.startswith("#")]
     comments = [ln.lstrip("#").strip() for ln in lines if ln.startswith("#")]
     return len(commands), (comments[0] if comments else (commands[0] if commands else ""))
 
 
-def listing() -> List[Tuple[str, str, int, str]]:
+def listing() -> List[Tuple[str, str, Optional[int], str]]:
     """(name, origin, commands, description) for every profile, yours before the shipped ones;
-    a shipped name you also have is listed once, as yours."""
+    a shipped name you also have is listed once, as yours. A file that cannot be read has
+    None for its commands and the reason as its description."""
     seen, out = set(), []
     for origin, directory in (("yours", user_dir()), ("shipped", SHIPPED_DIR)):
         if not directory.is_dir():
@@ -70,5 +79,6 @@ def listing_lines() -> List[str]:
         if not group:
             continue
         lines.append(f"{origin} ({user_dir() if origin == 'yours' else SHIPPED_DIR}):")
-        lines.extend(f"  {n:<{width}}  {c:>3} commands  {d}" for n, _, c, d in group)
+        lines.extend(f"  {n:<{width}}  {c:>3} commands  {d}" if c is not None
+                     else f"  {n:<{width}}  {'unreadable':>12}  {d}" for n, _, c, d in group)
     return lines

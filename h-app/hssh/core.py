@@ -73,22 +73,25 @@ def check_unique(targets: List["Target"], allow_repeats: bool = False) -> None:
     the wrong box or twice; the same row twice (allow_repeats=False) runs a
     device twice and writes both results to one file. A job may repeat a
     device on purpose (its entries run in order), so it allows repeats but
-    not contradictions. Raises ValueError naming the duplicate."""
-    by_name: dict = {}
-    by_host: dict = {}
+    not contradictions. A device is its host and the port the transport
+    will use, so `R1:10.0.0.1:junos` and `R2:10.0.0.1:830:junos` are one
+    box under two names; the message keeps the port as typed. Raises
+    ValueError naming the duplicate."""
+    by_name: dict = {}     # name -> ((host, port in use), host[:port] as typed)
+    by_host: dict = {}     # (host, port in use) -> name
     for t in targets:
-        where = (t.host, t.port)
-        if t.name in by_name and by_name[t.name] != where:
-            other = by_name[t.name]
-            raise ValueError(f"device name {t.name!r} is used for two hosts: "
-                             f"{other[0]}{':' + str(other[1]) if other[1] else ''} and "
-                             f"{t.host}{':' + str(t.port) if t.port else ''}")
+        where = (t.host, resolve_target_port(t))
+        typed = f"{t.host}:{t.port}" if t.port else t.host
+        if t.name in by_name and by_name[t.name][0] != where:
+            other, other_typed = by_name[t.name]
+            if other_typed == typed:      # the same host, the ports differ only by default: say which
+                other_typed, typed = f"{other[0]}:{other[1]}", f"{where[0]}:{where[1]}"
+            raise ValueError(f"device name {t.name!r} is used for two hosts: {other_typed} and {typed}")
         if where in by_host and by_host[where] != t.name:
-            raise ValueError(f"host {t.host}{':' + str(t.port) if t.port else ''} is listed under two names: "
-                             f"{by_host[where]!r} and {t.name!r}")
+            raise ValueError(f"host {typed} is listed under two names: {by_host[where]!r} and {t.name!r}")
         if not allow_repeats and t.name in by_name:
             raise ValueError(f"device {t.name!r} ({t.host}) is listed twice")
-        by_name[t.name] = where
+        by_name[t.name] = (where, typed)
         by_host[where] = t.name
 
 
@@ -340,6 +343,12 @@ def parse_jobs(data, default_vendor: str = "ssh") -> List[JobEntry]:
         has_edit = "edit" in item
         if has_show == has_edit:
             raise ValueError(f"Job entry {i} ({target.name}): must have exactly one of 'show' or 'edit'")
+        # As for -sC and -eC: a show is one line of text, an edit plain text.
+        key = "show" if has_show else "edit"
+        what = control_character(item[key], line_breaks=has_edit)
+        if what:
+            raise ValueError(f"Job entry {i} ({target.name}): '{key}' has {what} ({item[key]!r}); "
+                             f"{'a command is one line of text' if has_show else 'a payload is plain text'}")
 
         if has_show:
             entries.append(JobEntry(target=target, mode="show", command=item["show"]))
@@ -365,6 +374,35 @@ def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
     if not lines:
         raise ValueError(f"Empty config after filtering: {path}")
     return "\n".join(lines) + "\n"
+
+
+def read_failure(e: Exception) -> str:
+    """Why a text file could not be read, for an ERROR line: 'not UTF-8 text'
+    for one in another encoding, else the system's reason ('Permission denied')."""
+    if isinstance(e, UnicodeDecodeError):
+        return "not UTF-8 text"
+    return getattr(e, "strerror", None) or str(e)
+
+
+# What a command may not carry: the C0 and C1 control characters and DEL,
+# the line breaks among them. A tab is text.
+_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+_CONTROL_NAMES = {"\n": "a line break", "\r": "a carriage return", "\x00": "a NUL", "\x1b": "an ESC",
+                  "\x7f": "a DEL"}
+
+
+def control_character(text: str, line_breaks: bool = False) -> Optional[str]:
+    """The first control character in `text`, named ('a line break', 'a NUL',
+    'an ESC', else 'a control character' and its repr), or None. A command
+    is one line of text: a line break in it runs two commands (and a retry
+    both again), a NUL or an ESC is not text. An edit payload is lines, so
+    `line_breaks` lets the line breaks through."""
+    for m in _CONTROL.finditer(text):
+        ch = m.group()
+        if line_breaks and ch in "\r\n":
+            continue
+        return _CONTROL_NAMES.get(ch, f"a control character {ch!r}")
+    return None
 
 
 def read_command_file_lines(path: Path) -> List[str]:

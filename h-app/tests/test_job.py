@@ -1,5 +1,6 @@
 """Job file parsing tests."""
 import json
+import re
 import pytest
 from hssh.core import load_jobs, JobEntry, parse_inline_target, Target
 
@@ -143,3 +144,20 @@ def test_load_jobs_rejects_wrongly_typed_entries_with_the_entry_number(tmp_path,
     job_file.write_text(json.dumps([entry]))
     with pytest.raises(ValueError, match=text):
         load_jobs(str(job_file))
+
+
+def test_a_job_show_is_one_line_of_text_and_an_edit_plain_text(tmp_path):
+    """#110: what -sC and -eC refuse, a job entry (a --job file, a run file's
+    `jobs`) refuses too: a show with a line break runs both lines, an ESC
+    typed into a device's CLI is a key. An edit keeps its line breaks."""
+    job_file = tmp_path / "job.json"
+    for entry, text in (({"show": "show version\nrequest system reboot"}, "'show' has a line break"),
+                        ({"show": "show ver\x00sion"}, "'show' has a NUL"),
+                        ({"edit": "set system host-name x\x1b"}, "'edit' has an ESC")):
+        job_file.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": "show version"},
+                                        {"target": "R2:10.0.0.2:junos", **entry}]))
+        with pytest.raises(ValueError, match=re.escape(f"Job entry 1 (R2): {text} (")) as e:
+            load_jobs(str(job_file))
+        assert str(e.value).endswith("a command is one line of text" if "show" in entry else "a payload is plain text")
+    job_file.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "edit": "set a b\nset c d"}]))
+    assert load_jobs(str(job_file))[0].command == "set a b\nset c d"
