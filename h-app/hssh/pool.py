@@ -25,7 +25,6 @@ What a library needs on top, and only that:
 """
 
 import atexit
-from concurrent.futures import ThreadPoolExecutor
 import gc
 import logging
 import os
@@ -38,7 +37,8 @@ log = logging.getLogger("hssh.pool")
 
 DEFAULT_IDLE_TIMEOUT = 300
 CLEANUP_INTERVAL = 60
-CLOSE_WAIT = 1.0        # how long close_all() and the reaper wait for the closes they started, in all
+CLOSE_WAIT = 1.0        # how long close_all() and reap() wait for the closes they started, in all
+REAPER_CLOSE_WAIT = 10.0   # the same for the cleanup thread, which nobody waits on
 
 
 class Lease:
@@ -299,12 +299,17 @@ class ConnectionPool:
             if self._cleanup_token is not token:
                 break
             try:
-                self._cleanup_idle()
+                # Nobody waits on this thread, so it sees a slow close (one
+                # the router never acknowledges gives up after seconds)
+                # through before it collects what the close leaves (#113).
+                self._cleanup_idle(wait=REAPER_CLOSE_WAIT)
             except Exception as e:
                 log.debug("Pool: cleanup pass failed: %s", e)
 
-    def _cleanup_idle(self, now: Optional[float] = None) -> int:
-        """Close sessions idle for longer than idle_timeout; returns how many."""
+    def _cleanup_idle(self, now: Optional[float] = None, wait: Optional[float] = None) -> int:
+        """Close sessions idle for longer than idle_timeout; returns how many.
+        The closes it starts get `wait` seconds in all (CLOSE_WAIT if None)
+        before what they leave is collected."""
         now = time.time() if now is None else now
         # Collect idle candidates under the global lock, then close OUTSIDE it.
         # Holding _pool_lock across a blocking device.close() (a black-holed
@@ -339,23 +344,24 @@ class ConnectionPool:
             finally:
                 entry["lock"].release()
         if closed:
-            _release_closed_sessions(closes)
+            _release_closed_sessions(closes, wait)
         return closed
 
     reap = _cleanup_idle
 
-    def close_all(self, shutdown: bool = True) -> None:
+    def close_all(self, shutdown: bool = True, wait: Optional[float] = None) -> None:
         """Close all pooled connections.
 
         Args:
             shutdown: If True (default), don't wait on an in-flight operation —
                 skip busy entries; they are closed when their borrower returns
                 them. Use at exit, so a SIGTERM during a long command doesn't
-                hang teardown. The closes it does start still get up to
-                CLOSE_WAIT (a second, in all) to be acknowledged, so their
-                descriptors are freed with them (#113). If False, wait for
-                in-flight operations so a live RPC is not severed — use when
-                a run is over and the next one must start from fresh sessions.
+                hang teardown. If False, wait for in-flight operations so a
+                live RPC is not severed — use when a run is over and the next
+                one must start from fresh sessions.
+            wait: Either way, the closes it starts get this long in all
+                (CLOSE_WAIT, a second, if None) to be acknowledged, so their
+                descriptors are freed with them (#113).
         """
         # Snapshot entries under the global lock, then close each under its own
         # per-router lock (outside the global lock, so a slow close can't block
@@ -382,31 +388,53 @@ class ConnectionPool:
             finally:
                 entry["lock"].release()
 
-        # Closes run side by side: one unresponsive router costs its own close
-        # timeout, not one per router in a row, so a 350-router exit does not
-        # stall for minutes.
         live = [item for item in entries if item[1]["device"] is not None]
-        if len(live) > 1:
-            try:
-                with ThreadPoolExecutor(max_workers=min(32, len(live)), thread_name_prefix="hssh-pool-close") as ex:
-                    list(ex.map(close_one, live))
-            except RuntimeError as e:
-                # No thread to close on: the system refuses them (ulimit -u,
-                # a container's pids.max), or the interpreter is exiting and
-                # the executor takes no more work. What is still open closes
-                # here, one after another; one already closed is a no-op (#113).
-                log.info("Pool: closing on this thread, one session after another (%s)", e)
-                for item in live:
-                    close_one(item)
-        else:
-            for item in live:
-                close_one(item)
+        _side_by_side(close_one, live)
         if live:
-            _release_closed_sessions(closes)
+            _release_closed_sessions(closes, wait)
         log.info("Connection pool: all connections closed")
 
 
-def _release_closed_sessions(closes, timeout: Optional[float] = None) -> None:
+def _side_by_side(fn, items, workers: int = 32) -> None:
+    """fn(item) for every item, on up to `workers` threads at once: one
+    unresponsive router costs its own close timeout, not one per router in a
+    row, so a 350-router exit does not stall for minutes.
+
+    Plain threads, not an executor: concurrent.futures takes no more work
+    once the interpreter is exiting, which is when the atexit close_all()
+    runs. What the system gives no thread for (ulimit -u, a container's
+    pids.max) the threads it did give take on; with none at all, this
+    thread does it, one after another (#113)."""
+    if len(items) < 2:
+        for item in items:
+            fn(item)
+        return
+    todo = iter(items)
+    lock = threading.Lock()
+
+    def work():
+        while True:
+            with lock:
+                item = next(todo, None)
+            if item is None:
+                return
+            fn(item)
+
+    threads = []
+    for _ in range(min(workers, len(items))):
+        t = threading.Thread(target=work, daemon=True, name="hssh-pool-close")
+        try:
+            t.start()
+        except Exception as e:      # RuntimeError: can't start new thread
+            log.debug("Pool: no thread to close on (%s)", e)
+            break
+        threads.append(t)
+    for t in threads:
+        t.join()
+    work()          # what no thread took: all of it when the system gave none
+
+
+def _release_closed_sessions(closes, wait: Optional[float] = None) -> None:
     """A closed ncclient session keeps one descriptor until the garbage
     collector runs: its reader thread's selector (an epoll fd) is a local of
     a frame that survives in a reference cycle with the exception that ended
@@ -416,10 +444,10 @@ def _release_closed_sessions(closes, timeout: Optional[float] = None) -> None:
 
     `closes` is what the closer returned per session. The junos closer only
     starts a thread and hands it back (#98), so the collection first waits
-    for those, one deadline for all of them (CLOSE_WAIT, unless `timeout`);
+    for those, one deadline for all of them (`wait`, CLOSE_WAIT if None);
     collected before they are done, every session is still open and nothing
     is freed (#113). What is not a thread was a close already done."""
-    deadline = time.monotonic() + (CLOSE_WAIT if timeout is None else timeout)
+    deadline = time.monotonic() + (CLOSE_WAIT if wait is None else wait)
     for t in closes:
         if isinstance(t, threading.Thread):
             t.join(max(0.0, deadline - time.monotonic()))

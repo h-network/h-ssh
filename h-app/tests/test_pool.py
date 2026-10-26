@@ -740,12 +740,12 @@ def test_a_probe_that_times_out_still_means_dead(pooled, monkeypatch):
 
 # --- #113: the collection waits for the closes it is there for ----------------------
 
-def _recording_close(order):
+def _recording_close(order, delay=0.1):
     """The junos closer only starts a thread (#98): a close that takes its
     ~100 ms on the device and says when it is done."""
     class SlowClose(FakeDevice):
         def close(self):
-            time.sleep(0.1)
+            time.sleep(delay)
             super().close()
             order.append("closed")
     return SlowClose
@@ -773,6 +773,26 @@ def test_the_reaper_collects_after_the_closes_it_started(pooled, monkeypatch):
     show(host="10.0.0.2")
     assert pooled.reap(now=time.time() + 301) == 2
     assert order == ["closed", "closed", "collected"]
+
+
+def test_the_reaper_thread_sees_a_slow_close_through_before_it_collects(monkeypatch):
+    """Nobody waits on the cleanup thread, yet it collected after CLOSE_WAIT
+    like close_all(): a close slower than that (a router that never
+    acknowledges gives up after SHORT_TIMEOUT) kept its descriptor until
+    Python's next full collection, one per slow router in a long-lived
+    process."""
+    order = []
+    netconf.JunosDevice = _recording_close(order, delay=0.3)
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: order.append("collected"))
+    monkeypatch.setattr(pool, "CLOSE_WAIT", 0.05)
+    monkeypatch.setattr(pool, "CLEANUP_INTERVAL", 0.05)
+    monkeypatch.setattr(pool.POOL, "idle_timeout", 0)
+    pool.enable()
+    show()
+    deadline = time.monotonic() + 5
+    while "collected" not in order and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert order == ["closed", "collected"]
 
 
 def test_close_all_closes_on_its_own_clock_when_the_system_refuses_the_close_thread(pooled, monkeypatch):
@@ -808,23 +828,33 @@ def test_close_all_closes_every_session_itself_when_the_system_refuses_every_thr
     assert not netconf._CLOSES and netconf.wait_for_closes() == 0
 
 
-def test_the_close_all_at_interpreter_exit_closes_every_session(tmp_path):
+@pytest.mark.skipif((3, 12) <= sys.version_info[:3] < (3, 12, 3), reason="3.12 before 3.12.3 starts no thread at exit")
+def test_the_close_all_at_interpreter_exit_closes_every_session_side_by_side(tmp_path):
     """concurrent.futures takes no more work once the interpreter is
     exiting, before atexit runs: with two sessions or more the close_all()
     there raised 'cannot schedule new futures after interpreter shutdown'
-    and closed none of them."""
+    and closed none of them. Closed on the exiting thread instead, they
+    went one after another, a close timeout per router in a row, though
+    plain threads still start there."""
     script = tmp_path / "leaves.py"
     script.write_text(
+        "import time\n"
         "from hssh import pool\n"
+        "def closer(dev):\n"
+        "    start = time.monotonic()\n"
+        "    time.sleep(0.3)\n"
+        "    print('closed', dev, start, time.monotonic(), flush=True)\n"
         "pool.enable()\n"
         "for host in ('r1', 'r2', 'r3'):\n"
-        "    with pool.POOL.get_connection((host, 830, 'u'), opener=lambda: host,\n"
-        "                                  closer=lambda dev: print('closed', dev, flush=True)):\n"
+        "    with pool.POOL.get_connection((host, 830, 'u'), opener=lambda: host, closer=closer):\n"
         "        pass\n")
     env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(pool.__file__))}
     proc = subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0 and "Traceback" not in proc.stderr, proc.stderr
-    assert sorted(proc.stdout.splitlines()) == ["closed r1", "closed r2", "closed r3"]
+    closes = sorted(line.split() for line in proc.stdout.splitlines())
+    assert [c[:2] for c in closes] == [["closed", "r1"], ["closed", "r2"], ["closed", "r3"]]
+    starts, ends = [float(c[2]) for c in closes], [float(c[3]) for c in closes]
+    assert max(starts) < min(ends), proc.stdout          # side by side, not one after another
 
 
 def test_a_closer_that_returns_something_else_is_not_waited_for():
@@ -837,10 +867,13 @@ def test_a_closer_that_returns_something_else_is_not_waited_for():
         for host in ("r1", "r2"):
             with p.get_connection((host, 830, "u"), opener=lambda: object(), closer=lambda dev: True):
                 pass
+        t0 = time.monotonic()
         p.close_all(shutdown=False)
-        assert p.live() == 0
+        assert p.live() == 0 and time.monotonic() - t0 < 0.5      # CLOSE_WAIT is a second
         with p.get_connection(("r1", 830, "u"), opener=lambda: object(), closer=lambda dev: "<ok/>"):
             pass
+        t0 = time.monotonic()
         assert p.reap(now=time.time() + 301) == 1 and p.live() == 0
+        assert time.monotonic() - t0 < 0.5
     finally:
         p.disable()

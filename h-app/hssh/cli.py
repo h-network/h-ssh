@@ -1828,9 +1828,11 @@ def main_sync() -> None:
         # far, stands.
         _stdout_gone()
     finally:
+        # Half a second in all for the closes, close_all()'s own wait included (#113).
+        closing = time.monotonic()
         try:
-            pool.close_all()        # a job run that ended early (Ctrl-C, a crash) leaves no session open
+            pool.close_all(wait=0.5)    # a job run that ended early (Ctrl-C, a crash) leaves no session open
         except Exception:
             pass
-        _drain_closes(0.5)
+        _drain_closes(max(0.0, 0.5 - (time.monotonic() - closing)))
     sys.exit(rc)
