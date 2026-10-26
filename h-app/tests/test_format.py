@@ -219,6 +219,84 @@ def test_cli_diff_compares_the_pretty_printed_json(monkeypatch, capsys):
     assert '-  "host": "10.0.0.' in other["diff"] and '+  "host": "10.0.0.' in other["diff"]
 
 
+class Releases(FakeVendor):
+    """R1 and R2 on two releases: the replies differ in their last line, which
+    has no newline after it once the CLI has trimmed the reply."""
+    RELEASE = {"10.0.0.1": "24.2R1-S2.5", "10.0.0.2": "23.4R2.13"}
+
+    def show(self, host, user, passwd, cmd, st, ct, port=None, vendor_hint=None):
+        return f"Model: vmx\nJunos: {self.RELEASE[host]}\n"
+
+    def show_batch(self, host, user, passwd, cmds, st, ct, port=None, vendor_hint=None):
+        return [{"command": c, "ok": True, "output": self.show(host, user, passwd, c, st, ct)} for c in cmds]
+
+
+TWO = [*R1, "--target", "R2:10.0.0.2:junos"]
+
+
+def answers_last(monkeypatch, last):
+    """The runner as it is, except that device `last` answers only once the
+    other one has, and some turns of the event loop later, so the other's
+    answer is taken in first: a slower router, made certain."""
+    other_in = asyncio.Event()
+
+    async def run(**kw):
+        result = await runner.run_for_target_async(**kw)
+        if kw["t"].name != last:
+            other_in.set()
+            return result
+        await other_in.wait()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return result
+
+    monkeypatch.setattr(cli, "run_for_target_async", run)
+
+
+def show_or_batch(tmp_path, batch):
+    if not batch:
+        return ["-sC", "show version"]
+    cmds = tmp_path / "cmds.txt"
+    cmds.write_text("show version\n")
+    return ["--batch", str(cmds)]
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["show", "batch"])
+def test_cli_diff_baseline_is_the_first_device_given_whoever_answers_first(monkeypatch, capsys, tmp_path, batch):
+    """R1 is given first and is the baseline whether it answers first or last:
+    one command line diffs the same way every run, in --json and on screen."""
+    what = show_or_batch(tmp_path, batch)
+    diffs = []
+    for last in ("R1", "R2"):
+        answers_last(monkeypatch, last)
+        rc, out, _ = run_cli(monkeypatch, capsys, Releases(), *what, "--diff", "--json", *TWO)
+        by_name = {e["device"]: e for e in json.loads(out)}
+        assert rc == 0 and by_name["R1"]["diff"] == "(baseline)"
+        diffs.append(by_name["R2"]["diff"])
+        answers_last(monkeypatch, last)
+        rc, out, _ = run_cli(monkeypatch, capsys, Releases(), *what, "--diff", *TWO)
+        assert rc == 0 and "--- Diff (baseline: R1) ---" in out and "  R1 vs R2:" in out
+    assert diffs[0] == diffs[1]
+    diff = diffs[0][0]["diff"] if batch else diffs[0]
+    assert "-Junos: 24.2R1-S2.5" in diff and "+Junos: 23.4R2.13" in diff      # R1's line is the one taken away
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["show", "batch"])
+def test_cli_diff_puts_a_changed_last_line_on_two_lines(monkeypatch, capsys, tmp_path, batch):
+    """The last line of a trimmed reply has no newline after it; the line
+    taken away and the line put in are still a line each, in the --json field
+    and on screen."""
+    what = show_or_batch(tmp_path, batch)
+    rc, out, _ = run_cli(monkeypatch, capsys, Releases(), *what, "--diff", "--json", *TWO)
+    diff = {e["device"]: e for e in json.loads(out)}["R2"]["diff"]
+    assert rc == 0
+    assert (diff[0]["diff"] if batch else diff) == \
+        "--- R1\n+++ R2\n@@ -1,2 +1,2 @@\n Model: vmx\n-Junos: 24.2R1-S2.5\n+Junos: 23.4R2.13"
+    rc, out, _ = run_cli(monkeypatch, capsys, Releases(), *what, "--diff", *TWO)
+    indent = " " * (6 if batch else 4)
+    assert rc == 0 and f"{indent}-Junos: 24.2R1-S2.5\n{indent}+Junos: 23.4R2.13\n" in out
+
+
 def test_cli_job_show_entries_are_data_and_edit_entries_text(monkeypatch, capsys, tmp_path):
     job = tmp_path / "job.json"
     job.write_text(json.dumps([

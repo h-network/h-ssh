@@ -489,7 +489,7 @@ async def main() -> int:
     parser.add_argument("--times", type=_ranged_int(1, None, "--times"), default=None,
                         help="With --every: stop after this many ticks")
     parser.add_argument("--diff", action="store_true",
-                        help="Compare output across devices (show modes only, first device is baseline)")
+                        help="Compare output across devices (show modes only; the first device given is the baseline)")
     parser.add_argument("--raw", action="store_true",
                         help="Print only each device's output, no progress lines or headers")
     parser.add_argument("--list-commands", action="store_true",
@@ -1130,6 +1130,7 @@ async def main() -> int:
     skipped = 0                                              # held back by the safety gate (in the results)
     not_run = skipped_missing if not job_entries else 0      # no set file (--allow-missing): not in the results
     json_results = []
+    given_at = []        # each result's place in the inventory, for --diff's baseline
     run_start = time.time()
     store_run = None
     store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
@@ -1387,6 +1388,7 @@ async def main() -> int:
             entry["interrupted"] = True
             entry["error"] = f"interrupted while connecting: {entry['error']}"
         json_results.append(entry)
+        given_at.append(i)
 
         # What was sent to this device, for the audit log and the store: the
         # resolved show, the edit payload, the rollback, the commit history ask.
@@ -1550,22 +1552,27 @@ async def main() -> int:
 
     # Write structured JSONL log. It holds the same payloads, replies and
     # diffs as the audit log, so it gets the same redaction and file mode.
-    # Cross-device diff (show modes only)
+    # Cross-device diff (show modes only). The baseline is the first device
+    # given that answered, not the first to answer, so one command line
+    # diffs the same way every run. A reply's last line has no newline: the
+    # lines are diffed without theirs and joined with one, or a removed last
+    # line would run into the line added after it.
+    ok_results = []
     if args.diff and mode in ["show", "show-batch"]:
-        ok_results = [r for r in json_results if r["ok"]]
+        ok_results = [r for _, r in sorted(zip(given_at, json_results), key=lambda p: p[0]) if r["ok"]]
         if len(ok_results) >= 2:
             baseline = ok_results[0]
             baseline_name = baseline["device"]
 
             if mode == "show":
-                baseline_lines = document_text(baseline["output"]).splitlines(keepends=True)
+                baseline_lines = document_text(baseline["output"]).splitlines()
                 for other in ok_results[1:]:
-                    other_lines = document_text(other["output"]).splitlines(keepends=True)
+                    other_lines = document_text(other["output"]).splitlines()
                     diff_lines = list(difflib.unified_diff(
                         baseline_lines, other_lines,
-                        fromfile=baseline_name, tofile=other["device"],
+                        fromfile=baseline_name, tofile=other["device"], lineterm="",
                     ))
-                    diff_text = "".join(diff_lines).rstrip()
+                    diff_text = "\n".join(diff_lines)
                     other["diff"] = diff_text if diff_text else "(identical)"
                 baseline["diff"] = "(baseline)"
 
@@ -1578,11 +1585,11 @@ async def main() -> int:
                             continue
                         bl = baseline_map.get(cr["command"], "")
                         diff_lines = list(difflib.unified_diff(
-                            bl.splitlines(keepends=True),
-                            document_text(cr["output"]).splitlines(keepends=True),
-                            fromfile=baseline_name, tofile=other["device"],
+                            bl.splitlines(),
+                            document_text(cr["output"]).splitlines(),
+                            fromfile=baseline_name, tofile=other["device"], lineterm="",
                         ))
-                        diff_text = "".join(diff_lines).rstrip()
+                        diff_text = "\n".join(diff_lines)
                         cmd_diffs.append({
                             "command": cr["command"],
                             "diff": diff_text if diff_text else "(identical)",
@@ -1595,7 +1602,6 @@ async def main() -> int:
     else:
         # Print diff output
         if args.diff and mode in ["show", "show-batch"]:
-            ok_results = [r for r in json_results if r["ok"]]
             if len(ok_results) >= 2:
                 baseline_name = ok_results[0]["device"]
                 print(f"\n--- Diff (baseline: {baseline_name}) ---\n")

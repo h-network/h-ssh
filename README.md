@@ -112,7 +112,7 @@ h-ssh --user admin -sC bgp R1:10.0.1.1:junos R2:10.0.1.2:junos
 # ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows)
 h-ssh --user admin --json -sC "show version" --devices h-app/devices.csv
 
-# compare one command's output across the fleet
+# compare one command's output across the fleet, each device against the first one given
 h-ssh -sC bgp --diff R1:10.0.1.1:junos R2:10.0.1.2:junos
 
 # config change — look before you leap (no host typed: the inventory is ~/.h-ssh/devices.csv, or ./devices.csv)
@@ -982,7 +982,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (926 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (931 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

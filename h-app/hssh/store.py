@@ -457,11 +457,14 @@ def cmd_field(store: Store, args) -> int:
 def cmd_diff(store: Store, args) -> int:
     a, b = store.resolve_run(args.run_a), store.resolve_run(args.run_b)
     ra, rb = store.output(a, args.device, args.seq), store.output(b, args.device, args.seq)
-    la, lb = (ra["output"] or "").splitlines(keepends=True), (rb["output"] or "").splitlines(keepends=True)
-    diff = list(difflib.unified_diff(la, lb, fromfile=f"{args.device} {a}", tofile=f"{args.device} {b}"))
-    sys.stdout.writelines(diff)
-    if diff and not diff[-1].endswith("\n"):
-        print()
+    # A reply is kept with no newline after its last line: the lines are
+    # diffed without theirs and printed one to a line, or a removed last
+    # line would run into the line added after it.
+    la, lb = (ra["output"] or "").splitlines(), (rb["output"] or "").splitlines()
+    diff = list(difflib.unified_diff(la, lb, fromfile=f"{args.device} {a}", tofile=f"{args.device} {b}",
+                                     lineterm=""))
+    if diff:
+        print("\n".join(diff))
     return 1 if diff else 0
 
 
