@@ -7,6 +7,7 @@ import os
 import sqlite3
 import stat
 import sys
+import threading
 import types
 
 import pytest
@@ -159,6 +160,34 @@ def test_a_run_is_found_by_its_id_or_a_unique_prefix_or_as_the_last(tmp_path):
     s.close()
     with pytest.raises(StoreError, match="no store at"):
         Store(str(tmp_path / "missing.db"), readonly=True)
+
+
+def test_two_threads_writing_one_store_keep_every_row(tmp_path):
+    """One Store written from two threads at once (two Fleets sharing it):
+    one connection takes one transaction at a time, so a write waits for
+    the other's commit instead of sharing its statement and losing rows."""
+    path = tmp_path / "shared.db"
+    st = Store(str(path))
+    runs = [st.begin_run("show", ["t"], "u", 300, "0") for _ in range(2)]
+    errors = []
+
+    def writer(run):
+        try:
+            for i in range(300):
+                st.add_entry(run, {**SHOW, "device": f"d{i}", "output": "x" * 2000}, "show version")
+            st.finish_run(run, 300, 0, 0)
+        except Exception as e:                       # pragma: no cover - the failure we are testing against
+            errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=writer, args=(run,)) for run in runs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    st.close()
+    assert errors == []
+    assert rows(path, "SELECT COUNT(*) AS n FROM results")[0]["n"] == 600
+    assert all(r["finished"] for r in rows(path, "SELECT * FROM runs"))
 
 
 # --- the reader --------------------------------------------------------------------

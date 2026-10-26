@@ -536,7 +536,9 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
 no traceback, and whatever had landed stands. paramiko's transport thread logs a full traceback when
 a device closes the connection mid-handshake; the CLI keeps that off the screen (the one FAIL line
-already says so) unless `-v` is given. A library caller configures logging as it likes.
+already says so) unless `-v` is given. Under the library it stays off stderr too while logging is not
+set up (paramiko's and ncclient's loggers get a `NullHandler`, no level is changed); set logging up
+and those records go where you send them.
 
 `--raw` is the pipe-friendly one: no banner, no progress lines, no summary. Each device gets a
 `name:` line and its output; failures and the verdict go to stderr, so for a show `--raw > out.txt`
@@ -799,17 +801,21 @@ The library reads no environment variable and no config file; that is the CLI's 
   returned by then is a result and a store row; the run is recorded as interrupted with the rest as skipped;
   iterating its results afterwards gives what was done by then and nothing more (a call that returns later is
   dropped, its row says skipped), so the store and the script agree; a script waiting in its `for` loop wakes at
-  once, whichever thread called `close()`. A store this Fleet opened is closed, and
-  the sessions close (one still in use closes when its call returns). `async with Fleet(...)` and `aclose()`
-  do the same off the event loop;
-- `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
-  command line `Fleet.show show bgp summary`; one result row per device, per command for a batch), written
-  from the thread that iterates and, under `async for`, from a worker of the event loop, so SQLite never
-  blocks it; `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`)
-  that start the run on their first step. What the store could not keep is counted, never raised: a write
-  that fails is said once as a `RuntimeWarning` and the run goes on; at the end `res.not_kept` says how many
-  results were not kept and `res.store_error` why (a store file deleted or replaced under the run means every
-  result of it, and its run row is left open, as the CLI does);
+  once, whichever thread called `close()`, and a `close()` that lands while `show()` is still opening the run's
+  store row waits for the row, records the run as interrupted, and that `show()` raises `RuntimeError`. A store
+  this Fleet opened is closed, and the sessions close (one still in use closes when its call returns).
+  `async with Fleet(...)` and `aclose()` do the same off the event loop. A Fleet dropped without `close()` lets
+  its threads go and gives its share of the session pool back once Python collects it, as a dropped
+  `ThreadPoolExecutor` ends its workers; a run it left open is not recorded, so `close()` is still what ends one;
+- `store=`, a path or an open `hssh.store.Store` (one Store may be shared by several Fleets on several threads:
+  it takes one write at a time), keeps every result as the CLI's store does (one run row, its command line
+  `Fleet.show show bgp summary`; one result row per device, per command for a batch), written from the thread
+  that iterates and, under `async for`, from a worker of the event loop, so SQLite never blocks it;
+  `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`) that start
+  the run on their first step. What the store could not keep is counted, never raised: a write that fails is
+  said once per run as a `RuntimeWarning` that names the run, and the run goes on; at the end `res.not_kept`
+  says how many results were not kept and `res.store_error` why (a store file deleted or replaced under the
+  run means every result of it, and its run row is left open, as the CLI does);
 - `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only; on another
   transport that is the device's failure, nothing sent); `to_dicts()` is JSON-serialisable, in the shape of
   the CLI's `--json` records.
@@ -982,7 +988,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (926 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (939 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

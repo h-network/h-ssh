@@ -3,8 +3,10 @@ script, results as values in completion order, no thread in sight. Every
 device here is a fake driver in drivers.MODULES; nothing is contacted."""
 import asyncio
 import concurrent.futures as cf
+import gc
 import getpass
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -283,10 +285,31 @@ def test_the_budget_counts_the_transports_connect_phases():
                   user="u", session_timeout=2, command_timeout=3, retries=1)
     r1, r2, r3, r4 = fleet.targets
     grace = fleet_mod.GRACE_SECONDS
-    assert fleet_mod._budget(fleet, r1, 1) == 2 * (2 + 3) + 1 + grace          # NETCONF: one deadline for the set-up
-    assert fleet_mod._budget(fleet, r2, 1) == 2 * (3 * 2 + 3) + 1 + grace      # paramiko: connect, banner, auth
-    assert fleet_mod._budget(fleet, r3, 1) == fleet_mod._budget(fleet, r4, 1) == fleet_mod._budget(fleet, r2, 1)
-    assert fleet_mod._budget(fleet, r1, 2) == 2 * (2 + 3 * 2) + 1 + grace      # a batch: a timeout per command
+    assert fleet_mod._budget(fleet, r1, 1, 2) == 2 * (2 + 3) + 1 + grace          # NETCONF: one deadline for the set-up
+    assert fleet_mod._budget(fleet, r2, 1, 2) == 2 * (3 * 2 + 3) + 1 + grace      # paramiko: connect, banner, auth
+    assert fleet_mod._budget(fleet, r3, 1, 2) == fleet_mod._budget(fleet, r4, 1, 2) == fleet_mod._budget(fleet, r2, 1, 2)
+    assert fleet_mod._budget(fleet, r1, 2, 2) == 2 * (2 + 3 * 2) + 1 + grace      # a batch: a timeout per command
+    fleet.close()
+
+
+def test_the_budget_of_a_command_that_is_not_a_read_is_one_attempt():
+    """The runner sends `request …` once, whatever `retries` says; the budget
+    used to count every retry, so a wedged request held its worker for three
+    attempts' worth of time, and the given-up line claimed three attempts."""
+    fleet = Fleet(["R1:10.0.0.1:junos", "R2:10.0.0.2:ssh"], user="u", session_timeout=2, command_timeout=3, retries=2)
+    grace = fleet_mod.GRACE_SECONDS
+
+    def budgets(mode, command):
+        return [t.budget for t in fleet_mod._Run(fleet, mode, command, "text").tasks]
+    # a read: three attempts and the backoff before the second and the third
+    assert budgets("show", "show version") == [3 * (2 + 3) + (1 + 3) + grace, 3 * (3 * 2 + 3) + (1 + 3) + grace]
+    assert budgets("show", "request system reboot") == [(2 + 3) + grace, (3 * 2 + 3) + grace]
+    # a batch with one command that acts is sent once as a whole, as the runner does
+    assert budgets("show-batch", ["show version", "clear bgp neighbor all"]) == [(2 + 3 * 2) + grace,
+                                                                               (3 * 2 + 3 * 2) + grace]
+    assert budgets("show-batch", ["show version", "show route"])[0] == 3 * (2 + 3 * 2) + (1 + 3) + grace
+    acting = fleet_mod._Run(fleet, "show", "request system reboot", "text")
+    assert [t.attempts for t in acting.tasks] == [1, 1]                        # the runner is told so too
     fleet.close()
 
 
@@ -592,6 +615,80 @@ def test_close_from_another_thread_during_iteration_is_safe(monkeypatch, tmp_pat
     assert all(r["finished"] is not None for r in rows(path, "SELECT finished FROM runs"))
 
 
+def test_a_close_that_catches_the_run_being_started_leaves_no_run_row_open(monkeypatch, tmp_path):
+    """close() from another thread while show() is still inside begin_run():
+    the run row is opened under the run's lock, so the close waits for it,
+    records the run as interrupted and closes the store only after that;
+    show() then raises as on a closed Fleet. It used to close the store's
+    connection under the INSERT (a ProgrammingError out of show(), or a
+    segfault), and leave a caller's store with the run row open."""
+    install(monkeypatch, show=echo)
+    real_begin = Store.begin_run
+    entered = threading.Event()
+    fleet = None
+
+    def begin_run(self, *a, **kw):
+        entered.set()
+        assert wait_for(lambda: fleet._closed, 5)        # the close is under way: it waits for this row
+        return real_begin(self, *a, **kw)
+    monkeypatch.setattr(Store, "begin_run", begin_run)
+    path = tmp_path / "runs.db"
+    shared = Store(str(tmp_path / "shared.db"))
+    for store in (str(path), shared):                    # a store the Fleet owns, and a caller's
+        entered.clear()
+        fleet = Fleet(HOSTS, transport="junos", user="u", store=store)
+        closer = threading.Thread(target=lambda f: entered.wait(5) and f.close(), args=(fleet,))
+        closer.start()
+        with pytest.raises(RuntimeError, match="this Fleet is closed"):
+            fleet.show("show version")
+        closer.join(5)
+        assert not closer.is_alive() and fleet._closed and fleet._run is None
+    shared.conn.execute("SELECT 1").fetchone()           # the caller's store: still open
+    shared.close()
+    for db in (path, tmp_path / "shared.db"):
+        run, = rows(db, "SELECT * FROM runs")
+        assert run["finished"] is not None
+        assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (0, 0, 3, 1)
+        assert rows(db, "SELECT * FROM results") == []
+
+
+def test_a_close_armed_before_the_run_never_breaks_the_store(monkeypatch, tmp_path):
+    """A Timer closing the Fleet, armed before show(), many rounds in a
+    second: whatever the close catches (the admission, the run row, the
+    hand-out, the run itself), show() either returns the Results or raises
+    as on a closed Fleet, never a sqlite error, and no run row is left open."""
+    install(monkeypatch, show=lambda host, user, passwd, cmd, *a, **kw: "x" * 500)
+    hosts = [f"10.0.{i // 250}.{i % 250}" for i in range(20)]
+    path = tmp_path / "runs.db"
+    closer_errors = []
+    monkeypatch.setattr(threading, "excepthook",
+                        lambda a: closer_errors.append(f"{a.exc_type.__name__}: {a.exc_value}"))
+    outcomes = {"results": 0, "closed": 0}
+    rounds, t_end = 0, time.monotonic() + 1.0
+    while time.monotonic() < t_end or rounds < 20:
+        fleet = Fleet(hosts, transport="junos", user="u", workers=4, store=str(path))
+        timer = threading.Timer(0.0003 * (rounds % 10), fleet.close)
+        timer.start()
+        try:
+            res = fleet.show("show version")
+        except RuntimeError as e:
+            assert str(e) == "this Fleet is closed"
+            outcomes["closed"] += 1
+        else:
+            list(res)
+            outcomes["results"] += 1
+        timer.join()
+        assert not closer_errors, closer_errors
+        assert fleet._closed and fleet._run is None
+        with pytest.raises(sqlite3.ProgrammingError):        # the store this Fleet opened is closed
+            fleet._store.conn.execute("SELECT 1")
+        rounds += 1
+    assert rounds >= 20 and outcomes["results"] + outcomes["closed"] == rounds
+    runs = rows(path, "SELECT * FROM runs")
+    assert all(r["finished"] is not None for r in runs), [r["run_id"] for r in runs if r["finished"] is None]
+    assert all(r["ok"] + r["failed"] + r["skipped"] == 20 for r in runs)
+
+
 def test_iterating_after_close_ends_instead_of_hanging(monkeypatch, tmp_path):
     release, started = threading.Event(), threading.Event()
     install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2", "10.0.0.3"}))
@@ -686,8 +783,9 @@ def test_a_close_from_another_thread_wakes_an_async_consumer_at_once(monkeypatch
 
 def test_a_worker_thread_the_system_refuses_ends_the_run_instead_of_hanging(monkeypatch, tmp_path):
     """`ulimit -u` or memory pressure: Thread.start() raises. That is the
-    caller's error, said at once; the run is recorded as skipped, the pool
-    counts no dead thread, and the Fleet is usable once threads can start."""
+    caller's error, said at once; the run is recorded as skipped, no pool
+    of workers is kept with a dead thread in it (nor is the Fleet counted
+    in the session pool), and the Fleet is usable once threads can start."""
     install(monkeypatch, show=echo)
     refuse = [True]
     real_start = threading.Thread.start
@@ -703,7 +801,7 @@ def test_a_worker_thread_the_system_refuses_ends_the_run_instead_of_hanging(monk
             fleet.show("show version")
         run, = rows(path, "SELECT * FROM runs")
         assert run["finished"] is not None and (run["ok"], run["skipped"], run["interrupted"]) == (0, 3, 1)
-        assert fleet._workers.threads == []                          # no dead thread counted
+        assert fleet._workers is None and fleet_mod._POOL_FLEETS == 0  # no dead thread kept, nothing counted
         refuse[0] = False
         got = list(fleet.show("show version"))                       # not BUSY: the failed run was ended
         assert len(got) == 3 and all(r.ok for r in got)
@@ -728,6 +826,95 @@ def test_close_with_a_grace_yields_the_device_that_finished_inside_it(monkeypatc
     run, = rows(path, "SELECT * FROM runs")
     assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (2, 0, 1, 1)
     assert sorted(r["device"] for r in rows(path, "SELECT * FROM results")) == ["10.0.0.1", "10.0.0.2"]
+
+
+@pytest.mark.parametrize("how", ["for", "async for"])
+def test_a_close_with_a_grace_skips_the_queued_devices_instead_of_failing_them(monkeypatch, tmp_path, how):
+    """close(wait=) with devices still queued: a worker that frees up inside
+    the grace drains the cancelled queue and notifies the consumer, which
+    took those futures for results: a FAILED "every worker thread is held"
+    row per device never started (no worker was held), the run finished
+    and not interrupted. The promise is the README's: not started, skipped,
+    the run interrupted."""
+    hold, release, started = threading.Event(), threading.Event(), threading.Event()
+
+    def show(host, user, passwd, cmd, *a, **kw):
+        if host == "10.0.0.1":
+            hold.wait(10)
+        elif host == "10.0.0.2":
+            started.set()
+            release.wait(10)
+        return f"{cmd} on {host}"
+
+    install(monkeypatch, show=show)
+    path = tmp_path / "runs.db"
+    fleet = Fleet(HOSTS, transport="junos", user="u", workers=2, store=str(path))
+    res = fleet.show("show version")                         # two in flight, 10.0.0.3 queued
+    got = []
+
+    async def collect():
+        async for r in res:
+            got.append(r)
+
+    consumer = threading.Thread(target=(lambda: got.extend(res)) if how == "for" else (lambda: asyncio.run(collect())))
+    consumer.start()
+    try:
+        assert started.wait(2)
+        closer = threading.Thread(target=fleet.close, kwargs={"wait": 5})
+        closer.start()
+        queued = next(t for t in res._run.tasks if t.target.host == "10.0.0.3")
+        assert wait_for(lambda: queued.future.cancelled())   # close(wait=) under way: the queue is cancelled
+        release.set()                                        # 10.0.0.2 answers: its worker drains the queue
+        assert wait_for(lambda: any(r.device == "10.0.0.2" for r in got))
+        time.sleep(0.2)                                      # time enough to mistake the notified queue for results
+        hold.set()                                           # 10.0.0.1 answers: the grace is over
+        closer.join(5)
+        consumer.join(5)
+        assert not closer.is_alive() and not consumer.is_alive()
+    finally:
+        hold.set()
+        release.set()
+    assert sorted(r.device for r in got) == ["10.0.0.1", "10.0.0.2"], [(r.device, r.error) for r in got]
+    assert all(r.ok for r in got)
+    run, = rows(path, "SELECT * FROM runs")
+    assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (2, 0, 1, 1)
+    assert sorted(r["device"] for r in rows(path, "SELECT * FROM results")) == ["10.0.0.1", "10.0.0.2"]
+
+
+def test_a_close_with_a_grace_skips_the_queue_when_every_worker_is_held(monkeypatch, tmp_path):
+    """close(wait=) under way when the one worker's call is given up on:
+    with every worker held, the consumer fails what is still queued ("not
+    started: every worker thread is held"). Those were the close's already,
+    cancelled, and cancel() says yes again to a cancelled future; they are
+    skipped and the run interrupted, as close() promises."""
+    monkeypatch.setattr(fleet_mod, "GRACE_SECONDS", 0.2)
+    release, started = threading.Event(), threading.Event()
+    install(monkeypatch, show=holding(release, started, hosts={"10.0.0.1"}))
+    path = tmp_path / "runs.db"
+    fleet = Fleet(HOSTS, transport="junos", user="u", workers=1, session_timeout=1, command_timeout=1,
+                  retries=0, store=str(path))
+    res = fleet.show("show version")                         # 10.0.0.1 in flight, the other two queued
+    got = []
+    consumer = threading.Thread(target=lambda: got.extend(res))
+    consumer.start()
+    try:
+        assert started.wait(2)
+        closer = threading.Thread(target=fleet.close, kwargs={"wait": 10})
+        closer.start()
+        queued = [t for t in res._run.tasks if t.target.host != "10.0.0.1"]
+        assert wait_for(lambda: all(t.future.cancelled() for t in queued))
+        assert wait_for(lambda: fleet._stuck_count() == 1, 6)   # 10.0.0.1 given up on: every worker held
+        time.sleep(0.2)                                      # time enough to fail the cancelled queue
+        release.set()                                        # the call returns: the grace is over
+        closer.join(5)
+        consumer.join(5)
+        assert not closer.is_alive() and not consumer.is_alive()
+    finally:
+        release.set()
+    assert [(r.device, r.ok) for r in got] == [("10.0.0.1", False)], [(r.device, r.error) for r in got]
+    assert got[0].error.startswith("no result within 2.2s")
+    run, = rows(path, "SELECT * FROM runs")
+    assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (0, 1, 2, 1)
 
 
 def test_close_keeps_the_results_of_devices_that_finished_unconsumed(monkeypatch, tmp_path):
@@ -798,8 +985,9 @@ def test_store_loss_is_counted_and_said_but_never_raised(monkeypatch, tmp_path):
     assert sorted(r.device for r in got) == HOSTS and all(r.ok for r in got)
     assert res.not_kept == 1 and res.store_error == "disk I/O error"
     messages = [str(w.message) for w in said]
-    assert messages == [f"store {path}: disk I/O error; the run goes on, its results are shown but not kept",
-                        f"store {path}: 1 of 3 results were not kept: disk I/O error"]
+    run_id = res._run.store_run
+    assert messages == [f"store {path}, run {run_id}: disk I/O error; the run goes on, its results are shown but not kept",
+                        f"store {path}, run {run_id}: 1 of 3 results were not kept: disk I/O error"]
     run, = rows(path, "SELECT * FROM runs")
     assert run["finished"] is not None and (run["ok"], run["failed"]) == (3, 0)
     assert sorted(r["device"] for r in rows(path, "SELECT * FROM results")) == ["10.0.0.1", "10.0.0.3"]
@@ -825,6 +1013,32 @@ def test_store_loss_is_counted_and_said_but_never_raised(monkeypatch, tmp_path):
     assert finished == []                                    # nothing kept: the run row is not closed
 
 
+def test_store_loss_is_said_for_every_run_not_once_per_process(monkeypatch, tmp_path):
+    """The default warning filter prints a message once per place it comes
+    from, so a loop whose store kept losing rows was told once and then
+    nothing. The message names the run: every run's loss is said."""
+    install(monkeypatch, show=echo)
+    real_add = Store.add_entry
+
+    def add_entry(self, run_id, entry, *a, **kw):
+        if entry["device"] == "10.0.0.2":
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_add(self, run_id, entry, *a, **kw)
+    monkeypatch.setattr(Store, "add_entry", add_entry)
+    ids = []
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("default")                     # a script's filter: once per message and place
+        with Fleet(HOSTS, transport="junos", user="u", store=str(tmp_path / "runs.db")) as fleet:
+            for _ in range(2):
+                res = fleet.show("show version")
+                assert len(list(res)) == 3 and res.not_kept == 1
+                ids.append(res._run.store_run)
+    lost = [str(w.message) for w in said]
+    assert len(lost) == 4, lost                              # said as it happens and at the end, for each run
+    assert all(f"run {ids[0]}:" in m for m in lost[:2]) and all(f"run {ids[1]}:" in m for m in lost[2:])
+    assert ids[0] != ids[1]
+
+
 def test_a_batch_is_one_row_per_command_and_an_open_store_is_left_open(monkeypatch, tmp_path):
     install(monkeypatch, show_batch=lambda host, user, passwd, cmds, *a, **kw:
             [{"command": c, "ok": c != "show nothing", **({"output": f"{c} on {host}"} if c != "show nothing"
@@ -842,6 +1056,44 @@ def test_a_batch_is_one_row_per_command_and_an_open_store_is_left_open(monkeypat
         [(0, "show version", 1), (1, "show nothing", 0), (2, "show route", 1)]
     assert got_rows[1]["error"] == "refused" and got_rows[2]["output"] == "show route on 10.0.0.1"
     store.conn.execute("SELECT 1").fetchone()            # the caller's store: still open after the Fleet closed
+    store.close()
+
+
+def test_two_fleets_on_one_store_from_two_threads_keep_every_row(monkeypatch, tmp_path):
+    """One Store handed to two Fleets, iterated on two threads: two threads
+    inside one connection's transactions lost rows ("bad parameter or other
+    API misuse", a SystemError out of the loop) beyond what not_kept
+    counted, the run rows saying every result was kept. The store takes
+    one write at a time."""
+    install(monkeypatch, show=lambda host, user, passwd, cmd, *a, **kw: "x" * 2000)
+    path = tmp_path / "shared.db"
+    store = Store(str(path))
+    fleets = [Fleet([f"10.0.{n}.{i}" for i in range(1, 101)], transport="junos", user="u", workers=8, store=store)
+              for n in (1, 2)]
+    outcome = {}
+
+    def consume(n, fleet):
+        try:
+            res = fleet.show("show version")
+            outcome[n] = (len(list(res)), res.not_kept, res.store_error)
+        except BaseException as e:            # pragma: no cover - the failure we are testing against
+            outcome[n] = f"{type(e).__name__}: {e}"
+
+    with warnings.catch_warnings(record=True) as said:
+        warnings.simplefilter("always")
+        threads = [threading.Thread(target=consume, args=(n, fleet)) for n, fleet in enumerate(fleets)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        for fleet in fleets:
+            fleet.close()
+    assert outcome == {0: (100, 0, None), 1: (100, 0, None)}
+    assert [str(w.message) for w in said] == []
+    assert rows(path, "SELECT COUNT(*) AS n FROM results")[0]["n"] == 200
+    runs = rows(path, "SELECT * FROM runs")
+    assert [(r["targets"], r["ok"], r["failed"], r["skipped"], r["finished"] is not None) for r in runs] == \
+        [(100, 100, 0, 0, True)] * 2
     store.close()
 
 
@@ -900,6 +1152,143 @@ def test_two_fleets_share_the_pool_and_a_callers_pool_is_left_alone(monkeypatch)
         list(fleet.show("show version"))
         pool.disable()                                       # the caller changes their mind mid-way
     assert not pool.POOL.enabled
+
+
+def test_a_fleet_dropped_without_close_lets_its_threads_go_and_the_pool_count_back(monkeypatch):
+    """A function that makes a Fleet per request and returns the results
+    without close(): the worker threads sat on their queue for the life of
+    the process (50 requests: 195 threads) and the session pool stayed on,
+    its count never coming down. Collected, a Fleet gives both back, as a
+    dropped ThreadPoolExecutor ends its workers."""
+    install(monkeypatch, show=echo)
+    made = []                                                # the threads of this test's Fleets
+
+    def request():
+        fleet = Fleet(HOSTS, transport="junos", user="u")
+        oks = [r.ok for r in fleet.show("show version")]
+        made.extend(fleet._workers.threads)
+        return oks
+
+    def unread():
+        fleet = Fleet(HOSTS, transport="junos", user="u")
+        fleet.show("show version")                           # never iterated, never closed: a cycle through its run
+        assert wait_for(lambda: all(t.future.done() for t in fleet._run.tasks))
+        made.extend(fleet._workers.threads)
+
+    for _ in range(5):
+        assert request() == [True] * 3
+    unread()
+    deadline = time.monotonic() + 5
+    while any(t.is_alive() for t in made) and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.05)
+    assert not any(t.is_alive() for t in made)
+    assert fleet_mod._POOL_FLEETS == 0 and not pool.POOL.enabled
+
+
+def test_a_fleet_collected_inside_the_pool_lock_gives_the_pool_back_without_a_hang(monkeypatch):
+    """The collector runs on whatever thread it lands on: inside
+    _pool_acquire()'s lock, say, as another Fleet starts. A dropped Fleet's
+    release taken there, on that thread, would wait for that very lock and
+    hang the run for good; it is done on the dropped Fleet's own worker."""
+    install(monkeypatch, show=echo)
+    monkeypatch.setattr(fleet_mod, "_POOL_LOCK", threading.Lock())   # a hang would hold this one, not the module's
+
+    def drop():
+        fleet = Fleet(HOSTS, transport="junos", user="u")
+        fleet.show("show version")                           # never iterated: the run and the Fleet hold each other
+        assert wait_for(lambda: all(t.future.done() for t in fleet._run.tasks))
+        return fleet._workers.threads
+
+    gc.disable()                                                     # the collection runs where this test says
+    try:
+        threads = drop()
+        real_enable = pool.enable
+
+        def enable(*a, **kw):
+            gc.collect()                                     # the collector, here: under _POOL_LOCK
+            return real_enable(*a, **kw)
+        monkeypatch.setattr(pool, "enable", enable)
+        got = []
+
+        def another():
+            with Fleet(HOSTS, transport="junos", user="u") as fleet:
+                got.extend(r.ok for r in fleet.show("show version"))
+        t = threading.Thread(target=another, daemon=True)
+        t.start()
+        t.join(5)
+        assert not t.is_alive(), "the run hung in _pool_acquire()"
+        assert got == [True] * 3
+        assert wait_for(lambda: not any(w.is_alive() for w in threads))
+        assert fleet_mod._POOL_FLEETS == 0 and not pool.POOL.enabled
+    finally:
+        gc.enable()
+
+
+def test_a_refused_reaper_thread_leaves_the_pool_count_at_zero(monkeypatch):
+    """`ulimit -u` at the first run: the session pool's cleanup thread cannot
+    start. The error is the caller's at once; the pool stays off and
+    uncounted (it was counted as this Fleet's and left on, reaper or not),
+    and the Fleet runs once threads can start."""
+    install(monkeypatch, show=echo)
+    refuse = [True]
+    real_start = threading.Thread.start
+
+    def start(self):
+        if refuse[0] and self.name == "hssh-pool-cleanup":
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    with Fleet(HOSTS, transport="junos", user="u") as fleet:
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            fleet.show("show version")
+        assert fleet_mod._POOL_FLEETS == 0 and not pool.POOL.enabled and fleet._workers is None
+        refuse[0] = False
+        assert all(r.ok for r in fleet.show("show version"))     # not BUSY: the refused run was ended
+        assert fleet_mod._POOL_FLEETS == 1 and pool.POOL.enabled
+    assert fleet_mod._POOL_FLEETS == 0 and not pool.POOL.enabled
+
+
+def test_a_transport_traceback_stays_off_stderr_unless_the_caller_set_up_logging(monkeypatch, capsys):
+    """paramiko logs a traceback at ERROR from its transport thread when a
+    wedged device drops the connection mid-handshake, ncclient from its
+    session's; with no logging set up, Python's last-resort handler printed
+    it to stderr under the library, next to the failed result that says
+    the same. (PyEZ quiets paramiko when it is imported; an ssh fleet never
+    imports it, and nothing quieted ncclient.) Both get a NullHandler, as
+    the CLI gives them; a caller who sets up logging still gets the records."""
+    def show(host, user, passwd, cmd, *a, **kw):
+        for name in ("paramiko.transport", "ncclient.transport.ssh"):
+            try:
+                raise EOFError()
+            except EOFError:
+                logging.getLogger(name).error("Error reading SSH protocol banner", exc_info=True)
+        raise RuntimeError(f"no SSH banner from {host}:22 within 1s (sshd busy, or filtered)")
+
+    install(monkeypatch, show=show)
+    transports = [logging.getLogger(name) for name in ("paramiko", "ncclient")]
+    levels = [lg.level for lg in transports]
+    for lg in transports:                                    # as a fresh process has them: the CLI's tests quiet them
+        monkeypatch.setattr(lg, "handlers", [])
+        lg.setLevel(logging.NOTSET)
+    pytests = logging.root.handlers[:]
+    logging.root.handlers[:] = []                            # no logging set up, as in a plain script
+    try:
+        with Fleet(HOSTS, transport="ssh", user="u", retries=0) as fleet:
+            assert not any(r.ok for r in fleet.show("show version"))
+        err = capsys.readouterr().err
+        assert "Error reading SSH protocol banner" not in err and "Traceback" not in err, err
+        seen = []
+        handler = logging.Handler()
+        handler.emit = lambda record: seen.append(record.getMessage())
+        logging.root.handlers[:] = [handler]                 # the caller's own logging
+        with Fleet(HOSTS, transport="ssh", user="u", retries=0) as fleet:
+            list(fleet.show("show version"))
+        assert seen.count("Error reading SSH protocol banner") == 6            # three devices, two loggers
+    finally:
+        logging.root.handlers[:] = pytests
+        for lg, level in zip(transports, levels):
+            lg.setLevel(level)
 
 
 def test_a_netconf_fleet_logs_in_once_per_device(monkeypatch):
