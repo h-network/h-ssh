@@ -99,14 +99,16 @@ class OfflineSSHClient(paramiko.SSHClient):
     """paramiko's own connect() — host-key logic included — with no socket.
 
     The server presents whatever key the class attribute holds; auth records
-    the credentials it was handed instead of sending them anywhere.
+    the credentials it was handed instead of sending them anywhere. The fake
+    transport stands in for the one the ssh transport's factory would build.
     """
     server_key = None
     auth_calls = []
+    transport = FakeTransport
 
-    def connect(self, hostname, port=22, **kw):
+    def connect(self, hostname, port=22, transport_factory=None, **kw):
         return super().connect(hostname, port=port, sock=FakeSock(type(self).server_key),
-                               transport_factory=FakeTransport, **kw)
+                               transport_factory=type(self).transport, **kw)
 
     def _auth(self, username, password, *args, **kwargs):
         type(self).auth_calls.append((username, password))
@@ -703,8 +705,8 @@ def test_the_pin_files_are_parsed_once_per_process_not_per_connection(home, monk
     seed.add("10.0.0.1", key.get_name(), key)
     seed.save(str(pins))
     parses = []
-    real_load = paramiko.HostKeys.load
-    monkeypatch.setattr(paramiko.HostKeys, "load", lambda self, path: parses.append(path) or real_load(self, path))
+    real_parse = T._parse
+    monkeypatch.setattr(T, "_parse", lambda text, path, system: parses.append(path) or real_parse(text, path, system))
     T._PINS.clear()
 
     clients = [paramiko.SSHClient() for _ in range(5)]
@@ -730,3 +732,241 @@ def test_the_pin_files_are_parsed_once_per_process_not_per_connection(home, monk
     fresh = paramiko.SSHClient()
     T._load_pins(fresh, str(pins))
     assert len(parses) == seen + 1 and fresh.get_host_keys().lookup("10.0.0.3")
+
+
+# --- #114: the pin file read and written whole, OpenSSH's markers, damaged lines named ---
+
+import base64
+import fcntl
+
+
+def _key_line(host, key):
+    return f"{host} {key.get_name()} {key.get_base64()}"
+
+
+def _pins_with(home, *lines):
+    pins = pin_file(home)
+    pins.parent.mkdir(mode=0o700, exist_ok=True)
+    pins.write_text("".join(line + "\n" for line in lines))
+    return pins
+
+
+def test_a_reader_waits_for_a_save_in_progress_and_sees_the_whole_file(home):
+    """G1: the pin file was read under the thread lock only, while a save
+    truncates it and writes it again under the file lock: a run that read in
+    between saw no pins, and under accept-new pinned whatever a re-keyed
+    host presented. The read takes the file lock as well."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    seen = {}
+
+    def read():
+        client = paramiko.SSHClient()
+        ssh._load_pins(client, str(pins))
+        seen["keys"] = client.get_host_keys()
+    with open(pins, "r+") as saving:                  # another run, half-way through a save
+        fcntl.flock(saving, fcntl.LOCK_EX)
+        saving.truncate(0)
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        reader.join(0.5)
+        assert reader.is_alive()                      # waiting for the save, not reading an empty file
+        saving.write(_key_line("10.0.0.1", key) + "\n")
+        saving.flush()
+        fcntl.flock(saving, fcntl.LOCK_UN)
+    reader.join(5)
+    assert seen["keys"].lookup("10.0.0.1")["ecdsa-sha2-nistp256"] == key
+
+
+def test_a_host_another_run_pins_during_this_handshake_is_checked_against_that_pin(offline, home, monkeypatch):
+    """G1: the pin policy merged the file and then add()ed the key this
+    server presented, over a pin another run had written since this one
+    read the file: a torn or stale read re-pinned a changed key. The host
+    is looked up again under the lock, and a pin found there is checked."""
+    theirs = paramiko.ECDSAKey.generate()
+
+    class Racing(FakeTransport):
+        def start_client(self, timeout=None):
+            # another run pins this host, with the key it was shown, meanwhile
+            ssh._PinPolicy(str(pin_file(home))).missing_host_key(paramiko.SSHClient(), "10.0.0.1", theirs)
+    monkeypatch.setattr(offline, "transport", Racing)
+    with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.1: the key is not the one pinned"):
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert offline.auth_calls == []
+    assert pin_file(home).read_text() == _key_line("10.0.0.1", theirs) + "\n"
+
+
+def test_a_pin_is_saved_by_replacing_the_file_whole(offline, home, tmp_path):
+    """G1: paramiko's save truncated the pin file and wrote it again in
+    place. A pin is written to a new file renamed over the old one: a reader
+    has the old file or the new one, never a part of either. A pin file
+    that is a symlink stays one."""
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    before = pin_file(home).read_text()
+    with open(pin_file(home)) as held:                # opened before the next pin, read after it
+        ssh.show("10.0.0.2", "admin", "s3cret", "show version", 5, 10)
+        assert held.read() == before
+    lines = pin_file(home).read_text().splitlines()
+    assert lines[0] == before.strip() and lines[1].startswith("10.0.0.2 ecdsa-sha2-nistp256 ")
+    assert stat.S_IMODE(pin_file(home).stat().st_mode) == 0o600
+    assert [p.name for p in pin_file(home).parent.iterdir()] == ["known_hosts"]     # nothing left behind
+
+    shared = tmp_path / "shared-pins"
+    os.replace(pin_file(home), shared)
+    pin_file(home).symlink_to(shared)
+    ssh.show("10.0.0.3", "admin", "s3cret", "show version", 5, 10)
+    assert pin_file(home).is_symlink() and shared.read_text().splitlines()[2].startswith("10.0.0.3 ")
+
+
+def test_a_cert_authority_line_in_the_system_file_is_passed_over_and_the_rest_still_counts(offline, home):
+    """G2: an @cert-authority line, which an SSH CA puts in every user's
+    ~/.ssh/known_hosts, refused every connection as malformed. paramiko
+    cannot check a host certificate: the line is passed over, a host known
+    only through the CA is pinned on first contact, and the file's own pins
+    still count. So does a line of a key type paramiko does not know."""
+    ca = paramiko.ECDSAKey.generate()
+    dss = base64.b64encode(b"\x00\x00\x00\x07ssh-dss" + bytes(40)).decode()
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir(mode=0o700)
+    system.write_text(f"@cert-authority *.example.net {ca.get_name()} {ca.get_base64()}\n"
+                      f"10.0.0.8 ssh-dss {dss}\n"
+                      + _key_line("10.0.0.9", offline.server_key) + "\n")
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert pin_file(home).read_text().startswith("10.0.0.1 ecdsa-sha2-nistp256 ")
+    ssh.show("10.0.0.9", "admin", "s3cret", "show version", 5, 10)       # known from ~/.ssh/known_hosts
+    assert "10.0.0.9" not in pin_file(home).read_text()
+    offline.server_key = paramiko.ECDSAKey.generate()
+    with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.9"):
+        ssh.show("10.0.0.9", "admin", "s3cret", "show version", 5, 10)
+
+
+class _Sshd(paramiko.ServerInterface):
+    """Lets anyone in with a password, and notes who tried."""
+
+    def __init__(self, logins):
+        self.logins = logins
+
+    def get_allowed_auths(self, username):
+        return "password"
+
+    def check_auth_password(self, username, password):
+        self.logins.append(username)
+        return paramiko.AUTH_SUCCESSFUL
+
+
+@pytest.fixture
+def sshd():
+    """paramiko as an SSH server on 127.0.0.1: (port, its host key, the logins it saw)."""
+    key = paramiko.ECDSAKey.generate()
+    logins, transports = [], []
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            t = paramiko.Transport(conn)
+            t.add_server_key(key)
+            transports.append(t)
+            try:
+                t.start_server(server=_Sshd(logins))
+            except (paramiko.SSHException, EOFError, OSError):
+                pass
+    threading.Thread(target=serve, daemon=True).start()
+    yield srv.getsockname()[1], key, logins
+    srv.close()
+    for t in transports:
+        t.close()
+
+
+def test_a_key_the_system_file_marks_revoked_is_refused_before_any_credential(sshd, home, monkeypatch):
+    """G2: an @revoked line refused every connection as malformed. Passed
+    over, it would let a key the operator revoked be pinned on first
+    contact, or still match an old pin. It is refused whenever a server
+    presents it, pinned or not, under every policy, before any password."""
+    port, key, logins = sshd
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir(mode=0o700)
+    revoked = f"@revoked * {key.get_name()} {key.get_base64()}\n"
+    refused = r"^Host key verification failed for 127\.0\.0\.1: its key is marked @revoked in ~/\.ssh/known_hosts\.$"
+    system.write_text(revoked)
+    with pytest.raises(RuntimeError, match=refused):
+        ssh._connect("127.0.0.1", "u", "p", 5, port)
+    assert logins == [] and pin_file(home).read_text() == ""
+    system.write_text("")
+    ssh._connect("127.0.0.1", "u", "p", 5, port).close()                  # not revoked: in, and pinned
+    assert logins == ["u"] and pin_file(home).read_text().startswith(f"[127.0.0.1]:{port} ")
+    system.write_text(revoked)
+    for policy in ("accept-new", "yes", "no"):
+        monkeypatch.setenv("HSSH_HOST_KEY_POLICY", policy)
+        with pytest.raises(RuntimeError, match=refused):
+            ssh._connect("127.0.0.1", "u", "p", 5, port)
+    assert logins == ["u"]
+
+
+@pytest.mark.parametrize("damaged, why", [
+    ("10.0.0.1 ecdsa-sha2-nistp256", "expected host, key type and key"),
+    ("10.0.0.1 ssh-foo {blob}", "unknown key type ssh-foo"),
+    ("10.0.0.1 ssh-ed25519 aGVsbG8sIG5vdCBhIGtleQ==", "the key does not decode as ssh-ed25519"),
+    ("10.0.0.1 ssh-ed25519 AAAA!!!!", "the key is not base64"),
+    ("|1|AAAA|{hash} ecdsa-sha2-nistp256 {blob}", "a hashed host name that is not |1|salt|hash"),
+    ("@revoked 10.0.0.1 ecdsa-sha2-nistp256 {blob}", "markers are read from ~/.ssh/known_hosts only"),
+])
+def test_a_damaged_pin_line_is_refused_by_name_not_dropped_and_pinned_over(offline, home, damaged, why):
+    """G3: paramiko's load dropped such a line without a word: the host
+    counted as unknown, was pinned again on trust, and the next save deleted
+    the line (another host's too); a hashed name with a bad salt was an
+    empty AssertionError, retried. The run is refused with the line, nothing
+    sent and nothing rewritten."""
+    key = paramiko.ECDSAKey.generate()
+    damaged = damaged.format(blob=key.get_base64(), hash=base64.b64encode(b"h" * 20).decode())
+    pins = _pins_with(home, _key_line("10.0.0.9", key), damaged)
+    before = pins.read_text()
+    with pytest.raises(ValueError) as refused:
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert str(refused.value) == f"{pins}: malformed known_hosts line 2: {damaged!r} ({why}); fix or remove it"
+    assert runner.is_permanent_failure(refused.value)
+    assert offline.auth_calls == [] and pins.read_text() == before
+
+
+def test_a_bad_salt_fails_the_device_once_and_says_which_line(offline, home, capsys):
+    """G3: it was `RETRY 1/2 in 1s ()`, `RETRY 2/2 in 3s ()`, then `ERROR: `
+    with nothing after it."""
+    key = paramiko.ECDSAKey.generate()
+    _pins_with(home, f"|1|AAAA|{base64.b64encode(b'h' * 20).decode()} {key.get_name()} {key.get_base64()}")
+    name, ok, out, _ = runner.run_for_target(
+        t=Target("R1", "10.0.0.1", "ssh"), transport="ssh", mode="show",
+        show_cmd="show version", edit_cmd=None, config_dir=None, broadcast_file=None,
+        user="u", passwd="p", session_timeout=5, command_timeout=30,
+        dry_run=False, commit_confirmed=None, save_dir=None, quiet=False, max_attempts=3)
+    assert ok is False
+    assert f"ERROR: {pin_file(home)}: malformed known_hosts line 1: '|1|AAAA|" in out
+    assert "RETRY" not in capsys.readouterr().out
+
+
+def test_the_key_exchange_has_the_session_timeout_too_not_paramikos_fixed_15_s(monkeypatch):
+    """G4: connect() takes no handshake timeout and paramiko's Transport
+    gives the key exchange 15 s after the banner: a session timeout above
+    that failed at 15 s with an empty EOFError. The transport _connect
+    builds has the session timeout there as well."""
+    seen = {}
+
+    class Recording(paramiko.SSHClient):
+        def connect(self, **kw):
+            seen.update(kw)
+
+        def exec_command(self, cmd, timeout=None, **kw):
+            return exec_result(b"ok")
+    monkeypatch.setattr(ssh, "paramiko", FakeParamiko(Recording))
+    ssh.show("10.0.0.1", "u", "p", "show version", 40, 10)
+    a, b = socket.socketpair()
+    try:
+        assert seen["transport_factory"](a).handshake_timeout == 40.0
+    finally:
+        a.close()
+        b.close()

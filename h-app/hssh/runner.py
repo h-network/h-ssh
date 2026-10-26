@@ -82,6 +82,7 @@ _CONNECT_PHASE = (
     "ssh protocol banner",
     "connection timed out",
     "no ssh session",
+    "key exchange did not finish",          # the paramiko transports: banner, then no key exchange
 )
 
 

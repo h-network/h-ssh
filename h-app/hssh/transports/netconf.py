@@ -76,6 +76,8 @@ except ImportError:
 # deadline; paramiko's Transport reads it while the session is being set up.
 _DEADLINE = threading.local()
 
+_KEX_UNFINISHED = "the banner came, but key exchange did not finish"
+
 
 if _paramiko is not None:
     class _DeadlineTransport(_paramiko.Transport):
@@ -107,6 +109,17 @@ if _paramiko is not None:
         banner_timeout = _timeout("_hssh_banner", 15)
         handshake_timeout = _timeout("_hssh_handshake", 15)
         auth_timeout = _timeout("_hssh_auth", 30)
+
+        def start_client(self, event=None, timeout=None):
+            # A key exchange that does not finish (the deadline, or the
+            # server closing) ends in paramiko's bare EOFError, which ncclient
+            # lets through and PyEZ renders "ConnectError" with nothing after it.
+            try:
+                return super().start_client(event=event, timeout=timeout)
+            except EOFError as e:
+                if not self.remote_version or self.initial_kex_done:
+                    raise
+                raise _paramiko.SSHException(_KEX_UNFINISHED) from e
 
     class _ParamikoForNcclient:
         """ncclient's view of the paramiko module: as it is, except that
@@ -230,6 +243,10 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
         if elapsed < timeout / 2:
             return f"{where} dropped the session before login after {elapsed:.1f}s (sshd connection limit?)"
         return f"no SSH banner from {where} within {elapsed:.0f}s (sshd busy, or filtered)"
+    if _KEX_UNFINISHED in low:
+        if elapsed < timeout / 2:
+            return f"{where} dropped the session before login after {elapsed:.1f}s ({_KEX_UNFINISHED})"
+        return f"no SSH session to {where} within {timeout}s: {_KEX_UNFINISHED}"
     if "negotiation failed" in low:
         return f"SSH negotiation with {where} failed: {text.split(':', 1)[1].strip()}"
     if kind == "ConnectTimeoutError":
