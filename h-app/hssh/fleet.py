@@ -746,8 +746,10 @@ class Fleet:
     row; the run is recorded as interrupted with the rest as skipped, and
     its Results give what was done by then and nothing more (a call that
     returns later is dropped: its row says skipped). The sessions close (one
-    still in use closes when its call returns), a store this Fleet opened is
-    closed. Nothing waits on a device beyond `wait`; the worker threads are
+    still in use closes when its call returns), and the routers get up to a
+    second in all (pool.CLOSE_WAIT) to acknowledge that, so the sessions'
+    descriptors are freed with them; a store this Fleet opened is closed.
+    Nothing else waits on a device beyond `wait`; the worker threads are
     daemon threads, so a call that never returns keeps its thread and
     nothing else. `async with`, and `aclose()`, do the same off the event
     loop."""

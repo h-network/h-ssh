@@ -918,6 +918,43 @@ def test_a_netconf_fleet_logs_in_once_per_device(monkeypatch):
     assert all(d.closed for d in FakeDevice.instances) and pool.live() == 0
 
 
+def test_close_waits_up_to_close_wait_for_the_routers_to_acknowledge(monkeypatch):
+    """close() turns the pool off, and the pool waits for the closes it
+    starts before it collects what they leave (#113): until a router has
+    acknowledged, pool.CLOSE_WAIT at most. CLOSE_WAIT was read at import,
+    so setting it changed nothing: a second, always."""
+    from hssh.transports import netconf
+    from tests.test_junos import FakeConfig, FakeDevice
+    release = threading.Event()
+
+    class Acks(FakeDevice):
+        def close(self):
+            if self.params["host"] == "10.0.0.2":
+                release.wait(5)                  # no acknowledgement, as far as close() waits
+            else:
+                time.sleep(0.05)                 # the round trip of a <close-session>
+            super().close()
+    FakeDevice.instances = []
+    FakeDevice.open_error = None
+    FakeDevice.cli_outputs = {}
+    monkeypatch.setattr(netconf, "AVAILABLE", True)
+    monkeypatch.setattr(netconf, "JunosDevice", Acks)
+    monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
+    monkeypatch.setattr(pool, "CLOSE_WAIT", 0.3)
+    try:
+        fleet = Fleet(["R1:10.0.0.1:junos", "R2:10.0.0.2:junos"], user="u", passwd="p")
+        assert all(r.ok for r in fleet.show("show version"))
+        t0 = time.monotonic()
+        fleet.close()
+        elapsed = time.monotonic() - t0
+        r1, r2 = sorted(FakeDevice.instances, key=lambda d: d.params["host"])
+        assert r1._closed and not r2._closed                 # waited for the router that answered
+        assert 0.25 <= elapsed < 0.9, f"{elapsed:.2f}s"       # and CLOSE_WAIT for the other, no more
+    finally:
+        release.set()
+    assert netconf.wait_for_closes(2) == 0 and r2._closed
+
+
 # --- targets, credentials, refusals ---------------------------------------------------------
 
 def test_targets_in_every_form_are_accepted(monkeypatch, tmp_path):

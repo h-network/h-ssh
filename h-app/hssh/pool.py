@@ -154,9 +154,10 @@ class ConnectionPool:
                 uses (host, port, user))
             opener: Opens and returns a session; whatever it raises propagates
                 untouched and leaves the slot empty
-            closer: Closes a session this pool is done with; may return a
-                thread that is still finishing the close, which close_all()
-                and the reaper wait for before they collect what it leaves
+            closer: Closes a session this pool is done with; it may hand
+                the close to a thread and return that Thread, which
+                close_all() and the reaper wait for before they collect what
+                the close leaves. Any other return value is ignored
             timeout: Command timeout to set on the device for this borrow
             alive: alive(dev, idle_seconds) asked before a session is reused;
                 False or an exception means it is closed and a new one opened
@@ -269,8 +270,8 @@ class ConnectionPool:
 
     def _drop(self, entry: dict, counter: str):
         """Close and forget the entry's session. Caller holds entry["lock"].
-        Returns what the closer returned: the thread still finishing the
-        close, if it handed the close to one, else None."""
+        Returns what the closer returned (the thread still finishing the
+        close, if it handed the close to one)."""
         device, entry["device"] = entry["device"], None
         if device is None:
             return None
@@ -350,9 +351,11 @@ class ConnectionPool:
             shutdown: If True (default), don't wait on an in-flight operation —
                 skip busy entries; they are closed when their borrower returns
                 them. Use at exit, so a SIGTERM during a long command doesn't
-                hang teardown. If False, wait for in-flight operations so a
-                live RPC is not severed — use when a run is over and the next
-                one must start from fresh sessions.
+                hang teardown. The closes it does start still get up to
+                CLOSE_WAIT (a second, in all) to be acknowledged, so their
+                descriptors are freed with them (#113). If False, wait for
+                in-flight operations so a live RPC is not severed — use when
+                a run is over and the next one must start from fresh sessions.
         """
         # Snapshot entries under the global lock, then close each under its own
         # per-router lock (outside the global lock, so a slow close can't block
@@ -365,15 +368,17 @@ class ConnectionPool:
             self._generation += 1
             entries = list(self._connections.items())
 
+        closes = []     # what each close handed back, whichever thread ran it
+
         def close_one(item):
             key, entry = item
             if shutdown:
                 if not entry["lock"].acquire(blocking=False):
-                    return None
+                    return
             else:
                 entry["lock"].acquire()
             try:
-                return self._drop(entry, "discards")
+                closes.append(self._drop(entry, "discards"))
             finally:
                 entry["lock"].release()
 
@@ -382,16 +387,26 @@ class ConnectionPool:
         # stall for minutes.
         live = [item for item in entries if item[1]["device"] is not None]
         if len(live) > 1:
-            with ThreadPoolExecutor(max_workers=min(32, len(live)), thread_name_prefix="hssh-pool-close") as ex:
-                closes = list(ex.map(close_one, live))
+            try:
+                with ThreadPoolExecutor(max_workers=min(32, len(live)), thread_name_prefix="hssh-pool-close") as ex:
+                    list(ex.map(close_one, live))
+            except RuntimeError as e:
+                # No thread to close on: the system refuses them (ulimit -u,
+                # a container's pids.max), or the interpreter is exiting and
+                # the executor takes no more work. What is still open closes
+                # here, one after another; one already closed is a no-op (#113).
+                log.info("Pool: closing on this thread, one session after another (%s)", e)
+                for item in live:
+                    close_one(item)
         else:
-            closes = [close_one(item) for item in live]
+            for item in live:
+                close_one(item)
         if live:
             _release_closed_sessions(closes)
         log.info("Connection pool: all connections closed")
 
 
-def _release_closed_sessions(closes, timeout: float = CLOSE_WAIT) -> None:
+def _release_closed_sessions(closes, timeout: Optional[float] = None) -> None:
     """A closed ncclient session keeps one descriptor until the garbage
     collector runs: its reader thread's selector (an epoll fd) is a local of
     a frame that survives in a reference cycle with the exception that ended
@@ -401,11 +416,12 @@ def _release_closed_sessions(closes, timeout: float = CLOSE_WAIT) -> None:
 
     `closes` is what the closer returned per session. The junos closer only
     starts a thread and hands it back (#98), so the collection first waits
-    for those, one deadline for all of them; collected before they are done,
-    every session is still open and nothing is freed (#113)."""
-    deadline = time.monotonic() + timeout
+    for those, one deadline for all of them (CLOSE_WAIT, unless `timeout`);
+    collected before they are done, every session is still open and nothing
+    is freed (#113). What is not a thread was a close already done."""
+    deadline = time.monotonic() + (CLOSE_WAIT if timeout is None else timeout)
     for t in closes:
-        if t is not None:
+        if isinstance(t, threading.Thread):
             t.join(max(0.0, deadline - time.monotonic()))
     gc.collect()
 

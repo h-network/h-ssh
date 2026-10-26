@@ -108,3 +108,28 @@ def test_ctrl_c_mid_job_leaves_no_session_open(monkeypatch, capsys, tmp_path):
     assert rc == 130
     assert pool.live() == 0 and not pool.POOL.enabled
     assert all(d.closed for d in FakeDevice.instances)
+
+
+def test_the_end_of_a_job_gives_the_closes_one_second_in_all(monkeypatch, capsys, tmp_path):
+    """close_all() waits up to a second for the closes it starts (#113), and
+    the run's own wait for closes in flight then gave the same closes
+    another second: a router that never acknowledged its close cost the end
+    of every job two seconds instead of one."""
+    import threading
+    import time
+    release = threading.Event()
+
+    class Wedged(FakeDevice):
+        def close(self):
+            release.wait(10)
+            super().close()
+    monkeypatch.setattr(netconf, "JunosDevice", Wedged)
+    try:
+        t0 = time.monotonic()
+        rc, out, err = _run(monkeypatch, capsys, tmp_path, [{"target": "R1:10.0.0.1:junos", "show": "show version"}])
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+    assert rc == 0, err
+    assert 1.0 <= elapsed < 1.6, f"{elapsed:.2f}s"
+    assert FakeDevice.instances[0].closed and pool.live() == 0

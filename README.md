@@ -800,7 +800,8 @@ The library reads no environment variable and no config file; that is the CLI's 
   iterating its results afterwards gives what was done by then and nothing more (a call that returns later is
   dropped, its row says skipped), so the store and the script agree; a script waiting in its `for` loop wakes at
   once, whichever thread called `close()`. A store this Fleet opened is closed, and
-  the sessions close (one still in use closes when its call returns). `async with Fleet(...)` and `aclose()`
+  the sessions close (one still in use closes when its call returns); the routers get up to a second in all to
+  acknowledge that, so the sessions' descriptors are freed with them. `async with Fleet(...)` and `aclose()`
   do the same off the event loop;
 - `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
   command line `Fleet.show show bgp summary`; one result row per device, per command for a batch), written
@@ -982,7 +983,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (931 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (936 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

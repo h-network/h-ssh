@@ -1,6 +1,7 @@
 """Session pool: reuse, isolation per router, discard on failure, reaping,
 and the junos driver's behaviour on a pooled session."""
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ def fake_pyez(monkeypatch):
     monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
     yield
     pool.POOL.disable()
+    netconf.wait_for_closes()       # a close still in flight is this test's, not the next one's
     for k in pool.POOL.stats:
         pool.POOL.stats[k] = 0
 
@@ -788,3 +790,57 @@ def test_close_all_closes_on_its_own_clock_when_the_system_refuses_the_close_thr
     pool.close_all(shutdown=False)
     assert devices()[0]._closed and pooled.live() == 0
     assert not netconf._CLOSES and netconf.wait_for_closes() == 0
+
+
+def test_close_all_closes_every_session_itself_when_the_system_refuses_every_thread(pooled, monkeypatch):
+    """ulimit -u or a container's pids.max refuses the executor's threads
+    too, not only the close helper: with two sessions or more close_all()
+    raised before any close, every session stayed open on its router, and a
+    --job run ended in a traceback before its log and summary."""
+    show()
+    show(host="10.0.0.2")
+
+    def start(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, "start", start)
+    pool.close_all(shutdown=False)
+    assert [d._closed for d in devices()] == [True, True] and pooled.live() == 0
+    assert not netconf._CLOSES and netconf.wait_for_closes() == 0
+
+
+def test_the_close_all_at_interpreter_exit_closes_every_session(tmp_path):
+    """concurrent.futures takes no more work once the interpreter is
+    exiting, before atexit runs: with two sessions or more the close_all()
+    there raised 'cannot schedule new futures after interpreter shutdown'
+    and closed none of them."""
+    script = tmp_path / "leaves.py"
+    script.write_text(
+        "from hssh import pool\n"
+        "pool.enable()\n"
+        "for host in ('r1', 'r2', 'r3'):\n"
+        "    with pool.POOL.get_connection((host, 830, 'u'), opener=lambda: host,\n"
+        "                                  closer=lambda dev: print('closed', dev, flush=True)):\n"
+        "        pass\n")
+    env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(pool.__file__))}
+    proc = subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and "Traceback" not in proc.stderr, proc.stderr
+    assert sorted(proc.stdout.splitlines()) == ["closed r1", "closed r2", "closed r3"]
+
+
+def test_a_closer_that_returns_something_else_is_not_waited_for():
+    """Only a Thread is waited for. A closer such as `lambda m:
+    m.close_session()` (ncclient hands back the reply) made close_all() and
+    the reaper raise AttributeError instead of collecting."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    try:
+        for host in ("r1", "r2"):
+            with p.get_connection((host, 830, "u"), opener=lambda: object(), closer=lambda dev: True):
+                pass
+        p.close_all(shutdown=False)
+        assert p.live() == 0
+        with p.get_connection(("r1", 830, "u"), opener=lambda: object(), closer=lambda dev: "<ok/>"):
+            pass
+        assert p.reap(now=time.time() + 301) == 1 and p.live() == 0
+    finally:
+        p.disable()

@@ -1543,10 +1543,12 @@ async def main() -> int:
             else:
                 failures += 1
 
+    closing = time.monotonic()
     if job_entries:
         pool.close_all(shutdown=False)   # the run is over: every session closed cleanly, in parallel
         pool.disable()
-    _drain_closes()
+    # One second in all for the closes: close_all() has already waited on its own (#113).
+    _drain_closes(max(0.0, 1.0 - (time.monotonic() - closing)))
 
     # Write structured JSONL log. It holds the same payloads, replies and
     # diffs as the audit log, so it gets the same redaction and file mode.
