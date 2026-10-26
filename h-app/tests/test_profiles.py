@@ -2,7 +2,9 @@
 shipped ones; --list-profiles shows both; a profile is run exactly like --batch."""
 
 import asyncio
+import errno
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -116,15 +118,24 @@ def test_a_profile_that_is_not_utf8_is_said_so_and_still_listed(home, monkeypatc
 
 
 def test_a_profile_without_read_permission_is_said_so_and_still_listed(home, monkeypatch, capsys):
-    """The same for a file the user may not read: a PermissionError traceback before."""
+    """The same for a file the user may not read: a PermissionError traceback
+    before. Root may read a mode-000 file, and CI runs as root, so there the
+    read is refused as it is for anyone else rather than the test skipped
+    (#110 review: skipped there, it left the OSError handlers untested on CI)."""
     mine = home / ".h-ssh" / "profiles"
     mine.mkdir(parents=True)
     locked = mine / "locked.txt"
     locked.write_text("# locked\nshow version\n")
     locked.chmod(0)
     if os.access(locked, os.R_OK):
-        locked.chmod(0o600)
-        pytest.skip("a mode-000 file is readable here (root)")
+        read_text = Path.read_text
+
+        def refused(self, *a, **kw):
+            if self == locked:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(self))
+            return read_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", refused)
     try:
         rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "locked", "R1:10.0.0.1:junos"])
         assert rc == 2 and seen == [] and "Traceback" not in err
@@ -175,6 +186,41 @@ def test_a_profile_or_batch_behind_a_directory_that_may_not_be_read_is_said_so(h
     finally:
         shut.chmod(0o700)
         mine.chmod(0o700)
+
+
+def test_a_link_that_loops_is_said_so_and_never_hides_the_other_profiles(home, monkeypatch, capsys):
+    """#110 review: an entry of ~/.h-ssh/profiles that cannot be looked at (a
+    link that loops, or one into a directory that may not be searched) made
+    --list-profiles exit 2 with nothing listed, and `--profile nope` name
+    that file instead of saying there is no such profile. It is listed as
+    unreadable, with the reason; named by --profile or --batch it is said so;
+    a profiles directory that loops is said so. A loop needs no permissions,
+    so this runs as root too, as CI does."""
+    mine = home / ".h-ssh" / "profiles"
+    mine.mkdir(parents=True)
+    (mine / "core.txt").write_text("# core routers\nshow bgp summary\n")
+    loop = mine / "loop.txt"
+    loop.symlink_to(loop.name)
+    why = os.strerror(errno.ELOOP)
+    assert [r for r in profiles.listing() if r[1] == "yours"] == [("core", "yours", 1, "core routers"),
+                                                                  ("loop", "yours", None, why)]
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--list-profiles"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 0 and err == "" and "  1 commands  core routers" in out and f"  unreadable  {why}" in out
+    assert out.index("core ") < out.index("loop ") < out.index("shipped (") < out.index("junos-health")
+    rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "nope", "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and "ERROR: no profile 'nope'" in err and "(have: core, loop, junos-health" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["--profile", "loop", "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and f"ERROR reading profile 'loop' ({loop}): {why}" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["--batch", str(loop), "R1:10.0.0.1:junos"])
+    assert rc == 2 and seen == [] and f"ERROR reading batch file '{loop}': {why}" in err
+    shutil.rmtree(mine)
+    mine.symlink_to(mine.name)
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--list-profiles"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 2 and out == "" and f"ERROR reading {mine}: {why}" in err
 
 
 def test_a_profile_under_format_is_reads_only(home, monkeypatch, capsys):

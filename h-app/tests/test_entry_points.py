@@ -158,7 +158,8 @@ def test_the_installed_entry_points_never_include_hsshs_own(registry, monkeypatc
 
 def test_load_with_no_argument_is_the_builtins_and_what_is_installed(registry, installed):
     drivers.load()
-    assert drivers.BROKEN == {}
+    # h-ssh's own entry point is never loaded twice; another package installed here may be broken (#110)
+    assert "builtin" not in drivers.BROKEN
     assert BUILTIN_NAMES <= set(drivers.DRIVERS)                   # a subset, not the total
     assert installed <= set(drivers.DRIVERS) - BUILTIN_NAMES
     assert {drivers.SOURCES[n] for n in BUILTIN_NAMES} == {"built-in"}

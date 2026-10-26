@@ -65,7 +65,7 @@ def test_the_built_ins_lead_the_registry_and_say_so(installed):
         assert drivers.SOURCES[driver.name] == "built-in"
     assert installed <= set(drivers.DRIVERS)
     assert all(drivers.SOURCES[n] != "built-in" for n in list(drivers.DRIVERS)[len(drivers.BUILTIN):])
-    assert drivers.BROKEN == {}
+    assert "builtin" not in drivers.BROKEN          # h-ssh's own; another package may be broken (#110)
 
 
 def test_a_retired_name_gets_its_line_and_an_unknown_one_the_list():

@@ -814,8 +814,9 @@ The library reads no environment variable and no config file; that is the CLI's 
   only: on another transport, or for a command that is not a read, that is the device's failure, nothing
   sent); `to_dicts()` is JSON-serialisable, in the shape of the CLI's `--json` records.
 
-Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's), one line of text: a line
-break or another control character in it is a `ValueError` before anything runs. Edits keep their gates
+Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's), one line of text: the line
+break that ends a line read from a file is dropped (`fleet.batch(open(path))`), and any other line break or control
+character is a `ValueError` before anything runs. Edits keep their gates
 in the CLI (the set-syntax guard, the pre-flight check, the question) and in the transports' own
 `edit()`/`begin()` below.
 
@@ -984,7 +985,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (958 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (964 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

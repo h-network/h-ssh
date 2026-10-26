@@ -51,20 +51,27 @@ def describe(path: Path) -> Tuple[Optional[int], str]:
 
 def listing() -> List[Tuple[str, str, Optional[int], str]]:
     """(name, origin, commands, description) for every profile, yours before the shipped ones;
-    a shipped name you also have is listed once, as yours. A file that cannot be read has
-    None for its commands and the reason as its description."""
+    a shipped name you also have is listed once, as yours. A file that cannot be read, or
+    looked at (a link that loops, or into a directory that may not be searched), has None
+    for its commands and the reason as its description: one such file never hides the rest."""
     seen, out = set(), []
     for origin, directory in (("yours", user_dir()), ("shipped", SHIPPED_DIR)):
         if not is_dir(directory):
             continue
         for path in sorted(directory.iterdir()):
-            if path.name.startswith(".") or not is_file(path):
+            if path.name.startswith("."):
                 continue
+            try:
+                if not is_file(path):
+                    continue
+                unreadable = None
+            except OSError as e:
+                unreadable = read_failure(e)
             name = path.name[:-4] if path.name.endswith(".txt") else path.name
             if name in seen:
                 continue
             seen.add(name)
-            count, text = describe(path)
+            count, text = describe(path) if unreadable is None else (None, unreadable)
             out.append((name, origin, count, text))
     return out
 

@@ -555,6 +555,33 @@ def test_a_command_with_a_control_character_is_refused_before_anything_runs(monk
     assert sorted(sent) == HOSTS
 
 
+def test_the_lines_of_an_open_file_are_commands_without_their_line_breaks(monkeypatch, tmp_path):
+    """#110 review: fleet.batch(open(path)) hands over lines that end in a
+    line break. That ran before #110 and was then refused as a line break;
+    the closing one is dropped, as the CLI drops it from a batch file's
+    lines. One inside a command, or a second one, is still refused."""
+    sent = []
+
+    def show_batch(host, user, passwd, cmds, *a, **kw):
+        sent.append(list(cmds))
+        return [{"command": c, "ok": True, "output": c} for c in cmds]
+
+    install(monkeypatch, show=lambda host, user, passwd, cmd, *a, **kw: sent.append(cmd) or cmd, show_batch=show_batch)
+    path = tmp_path / "cmds.txt"
+    path.write_text("show version\nshow route summary\n")
+    with Fleet(["R1:10.0.0.1:junos"], user="u") as fleet:
+        with open(path) as f:
+            got = list(fleet.batch(f))
+        assert got[0].ok and got[0].command == ["show version", "show route summary"]
+        assert [r.command for r in fleet.show("show version\r\n")] == ["show version"]
+        for bad in ("show version\nrequest system reboot\n", "show version\n\n", "show version\r"):
+            with pytest.raises(ValueError, match="a command is one line of text"):
+                fleet.batch(["show version", bad])
+            with pytest.raises(ValueError, match="a command is one line of text"):
+                fleet.show(bad)
+    assert sent == [["show version", "show route summary"], "show version"]
+
+
 def test_breaking_out_early_loses_nothing(monkeypatch):
     install(monkeypatch, show=echo)
     with Fleet(HOSTS, transport="junos", user="u") as fleet:
