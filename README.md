@@ -198,10 +198,12 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 
 ### Watching: `--every`
 
-`--every SECONDS` runs the same read again, SECONDS after the previous tick finished, until Ctrl-C or
-`--times N`. Reads only (`-sC`, `--batch`, `--profile`), and the store must be on: every tick is a run
-in the store, and the ticks are compared through it. The screen gets one line per tick and, for every
-device whose reply changed since the tick before, the difference:
+`--every SECONDS` runs the same read again, SECONDS after the previous tick finished (one second to a
+day), until Ctrl-C or `--times N`. Reads only (`-sC`, `--batch`, `--profile`), and the store must be
+on: every tick is a run in the store, and the ticks are compared through it. `--json` and `--raw` are
+refused with it: a watch prints tick lines, and a pipeline reads the ticks from the store
+(`h-ssh-store export`). The password is asked once, before the first tick. The screen gets one line
+per tick and, for every device whose reply changed since the tick before, the difference:
 
 ```
 tick 1 14:02:10: 250 OK, 0 failed; baseline kept as run 20261025-140210-3f1a
@@ -214,9 +216,18 @@ tick 2 14:02:43: 250 OK, 0 failed, 1 changed
   +10.9.9.8  65000  Active
 ```
 
-A device that fails on a tick shows as `OK -> FAIL (reason)`. The structured summary line still goes to
-stderr once per tick, and any two ticks can be compared later with `h-ssh-store diff DEVICE RUN_A RUN_B`.
-Ctrl-C between ticks stops the watch and says how many ticks are kept.
+A device that fails on a tick shows as `OK -> FAIL (reason)`. A tick the store could not keep in full
+says so on its line, in the warning's words: `baseline not kept (N of M results were not kept: why)` in
+place of the baseline's run id, `; N of M results were not kept: why` after a later tick's count; what
+the store lost is still compared, as the tick got it. With `--diff` every tick also prints how each
+device's reply differs from the first device's, as a single run does. The structured summary line
+still goes to stderr once per tick, and any two ticks can be compared later with
+`h-ssh-store diff DEVICE RUN_A RUN_B`.
+Ctrl-C between ticks stops the watch and says how many ticks are kept, and how many were not kept in
+full. The exit code is the worst tick's, in this order: `130` > `4` > `2` > `1` > `3` > `0`. A device
+that failed on one tick is exit `1` however clean the ticks after it, and a tick that cannot start ends
+the watch with `2`, as when the store was deleted or replaced since tick 1: a watch keeps all its ticks
+in one store.
 
 ## Transports
 
@@ -536,7 +547,9 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
 no traceback, and whatever had landed stands. paramiko's transport thread logs a full traceback when
 a device closes the connection mid-handshake; the CLI keeps that off the screen (the one FAIL line
-already says so) unless `-v` is given. A library caller configures logging as it likes.
+already says so) unless `-v` is given. Under `Fleet` it stays off stderr too while logging is not
+set up (paramiko's and ncclient's loggers get a `NullHandler`, no level is changed); set logging up
+and those records go where you send them.
 
 `--raw` is the pipe-friendly one: no banner, no progress lines, no summary. Each device gets a
 `name:` line and its output; failures and the verdict go to stderr, so for a show `--raw > out.txt`
@@ -799,17 +812,23 @@ The library reads no environment variable and no config file; that is the CLI's 
   returned by then is a result and a store row; the run is recorded as interrupted with the rest as skipped;
   iterating its results afterwards gives what was done by then and nothing more (a call that returns later is
   dropped, its row says skipped), so the store and the script agree; a script waiting in its `for` loop wakes at
-  once, whichever thread called `close()`. A store this Fleet opened is closed, and
-  the sessions close (one still in use closes when its call returns). `async with Fleet(...)` and `aclose()`
-  do the same off the event loop;
-- `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
-  command line `Fleet.show show bgp summary`; one result row per device, per command for a batch), written
-  from the thread that iterates and, under `async for`, from a worker of the event loop, so SQLite never
-  blocks it; `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`)
-  that start the run on their first step. What the store could not keep is counted, never raised: a write
-  that fails is said once as a `RuntimeWarning` and the run goes on; at the end `res.not_kept` says how many
-  results were not kept and `res.store_error` why (a store file deleted or replaced under the run means every
-  result of it, and its run row is left open, as the CLI does);
+  once, whichever thread called `close()`, and a `close()` that lands while `show()` is still opening the run's
+  store row waits for the row, records the run as interrupted, and that `show()` raises `RuntimeError`. A store
+  this Fleet opened is closed, and the sessions close (one still in use closes when its call returns).
+  `async with Fleet(...)` and `aclose()` do the same off the event loop. A Fleet dropped without `close()` lets
+  its threads go and gives its share of the session pool back once it is collected, as a dropped
+  `ThreadPoolExecutor` ends its workers. That can wait for the garbage collector's next pass: a device call that
+  raised leaves its frames in a reference cycle, and they hold the Fleet; so do the first Fleet of a process, whose
+  workers import the transport, and a run it left open, which is not recorded, so `close()` is still what ends one;
+- `store=`, a path or an open `hssh.store.Store` (one Store may be shared by several Fleets on several threads:
+  it takes one write at a time), keeps every result as the CLI's store does (one run row, its command line
+  `Fleet.show show bgp summary`; one result row per device, per command for a batch), written from the thread
+  that iterates and, under `async for`, from a worker of the event loop, so SQLite never blocks it;
+  `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`) that start
+  the run on their first step. What the store could not keep is counted, never raised: a write that fails is
+  said once per run as a `RuntimeWarning` that names the run, and the run goes on; at the end `res.not_kept`
+  says how many results were not kept and `res.store_error` why (a store file deleted or replaced under the
+  run means every result of it, and its run row is left open, as the CLI does);
 - `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only, and reads
   only: on another transport, or for a command that is not a read, that is the device's failure, nothing
   sent); `to_dicts()` is JSON-serialisable, in the shape of the CLI's `--json` records.
@@ -985,7 +1004,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (964 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (997 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

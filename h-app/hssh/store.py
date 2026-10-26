@@ -34,6 +34,7 @@ import secrets
 import sqlite3
 import stat
 import sys
+import threading
 import time
 from typing import Iterable, List, Optional
 
@@ -150,9 +151,11 @@ class Store:
             self._create_private(path)
             try:
                 # Not pinned to the opening thread: a library caller may open a
-                # store here and write it from the thread that consumes the results.
-                # One writer at a time is still the rule; the CLI writes from its
-                # main thread only, Fleet from the iterating thread only.
+                # store here and write it from the thread that consumes the results,
+                # or hand one Store to several Fleets on several threads. One
+                # connection takes one transaction at a time (two threads inside
+                # it at once lose rows, or worse: "bad parameter or other API
+                # misuse"), so every write below is one transaction under _writing.
                 self.conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT, check_same_thread=False)
                 _wal(self.conn)
                 # WAL with synchronous=NORMAL: every commit is safe against the
@@ -166,6 +169,7 @@ class Store:
                 raise StoreError(f"{path}: {e}") from e
         self.conn.row_factory = sqlite3.Row
         self.identity = _identity(path)
+        self._writing = threading.Lock()
 
     def still_there(self) -> Optional[str]:
         """None while the path still leads to the file this store opened, else
@@ -196,10 +200,12 @@ class Store:
             os.close(fd)
 
     def close(self) -> None:
-        try:
-            self.conn.close()
-        except sqlite3.Error:
-            pass
+        """Closed once the write under way, if any, has committed."""
+        with self._writing:
+            try:
+                self.conn.close()
+            except sqlite3.Error:
+                pass
 
     # --- writing ------------------------------------------------------------
 
@@ -216,7 +222,7 @@ class Store:
         for attempt in range(8):
             candidate = run_id or new_run_id()
             try:
-                with self.conn:
+                with self._writing, self.conn:
                     self.conn.execute(
                         "INSERT INTO runs (run_id, started, mode, command, argv, user, origin, version, targets) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -235,7 +241,7 @@ class Store:
         """One command's row, committed. A second result for the same (run,
         device, seq) replaces the first: a retry's verdict is the one that
         stands."""
-        with self.conn:
+        with self._writing, self.conn:
             self._row(run_id, device, seq, command, ok, duration_ms, error, output, fmt, host, vendor, ts)
 
     def _row(self, run_id, device, seq, command, ok, duration_ms, error, output, fmt, host, vendor, ts=None) -> None:
@@ -255,7 +261,7 @@ class Store:
         device result, however many rows. Returns the rows written."""
         device, host, vendor = entry["device"], entry.get("host"), entry.get("vendor")
         duration = entry.get("duration_ms")
-        with self.conn:
+        with self._writing, self.conn:
             if "commands" in entry and isinstance(entry["commands"], list) and entry["commands"]:
                 for seq, cr in enumerate(entry["commands"]):
                     out = cr.get("output")
@@ -277,7 +283,7 @@ class Store:
             return 1
 
     def finish_run(self, run_id: str, ok: int, failed: int, skipped: int, interrupted: bool = False) -> None:
-        with self.conn:
+        with self._writing, self.conn:
             self.conn.execute(
                 "UPDATE runs SET finished = ?, ok = ?, failed = ?, skipped = ?, interrupted = ? WHERE run_id = ?",
                 (_now(), ok, failed, skipped, 1 if interrupted else 0, run_id))

@@ -27,9 +27,11 @@ would then fail honest devices. Sessions are pooled for the Fleet's lifetime
 With `store=`, every result is kept in the result store the way the CLI
 keeps it, written from the thread that iterates (from a worker thread of
 the event loop, under `async for`); what the store could not keep is counted
-in `Results.not_kept`, said as a RuntimeWarning, never raised. The library
-reads no environment variable and no config file: what it is given is what
-it uses.
+in `Results.not_kept`, said as a RuntimeWarning, never raised. One Store
+may serve several Fleets on several threads: its writes are serialised. A
+Fleet dropped without close() lets its worker threads go, and gives the
+session pool back, once it is collected. The library reads no environment
+variable and no config file: what it is given is what it uses.
 
 Reads only, `show` and `batch`. An edit has gates the CLI applies before
 the runner is called (the set-syntax guard, the pre-flight check, the
@@ -39,14 +41,18 @@ question); those stay with the CLI and the transports' own edit()/begin().
 import asyncio
 import concurrent.futures as cf
 import datetime as _dt
+import functools
 import getpass
 import json
+import logging
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 import warnings
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterable, Iterator, List, Optional, Union
 
@@ -85,16 +91,31 @@ def _now() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _warn(message: str) -> None:
+    """warnings.warn(message, RuntimeWarning, stacklevel=2), kept in no
+    registry. The default filter remembers every message it has said, per
+    place, for the life of the process, and a store-loss message names its
+    run: a long-lived loop whose store kept failing grew that memory by two
+    entries a run. Each is said, the filters decide as ever, nothing is
+    kept."""
+    caller = sys._getframe(2)
+    warnings.warn_explicit(message, RuntimeWarning, caller.f_code.co_filename, caller.f_lineno,
+                           module=caller.f_globals.get("__name__", "<string>"), registry=None)
+
+
 def _pool_acquire() -> None:
     """A Fleet starts using the process-wide session pool: turned on if it
     was off, and that remembered, so that the last Fleet to close turns it
-    off again; a pool the caller enabled is used and left on."""
+    off again; a pool the caller enabled is used and left on. Counted once
+    enable() has returned: a reaper thread the system refuses is the
+    caller's error and leaves the count as it was."""
     global _POOL_FLEETS, _POOL_WAS_OFF
     with _POOL_LOCK:
-        if _POOL_FLEETS == 0:
-            _POOL_WAS_OFF = not pool.POOL.enabled
-        _POOL_FLEETS += 1
+        was_off = not pool.POOL.enabled
         pool.enable()
+        if _POOL_FLEETS == 0:
+            _POOL_WAS_OFF = was_off
+        _POOL_FLEETS += 1
 
 
 def _pool_release() -> None:
@@ -109,15 +130,41 @@ def _pool_release() -> None:
             _POOL_WAS_OFF = False
 
 
+def _let_go(workers: "_DaemonPool") -> None:
+    """A Fleet dropped without close(), once it is collected: its worker
+    threads end (they sat on the queue for the life of the process) and its
+    use of the session pool is given back, as close() would have. No worker
+    is in a call for it by then (the call would hold it). The release runs
+    on one of those workers, not here: a collection runs on whatever thread
+    it lands on, inside _pool_acquire()'s lock or the session pool's own
+    perhaps, and taking either again there hangs that thread for good. A
+    dropped ThreadPoolExecutor does as little in its own callback."""
+    workers.shutdown(wait=False, cancel_futures=True, then=_pool_release)
+
+
+def _quiet_transport_logs() -> None:
+    """paramiko logs a full traceback at ERROR from its transport thread when
+    a device closes the connection mid-handshake; with no logging set up,
+    Python's last-resort handler prints it to stderr next to the failed
+    result that already says so. A NullHandler, as the CLI adds, ends that;
+    no level is touched, so a caller who sets up logging still gets every
+    record where they sent it."""
+    for name in ("paramiko", "ncclient"):
+        lg = logging.getLogger(name)
+        if not lg.handlers:
+            lg.addHandler(logging.NullHandler())
+
+
 class _DaemonPool:
     """The threads that talk to the devices, up to `workers` of them, made
-    as the work needs them: daemon threads, so a call that never returns
-    holds its thread but never the interpreter's exit, on any Python. They
-    do device I/O only (the store is written by the consumer), so an exit
-    that cuts one short loses nothing that was promised. The Futures are
-    concurrent.futures', with the semantics the rest of this module waits
-    on: `cancel()` on a queued one is honoured by the worker that reaches
-    it, `shutdown(cancel_futures=True)` cancels the queue at once."""
+    as the work needs them (the first at once): daemon threads, so a call
+    that never returns holds its thread but never the interpreter's exit,
+    on any Python. They do device I/O only (the store is written by the
+    consumer), so an exit that cuts one short loses nothing that was
+    promised. The Futures are concurrent.futures', with the semantics the
+    rest of this module waits on: `cancel()` on a queued one is honoured by
+    the worker that reaches it, `shutdown(cancel_futures=True)` cancels the
+    queue at once."""
 
     def __init__(self, workers: int, name: str = "hssh-fleet"):
         self._max = workers
@@ -127,6 +174,15 @@ class _DaemonPool:
         self._idle = threading.Semaphore(0)     # a release per worker waiting for work
         self._lock = threading.Lock()
         self._down = False
+        # One thread from the start, waiting for work: a pool always has one
+        # to run what shutdown(then=) hands it. Refused, there is no pool.
+        self._grow()
+        self._idle.release()
+
+    def _grow(self) -> None:
+        t = threading.Thread(target=self._loop, name=f"{self._name}-{len(self._threads) + 1}", daemon=True)
+        t.start()
+        self._threads.append(t)
 
     def submit(self, fn, *args) -> cf.Future:
         future: cf.Future = cf.Future()
@@ -138,9 +194,7 @@ class _DaemonPool:
             # (ulimit -u, memory) is the caller's error and not an item that
             # waits for a worker that never came.
             if len(self._threads) < self._max and not self._idle.acquire(timeout=0):
-                t = threading.Thread(target=self._loop, name=f"{self._name}-{len(self._threads) + 1}", daemon=True)
-                t.start()
-                self._threads.append(t)
+                self._grow()
             self._queue.put((future, fn, args))
         return future
 
@@ -160,11 +214,13 @@ class _DaemonPool:
             del item, future, fn, args
             self._idle.release()
 
-    def shutdown(self, wait: bool = False, cancel_futures: bool = True, timeout: float = 1.0) -> None:
+    def shutdown(self, wait: bool = False, cancel_futures: bool = True, timeout: float = 1.0,
+                 then=None) -> None:
         """No more work. `cancel_futures`: what is queued is cancelled now,
-        and notified, so a waiter sees it done. `wait`: the idle workers
-        are joined, for at most `timeout` seconds in all; a worker inside a
-        device call is never waited for."""
+        and notified, so a waiter sees it done. `then`: called on a worker,
+        before the workers end, never on the calling thread. `wait`: the
+        idle workers are joined, for at most `timeout` seconds in all; a
+        worker inside a device call is never waited for."""
         with self._lock:
             self._down = True
             threads = list(self._threads)
@@ -177,6 +233,8 @@ class _DaemonPool:
                 if item is not None:
                     item[0].cancel()
                     item[0].set_running_or_notify_cancel()
+        if then is not None:
+            self._queue.put((cf.Future(), then, ()))
         for _ in threads:
             self._queue.put(None)
         if wait:
@@ -259,11 +317,21 @@ def _connect_factor(target: Target) -> int:
     return 1 if drivers.get(target.vendor).transport.name == "netconf" else 3
 
 
-def _budget(fleet: "Fleet", target: Target, commands: int) -> float:
+def _attempts(fleet: "Fleet", target: Target, command) -> int:
+    """How many times the runner may send `command` to `target`: `retries`
+    more than once for a read, once for a command that acts on the device
+    (a batch with one such command is sent once as a whole), as the runner
+    classifies it, so a wedged `request …` is given up on after one
+    attempt's worth of time, not three."""
+    commands = command if isinstance(command, list) else [command]
+    dialect = drivers.get(target.vendor).dialect
+    return fleet.retries + 1 if all(dialect.is_read(c) for c in commands) else 1
+
+
+def _budget(fleet: "Fleet", target: Target, commands: int, attempts: int) -> float:
     """Seconds after which a device's call is given up on: what the
     transport promises to return within, every attempt and the backoff
     between them, plus GRACE_SECONDS."""
-    attempts = fleet.retries + 1
     per_attempt = _connect_factor(target) * fleet.session_timeout + fleet.command_timeout * commands
     return attempts * per_attempt + sum(_backoff(i) for i in range(1, attempts)) + GRACE_SECONDS
 
@@ -331,12 +399,24 @@ class DeviceResult:
         return d
 
 
-class _Task:
-    __slots__ = ("target", "future", "started", "budget")
+def _call_returned(fleet_ref: "weakref.ref", name: str, future: cf.Future) -> None:
+    """A device's future is done: the Fleet no longer counts the device as
+    held by that call. Given the Fleet weakly and the device by name: a
+    callback that held the task and the Fleet made a cycle with the future,
+    so a Fleet read to the end and dropped waited for the collector, its
+    threads with it, instead of going with its last reference."""
+    fleet = fleet_ref()
+    if fleet is not None:
+        fleet._stuck_release(name, future)
 
-    def __init__(self, target: Target, budget: float):
+
+class _Task:
+    __slots__ = ("target", "future", "started", "budget", "attempts")
+
+    def __init__(self, target: Target, budget: float, attempts: int):
         self.target = target
         self.budget = budget
+        self.attempts = attempts
         self.future: Optional[cf.Future] = None
         self.started: Optional[float] = None    # set by the worker thread when it picks the task up
 
@@ -354,8 +434,10 @@ class _Run:
         self.command = command           # the command, or the list for a batch
         self.fmt = fmt
         self.commands = len(command) if mode == "show-batch" else 1
-        self.attempts = fleet.retries + 1
-        self.tasks = [_Task(t, _budget(fleet, t, self.commands)) for t in fleet.targets]
+        self.tasks: List[_Task] = []
+        for t in fleet.targets:
+            attempts = _attempts(fleet, t, command)
+            self.tasks.append(_Task(t, _budget(fleet, t, self.commands, attempts), attempts))
         self.pending: List[_Task] = list(self.tasks)
         self.done: List[DeviceResult] = []
         self.by_future: dict = {}
@@ -375,23 +457,24 @@ class _Run:
     def start(self) -> None:
         """Admit the run (one at a time per Fleet), open its store row, hand
         every device to the workers. Nothing is sent before the store row
-        exists: a store that cannot be written is no run."""
+        exists: a store that cannot be written is no run. The row is opened
+        under the run's lock: a close() from another thread either waits
+        for it (end() then records the run as interrupted, and a store this
+        Fleet owns is closed only after that) or got in first, and then
+        nothing is opened."""
         fleet = self.fleet
         fleet._admit(self)
         try:
-            if fleet._store is not None:
-                batch = self.mode == "show-batch"
-                argv = ["Fleet.batch", *self.command] if batch else ["Fleet.show", self.command]
-                about = "\n".join(self.command) if batch else self.command
-                self.store_run = fleet._store.begin_run(self.mode, argv, fleet.user, len(self.tasks), _version(),
-                                                        origin=socket.gethostname(), command=about)
-            workers = fleet._engine()
-        except BaseException:
             with self._lock:
-                self.ended = True
-            fleet._forget(self)
-            raise
-        try:
+                if self.ended:                   # closed while being admitted
+                    raise RuntimeError("this Fleet is closed")
+                if fleet._store is not None:
+                    batch = self.mode == "show-batch"
+                    argv = ["Fleet.batch", *self.command] if batch else ["Fleet.show", self.command]
+                    about = "\n".join(self.command) if batch else self.command
+                    self.store_run = fleet._store.begin_run(self.mode, argv, fleet.user, len(self.tasks),
+                                                            _version(), origin=socket.gethostname(), command=about)
+                workers = fleet._engine()
             self._submit_all(workers)
         except BaseException:
             self.end(interrupted=True)           # the devices not handed out are skipped, the row says so
@@ -415,7 +498,7 @@ class _Run:
                     future = workers.submit(self.work, task)
                     # Runs once the future's state is set, so a task counted as
                     # stuck (see _given_up) is always let go of when its call returns.
-                    future.add_done_callback(lambda f, task=task: fleet._stuck_release(task))
+                    future.add_done_callback(functools.partial(_call_returned, weakref.ref(fleet), task.target.name))
                 task.future = future
                 self.by_future[future] = task
 
@@ -433,7 +516,7 @@ class _Run:
                 session_timeout=fleet.session_timeout, command_timeout=fleet.command_timeout,
                 dry_run=False, commit_confirmed=None, save_dir=None, quiet=True,
                 batch_cmds=list(self.command) if self.mode == "show-batch" else None,
-                max_attempts=self.attempts, fmt=self.fmt)
+                max_attempts=task.attempts, fmt=self.fmt)
         except Exception as e:
             # The runner reports every failure as a result; this is the way
             # out for one it did not expect, so the device still gets a verdict.
@@ -474,11 +557,22 @@ class _Run:
         now = time.monotonic()
         pending = self._snapshot()
         due = [t for t in pending if t.started is not None and now >= t.started + t.budget]
-        if self.fleet._stuck_count() >= self.fleet.workers:
-            for t in pending:
-                # cancel() is False once a thread has picked the task up: then it gets its deadline
-                if t.started is None and t not in due and t.future is not None and t.future.cancel():
+        held = self.fleet._stuck_count() >= self.fleet.workers
+        for t in pending:
+            if t.started is not None or t.future is None:
+                continue
+            if t.future.cancelled():
+                # A close() under way cancelled it: end() counts it as skipped.
+                # Before any close(), only this did, and the finish after it
+                # was lost (an async consumer cancelled while it waited for
+                # the loop's executor): due still, workers held or not, or
+                # the run could never end.
+                if not self.fleet._closed:
                     due.append(t)
+            elif held and t.future.cancel():
+                # cancel() is False once a thread has picked the task up: then
+                # it gets its deadline
+                due.append(t)
         return due
 
     def finish(self, task: _Task) -> Optional[DeviceResult]:
@@ -522,19 +616,21 @@ class _Run:
         fleet = self.fleet
         if task.started is None:
             ms = 0
-            error = (f"not started: every worker thread ({fleet.workers}) is held by a call to a device "
-                     "that has not returned")
+            # Said as of the decision: a later iteration may report it once
+            # the held call has returned
+            error = (f"not started: every worker thread ({fleet.workers}) was held by a call to a device "
+                     "that had not returned")
         else:
             fleet._stuck_hold(task)
             if task.future is not None and task.future.done():   # it returned just now: not stuck after all
-                fleet._stuck_release(task)
+                fleet._stuck_release(task.target.name, task.future)
             ms = int((time.monotonic() - task.started) * 1000)
             factor = _connect_factor(task.target)
             each = (f"{factor} x " if factor > 1 else "") + f"session_timeout {fleet.session_timeout}s"
             each += f" + command_timeout {fleet.command_timeout}s"
             if self.mode == "show-batch":
                 each += f" x {self.commands} commands"
-            error = (f"no result within {task.budget:g}s ({self.attempts} attempt(s) at {each}, plus "
+            error = (f"no result within {task.budget:g}s ({task.attempts} attempt(s) at {each}, plus "
                      f"{GRACE_SECONDS:g}s): the transport call has not returned")
         return self._result(task.target, _failed(task.target, self.mode, error, ms))
 
@@ -566,12 +662,13 @@ class _Run:
             store.add_entry(self.store_run, result.to_dict(), sent, fmt=self.fmt)
         except Exception as e:
             # The run goes on and the result is still handed over; the loss is
-            # counted, said once as it happens and once more at the end.
+            # counted, said once as it happens and once more at the end, the
+            # run named, for every run of a loop (see _warn).
             self.not_kept += 1
             if self.store_error is None:
                 self.store_error = str(e)
-                warnings.warn(f"store {store.path}: {e}; the run goes on, its results are shown but not kept",
-                              RuntimeWarning, stacklevel=2)
+                _warn(f"store {store.path}, run {self.store_run}: {e}; the run goes on, its results are shown but "
+                      "not kept")
 
     def _close_store_row(self, ok: int, failed: int, skipped: int, interrupted: bool) -> None:
         """Caller holds the lock. As the CLI: SQLite writes into a deleted or
@@ -591,10 +688,10 @@ class _Run:
             except Exception as e:
                 if self.store_error is None:
                     self.store_error = str(e)
-                warnings.warn(f"store {store.path}: {e}", RuntimeWarning, stacklevel=2)
+                _warn(f"store {store.path}, run {self.store_run}: {e}")
         if self.not_kept:
-            warnings.warn(f"store {store.path}: {self.not_kept} of {self.rows_tried} results were not kept: "
-                          f"{self.store_error}", RuntimeWarning, stacklevel=2)
+            _warn(f"store {store.path}, run {self.store_run}: {self.not_kept} of {self.rows_tried} results were not "
+                  f"kept: {self.store_error}")
 
     def wait_for_inflight(self, seconds: float) -> None:
         """close(wait=): the devices not started are not started; the ones a
@@ -617,17 +714,24 @@ class _Run:
         with self._lock:
             if self.ended:
                 return
-            self.settle()
-            self.ended = True
-            for task in self.pending:
-                if task.future is not None:
-                    task.future.cancel()
-            skipped = len(self.pending)
-            ok = sum(1 for r in self.done if r.ok)
-            self._close_store_row(ok, len(self.done) - ok, skipped, interrupted and skipped > 0)
-        if self.stop.cancel():                   # wakes a consumer waiting on the run's futures
-            self.stop.set_running_or_notify_cancel()
-        self.fleet._forget(self)
+            # The run is over even when a filter made a store-loss warning an
+            # error, while settling or while closing the row: the consumer
+            # wakes, the next run gets in.
+            try:
+                self.settle()
+            finally:
+                self.ended = True
+                try:
+                    for task in self.pending:
+                        if task.future is not None:
+                            task.future.cancel()
+                    skipped = len(self.pending)
+                    ok = sum(1 for r in self.done if r.ok)
+                    self._close_store_row(ok, len(self.done) - ok, skipped, interrupted and skipped > 0)
+                finally:
+                    if self.stop.cancel():       # wakes a consumer waiting on the run's futures
+                        self.stop.set_running_or_notify_cancel()
+                    self.fleet._forget(self)
 
 
 def _finish_all(run: _Run, tasks: List[_Task]) -> None:
@@ -679,7 +783,10 @@ class Results:
                 time.sleep(0.05)
                 continue
             done, _ = cf.wait(futures, timeout=run.wait_timeout(), return_when=cf.FIRST_COMPLETED)
-            _finish_all(run, [run.by_future[f] for f in done if f in run.by_future])   # not `stop`
+            # Not `stop`, and not a task a close() under way cancelled: a
+            # worker freed inside close(wait=) drains the queue and notifies
+            # those; they are end()'s to count as skipped, not results.
+            _finish_all(run, [run.by_future[f] for f in done if f in run.by_future and not f.cancelled()])
 
     def __aiter__(self) -> AsyncIterator[DeviceResult]:
         return self._aiter()
@@ -713,7 +820,8 @@ class Results:
                     af = wrapped[f] = asyncio.wrap_future(f, loop=loop)
                 waiting[af] = f
             done, _ = await asyncio.wait(waiting, timeout=run.wait_timeout(), return_when=asyncio.FIRST_COMPLETED)
-            ready = [run.by_future[waiting[af]] for af in done if waiting[af] in run.by_future]   # not `stop`
+            ready = [run.by_future[waiting[af]] for af in done                 # not `stop`, not cancelled
+                     if waiting[af] in run.by_future and not waiting[af].cancelled()]
             if ready:
                 # finish() builds the result and writes the store: SQLite, off the loop
                 await loop.run_in_executor(None, _finish_all, run, ready)
@@ -747,7 +855,8 @@ class Fleet:
     `retries`: attempts after the first, for failures the runner's
     classification allows; 2 by default, as the CLI's --retries. `store`: a
     path, or an open Store, to keep every result in; a path the Fleet opens
-    it closes on exit.
+    it closes on exit; an open Store may be shared with other Fleets, on
+    other threads.
 
     One run at a time: a second show() or batch() while devices of the
     previous run are still in flight raises RuntimeError; a previous run
@@ -757,12 +866,23 @@ class Fleet:
     seconds to answer, and what has returned by then is a result and a store
     row; the run is recorded as interrupted with the rest as skipped, and
     its Results give what was done by then and nothing more (a call that
-    returns later is dropped: its row says skipped). The sessions close (one
-    still in use closes when its call returns), a store this Fleet opened is
-    closed. Nothing waits on a device beyond `wait`; the worker threads are
-    daemon threads, so a call that never returns keeps its thread and
-    nothing else. `async with`, and `aclose()`, do the same off the event
-    loop."""
+    returns later is dropped: its row says skipped). A close() that lands
+    while show() is still opening the run's store row waits for the row,
+    records the run as interrupted, and that show() raises
+    RuntimeError("this Fleet is closed"). The sessions close (one still in
+    use closes when its call returns), a store this Fleet opened is closed.
+    Nothing waits on a device beyond `wait`; the worker threads are daemon
+    threads, so a call that never returns keeps its thread and nothing
+    else. `async with`, and `aclose()`, do the same off the event loop. A
+    Fleet dropped without close() gives its threads and the session pool
+    back once it is collected, as a dropped ThreadPoolExecutor does. That
+    can wait for the garbage collector's next pass: a device call that
+    raised leaves its frames in a reference cycle, and they hold the Fleet;
+    so do the first Fleet of a process, whose workers import the transport,
+    and a run it left open (not recorded, so close() is still the way to
+    end one). With no logging set up, paramiko's and ncclient's
+    tracebacks stay off stderr (each gets a NullHandler, as the CLI gives
+    it); set logging up and they go where it sends them."""
 
     def __init__(self, targets, transport: str = "ssh", user: Optional[str] = None,
                  passwd: Optional[str] = None, workers: int = 32, session_timeout: int = 30,
@@ -798,6 +918,7 @@ class Fleet:
         self._lock = threading.RLock()
         self._workers: Optional[_DaemonPool] = None
         self._pooled = False               # counted in the session pool's users
+        self._finalizer = None             # lets the workers go if the Fleet is dropped without close()
         self._closed = False
         self._run: Optional[_Run] = None   # the run in progress, if any
         self._stuck: dict = {}             # device name -> the task whose call has not returned
@@ -895,9 +1016,20 @@ class Fleet:
                 if note:
                     warnings.warn(note, RuntimeWarning, stacklevel=4)
                 self.workers = fitted
-                self._workers = _DaemonPool(fitted)
-                _pool_acquire()
-                self._pooled = True
+                _pool_acquire()              # refused: nothing is counted, the next run tries again
+                try:
+                    workers = _DaemonPool(fitted)
+                except BaseException:        # its first thread refused: nor is this Fleet counted
+                    _pool_release()
+                    raise
+                self._workers, self._pooled = workers, True
+                # A Fleet dropped without close() gives its threads and its
+                # use of the pool back once it is collected. The callback
+                # holds the workers, never the Fleet; at exit it is not run,
+                # the threads being daemon threads.
+                self._finalizer = weakref.finalize(self, _let_go, workers)
+                self._finalizer.atexit = False
+                _quiet_transport_logs()
             return self._workers
 
     def _forget(self, run: _Run) -> None:
@@ -917,10 +1049,11 @@ class Fleet:
         with self._stuck_lock:
             self._stuck[task.target.name] = task
 
-    def _stuck_release(self, task: _Task) -> None:
+    def _stuck_release(self, name: str, future: cf.Future) -> None:
         with self._stuck_lock:
-            if self._stuck.get(task.target.name) is task:
-                del self._stuck[task.target.name]
+            held = self._stuck.get(name)
+            if held is not None and held.future is future:
+                del self._stuck[name]
 
     def close(self, wait: float = 0) -> None:
         """Done with the fleet; see the class docstring for what that means
@@ -932,11 +1065,17 @@ class Fleet:
                 return
             self._closed = True
             run, workers, pooled = self._run, self._workers, self._pooled
+            if self._finalizer is not None:
+                self._finalizer.detach()     # the steps below are the finalizer's work, done now
         try:
             if run is not None:
-                if wait and wait > 0:
-                    run.wait_for_inflight(wait)
-                run.end(interrupted=True)
+                try:
+                    if wait and wait > 0:
+                        run.wait_for_inflight(wait)
+                finally:
+                    # A Ctrl-C during the grace too: its queue is cancelled
+                    # already, and nothing but this ends the run.
+                    run.end(interrupted=True)
         finally:
             try:
                 if workers is not None:
