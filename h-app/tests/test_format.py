@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -349,6 +350,24 @@ def test_cli_format_is_refused_where_nothing_is_shown(monkeypatch, capsys, tmp_p
         v = FakeVendor()
         rc, _, err = run_cli(monkeypatch, capsys, v, "--format", "json", *argv)
         assert rc == 2 and "--format goes with a show" in err and v.calls == []
+
+
+def test_cli_a_batch_under_format_is_reads_only_before_any_device(monkeypatch, capsys, tmp_path):
+    """#110: -sC "request system reboot" was refused under --format; a --batch
+    line like it went to rpc_batch with the rest. Both are now a usage error
+    before anything is opened or sent; as text the line is sent, once."""
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\nrequest system reboot\n")
+    for argv in (["--batch", str(batch), "--format", "json"], ["--batch", str(batch), "--format", "xml"],
+                 ["-sC", "request system reboot", "--format", "json"]):
+        v = FakeVendor()
+        rc, _, err = run_cli(monkeypatch, capsys, v, *argv, *R1)
+        assert rc == 2 and v.calls == [], err
+        assert "runs reads only (show …, get-*); 'request system reboot' would act on the device" in err
+        assert not Path(os.environ["HSSH_STORE"]).exists()             # no run was kept: none began
+    v = FakeVendor()
+    rc, _, err = run_cli(monkeypatch, capsys, v, "--batch", str(batch), *R1)
+    assert rc == 0 and v.calls == [("show_batch", ["show version", "request system reboot"], None)], err
 
 
 def test_structured_and_format_is_a_usage_error():

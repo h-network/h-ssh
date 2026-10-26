@@ -108,3 +108,61 @@ def test_ctrl_c_mid_job_leaves_no_session_open(monkeypatch, capsys, tmp_path):
     assert rc == 130
     assert pool.live() == 0 and not pool.POOL.enabled
     assert all(d.closed for d in FakeDevice.instances)
+
+
+def test_the_end_of_a_job_gives_the_closes_one_second_in_all(monkeypatch, capsys, tmp_path):
+    """close_all() waits up to a second for the closes it starts (#113), and
+    the run's own wait for closes in flight then gave the same closes
+    another second: a router that never acknowledged its close cost the end
+    of every job two seconds instead of one."""
+    import threading
+    import time
+    release, closing = threading.Event(), []
+
+    class Wedged(FakeDevice):
+        def close(self):
+            closing.append(time.monotonic())
+            release.wait(10)
+            super().close()
+    monkeypatch.setattr(netconf, "JunosDevice", Wedged)
+    try:
+        rc, out, err = _run(monkeypatch, capsys, tmp_path, [{"target": "R1:10.0.0.1:junos", "show": "show version"}])
+        elapsed = time.monotonic() - closing[0]         # from the close to the end of the run
+    finally:
+        release.set()
+    assert rc == 0, err
+    assert 0.9 <= elapsed < 1.6, f"{elapsed:.2f}s"
+    assert FakeDevice.instances[0].closed and pool.live() == 0
+
+
+def test_a_run_that_ends_early_gives_the_closes_half_a_second_in_all(monkeypatch, capsys):
+    """A second Ctrl-C or a crash ends main() with the job's sessions still
+    pooled; the way out closes them. close_all() there waited up to a
+    second for its closes, then the exit gave the same closes the half
+    second it always had: a router that never acknowledged held the exit
+    one and a half seconds."""
+    import threading
+    import time
+    release = threading.Event()
+
+    class Wedged(FakeDevice):
+        def close(self):
+            release.wait(10)
+            super().close()
+    monkeypatch.setattr(netconf, "JunosDevice", Wedged)
+
+    async def main():
+        pool.enable()
+        netconf.show("10.0.0.1", "u", "p", "show version", 5, 30)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(cli, "main", main)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(SystemExit) as exc:
+            cli.main_sync()
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+    assert exc.value.code == 130 and "Interrupted" in capsys.readouterr().err
+    assert 0.45 <= elapsed < 1.0, f"{elapsed:.2f}s"
+    assert FakeDevice.instances[0].closed and pool.live() == 0

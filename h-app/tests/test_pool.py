@@ -1,6 +1,7 @@
 """Session pool: reuse, isolation per router, discard on failure, reaping,
 and the junos driver's behaviour on a pooled session."""
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ def fake_pyez(monkeypatch):
     monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
     yield
     pool.POOL.disable()
+    netconf.wait_for_closes()       # a close still in flight is this test's, not the next one's
     for k in pool.POOL.stats:
         pool.POOL.stats[k] = 0
 
@@ -179,7 +181,7 @@ def test_close_uses_a_short_timeout_and_tears_down_a_stuck_transport():
         _session = Session()
 
     dev._conn = Conn()
-    netconf._close(dev)
+    netconf._close(dev).join(2)                 # the close runs in its helper thread
     assert dev.timeout_at_close == netconf.SHORT_TIMEOUT
     assert Stuck.torn_down
 
@@ -234,6 +236,25 @@ def test_batch_on_a_dead_reused_session_is_rerun_on_a_fresh_one(pooled):
     assert [r["output"] for r in res] == ["fresh show a", "fresh show b"]
     assert devices()[0].closed and devices()[0].cli_calls == ["show version", "show a", "show b"]
     assert devices()[1].cli_calls == ["show a", "show b"]
+
+
+def test_a_command_that_is_not_a_read_is_not_sent_again_on_a_fresh_session(pooled):
+    """show() and show_batch() reopened a dead reused session and ran again
+    whatever the command, so a job's second entry or a Fleet's second run
+    could send `request system reboot` twice; rpc() never did. Only a read
+    runs once more, and a string with a line break is none (#110 review)."""
+    for cmd in ("request system reboot", "show version\nrequest system reboot"):
+        show()                                   # a session, reused below
+        FakeDevice.cli_outputs = {cmd: netconf.TransportError("closed")}
+        with pytest.raises(netconf.TransportError):
+            show(cmd=cmd)
+        assert devices()[-1].closed and devices()[-1].cli_calls == ["show version", cmd]
+    show()
+    FakeDevice.cli_outputs = {"request system reboot": netconf.TransportError("closed")}
+    with pytest.raises(netconf.TransportError):
+        netconf.show_batch("10.0.0.1", "u", None, ["show a", "request system reboot"], 5, 30)
+    assert devices()[-1].closed and devices()[-1].cli_calls == ["show version", "show a", "request system reboot"]
+    assert len(devices()) == 3 and pooled.live() == 0
 
 
 def test_batch_keeps_going_after_a_timeout_but_drops_the_session(pooled):
@@ -734,3 +755,144 @@ def test_a_probe_that_times_out_still_means_dead(pooled, monkeypatch):
     show()
     assert pooled.stats["opens"] == 2 and pooled.stats["discards"] == 1
     assert devices()[0].closed and not devices()[1].closed
+
+
+# --- #113: the collection waits for the closes it is there for ----------------------
+
+def _recording_close(order, delay=0.1):
+    """The junos closer only starts a thread (#98): a close that takes its
+    ~100 ms on the device and says when it is done."""
+    class SlowClose(FakeDevice):
+        def close(self):
+            time.sleep(delay)
+            super().close()
+            order.append("closed")
+    return SlowClose
+
+
+def test_close_all_collects_after_the_closes_it_started(pooled, monkeypatch):
+    """close_all() collected right after _drop(), which only starts the close
+    threads: the collection ran with every session still open, and the
+    descriptor of #58 was held until Python's next full collection."""
+    order = []
+    netconf.JunosDevice = _recording_close(order)
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: order.append("collected"))
+    for host in ("10.0.0.1", "10.0.0.2", "10.0.0.3"):
+        show(host=host)
+    pool.close_all(shutdown=False)
+    assert order == ["closed"] * 3 + ["collected"]
+    assert netconf.wait_for_closes(timeout=0) == 0      # nothing left in flight
+
+
+def test_the_reaper_collects_after_the_closes_it_started(pooled, monkeypatch):
+    order = []
+    netconf.JunosDevice = _recording_close(order)
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: order.append("collected"))
+    show()
+    show(host="10.0.0.2")
+    assert pooled.reap(now=time.time() + 301) == 2
+    assert order == ["closed", "closed", "collected"]
+
+
+def test_the_reaper_thread_sees_a_slow_close_through_before_it_collects(monkeypatch):
+    """Nobody waits on the cleanup thread, yet it collected after CLOSE_WAIT
+    like close_all(): a close slower than that (a router that never
+    acknowledges gives up after SHORT_TIMEOUT) kept its descriptor until
+    Python's next full collection, one per slow router in a long-lived
+    process."""
+    order = []
+    netconf.JunosDevice = _recording_close(order, delay=0.3)
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: order.append("collected"))
+    monkeypatch.setattr(pool, "CLOSE_WAIT", 0.05)
+    monkeypatch.setattr(pool, "CLEANUP_INTERVAL", 0.05)
+    monkeypatch.setattr(pool.POOL, "idle_timeout", 0)
+    pool.enable()
+    show()
+    deadline = time.monotonic() + 5
+    while "collected" not in order and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert order == ["closed", "collected"]
+
+
+def test_close_all_closes_on_its_own_clock_when_the_system_refuses_the_close_thread(pooled, monkeypatch):
+    """The pool logged the closer's RuntimeError and went on: the session
+    stayed open on the router, and the never-started thread made every
+    later wait_for_closes() raise."""
+    show()
+    real_start = threading.Thread.start
+
+    def start(self):
+        if self.name == "hssh-netconf-close":
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    pool.close_all(shutdown=False)
+    assert devices()[0]._closed and pooled.live() == 0
+    assert not netconf._CLOSES and netconf.wait_for_closes() == 0
+
+
+def test_close_all_closes_every_session_itself_when_the_system_refuses_every_thread(pooled, monkeypatch):
+    """ulimit -u or a container's pids.max refuses the executor's threads
+    too, not only the close helper: with two sessions or more close_all()
+    raised before any close, every session stayed open on its router, and a
+    --job run ended in a traceback before its log and summary."""
+    show()
+    show(host="10.0.0.2")
+
+    def start(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, "start", start)
+    pool.close_all(shutdown=False)
+    assert [d._closed for d in devices()] == [True, True] and pooled.live() == 0
+    assert not netconf._CLOSES and netconf.wait_for_closes() == 0
+
+
+@pytest.mark.skipif((3, 12) <= sys.version_info[:3] < (3, 12, 3), reason="3.12 before 3.12.3 starts no thread at exit")
+def test_the_close_all_at_interpreter_exit_closes_every_session_side_by_side(tmp_path):
+    """concurrent.futures takes no more work once the interpreter is
+    exiting, before atexit runs: with two sessions or more the close_all()
+    there raised 'cannot schedule new futures after interpreter shutdown'
+    and closed none of them. Closed on the exiting thread instead, they
+    went one after another, a close timeout per router in a row, though
+    plain threads still start there."""
+    script = tmp_path / "leaves.py"
+    script.write_text(
+        "import time\n"
+        "from hssh import pool\n"
+        "def closer(dev):\n"
+        "    start = time.monotonic()\n"
+        "    time.sleep(0.3)\n"
+        "    print('closed', dev, start, time.monotonic(), flush=True)\n"
+        "pool.enable()\n"
+        "for host in ('r1', 'r2', 'r3'):\n"
+        "    with pool.POOL.get_connection((host, 830, 'u'), opener=lambda: host, closer=closer):\n"
+        "        pass\n")
+    env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(pool.__file__))}
+    proc = subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and "Traceback" not in proc.stderr, proc.stderr
+    closes = sorted(line.split() for line in proc.stdout.splitlines())
+    assert [c[:2] for c in closes] == [["closed", "r1"], ["closed", "r2"], ["closed", "r3"]]
+    starts, ends = [float(c[2]) for c in closes], [float(c[3]) for c in closes]
+    assert max(starts) < min(ends), proc.stdout          # side by side, not one after another
+
+
+def test_a_closer_that_returns_something_else_is_not_waited_for():
+    """Only a Thread is waited for. A closer such as `lambda m:
+    m.close_session()` (ncclient hands back the reply) made close_all() and
+    the reaper raise AttributeError instead of collecting."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    try:
+        for host in ("r1", "r2"):
+            with p.get_connection((host, 830, "u"), opener=lambda: object(), closer=lambda dev: True):
+                pass
+        t0 = time.monotonic()
+        p.close_all(shutdown=False)
+        assert p.live() == 0 and time.monotonic() - t0 < 0.5      # CLOSE_WAIT is a second
+        with p.get_connection(("r1", 830, "u"), opener=lambda: object(), closer=lambda dev: "<ok/>"):
+            pass
+        t0 = time.monotonic()
+        assert p.reap(now=time.time() + 301) == 1 and p.live() == 0
+        assert time.monotonic() - t0 < 0.5
+    finally:
+        p.disable()

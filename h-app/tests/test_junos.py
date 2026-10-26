@@ -632,3 +632,38 @@ def test_the_session_close_is_not_on_the_callers_clock(monkeypatch):
     assert netconf.wait_for_closes(timeout=2.0) == 0    # joined
     assert dev._closed
     assert not any(th.name == "hssh-netconf-close" and th.is_alive() for th in threading.enumerate())
+
+
+def test_a_close_thread_the_system_refuses_closes_on_the_caller_instead(monkeypatch):
+    """Thread.start() raises under `ulimit -u` or a container's pids.max.
+    The never-started thread stayed in the set: the session was never
+    closed, the RuntimeError came out of the pool's finally over the show's
+    result, and every later wait_for_closes() raised instead of waiting."""
+    import threading
+    real_start = threading.Thread.start
+
+    def start(self):
+        if self.name == "hssh-netconf-close":
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    assert netconf.wait_for_closes() == 0
+    assert netconf.show("10.0.0.1", "u", "p", "show version", 5, 30) == "output of show version"
+    dev = FakeDevice.instances[0]
+    assert dev._closed                                  # closed on the caller, before show() returned
+    assert not netconf._CLOSES
+    assert netconf.wait_for_closes() == 0
+
+
+def test_wait_for_closes_skips_an_entry_that_was_never_started():
+    """_close() adds its thread to the set before it starts it; a wait that
+    looks in between must not trip over an entry it cannot join."""
+    import threading
+    t = threading.Thread(target=lambda: None, name="hssh-netconf-close", daemon=True)
+    with netconf._CLOSES_LOCK:
+        netconf._CLOSES.add(t)
+    try:
+        assert netconf.wait_for_closes(timeout=0.1) == 0
+    finally:
+        with netconf._CLOSES_LOCK:
+            netconf._CLOSES.discard(t)
