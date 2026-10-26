@@ -840,7 +840,8 @@ The library reads no environment variable and no config file; that is the CLI's 
   dropped, its row says skipped), so the store and the script agree; a script waiting in its `for` loop wakes at
   once, whichever thread called `close()`, and a `close()` that lands while `show()` is still opening the run's
   store row waits for the row, records the run as interrupted, and that `show()` raises `RuntimeError`. A store
-  this Fleet opened is closed, and the sessions close (one still in use closes when its call returns).
+  this Fleet opened is closed, and the sessions close (one still in use closes when its call returns); the
+  routers get up to a second in all to acknowledge that, so the sessions' descriptors are freed with them.
   `async with Fleet(...)` and `aclose()` do the same off the event loop. A Fleet dropped without `close()` lets
   its threads go and gives its share of the session pool back once it is collected, as a dropped
   `ThreadPoolExecutor` ends its workers. That can wait for the garbage collector's next pass: a device call that
@@ -981,7 +982,7 @@ unlock that failed, an RPC timeout, or the router closing it. A read (`show_stru
 `show_batch`, `rpc` and `rpc_batch` for a `show …` command or `get-*` RPC, every one of a batch) that
 finds its reused session dead opens a new one and runs once more; any other command (`request …`,
 `request-*`, …) and an edit never do —
-an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll), so size `ulimit -n` for the sessions you keep; what a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
+an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll), so size `ulimit -n` for the sessions you keep; what a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything, once the closes it started are done, since a close runs beside the work: `close_all()` and `reap()` wait up to a second for them (`wait=` to change it), the reaper's own thread, which nothing waits on, up to ten seconds. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
 
 ## Package structure
 
@@ -1034,7 +1035,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1031 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1043 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

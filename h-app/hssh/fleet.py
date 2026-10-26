@@ -874,13 +874,15 @@ class Fleet:
     while show() is still opening the run's store row waits for the row,
     records the run as interrupted, and that show() raises
     RuntimeError("this Fleet is closed"). The sessions close (one still in
-    use closes when its call returns), a store this Fleet opened is closed.
-    Nothing waits on a device beyond `wait`; the worker threads are daemon
-    threads, so a call that never returns keeps its thread and nothing
-    else. `async with`, and `aclose()`, do the same off the event loop. A
-    Fleet dropped without close() gives its threads and the session pool
-    back once it is collected, as a dropped ThreadPoolExecutor does. That
-    can wait for the garbage collector's next pass: a device call that
+    use closes when its call returns), and the routers get up to a second
+    in all (pool.CLOSE_WAIT) to acknowledge that, so the sessions'
+    descriptors are freed with them; a store this Fleet opened is closed.
+    Nothing else waits on a device beyond `wait`; the worker threads are
+    daemon threads, so a call that never returns keeps its thread and
+    nothing else. `async with`, and `aclose()`, do the same off the event
+    loop. A Fleet dropped without close() gives its threads and the session
+    pool back once it is collected, as a dropped ThreadPoolExecutor does.
+    That can wait for the garbage collector's next pass: a device call that
     raised leaves its frames in a reference cycle, and they hold the Fleet;
     so do the first Fleet of a process, whose workers import the transport,
     and a run it left open (not recorded, so close() is still the way to
