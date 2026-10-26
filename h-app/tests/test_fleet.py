@@ -16,6 +16,7 @@ import threading
 import time
 import types
 import warnings
+import weakref
 from pathlib import Path
 
 import pytest
@@ -460,6 +461,62 @@ def test_batch_async_and_a_cancelled_consumer_leave_the_run_intact(monkeypatch, 
     assert len(rows(path, "SELECT * FROM results WHERE run_id = ?", runs[0]["run_id"])) == 6     # 3 devices x 2 commands
 
 
+@pytest.mark.parametrize("returned", [False, True], ids=["call held", "call returned"])
+def test_iterating_again_fails_the_queue_a_cancelled_consumer_had_given_up_on(monkeypatch, returned):
+    """Every worker held: the consumer gives up on the queue (cancelled, so
+    no worker takes it) and hands it to the loop's executor to be failed.
+    An async consumer cancelled right then (asyncio.timeout around `async
+    for`, the executor busy) loses that step. The queue sat there cancelled
+    and pending for good: iterating again waited forever and every later
+    show() was refused as busy. It is given up on again, whether the held
+    call has returned by then or not."""
+    monkeypatch.setattr(fleet_mod, "GRACE_SECONDS", 0.2)
+    release, busy = threading.Event(), threading.Event()
+    install(monkeypatch, show=holding(release, hosts={"10.0.0.1"}))
+    try:
+        with Fleet(HOSTS, transport="junos", user="u", workers=1, session_timeout=1, command_timeout=1,
+                   retries=0) as fleet:
+            res = fleet.show("show version")                 # 10.0.0.1 held, the other two queued
+            queued = [t for t in res._run.tasks if t.target.host != "10.0.0.1"]
+
+            async def main():
+                loop = asyncio.get_running_loop()
+                loop.set_default_executor(cf.ThreadPoolExecutor(max_workers=1))
+                got = []
+
+                async def consume():
+                    async for r in res:
+                        got.append(r)
+                        loop.run_in_executor(None, busy.wait, 10)    # the loop's executor busy from here on
+
+                consumer = asyncio.create_task(consume())
+                while not all(t.future.cancelled() for t in queued):   # 10.0.0.1 given up on, then the queue
+                    await asyncio.sleep(0.01)
+                consumer.cancel()                            # while the queue's failing waits for the executor
+                with pytest.raises(asyncio.CancelledError):
+                    await consumer
+                busy.set()
+                return got
+
+            got = asyncio.run(main())
+            assert [(r.device, r.ok) for r in got] == [("10.0.0.1", False)]
+            assert all(t in res._run.pending for t in queued)    # the queue's failing was lost
+            if returned:
+                release.set()
+                assert wait_for(lambda: fleet._stuck_count() == 0)
+            again = []
+            consumer = threading.Thread(target=lambda: again.extend(res), daemon=True)
+            consumer.start()
+            consumer.join(5)
+            assert not consumer.is_alive(), "iterating again waits for a queue nobody will finish"
+            assert [r.device for r in again] == HOSTS and not any(r.ok for r in again)
+            assert all(r.error.startswith("not started: every worker thread (1) is held") for r in again[1:])
+            assert len(list(fleet.show("show version"))) == 3    # not refused as busy: the run was ended
+    finally:
+        busy.set()
+        release.set()
+
+
 def test_async_keeps_sqlite_and_the_host_name_off_the_event_loop(monkeypatch, tmp_path):
     install(monkeypatch, show=echo)
     seen = {"begin": set(), "add": set(), "finish": set(), "hostname": set()}
@@ -746,18 +803,24 @@ def test_a_close_from_another_thread_wakes_the_consumer_at_once(monkeypatch):
     not leave it waiting until the wedged device's budget runs out."""
     release, started = threading.Event(), threading.Event()
     install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2"}))
+    timers = []
     try:
         fleet = Fleet(HOSTS, transport="junos", user="u", workers=2, session_timeout=5, command_timeout=5, retries=0)
         res = fleet.show("show version")
         assert started.wait(2)
         t0 = time.monotonic()
-        threading.Timer(0.3, fleet.close).start()
+        timers.append(threading.Timer(0.3, fleet.close))
+        timers[0].start()
         got = list(res)                                   # the two that answered; the close ends the wait
         elapsed = time.monotonic() - t0
         assert 0.3 <= elapsed < 1.5, f"{elapsed:.1f}s: the consumer slept through the close"
         assert sorted(r.device for r in got) == ["10.0.0.1", "10.0.0.3"] and all(r.ok for r in got)
     finally:
         release.set()
+        # close() wakes the consumer before it gives the pool back: that lands
+        # in this test, not in the next one's count
+        for t in timers:
+            t.join(5)
 
 
 def test_a_close_from_another_thread_wakes_an_async_consumer_at_once(monkeypatch):
@@ -769,14 +832,18 @@ def test_a_close_from_another_thread_wakes_an_async_consumer_at_once(monkeypatch
         res = fleet.show("show version")
         assert started.wait(2)
         t0 = time.monotonic()
-        threading.Timer(0.3, fleet.close).start()
+        timers.append(threading.Timer(0.3, fleet.close))
+        timers[0].start()
         got = [r async for r in res]
         return got, time.monotonic() - t0
 
+    timers = []
     try:
         got, elapsed = asyncio.run(main())
     finally:
         release.set()
+        for t in timers:                                  # as above: the pool given back in this test
+            t.join(5)
     assert 0.3 <= elapsed < 1.5, f"{elapsed:.1f}s: the consumer slept through the close"
     assert sorted(r.device for r in got) == ["10.0.0.1", "10.0.0.3"]
 
@@ -1016,7 +1083,9 @@ def test_store_loss_is_counted_and_said_but_never_raised(monkeypatch, tmp_path):
 def test_store_loss_is_said_for_every_run_not_once_per_process(monkeypatch, tmp_path):
     """The default warning filter prints a message once per place it comes
     from, so a loop whose store kept losing rows was told once and then
-    nothing. The message names the run: every run's loss is said."""
+    nothing. The message names the run: every run's loss is said. Nor does
+    the filter keep each run's message for the life of the process: a
+    long-lived loop whose store keeps failing grows nothing."""
     install(monkeypatch, show=echo)
     real_add = Store.add_entry
 
@@ -1033,10 +1102,12 @@ def test_store_loss_is_said_for_every_run_not_once_per_process(monkeypatch, tmp_
                 res = fleet.show("show version")
                 assert len(list(res)) == 3 and res.not_kept == 1
                 ids.append(res._run.store_run)
+        kept = [k for k in vars(fleet_mod).get("__warningregistry__", {}) if any(f"run {i}:" in str(k) for i in ids)]
     lost = [str(w.message) for w in said]
     assert len(lost) == 4, lost                              # said as it happens and at the end, for each run
     assert all(f"run {ids[0]}:" in m for m in lost[:2]) and all(f"run {ids[1]}:" in m for m in lost[2:])
     assert ids[0] != ids[1]
+    assert kept == []                                        # nothing kept per message: it was two a run, for good
 
 
 def test_a_batch_is_one_row_per_command_and_an_open_store_is_left_open(monkeypatch, tmp_path):
@@ -1184,6 +1255,33 @@ def test_a_fleet_dropped_without_close_lets_its_threads_go_and_the_pool_count_ba
         time.sleep(0.05)
     assert not any(t.is_alive() for t in made)
     assert fleet_mod._POOL_FLEETS == 0 and not pool.POOL.enabled
+
+
+@pytest.mark.parametrize("how", ["for", "async for"])
+def test_a_fleet_read_to_the_end_and_dropped_goes_with_its_last_reference(monkeypatch, how):
+    """A Fleet per request, its results read to the end, then dropped: it
+    goes with its last reference, as a ThreadPoolExecutor does, and gives
+    its threads and the pool back then, no collector pass needed. Each
+    device's future held a callback that held its task and the Fleet, a
+    cycle: such Fleets piled up, threads and all, until the collector came
+    round to them."""
+    install(monkeypatch, show=echo)
+
+    async def read(fleet):
+        return [r.ok async for r in fleet.show_async("show version")]
+
+    gc.disable()                                             # reference counts only
+    try:
+        fleet = Fleet(HOSTS, transport="junos", user="u")
+        got = [r.ok for r in fleet.show("show version")] if how == "for" else asyncio.run(read(fleet))
+        assert got == [True] * 3
+        threads, gone = fleet._workers.threads, weakref.ref(fleet)
+        del fleet
+        assert gone() is None, "the Fleet outlived its last reference"
+        assert wait_for(lambda: not any(t.is_alive() for t in threads), 5)
+        assert fleet_mod._POOL_FLEETS == 0 and not pool.POOL.enabled
+    finally:
+        gc.enable()
 
 
 def test_a_fleet_collected_inside_the_pool_lock_gives_the_pool_back_without_a_hang(monkeypatch):

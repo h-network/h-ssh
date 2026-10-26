@@ -41,12 +41,14 @@ question); those stay with the CLI and the transports' own edit()/begin().
 import asyncio
 import concurrent.futures as cf
 import datetime as _dt
+import functools
 import getpass
 import json
 import logging
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 import warnings
@@ -87,6 +89,18 @@ def _version() -> str:
 
 def _now() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _warn(message: str) -> None:
+    """warnings.warn(message, RuntimeWarning, stacklevel=2), kept in no
+    registry. The default filter remembers every message it has said, per
+    place, for the life of the process, and a store-loss message names its
+    run: a long-lived loop whose store kept failing grew that memory by two
+    entries a run. Each is said, the filters decide as ever, nothing is
+    kept."""
+    caller = sys._getframe(2)
+    warnings.warn_explicit(message, RuntimeWarning, caller.f_code.co_filename, caller.f_lineno,
+                           module=caller.f_globals.get("__name__", "<string>"), registry=None)
 
 
 def _pool_acquire() -> None:
@@ -373,6 +387,17 @@ class DeviceResult:
         return d
 
 
+def _call_returned(fleet_ref: "weakref.ref", name: str, future: cf.Future) -> None:
+    """A device's future is done: the Fleet no longer counts the device as
+    held by that call. Given the Fleet weakly and the device by name: a
+    callback that held the task and the Fleet made a cycle with the future,
+    so a Fleet read to the end and dropped waited for the collector, its
+    threads with it, instead of going with its last reference."""
+    fleet = fleet_ref()
+    if fleet is not None:
+        fleet._stuck_release(name, future)
+
+
 class _Task:
     __slots__ = ("target", "future", "started", "budget", "attempts")
 
@@ -461,7 +486,7 @@ class _Run:
                     future = workers.submit(self.work, task)
                     # Runs once the future's state is set, so a task counted as
                     # stuck (see _given_up) is always let go of when its call returns.
-                    future.add_done_callback(lambda f, task=task: fleet._stuck_release(task))
+                    future.add_done_callback(functools.partial(_call_returned, weakref.ref(fleet), task.target.name))
                 task.future = future
                 self.by_future[future] = task
 
@@ -520,14 +545,22 @@ class _Run:
         now = time.monotonic()
         pending = self._snapshot()
         due = [t for t in pending if t.started is not None and now >= t.started + t.budget]
-        if self.fleet._stuck_count() >= self.fleet.workers:
-            for t in pending:
-                # cancel() is False once a thread has picked the task up: then
-                # it gets its deadline. One cancelled already is a close()
-                # under way: end() counts it as skipped.
-                if (t.started is None and t not in due and t.future is not None
-                        and not t.future.cancelled() and t.future.cancel()):
+        held = self.fleet._stuck_count() >= self.fleet.workers
+        for t in pending:
+            if t.started is not None or t.future is None:
+                continue
+            if t.future.cancelled():
+                # A close() under way cancelled it: end() counts it as skipped.
+                # Before any close(), only this did, and the finish after it
+                # was lost (an async consumer cancelled while it waited for
+                # the loop's executor): due still, workers held or not, or
+                # the run could never end.
+                if not self.fleet._closed:
                     due.append(t)
+            elif held and t.future.cancel():
+                # cancel() is False once a thread has picked the task up: then
+                # it gets its deadline
+                due.append(t)
         return due
 
     def finish(self, task: _Task) -> Optional[DeviceResult]:
@@ -576,7 +609,7 @@ class _Run:
         else:
             fleet._stuck_hold(task)
             if task.future is not None and task.future.done():   # it returned just now: not stuck after all
-                fleet._stuck_release(task)
+                fleet._stuck_release(task.target.name, task.future)
             ms = int((time.monotonic() - task.started) * 1000)
             factor = _connect_factor(task.target)
             each = (f"{factor} x " if factor > 1 else "") + f"session_timeout {fleet.session_timeout}s"
@@ -615,14 +648,13 @@ class _Run:
             store.add_entry(self.store_run, result.to_dict(), sent, fmt=self.fmt)
         except Exception as e:
             # The run goes on and the result is still handed over; the loss is
-            # counted, said once as it happens and once more at the end. The
-            # message names the run: the default warning filter prints a
-            # message once per place, and a loop of runs must hear each loss.
+            # counted, said once as it happens and once more at the end, the
+            # run named, for every run of a loop (see _warn).
             self.not_kept += 1
             if self.store_error is None:
                 self.store_error = str(e)
-                warnings.warn(f"store {store.path}, run {self.store_run}: {e}; the run goes on, its results are "
-                              "shown but not kept", RuntimeWarning, stacklevel=2)
+                _warn(f"store {store.path}, run {self.store_run}: {e}; the run goes on, its results are shown but "
+                      "not kept")
 
     def _close_store_row(self, ok: int, failed: int, skipped: int, interrupted: bool) -> None:
         """Caller holds the lock. As the CLI: SQLite writes into a deleted or
@@ -642,10 +674,10 @@ class _Run:
             except Exception as e:
                 if self.store_error is None:
                     self.store_error = str(e)
-                warnings.warn(f"store {store.path}, run {self.store_run}: {e}", RuntimeWarning, stacklevel=2)
+                _warn(f"store {store.path}, run {self.store_run}: {e}")
         if self.not_kept:
-            warnings.warn(f"store {store.path}, run {self.store_run}: {self.not_kept} of {self.rows_tried} results "
-                          f"were not kept: {self.store_error}", RuntimeWarning, stacklevel=2)
+            _warn(f"store {store.path}, run {self.store_run}: {self.not_kept} of {self.rows_tried} results were not "
+                  f"kept: {self.store_error}")
 
     def wait_for_inflight(self, seconds: float) -> None:
         """close(wait=): the devices not started are not started; the ones a
@@ -821,9 +853,10 @@ class Fleet:
     beyond `wait`; the worker threads are daemon threads, so a call that
     never returns keeps its thread and nothing else. `async with`, and
     `aclose()`, do the same off the event loop. A Fleet dropped without
-    close() gives its threads and the session pool back once it is
-    collected, as a dropped ThreadPoolExecutor does; a run it left open is
-    not recorded, so close() is still the way to end one. With no logging
+    close() gives its threads and the session pool back when its last
+    reference goes, as a dropped ThreadPoolExecutor does; a run it left
+    open keeps it until the garbage collector's next pass, and is not
+    recorded, so close() is still the way to end one. With no logging
     set up, paramiko's and ncclient's tracebacks stay off stderr (each gets
     a NullHandler, as the CLI gives it); set logging up and they go where
     it sends them."""
@@ -986,10 +1019,11 @@ class Fleet:
         with self._stuck_lock:
             self._stuck[task.target.name] = task
 
-    def _stuck_release(self, task: _Task) -> None:
+    def _stuck_release(self, name: str, future: cf.Future) -> None:
         with self._stuck_lock:
-            if self._stuck.get(task.target.name) is task:
-                del self._stuck[task.target.name]
+            held = self._stuck.get(name)
+            if held is not None and held.future is future:
+                del self._stuck[name]
 
     def close(self, wait: float = 0) -> None:
         """Done with the fleet; see the class docstring for what that means
