@@ -158,13 +158,16 @@ MAX_SECONDS = 86400
 
 
 def _seconds_arg(text: str) -> float:
-    """--every SECONDS: one second or more; fractions are allowed."""
+    """--every SECONDS: one second to a day (MAX_SECONDS, the timeouts'
+    ceiling too); fractions are allowed."""
     try:
         value = float(text)
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError(f"--every takes seconds, not {text!r}")
     if not value >= 1:
         raise argparse.ArgumentTypeError(f"--every takes 1 second or more, not {text}")
+    if value > MAX_SECONDS:
+        raise argparse.ArgumentTypeError(f"--every takes at most {MAX_SECONDS} seconds (a day), not {text}")
     return value
 
 
@@ -934,6 +937,13 @@ async def main() -> int:
             print("ERROR: --every compares every tick with the one before through the store; drop --no-store "
                   "or name a --store.", file=sys.stderr)
             return 2
+        if json_mode or raw_mode:
+            # The tick lines and the diffs are the watch's output, and they
+            # are neither a JSON array nor device output: `--json --every | jq`
+            # broke at the first tick. The ticks are in the store for a pipeline.
+            print("ERROR: --every prints one line per tick and what changed, not --json or --raw output; "
+                  "drop one of them (every tick is in the store for h-ssh-store).", file=sys.stderr)
+            return 2
         show_progress = False      # a watch prints one line per tick and what changed, not every device every time
 
     if not user:
@@ -946,7 +956,11 @@ async def main() -> int:
         # run would otherwise go on to key authentication without a word.
         print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
         return 2
-    if not passwd:
+    if args.every is not None and _WATCH["tick"]:
+        # A later tick of a watch: the password typed (or skipped) before
+        # tick 1 is the watch's, not asked for again after every sleep.
+        passwd = _WATCH["passwd"]
+    elif not passwd:
         # No transport needs a password up front: a key or an agent may do.
         if _tty(sys.stdin):
             try:
@@ -957,6 +971,8 @@ async def main() -> int:
                 return 2
         else:
             passwd = None
+    if args.every is not None:
+        _WATCH["passwd"] = passwd
 
     # Command shortcuts are kept unresolved here and resolved per target, since
     # each target carries its own vendor and the template library is per vendor.
@@ -1703,12 +1719,12 @@ async def main() -> int:
                 store.finish_run(store_run, ok_count, failures, skipped + not_run, interrupted)
             except Exception as e:
                 print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
-        if not_kept:
-            print(f"WARNING: store {store.path}: {not_kept} of {store_tried} results were not kept: {store_reason}",
-                  file=sys.stderr)
+        lost = f"{not_kept} of {store_tried} results were not kept: {store_reason}" if not_kept else None
+        if lost:
+            print(f"WARNING: store {store.path}: {lost}", file=sys.stderr)
         if args.every is not None:
             _WATCH["tick"] += 1
-            _watch_report(store, store_run, _WATCH["previous"], _WATCH["tick"], ok_count, failures)
+            _watch_report(store, store_run, _WATCH["previous"], _WATCH["tick"], ok_count, failures, lost)
             _WATCH["previous"] = store_run
             _WATCH["every"] = args.every
             _WATCH["again"] = not interrupted and (args.times is None or _WATCH["tick"] < args.times)
@@ -1728,21 +1744,35 @@ async def main() -> int:
 
 
 # --every: the watch's state between ticks. main() runs one tick and leaves
-# `again` for main_sync(), which sleeps and runs the next.
-_WATCH = {"tick": 0, "previous": None, "again": False, "every": None}
+# `again` for main_sync(), which sleeps and runs the next; `passwd` is what
+# the prompt got before tick 1, asked once for the whole watch.
+_WATCH = {"tick": 0, "previous": None, "again": False, "every": None, "passwd": None}
+
+# A watch exits with the worst of its ticks, ranked as a single run's codes
+# are: interrupted, results not kept, refused (a tick that cannot start ends
+# the watch), a device failed, not everything ran, fine.
+_WATCH_CODES = (130, 4, 2, 1, 3, 0)
+
+
+def _worst(a: int, b: int) -> int:
+    return min(a, b, key=lambda code: _WATCH_CODES.index(code) if code in _WATCH_CODES else len(_WATCH_CODES))
 
 
 def _watch_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _watch_report(store, run_id: str, previous: Optional[str], tick: int, ok: int, failed: int) -> None:
+def _watch_report(store, run_id: str, previous: Optional[str], tick: int, ok: int, failed: int,
+                  lost: Optional[str] = None) -> None:
     """One line per tick and, for every device whose reply changed since the
     tick before, the difference: the thing a watch is for. Every tick is a
-    run in the store, so `h-ssh-store diff` can go back to any two of them."""
+    run in the store, so `h-ssh-store diff` can go back to any two of them.
+    `lost` is what the store could not keep of this tick, in the warning's
+    words: a baseline that is not all there is not called kept."""
     stamp = time.strftime("%H:%M:%S")
     if previous is None:
-        print(f"tick {tick} {stamp}: {ok} OK, {failed} failed; baseline kept as run {run_id}", flush=True)
+        kept = f"baseline not kept ({lost})" if lost else f"baseline kept as run {run_id}"
+        print(f"tick {tick} {stamp}: {ok} OK, {failed} failed; {kept}", flush=True)
         return
     before = {(r["device"], r["seq"]): r for r in store.results(run_id=previous)}
     changed = []
@@ -1806,13 +1836,13 @@ def _stdout_gone() -> None:
 def main_sync() -> None:
     """Synchronous entry point for console_scripts and h-ssh.py."""
     rc = 0
-    _WATCH.update(tick=0, previous=None, again=False, every=None)
+    _WATCH.update(tick=0, previous=None, again=False, every=None, passwd=None)
     try:
         rc = asyncio.run(main())
         while _WATCH["again"]:      # --every: the tick left word that another follows
             _WATCH["again"] = False
             _watch_sleep(_WATCH["every"])
-            rc = asyncio.run(main())
+            rc = _worst(rc, asyncio.run(main()))    # a tick that failed is not forgotten by a clean one after it
         sys.stdout.flush()          # a reader that left shows up here, not at interpreter exit
     except KeyboardInterrupt:
         # Ctrl-C is a normal way to stop a fleet run; a stack trace is not a
@@ -1826,6 +1856,7 @@ def main_sync() -> None:
         # far, stands.
         _stdout_gone()
     finally:
+        _WATCH["passwd"] = None     # the watch is over; its credential is not kept around
         try:
             pool.close_all()        # a job run that ended early (Ctrl-C, a crash) leaves no session open
         except Exception:
