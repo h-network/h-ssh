@@ -1,6 +1,7 @@
 """--every SECONDS: the same reads again and again, every tick a run in the
 store, and per tick one line plus what changed since the tick before."""
 
+import json
 import os
 import pty
 import re
@@ -80,6 +81,23 @@ def test_a_tick_that_fails_a_device_says_so_in_the_change(tmp_path, monkeypatch,
                                                           "--retries", "0", "R1:10.0.0.1:junos", "-sC", "show version"], fake)
     assert rc == 1
     assert "tick 2 " in out and "0 OK, 1 failed, 1 changed" in out and "--- R1: show version: OK -> FAIL (" in out
+
+
+def test_a_change_shown_on_a_terminal_carries_no_control_sequence(tmp_path, monkeypatch, capsys):
+    """A watch's diff is device output on the operator's terminal: a reply
+    cannot clear or retitle it there (#47)."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    calls = {}
+
+    def show(host, user, passwd, cmd, *a, **kw):
+        n = calls[host] = calls.get(host, 0) + 1
+        return "peer 10.9.9.8 Establ\n" if n == 1 else "peer 10.9.9.8 Active\x1b]0;owned\x07\x1b[2J\n"
+
+    rc, out, err, slept = run_watch(monkeypatch, capsys, ["--store", str(tmp_path / "w.db"), "--every", "5", "--times", "2",
+                                                          "R1:10.0.0.1:junos", "-sC", "show bgp summary"],
+                                    types.SimpleNamespace(AVAILABLE=True, show=show))
+    assert rc == 0, err
+    assert "  +peer 10.9.9.8 Active" in out and "\x1b" not in out and "\x07" not in out, repr(out)
 
 
 def test_ctrl_c_between_ticks_stops_the_watch_and_says_how_many_are_kept(tmp_path, monkeypatch, capsys):
@@ -199,6 +217,16 @@ def test_the_exit_code_is_the_worst_tick_not_the_last(tmp_path, monkeypatch, cap
     assert "0 OK, 1 failed" in ticks[0] and ticks[2].endswith("1 OK, 0 failed, 0 changed")
 
 
+def test_tick_exit_codes_rank_as_the_readme_says():
+    """README: `130` > `4` > `2` > `1` > `3` > `0`. Only where 2 goes was
+    pinned: 3 over 1 (a safety-gate skip on tick 1 outranking a device that
+    failed on tick 2) or 4 over 130 passed every test."""
+    order = (130, 4, 2, 1, 3, 0)
+    for i, worse in enumerate(order):
+        for better in order[i:]:
+            assert cli._worst(worse, better) == cli._worst(better, worse) == worse, (worse, better)
+
+
 def test_a_baseline_the_store_lost_is_said_and_the_watch_exits_4(tmp_path, monkeypatch, capsys):
     """Results not kept on tick 1 only: the tick line said `baseline kept as
     run ...` and a clean tick 2 made the exit 0. The line now says what was
@@ -282,6 +310,39 @@ def test_a_reply_the_store_lost_on_a_later_tick_is_still_compared_and_the_line_s
     assert "--- R1: show version" in out and "  -peer 10.9.9.8 Establ" in out and "  +peer 10.9.9.8 Active" in out
     assert ticks[2].endswith("2 OK, 0 failed, 0 changed"), out      # against tick 2 as it was got, not `new`
     assert ": new" not in out and "--- R2" not in out
+
+
+def test_a_result_the_store_lost_is_compared_in_the_rows_the_store_keeps(tmp_path):
+    """A result the store could not keep is compared in rows _watch_rows
+    shapes as Store.add_entry shapes the ones it keeps. Only a text show was
+    checked: a --format json reply left as data made the next diff a
+    traceback, a batch numbered from 1 called every command new, and every
+    test passed. Each kind of result a watch reads gives the same rows both
+    ways."""
+    store = Store(str(tmp_path / "w.db"))
+    r1 = {"device": "R1", "host": "10.0.0.1", "vendor": "junos", "ok": True, "duration_ms": 12}
+    batch = json.dumps(["show version", "show chassis alarms"])
+    kinds = {
+        "show": ({**r1, "command": "show version", "output": "Junos: 24.2R1\n"}, "show version", "text"),
+        "show --format json": ({**r1, "command": "show version",
+                                "output": {"software-information": [{"junos-version": [{"data": "24.2R1"}]}]}},
+                               "show version", "json"),
+        "a show that failed": ({**r1, "ok": False, "error": "connect timed out"}, "show version", "text"),
+        "batch": ({**r1, "ok": False, "error": "syntax error",
+                   "commands": [{"command": "show version", "ok": True, "output": "Junos: 24.2R1"},
+                                {"command": "show chassis alarms", "ok": False, "error": "syntax error"}]}, batch, "text"),
+        "batch --format json": ({**r1, "commands": [{"command": "show version", "ok": True, "output": {"software-information": []}},
+                                                    {"command": "show chassis alarms", "ok": True,
+                                                     "output": {"alarm-information": []}}]}, batch, "json"),
+        "a batch that never got a reply": ({**r1, "ok": False, "commands": [], "error": "connect timed out"}, batch, "text"),
+    }
+    fields = ("device", "seq", "command", "ok", "error", "output")
+    for kind, (entry, sent, fmt) in kinds.items():
+        run = store.begin_run("show", ["h-ssh"], "u", 1, "0")
+        store.add_entry(run, entry, sent, fmt=fmt)
+        kept = [tuple(r[f] for f in fields) for r in store.results(run_id=run)]
+        assert [tuple(r[f] for f in fields) for r in cli._watch_rows(entry, sent)] == kept, kind
+    store.close()
 
 
 def watch_and_delete_the_store_after_tick_1(db, monkeypatch, capsys, fail=False, lose=False):
