@@ -92,6 +92,25 @@ def test_ctrl_c_between_ticks_stops_the_watch_and_says_how_many_are_kept(tmp_pat
                                                           "R1:10.0.0.1:junos", "-sC", "show version"], fake, sleeps=interrupt)
     assert rc == 130 and "Interrupted. 1 tick(s) kept in the store." in err and calls == {"10.0.0.1": 1}
 
+    # A tick whose result the store lost is not counted as kept: tick 1 loses
+    # it, tick 2 keeps it, Ctrl-C in the second sleep.
+    real, sleeps = Store.add_entry, []
+
+    def lose_tick_1(self, *a, **kw):
+        if not sleeps:
+            raise sqlite3.OperationalError("database or disk is full")
+        return real(self, *a, **kw)
+
+    def interrupt_the_second(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(Store, "add_entry", lose_tick_1)
+    rc, out, err, _ = run_watch(monkeypatch, capsys, ["--store", str(tmp_path / "w2.db"), "--every", "60",
+                                                      "R1:10.0.0.1:junos", "-sC", "show version"], fake, sleeps=interrupt_the_second)
+    assert rc == 130 and "Interrupted. 1 tick(s) kept in the store, 1 not kept in full." in err, err
+
 
 def test_the_watch_refuses_what_it_cannot_watch(tmp_path, monkeypatch, capsys):
     fake, _ = changing_fake()
@@ -103,6 +122,7 @@ def test_the_watch_refuses_what_it_cannot_watch(tmp_path, monkeypatch, capsys):
     assert rc == 2 and "watches reads" in err
     rc, out, err, _ = run_watch(monkeypatch, capsys, ["--store", str(tmp_path / "w.db"), "--every", "0.5", "R1:10.0.0.1:junos", "-sC", "show version"], fake)
     assert rc == 2 and "1 second or more" in err
+    assert not (tmp_path / "w.db").exists()                 # refused before the store is opened: none is made
 
 
 PROMPT = b"Password (press Enter to skip):"
@@ -182,7 +202,8 @@ def test_the_exit_code_is_the_worst_tick_not_the_last(tmp_path, monkeypatch, cap
 def test_a_baseline_the_store_lost_is_said_and_the_watch_exits_4(tmp_path, monkeypatch, capsys):
     """Results not kept on tick 1 only: the tick line said `baseline kept as
     run ...` and a clean tick 2 made the exit 0. The line now says what was
-    lost, in the warning's words, and the 4 is kept to the end."""
+    lost, in the warning's words, and the 4 is kept to the end. The lost
+    reply is compared on tick 2 as tick 1 got it, not called new."""
     fake = types.SimpleNamespace(AVAILABLE=True, show=lambda host, user, passwd, cmd, *a, **kw: "up\n")
     real, tries = Store.add_entry, []
 
@@ -200,20 +221,25 @@ def test_a_baseline_the_store_lost_is_said_and_the_watch_exits_4(tmp_path, monke
     ticks = [ln for ln in out.splitlines() if ln.startswith("tick ")]
     assert ticks[0].endswith("2 OK, 0 failed; baseline not kept (1 of 2 results were not kept: database or disk is full)")
     assert "baseline kept" not in out
-    assert ticks[1].endswith("2 OK, 0 failed, 1 changed") and out.count(": show version: new") == 1   # the lost one is new to the store
+    assert ticks[1].endswith("2 OK, 0 failed, 0 changed") and ": new" not in out      # the lost one, as tick 1 got it
     assert err.count("1 of 2 results were not kept: database or disk is full") == 1                 # tick 2 kept everything
 
 
 def test_json_and_raw_are_refused_with_every_before_anything_runs(tmp_path, monkeypatch, capsys):
     """The tick lines and the diffs went to stdout after the JSON array or
     the raw device output: `--json --every | jq` failed at the first tick.
-    Neither is a watch's output, so both are refused: exit 2, nothing sent."""
+    Neither is a watch's output, so both are refused: exit 2, nothing sent,
+    no store made. The help says so with the other watch refusals."""
     fake, calls = changing_fake()
+    db = tmp_path / "new" / "w.db"
     for flag in ("--json", "--raw"):
-        rc, out, err, slept = run_watch(monkeypatch, capsys, ["--store", str(tmp_path / "w.db"), "--every", "5", "--times", "1",
+        rc, out, err, slept = run_watch(monkeypatch, capsys, ["--store", str(db), "--every", "5", "--times", "1",
                                                               flag, "R1:10.0.0.1:junos", "-sC", "show version"], fake)
         assert rc == 2 and "--every prints one line per tick and what changed, not --json or --raw output" in err, err
         assert out == "" and calls == {} and slept == [] and "Traceback" not in err
+        assert not db.parent.exists()                       # neither the store nor its directory
+    rc, out, err, _ = run_watch(monkeypatch, capsys, ["--help"], fake)
+    assert rc == 0 and "(reads only, the store on, not with --json or --raw; 1 to 86400 s)" in " ".join(out.split())
 
 
 def test_every_takes_at_most_a_day_like_the_timeouts(tmp_path, monkeypatch, capsys):
@@ -225,3 +251,111 @@ def test_every_takes_at_most_a_day_like_the_timeouts(tmp_path, monkeypatch, caps
                                                               "R1:10.0.0.1:junos", "-sC", "show version"], fake)
         assert rc == 2 and f"--every takes at most 86400 seconds (a day), not {value}" in err and calls == {}, err
     assert cli._seconds_arg("86400") == 86400.0 and cli._seconds_arg("1.5") == 1.5
+
+
+def test_a_reply_the_store_lost_on_a_later_tick_is_still_compared_and_the_line_says_so(tmp_path, monkeypatch, capsys):
+    """Results the store did not keep after tick 1 were left out of the
+    change report: R1 changed on tick 2, the line said `0 changed` and
+    nothing of the loss, and tick 3 called R1 `new` with no diff. The
+    replies are compared as the ticks got them, kept or not, and every
+    tick's line says what the store did not keep."""
+    calls = {}
+
+    def show(host, user, passwd, cmd, *a, **kw):
+        n = calls[host] = calls.get(host, 0) + 1
+        return "peer 10.9.9.8 Active\n" if host == "10.0.0.1" and n > 1 else "peer 10.9.9.8 Establ\n"   # R1 drops on tick 2
+
+    real = Store.add_entry
+
+    def full_on_tick_2(self, run_id, entry, *a, **kw):
+        if calls[entry["host"]] == 2:              # neither reply of tick 2 is kept: R1's changed, R2's did not
+            raise sqlite3.OperationalError("database or disk is full")
+        return real(self, run_id, entry, *a, **kw)
+
+    monkeypatch.setattr(Store, "add_entry", full_on_tick_2)
+    fake = types.SimpleNamespace(AVAILABLE=True, show=show)
+    rc, out, err, slept = run_watch(monkeypatch, capsys, ["--store", str(tmp_path / "w.db"), "--every", "5", "--times", "3",
+                                                          "R1:10.0.0.1:junos", "R2:10.0.0.2:junos", "-sC", "show version"], fake)
+    assert rc == 4, err
+    ticks = [ln for ln in out.splitlines() if ln.startswith("tick ")]
+    assert ticks[1].endswith("2 OK, 0 failed, 1 changed; 2 of 2 results were not kept: database or disk is full"), out
+    assert "--- R1: show version" in out and "  -peer 10.9.9.8 Establ" in out and "  +peer 10.9.9.8 Active" in out
+    assert ticks[2].endswith("2 OK, 0 failed, 0 changed"), out      # against tick 2 as it was got, not `new`
+    assert ": new" not in out and "--- R2" not in out
+
+
+def watch_and_delete_the_store_after_tick_1(db, monkeypatch, capsys, fail=False, lose=False):
+    """Three ticks of R1 asked for; in the sleep after tick 1 the store file
+    goes, with its -wal and -shm. `fail`: R1 fails on tick 1; `lose`: the
+    store does not keep R1's tick-1 result."""
+    calls, gaps = {}, []
+
+    def show(host, user, passwd, cmd, *a, **kw):
+        n = calls[host] = calls.get(host, 0) + 1
+        if fail and n == 1:
+            raise RuntimeError("connect timed out")
+        return "up\n"
+
+    real = Store.add_entry
+
+    def add_entry(self, run_id, entry, *a, **kw):
+        if lose and calls[entry["host"]] == 1:
+            raise sqlite3.OperationalError("database or disk is full")
+        return real(self, run_id, entry, *a, **kw)
+
+    def delete_the_store(seconds):
+        gaps.append(seconds)
+        for path in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+            path.unlink(missing_ok=True)
+
+    with monkeypatch.context() as m:
+        m.setattr(Store, "add_entry", add_entry)
+        rc, out, err, _ = run_watch(monkeypatch, capsys, ["--store", str(db), "--every", "5", "--times", "3", "--retries", "0",
+                                                          "R1:10.0.0.1:junos", "-sC", "show version"],
+                                    types.SimpleNamespace(AVAILABLE=True, show=show), sleeps=delete_the_store)
+    return rc, err, calls, gaps
+
+
+def test_a_store_deleted_between_ticks_ends_the_watch_with_2_unless_a_tick_was_worse(tmp_path, monkeypatch, capsys):
+    """The next tick made a deleted store again, empty, and the watch went
+    on there with every device `new` and exit 0, while the README said a
+    tick that cannot start ends the watch with 2. It does now, with nothing
+    made again and no tick after it; and the worst code still wins: 2 over
+    a device that failed on tick 1, a result lost on tick 1 (4) over the 2."""
+    for name, fail, lose, want in (("clean", False, False, 2), ("failed", True, False, 2), ("lost", False, True, 4)):
+        db = tmp_path / f"{name}.db"
+        rc, err, calls, gaps = watch_and_delete_the_store_after_tick_1(db, monkeypatch, capsys, fail=fail, lose=lose)
+        assert rc == want, (name, err)
+        assert (f"ERROR: store {db}: the store file was deleted after tick 1; a watch keeps all its ticks in one store, "
+                "so it stops here.") in err, err
+        assert calls == {"10.0.0.1": 1} and gaps == [5.0] and not db.exists(), name   # no tick 2, no new empty store
+
+
+def test_a_store_replaced_between_ticks_is_left_alone_and_ends_the_watch(tmp_path, monkeypatch, capsys):
+    """Another file put where the store was is not the watch's store: the
+    watch says so and stops, and the file is not touched."""
+    db, other = tmp_path / "w.db", tmp_path / "other.db"
+    other.write_bytes(b"")
+    fake, calls = changing_fake()
+
+    def replace_the_store(seconds):
+        if other.exists():
+            os.replace(other, db)
+
+    rc, out, err, _ = run_watch(monkeypatch, capsys, ["--store", str(db), "--every", "5", "--times", "3",
+                                                      "R1:10.0.0.1:junos", "-sC", "show version"], fake, sleeps=replace_the_store)
+    assert rc == 2 and "the store file was replaced after tick 1" in err, err
+    assert calls == {"10.0.0.1": 1} and db.read_bytes() == b""
+
+
+def test_a_shortcut_is_resolved_once_for_the_whole_watch(tmp_path, monkeypatch, capsys):
+    """`Resolved 'alarms' -> 'show chassis alarms' (junos)` went to stdout
+    before every tick line. It is said once, before the first."""
+    monkeypatch.setenv("HOME", str(tmp_path))          # the shipped shortcut, not one from ~/.h-ssh/commands
+    fake, calls = changing_fake()
+    rc, out, err, slept = run_watch(monkeypatch, capsys, ["--store", str(tmp_path / "w.db"), "--every", "5", "--times", "3",
+                                                          "R1:10.0.0.1:junos", "-sC", "alarms"], fake)
+    assert rc == 0, err
+    lines = out.splitlines()
+    assert lines[0] == "Resolved 'alarms' -> 'show chassis alarms' (junos)" and out.count("Resolved ") == 1, out
+    assert len([ln for ln in lines if ln.startswith("tick ")]) == 3

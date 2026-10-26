@@ -216,13 +216,16 @@ tick 2 14:02:43: 250 OK, 0 failed, 1 changed
   +10.9.9.8  65000  Active
 ```
 
-A device that fails on a tick shows as `OK -> FAIL (reason)`; a baseline the store could not keep in
-full says `baseline not kept (N of M results were not kept: why)` in place of its run id. The structured
-summary line still goes to stderr once per tick, and any two ticks can be compared later with
-`h-ssh-store diff DEVICE RUN_A RUN_B`. Ctrl-C between ticks stops the watch and says how many ticks are
-kept. The exit code is the worst tick's, ranked as a single run's codes are (`130` > `4` > `2` > `1` >
-`3` > `0`): a device that failed on one tick is exit `1` however clean the ticks after it, and a tick
-that cannot start (its store gone, say) ends the watch with `2`.
+A device that fails on a tick shows as `OK -> FAIL (reason)`. A tick the store could not keep in full
+says so on its line, in the warning's words: `baseline not kept (N of M results were not kept: why)` in
+place of the baseline's run id, `; N of M results were not kept: why` after a later tick's count; what
+the store lost is still compared, as the tick got it. The structured summary line still goes to stderr
+once per tick, and any two ticks can be compared later with `h-ssh-store diff DEVICE RUN_A RUN_B`.
+Ctrl-C between ticks stops the watch and says how many ticks are kept, and how many were not kept in
+full. The exit code is the worst tick's, in this order: `130` > `4` > `2` > `1` > `3` > `0`. A device
+that failed on one tick is exit `1` however clean the ticks after it, and a tick that cannot start ends
+the watch with `2`, as when the store was deleted or replaced since tick 1: a watch keeps all its ticks
+in one store.
 
 ## Transports
 
@@ -988,7 +991,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (931 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (935 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
