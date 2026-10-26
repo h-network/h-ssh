@@ -23,9 +23,12 @@ from typing import List, Optional
 
 from ..core import check_confirm_minutes
 from ..dialects.junos import SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS, COMMIT_PENDING as _PENDING
-from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
+# ConnectTimeoutError is h-ssh's (hssh.errors), not PyEZ's class of that name.
+from ..errors import AmbiguousCommitError, ConnectTimeoutError, NotAppliedError, NothingToConfirmError
 from ..drivers import results as R
 from ..pool import POOL
+from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
+                      tcp_timed_out, timed_out)
 
 try:
     from jnpr.junos import Device as JunosDevice
@@ -72,8 +75,11 @@ try:
 except ImportError:
     _paramiko = _ncclient_ssh = None
 
-# The session timeout of the _open() running on this thread, as a monotonic
-# deadline; paramiko's Transport reads it while the session is being set up.
+# The deadlines of the _open() running on this thread, monotonic: `at` for
+# the whole session set-up, `connect_at` for its connect phase (the TCP
+# connect and the banner, #126); paramiko's Transport and the socket
+# ncclient opens read them while the session is being set up, and the
+# socket leaves what the OS answered its connect in `connect_error`.
 _DEADLINE = threading.local()
 
 _KEX_UNFINISHED = "the banner came, but key exchange did not finish"
@@ -87,19 +93,23 @@ if _paramiko is not None:
         neither ncclient nor PyEZ passes anything else, so a router that
         accepts TCP and then says nothing cost 15 s whatever --session-timeout
         said (H3). Each timeout now answers with what is left of this thread's
-        session timeout, read when paramiko asks: one deadline for the whole
-        session set-up. Without a deadline (another ncclient user in the same
-        process) the defaults stay."""
+        deadlines, read when paramiko asks: the banner with what is left of
+        the connect phase (#126), the key exchange and authentication with
+        what is left of the session set-up. Without a deadline (another
+        ncclient user in the same process) the defaults stay."""
 
         def __init__(self, *args, **kwargs):
             # Captured here, on the thread that runs _open(); the timeouts
             # are read on the Transport's own thread, where the local is unset.
             self._hssh_deadline = getattr(_DEADLINE, "at", None)
+            self._hssh_connect_deadline = getattr(_DEADLINE, "connect_at", None)
             super().__init__(*args, **kwargs)
 
-        def _timeout(name, default):
+        def _timeout(name, default, connect_phase=False):
             def get(self):
                 at = self.__dict__.get("_hssh_deadline")
+                if connect_phase and self.__dict__.get("_hssh_connect_deadline") is not None:
+                    at = self.__dict__["_hssh_connect_deadline"]
                 own = self.__dict__.get(name, default)
                 return own if at is None else max(0.1, at - time.monotonic())
 
@@ -107,7 +117,7 @@ if _paramiko is not None:
                 self.__dict__[name] = value
             return property(get, set)
 
-        banner_timeout = _timeout("_hssh_banner", 15)
+        banner_timeout = _timeout("_hssh_banner", 15, connect_phase=True)
         handshake_timeout = _timeout("_hssh_handshake", 15)
         auth_timeout = _timeout("_hssh_auth", 30)
 
@@ -166,6 +176,41 @@ if _paramiko is not None:
     if _ncclient_ssh is not None and not isinstance(_ncclient_ssh.paramiko, _ParamikoForNcclient):
         _ncclient_ssh.paramiko = _ParamikoForNcclient(_ncclient_ssh.paramiko)
 
+    class _ConnectSocket(socket.socket):
+        """The socket ncclient opens to the router. Its connect gets what is
+        left of this thread's connect phase, every address of the name
+        together (ncclient gives each one the whole timeout again), and what
+        the OS answered is kept: ncclient says only "Could not open socket",
+        where the reason should say refused, no route or no answer (#126)."""
+
+        def connect(self, address):
+            at = getattr(_DEADLINE, "connect_at", None)
+            if at is not None:
+                left = max(0.001, at - time.monotonic())
+                own = self.gettimeout()
+                self.settimeout(left if own is None else min(own, left))
+            try:
+                return super().connect(address)
+            except OSError as e:
+                if at is not None:
+                    _DEADLINE.connect_error = e
+                raise
+
+    class _SocketForNcclient:
+        """ncclient's view of the socket module: as it is, except that the
+        socket it opens to the router is a _ConnectSocket."""
+
+        socket = _ConnectSocket
+
+        def __init__(self, module):
+            self._module = module
+
+        def __getattr__(self, name):
+            return getattr(self._module, name)
+
+    if _ncclient_ssh is not None and not isinstance(_ncclient_ssh.socket, _SocketForNcclient):
+        _ncclient_ssh.socket = _SocketForNcclient(_ncclient_ssh.socket)
+
 DEFAULT_PORT = 830
 
 # A pooled session idle this long is probed with a cheap RPC before reuse, so
@@ -182,14 +227,19 @@ def _require() -> None:
 
 
 def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
-          command_timeout: int, port: Optional[int]):
+          command_timeout: int, port: Optional[int], connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """Open a NETCONF session. Failures here mean nothing reached the device."""
+    connect_s = budget(connect_timeout, session_timeout)
     params = {
         "host": host,
         "user": user,
         "port": port or DEFAULT_PORT,
         "gather_facts": False,
-        "conn_open_timeout": session_timeout,
+        # PyEZ hands this to ncclient for the TCP connect; _ConnectSocket
+        # holds every address of the name to it together. On port 23 PyEZ
+        # opens a console over telnet instead, where it is the whole login's
+        # timeout, and that stays the session timeout.
+        "conn_open_timeout": session_timeout if str(port) == "23" else connect_s,
         # A reply with a text node over 10 MB (a big configuration, a log
         # file) is rejected by lxml unless the parser is told to expect it.
         "huge_tree": True,
@@ -212,12 +262,17 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         # underscores, hyphens, or bracketed IPv6 literals are permitted".
         raise NotAppliedError(f"NETCONF connect failed: PyEZ does not accept host {host!r}: {e}") from e
     started = time.monotonic()
-    # The TCP connect gets conn_open_timeout from PyEZ; the banner, key
-    # exchange and authentication get what is left of the same budget.
+    # One deadline for the session set-up, and a nearer one for its connect
+    # phase: the TCP connect and the banner have --connect-timeout between
+    # them (#126), the key exchange and authentication what is left of the
+    # session timeout.
     _DEADLINE.at = started + session_timeout
+    _DEADLINE.connect_at = started + connect_s
+    _DEADLINE.connect_error = None
     try:
         dev.open()
     except Exception as e:
+        os_error = getattr(_DEADLINE, "connect_error", None)
         # open() may have partially established the transport before
         # raising; close the local device so we don't leak it.
         try:
@@ -226,23 +281,32 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
             pass
         if isinstance(e, ConnectError):
             reason = _connect_reason(e, host, user, params["port"], session_timeout,
-                                     time.monotonic() - started)
-            raise NotAppliedError(f"NETCONF connect failed: {reason}") from e
+                                     time.monotonic() - started, connect_timeout=connect_s, os_error=os_error)
+            # A connect phase that ran out is retried; anything else in it is not.
+            failed = ConnectTimeoutError if timed_out(reason) else NotAppliedError
+            raise failed(f"NETCONF connect failed: {reason}") from e
         raise
     finally:
-        _DEADLINE.at = None
+        _DEADLINE.at = _DEADLINE.connect_at = _DEADLINE.connect_error = None
     dev.timeout = command_timeout
     return dev
 
 
 def _connect_reason(exc: BaseException, host: str, user: str, port: int,
-                    timeout: float, elapsed: float) -> str:
+                    timeout: float, elapsed: float, connect_timeout: Optional[float] = None,
+                    os_error: Optional[BaseException] = None) -> str:
     """Why the session did not open, in words. PyEZ names a connect failure
     by its class and picks the class by the clock: anything that fails
     within 3 s is ConnectRefusedError, whether the port was closed, the
     banner was garbage, sshd dropped the session or the host key was
-    refused. The reason is in the exception PyEZ was handling, so read that."""
+    refused. The reason is in the exception PyEZ was handling, so read that,
+    and for the TCP connect, which ncclient reports as "Could not open
+    socket" whatever happened, what the OS answered it (`os_error`).
+    `timeout` is the session timeout, `connect_timeout` what the TCP
+    connect and the banner had between them (the session timeout when not
+    given)."""
     where = f"{host}:{port}"
+    seconds = timeout if connect_timeout is None else connect_timeout
     kind = type(exc).__name__
     cause = getattr(exc, "_orig", None) or exc.__context__ or exc.__cause__
     cause_kind = type(cause).__name__ if cause is not None else ""
@@ -263,8 +327,10 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     if "malformed known_hosts line" in low:
         return text
     if "could not open socket" in low:
-        if elapsed >= timeout - 0.5:
-            return f"connect to {where} timed out after {timeout}s (filtered, or down)"
+        if os_error is not None:
+            return tcp_timed_out(where, seconds) if is_timeout(os_error) else answered(os_error, where)
+        if elapsed >= seconds - 0.5:
+            return tcp_timed_out(where, seconds)
         return f"connection refused by {where} (nothing listening, or no route)"
     if "ssh protocol banner" in low:
         detail = text.split("banner", 1)[1].strip()
@@ -273,9 +339,14 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
         if detail and "timed out" not in detail:
             return (f"{where} dropped the session before login after {elapsed:.1f}s "
                     f"({detail}; sshd connection limit?)")
-        if elapsed < timeout / 2:
-            return f"{where} dropped the session before login after {elapsed:.1f}s (sshd connection limit?)"
-        return f"no SSH banner from {where} within {elapsed:.0f}s (sshd busy, or filtered)"
+        # paramiko says the same for a banner that never came and a server
+        # that closed first; what it was handling (a timeout, or an EOF)
+        # tells them apart, and the clock does when that is not there.
+        chain = list(_chain(cause))
+        if any(isinstance(e, TimeoutError) for e in chain) or (
+                not any(isinstance(e, EOFError) for e in chain) and elapsed >= seconds - 0.5):
+            return no_banner(where, seconds)
+        return f"{where} dropped the session before login after {elapsed:.1f}s (sshd connection limit?)"
     if _KEX_UNFINISHED in low:
         if elapsed < timeout / 2:
             return f"{where} dropped the session before login after {elapsed:.1f}s ({_KEX_UNFINISHED})"
@@ -283,7 +354,7 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     if "negotiation failed" in low:
         return f"SSH negotiation with {where} failed: {text.split(':', 1)[1].strip()}"
     if kind == "ConnectTimeoutError":
-        return f"connect to {where} timed out after {timeout}s"
+        return tcp_timed_out(where, seconds)
     return f"{kind} for {where}" + (f": {text}" if text else "")
 
 
@@ -395,7 +466,7 @@ def _pool_key(host: str, port: Optional[int], user: str, passwd: Optional[str]) 
 
 @contextmanager
 def _session(host: str, user: str, passwd: Optional[str], session_timeout: int,
-             command_timeout: int, port: Optional[int]):
+             command_timeout: int, port: Optional[int], connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """A session for this router: fresh, or borrowed from the pool."""
     # The credential is part of a session's identity: a later call with a
     # different, wrong or absent password must not ride the session the
@@ -403,7 +474,7 @@ def _session(host: str, user: str, passwd: Optional[str], session_timeout: int,
     key = _pool_key(host, port, user, passwd)
     with POOL.get_connection(
         key,
-        opener=lambda: _open(host, user, passwd, session_timeout, command_timeout, port),
+        opener=lambda: _open(host, user, passwd, session_timeout, command_timeout, port, connect_timeout),
         closer=_close,
         timeout=command_timeout,
         alive=_alive,
@@ -411,12 +482,13 @@ def _session(host: str, user: str, passwd: Optional[str], session_timeout: int,
         yield lease
 
 
-def _on_session(host, user, passwd, session_timeout, command_timeout, port, fn):
+def _on_session(host, user, passwd, session_timeout, command_timeout, port, fn,
+                connect_timeout=DEFAULT_CONNECT_TIMEOUT):
     """Run fn(lease) on the router's session. A read is idempotent, so if a
     *reused* session turns out to be dead, open a new one and run it again
     once; a timeout or a dead fresh session is reported as before."""
     for attempt in (1, 2):
-        with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+        with _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout) as lease:
             try:
                 return fn(lease)
             except Exception as e:
@@ -439,20 +511,22 @@ def _cli(dev, cmd: str) -> str:
 
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
-         port: int = None, vendor_hint: str = None) -> str:
+         port: int = None, vendor_hint: str = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """Execute a show command over NETCONF. A read finds a dead reused
     session and runs once more on a new one; anything else (`request …`)
-    is sent once, as rpc() does."""
+    is sent once, as rpc() does. `connect_timeout` bounds the TCP connect
+    and the SSH banner, never more than `session_timeout` (every function
+    here that opens a session takes it)."""
     _require()
     run_on = _on_session if _is_read(cmd) else _on_session_once
     return run_on(host, user, passwd, session_timeout, command_timeout, port,
-                  lambda lease: _cli(lease.dev, cmd))
+                  lambda lease: _cli(lease.dev, cmd), connect_timeout)
 
 
 def show_structured(host: str, user: str, passwd: str, cmd: str,
                     session_timeout: int, command_timeout: int,
                     port: int = None, vendor_hint: str = None,
-                    binding: Optional[dict] = None):
+                    binding: Optional[dict] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """Fetch structured data over NETCONF using a PyEZ Table/View binding.
 
     Note this is *not* a parse of the `cmd` text — it issues the RPC named in
@@ -503,7 +577,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
         table.get()
         return {key: dict(item) for key, item in table.items()}
 
-    return _on_session(host, user, passwd, session_timeout, command_timeout, port, fetch)
+    return _on_session(host, user, passwd, session_timeout, command_timeout, port, fetch, connect_timeout)
 
 
 def _config_format(payload: str) -> str:
@@ -665,13 +739,14 @@ class Transaction:
 
 
 def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
-           command_timeout: int, port: Optional[int], stage, label: str) -> Transaction:
+           command_timeout: int, port: Optional[int], stage, label: str,
+           connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> Transaction:
     """lock -> stage(cu) -> diff -> commit_check, left open as a Transaction.
     `stage` puts the change into the candidate: a load for edit(), a rollback
     for rollback(). Raises NotAppliedError for failures before anything could
     change on the device and RuntimeError for rejected config; on any failure
     the candidate is discarded and the lock released."""
-    cm = _session(host, user, passwd, session_timeout, command_timeout, port)
+    cm = _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout)
     lease = cm.__enter__()
     cu = None
     locked = False
@@ -704,14 +779,15 @@ def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
 def _transaction(host: str, user: str, passwd: str, session_timeout: int,
                  command_timeout: int, port: Optional[int], stage, label: str,
                  dry_run: bool, commit_confirmed: Optional[int],
-                 comment: Optional[str] = None, expected_diff: Optional[str] = None) -> str:
+                 comment: Optional[str] = None, expected_diff: Optional[str] = None,
+                 connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """begin() and finish in one go: commit (confirmed if asked), or for
     dry_run show the diff the device produced and discard it. With
     `expected_diff` (the diff a dry run showed) the commit goes ahead only
     if the candidate produces that diff again. Only NotAppliedError is safe
     to retry; AmbiguousCommitError means a commit was sent and its outcome
     is unknown."""
-    tx = _begin(host, user, passwd, session_timeout, command_timeout, port, stage, label)
+    tx = _begin(host, user, passwd, session_timeout, command_timeout, port, stage, label, connect_timeout)
     if expected_diff is not None and tx.diff.strip() != expected_diff.strip():
         # The device, or the file, changed between the preview and the y:
         # what would be committed is not what was approved.
@@ -729,7 +805,8 @@ def _transaction(host: str, user: str, passwd: str, session_timeout: int,
 
 def begin(host: str, user: str, passwd: str, payload: Optional[str],
           session_timeout: int, command_timeout: int,
-          port: int = None, vendor_hint: str = None, rollback: Optional[int] = None) -> Transaction:
+          port: int = None, vendor_hint: str = None, rollback: Optional[int] = None,
+          connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> Transaction:
     """Open a change and hand it back for a decision: `payload` (set/text
     config) or `rollback=n`, locked, loaded, checked and diffed on the
     router's session. Then tx.commit(confirmed=, comment=) or tx.abort().
@@ -745,11 +822,12 @@ def begin(host: str, user: str, passwd: str, payload: Optional[str],
     if rollback is not None:
         n = _rollback_number(rollback)
         return _begin(host, user, passwd, session_timeout, command_timeout, port,
-                      stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ")
+                      stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ", connect_timeout=connect_timeout)
     fmt = _config_format(payload)
     body = _strip_comments(payload) if fmt == "set" else payload
     return _begin(host, user, passwd, session_timeout, command_timeout, port,
-                  stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="")
+                  stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="",
+                  connect_timeout=connect_timeout)
 
 
 # Load warnings that do not fail the device. A delete of a statement the
@@ -773,7 +851,8 @@ def edit(host: str, user: str, passwd: str, payload: str,
          session_timeout: int, command_timeout: int,
          commit_confirmed: int = None, port: int = None,
          vendor_hint: str = None, dry_run: bool = False,
-         comment: Optional[str] = None, expected_diff: Optional[str] = None) -> str:
+         comment: Optional[str] = None, expected_diff: Optional[str] = None,
+         connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """Apply configuration over NETCONF: load the payload into the candidate
     and run it through _transaction() (lock -> load -> diff -> commit_check
     -> commit, or rollback for dry_run -> unlock). `comment` is logged with
@@ -787,14 +866,15 @@ def edit(host: str, user: str, passwd: str, payload: str,
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
                         stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="",
                         dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment,
-                        expected_diff=expected_diff)
+                        expected_diff=expected_diff, connect_timeout=connect_timeout)
 
 
 def rollback(host: str, user: str, passwd: str, n: int,
              session_timeout: int, command_timeout: int,
              port: int = None, vendor_hint: str = None,
              dry_run: bool = False, commit_confirmed: int = None,
-             comment: Optional[str] = None, expected_diff: Optional[str] = None) -> str:
+             comment: Optional[str] = None, expected_diff: Optional[str] = None,
+             connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """Return to rollback `n` (0-49) over NETCONF, with the same gates as an
     edit: lock -> rollback n -> diff -> commit_check -> commit (confirmed if
     asked), or show the diff and discard it for dry_run, or refuse it when
@@ -806,13 +886,13 @@ def rollback(host: str, user: str, passwd: str, n: int,
     return _transaction(host, user, passwd, session_timeout, command_timeout, port,
                         stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ",
                         dry_run=dry_run, commit_confirmed=commit_confirmed, comment=comment,
-                        expected_diff=expected_diff)
+                        expected_diff=expected_diff, connect_timeout=connect_timeout)
 
 
 def confirm(host: str, user: str, passwd: str,
             session_timeout: int, command_timeout: int,
             port: int = None, vendor_hint: str = None,
-            comment: Optional[str] = None) -> str:
+            comment: Optional[str] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """Confirm a pending commit-confirmed with a plain commit, under the
     configuration lock. The commit takes the whole shared candidate with
     it, another user's uncommitted edits included; the lock is refused
@@ -820,7 +900,7 @@ def confirm(host: str, user: str, passwd: str,
     (nothing sent, retried like any other) rather than their change going
     in with the confirmation."""
     _require()
-    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+    with _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout) as lease:
         # A plain commit with nothing waiting is not a confirmation: the
         # timer expired (the change is gone) or someone confirmed before.
         # Either way the operator must know; a commit would only hide it.
@@ -853,7 +933,8 @@ def confirm(host: str, user: str, passwd: str,
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
-               port: int = None, vendor_hint: str = None) -> List[dict]:
+               port: int = None, vendor_hint: str = None,
+               connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
     """Execute several show commands on one NETCONF session.
 
     A rejected or timed-out command is reported in its own result and the
@@ -877,7 +958,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
         return R.BatchResult(results)
 
     run_on = _on_session if all(_is_read(c) for c in cmds) else _on_session_once
-    return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
+    return run_on(host, user, passwd, session_timeout, command_timeout, port, run, connect_timeout)
 
 
 def _is_cli_command(text: str) -> bool:
@@ -936,10 +1017,11 @@ def _is_read(command: str) -> bool:
     return "\n" not in text and "\r" not in text and (text.startswith("show ") or text.startswith("get"))
 
 
-def _on_session_once(host, user, passwd, session_timeout, command_timeout, port, fn):
+def _on_session_once(host, user, passwd, session_timeout, command_timeout, port, fn,
+                     connect_timeout=DEFAULT_CONNECT_TIMEOUT):
     """Run fn(lease) on the router's session exactly once: a failure drops a
     session left in doubt and is never re-sent, reused session or not."""
-    with _session(host, user, passwd, session_timeout, command_timeout, port) as lease:
+    with _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout) as lease:
         try:
             return fn(lease)
         except Exception as e:
@@ -956,7 +1038,7 @@ def _rpc_on_lease(lease, command: str, args: Optional[dict], fmt: str):
 def rpc(host: str, user: str, passwd: str, command: str,
         session_timeout: int, command_timeout: int,
         port: int = None, vendor_hint: str = None,
-        args: Optional[dict] = None, fmt: str = "json"):
+        args: Optional[dict] = None, fmt: str = "json", connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """Call a Junos RPC and return the reply as the router produces it: a
     dict for fmt="json", the reply XML as a string for fmt="xml".
 
@@ -973,13 +1055,13 @@ def rpc(host: str, user: str, passwd: str, command: str,
     fmt = _rpc_format(fmt)
     run_on = _on_session if _is_read(command) else _on_session_once
     return run_on(host, user, passwd, session_timeout, command_timeout, port,
-                  lambda lease: _rpc_reply(lease.dev, command, args, fmt))
+                  lambda lease: _rpc_reply(lease.dev, command, args, fmt), connect_timeout)
 
 
 def rpc_batch(host: str, user: str, passwd: str, cmds: List[str],
               session_timeout: int, command_timeout: int,
               port: int = None, vendor_hint: str = None,
-              fmt: str = "json") -> List[dict]:
+              fmt: str = "json", connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
     """rpc() for several CLI commands on one NETCONF session, each answered
     in its own {command, ok, output|error} the way show_batch() reports.
 
@@ -1007,14 +1089,15 @@ def rpc_batch(host: str, user: str, passwd: str, cmds: List[str],
         return R.BatchResult(results)
 
     run_on = _on_session if all(_is_read(c) for c in cmds) else _on_session_once
-    return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
+    return run_on(host, user, passwd, session_timeout, command_timeout, port, run, connect_timeout)
 
 
 
 
 def commit_status(host: str, user: str, passwd: str,
                   session_timeout: int, command_timeout: int,
-                  port: int = None, vendor_hint: str = None) -> List[dict]:
+                  port: int = None, vendor_hint: str = None,
+                  connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
     """`show system commit` as data: one dict per entry, newest first —
     seq, user, client, time, epoch, comment (what was logged with the
     commit), note (the device's own text, "commit confirmed, rollback in
@@ -1026,7 +1109,8 @@ def commit_status(host: str, user: str, passwd: str,
     with `commit check` writes no entry, so seq 0 still reads as pending
     after it; h-ssh confirms with a commit.)"""
     _require()
-    doc = rpc(host, user, passwd, "get-commit-information", session_timeout, command_timeout, port=port)
+    doc = rpc(host, user, passwd, "get-commit-information", session_timeout, command_timeout, port=port,
+              connect_timeout=connect_timeout)
     return R.CommitStatus(_commit_entries(doc))
 
 
@@ -1104,7 +1188,8 @@ def _ours(entry: Optional[dict], user: str, comment: Optional[str]) -> Optional[
 
 def guarded_commit(host: str, user: str, passwd: str, payload: str,
                    session_timeout: int, command_timeout: int, minutes: int, check,
-                   port: int = None, comment: Optional[str] = None) -> dict:
+                   port: int = None, comment: Optional[str] = None,
+                   connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> dict:
     """Commit confirmed, run `check()`, then confirm — or roll straight back.
 
     `check` is the caller's verdict (anything true to keep the change); an
@@ -1124,26 +1209,29 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     """
     check_confirm_minutes(minutes)
     out = edit(host, user, passwd, payload, session_timeout, command_timeout,
-               commit_confirmed=minutes, port=port, comment=comment)
+               commit_confirmed=minutes, port=port, comment=comment, connect_timeout=connect_timeout)
     if out.startswith("NO CHANGES"):
         return {"final": "no changes", "commit": out, "checks": None}
-    ours = _ours(pending_commit(commit_status(host, user, passwd, session_timeout, command_timeout, port=port)),
+    ours = _ours(pending_commit(commit_status(host, user, passwd, session_timeout, command_timeout, port=port,
+                                              connect_timeout=connect_timeout)),
                  user, comment)
     try:
         ok, reason = bool(check()), None
     except Exception as e:
         ok, reason = False, f"{type(e).__name__}: {e}"
-    entries = commit_status(host, user, passwd, session_timeout, command_timeout, port=port)
+    entries = commit_status(host, user, passwd, session_timeout, command_timeout, port=port,
+                            connect_timeout=connect_timeout)
     moved = _history_moved(ours, entries)
     if ok:
         if moved:
             return {"final": "not confirmed", "commit": out, "checks": True, "reason": moved, "status": entries}
         done = confirm(host, user, passwd, session_timeout, command_timeout, port=port,
-                       comment=f"{comment} (confirmed)" if comment else None)
+                       comment=f"{comment} (confirmed)" if comment else None, connect_timeout=connect_timeout)
         return {"final": "confirmed", "commit": out, "checks": True, "confirm": done}
     if moved:
         return {"final": "not rolled back", "commit": out, "checks": False, "reason": moved,
                 "check_error": reason, "status": entries}
     back = rollback(host, user, passwd, 1, session_timeout, command_timeout, port=port,
-                    comment=f"{comment} (rolled back: checks failed)" if comment else "rolled back: checks failed")
+                    comment=f"{comment} (rolled back: checks failed)" if comment else "rolled back: checks failed",
+                    connect_timeout=connect_timeout)
     return {"final": "rolled back", "commit": out, "checks": False, "reason": reason, "rollback": back}

@@ -1,6 +1,7 @@
 """Task runner for executing commands on devices."""
 
 import asyncio
+import inspect
 import json
 import sys
 import time
@@ -8,30 +9,38 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, NamedTuple, Optional, Tuple
 
-from .errors import LocalError, NotAppliedError
+from .errors import ConnectTimeoutError, LocalError, NotAppliedError
 from .audit import secure_write
 from .core import Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
 from . import drivers
 from .drivers import results as R
+from .transports import connect as _connect
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 3]  # seconds between attempt 1->2, 2->3
+# After a connect phase that ran out (no TCP answer, no SSH banner within
+# --connect-timeout): nothing was sent, and each attempt costs one connect
+# timeout, so three at the defaults (3 s each) take about 10 s in all.
+CONNECT_BACKOFF = [0.5, 1]
+DEFAULT_CONNECT_TIMEOUT = _connect.DEFAULT
 
 # Failures that the same call cannot fix. Retrying them costs a full timeout
 # each and, for the auth cases, spends real login attempts against a device
 # that may well lock the account out.
 _PERMANENT = (
-    # Unreachable is unreachable for the duration of a run. A connect-phase
-    # failure has already spent the full ConnectTimeout; spending it twice more
-    # is what makes one dead device dominate a fleet run.
+    # A clear answer in the connect phase is the same answer for the rest of
+    # the run: a port that refuses, no route to the host, a name that does
+    # not resolve. A connect phase that got no answer at all is not one:
+    # is_connect_timeout() is asked first, and that is retried.
     "connect to host",
     # PyEZ reports the connect phase by exception class, and the junos driver
-    # wraps every one of them: "NETCONF connect failed: ConnectTimeoutError(host)".
-    # The prefix covers the whole connect phase, so the class names need no
-    # entry of their own. ConnectClosedError and RpcTimeoutError only ever
-    # arrive bare, after the session was up, so they fall through and are
-    # retried: the next attempt may succeed.
+    # wraps every one of them in words: "NETCONF connect failed: connection
+    # refused by HOST:PORT". The prefix covers the connect phase but for its
+    # two timeouts, so the class names need no entry of their own.
+    # ConnectClosedError and RpcTimeoutError only ever arrive bare, after
+    # the session was up, so they fall through and are retried: the next
+    # attempt may succeed.
     "netconf connect failed",
     "connection timed out",
     "connection refused",
@@ -76,10 +85,13 @@ _PERMANENT = (
 _CONNECT_PHASE = (
     "netconf connect failed",
     "connect to host",
+    "tcp connect to",                       # the SSH transports' own words for the TCP connect
+    "no ssh banner from",
     "connection refused",
     "no route to host",
     "network is unreachable",
     "unable to connect to port",
+    "cannot resolve",
     "ssh protocol banner",
     "connection timed out",
     "no ssh session",
@@ -87,8 +99,18 @@ _CONNECT_PHASE = (
 )
 
 
+def is_connect_timeout(exc_or_text) -> bool:
+    """True when the connect phase ran out: no TCP answer, or no SSH banner,
+    within --connect-timeout. Nothing was sent, and a box that is booting or
+    an sshd that was busy may answer the next attempt, so unlike a clear
+    answer it is tried again (an edit too), after a short pause."""
+    return isinstance(exc_or_text, ConnectTimeoutError) or _connect.timed_out(exc_or_text)
+
+
 def is_permanent_failure(exc) -> bool:
     """True when another identical attempt cannot plausibly succeed."""
+    if is_connect_timeout(exc):
+        return False
     text = str(exc).lower()
     return any(marker in text for marker in _PERMANENT)
 
@@ -98,7 +120,8 @@ def is_connect_failure(exc_or_text) -> bool:
     existed: nothing reached the device. paramiko's bare socket timeout is
     the whole message 'timed out'; a command timeout always says more."""
     text = str(exc_or_text).strip().lower()
-    return text == "timed out" or any(marker in text for marker in _CONNECT_PHASE)
+    return (text == "timed out" or is_connect_timeout(exc_or_text)
+            or any(marker in text for marker in _CONNECT_PHASE))
 
 
 def _is_local_error(exc) -> bool:
@@ -119,11 +142,34 @@ def _say(text: str) -> None:
         pass
 
 
-def _backoff(attempt: int) -> int:
-    """Seconds before attempt+1. Falls back to the last step once the table runs out."""
-    if attempt <= len(RETRY_BACKOFF):
-        return RETRY_BACKOFF[attempt - 1]
-    return RETRY_BACKOFF[-1] if RETRY_BACKOFF else 1
+def _backoff(attempt: int, steps=None) -> float:
+    """Seconds before attempt+1, from `steps` (RETRY_BACKOFF unless given).
+    Falls back to the last step once the table runs out."""
+    steps = RETRY_BACKOFF if steps is None else steps
+    if attempt <= len(steps):
+        return steps[attempt - 1]
+    return steps[-1] if steps else 1
+
+
+def _takes(fn, name: str) -> bool:
+    """Whether fn accepts the keyword `name`, by name or through **kwargs."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    p = params.get(name)
+    if p is not None:
+        return p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+    return any(q.kind is q.VAR_KEYWORD for q in params.values())
+
+
+def _connect_kwargs(fn, connect_timeout) -> dict:
+    """{"connect_timeout": n} for a driver function that takes it, as every
+    one of the three SSH transports' does; nothing for one that does not
+    (telnet, which is frozen; a driver from another package; a stand-in)."""
+    if connect_timeout is None or not _takes(fn, "connect_timeout"):
+        return {}
+    return {"connect_timeout": connect_timeout}
 
 
 def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, **kwargs):
@@ -137,7 +183,7 @@ def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, **kwargs):
             if is_permanent_failure(e) or not should_retry(e):
                 raise
             if attempt < attempts:
-                delay = _backoff(attempt)
+                delay = _backoff(attempt, CONNECT_BACKOFF if is_connect_timeout(e) else None)
                 if not quiet:
                     _say(f"{name:16s} RETRY {attempt}/{attempts - 1} in {delay}s ({e})")
                 time.sleep(delay)
@@ -256,7 +302,7 @@ def _check_edit_policy(b: Bound, commit_confirmed, dry_run):
 
 def _apply_rollback(b: Bound, name, quiet, max_attempts, host, user, passwd,
                     n, session_timeout, command_timeout, commit_confirmed, port, dry_run=False,
-                    comment=None, expected_diff=None):
+                    comment=None, expected_diff=None, connect_timeout=None):
     """Return to rollback n. Same rules as an edit: refused where the transport
     cannot really do it, retried only when nothing reached the device, and
     with `expected_diff` committed only if the device shows that diff again."""
@@ -268,20 +314,22 @@ def _apply_rollback(b: Bound, name, quiet, max_attempts, host, user, passwd,
         lambda e: isinstance(e, NotAppliedError),
         host, user, passwd, n, session_timeout, command_timeout,
         port=port, vendor_hint=b.hint, dry_run=dry_run, commit_confirmed=commit_confirmed,
-        **_comment_kwargs(b, comment), **_expected_diff_kwargs(b, expected_diff))
+        **_comment_kwargs(b, comment), **_expected_diff_kwargs(b, expected_diff),
+        **_connect_kwargs(b.mod.rollback, connect_timeout))
 
 
 def _apply_edit(b: Bound, name, quiet, max_attempts, host, user, passwd,
                 payload, session_timeout, command_timeout, commit_confirmed,
-                port, dry_run=False, comment=None, expected_diff=None):
+                port, dry_run=False, comment=None, expected_diff=None, connect_timeout=None):
     """Push configuration. An edit is not idempotent, so it is only retried when
-    the driver says nothing reached the device (NotAppliedError); any other
-    failure, and above all a timeout around a commit, is reported, not repeated.
-    `expected_diff` is the diff a dry run showed: the driver commits only if
-    the candidate produces it again."""
+    the driver says nothing reached the device (NotAppliedError, which a
+    connect phase that ran out is too); any other failure, and above all a
+    timeout around a commit, is reported, not repeated. `expected_diff` is
+    the diff a dry run showed: the driver commits only if the candidate
+    produces it again."""
     _check_edit_policy(b, commit_confirmed, dry_run)
     kwargs = {"port": port, "vendor_hint": b.hint, **_comment_kwargs(b, comment),
-              **_expected_diff_kwargs(b, expected_diff)}
+              **_expected_diff_kwargs(b, expected_diff), **_connect_kwargs(b.mod.edit, connect_timeout)}
     if dry_run:
         kwargs["dry_run"] = True
     return _retry_loop(
@@ -344,6 +392,7 @@ def _run_for_target_sync(
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
     seq: int = 0,
+    connect_timeout: Optional[int] = DEFAULT_CONNECT_TIMEOUT,
 ) -> RunResult:
     """
     Execute task on a single target device (internal sync implementation).
@@ -394,9 +443,11 @@ def _run_for_target_sync(
                 # The router's own JSON or XML for the command, through its
                 # RPC translation. Only the NETCONF driver can do that; a
                 # transport that cannot refuses here, before any device I/O.
-                data = _with_retry(_rpc_call(b), name, quiet, max_attempts,
+                fn = _rpc_call(b)
+                data = _with_retry(fn, name, quiet, max_attempts,
                                    host, user, passwd, show_cmd, session_timeout, command_timeout,
-                                   port=t.port, vendor_hint=b.hint, fmt=fmt)
+                                   port=t.port, vendor_hint=b.hint, fmt=fmt,
+                                   **_connect_kwargs(fn, connect_timeout))
                 typed = data
                 result = data if fmt == "xml" else json.dumps(data, indent=2)
             elif structured and "show_structured" in b.caps:
@@ -406,7 +457,8 @@ def _run_for_target_sync(
                                    host, user, passwd, show_cmd,
                                    session_timeout, command_timeout,
                                    port=t.port, vendor_hint=b.hint,
-                                   binding=structured_binding)
+                                   binding=structured_binding,
+                                   **_connect_kwargs(b.mod.show_structured, connect_timeout))
                 typed = data
                 result = json.dumps(data, indent=2, default=str)
             else:
@@ -414,7 +466,8 @@ def _run_for_target_sync(
                     _say(f"{name:16s} NOTE {show_cmd!r} is not a read: sent once, never retried")
                 result = _with_retry(b.mod.show, name, quiet, attempts,
                                      host, user, passwd, show_cmd, session_timeout, command_timeout,
-                                     port=t.port, vendor_hint=b.hint)
+                                     port=t.port, vendor_hint=b.hint,
+                                     **_connect_kwargs(b.mod.show, connect_timeout))
             if typed is None:
                 typed = result
             output.append(result.rstrip())
@@ -434,12 +487,13 @@ def _run_for_target_sync(
                                      lambda e: isinstance(e, NotAppliedError),
                                      host, user, passwd, session_timeout, command_timeout,
                                      port=t.port, vendor_hint=b.hint,
-                                     **_comment_kwargs(b, comment))
+                                     **_comment_kwargs(b, comment),
+                                     **_connect_kwargs(b.mod.confirm, connect_timeout))
             else:
                 result = _apply_edit(b, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                     expected_diff)
+                                     expected_diff, connect_timeout)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -452,7 +506,7 @@ def _run_for_target_sync(
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                 expected_diff)
+                                 expected_diff, connect_timeout)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -463,7 +517,7 @@ def _run_for_target_sync(
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                 expected_diff)
+                                 expected_diff, connect_timeout)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -478,7 +532,8 @@ def _run_for_target_sync(
             else:
                 entries = _with_retry(b.mod.commit_status, name, quiet, max_attempts,
                                       host, user, passwd, session_timeout, command_timeout,
-                                      port=t.port, vendor_hint=b.hint)
+                                      port=t.port, vendor_hint=b.hint,
+                                      **_connect_kwargs(b.mod.commit_status, connect_timeout))
                 typed = R.as_commits(entries)
                 output.append(json.dumps(typed.to_list()))
 
@@ -488,7 +543,7 @@ def _run_for_target_sync(
             result = _apply_rollback(b, name, quiet, max_attempts,
                                      host, user, passwd, rollback, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                     expected_diff)
+                                     expected_diff, connect_timeout)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -506,13 +561,16 @@ def _run_for_target_sync(
             if dry_run:
                 cmd_results = [{"command": c, "ok": True, "output": f"DRY-RUN show: {c}"} for c in batch_cmds]
             elif fmt != "text":
-                cmd_results = _with_retry(_rpc_call(b, batch=True), name, quiet, max_attempts,
+                fn = _rpc_call(b, batch=True)
+                cmd_results = _with_retry(fn, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
-                                          port=t.port, vendor_hint=b.hint, fmt=fmt)
+                                          port=t.port, vendor_hint=b.hint, fmt=fmt,
+                                          **_connect_kwargs(fn, connect_timeout))
             else:
                 cmd_results = _with_retry(b.mod.show_batch, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
-                                          port=t.port, vendor_hint=b.hint)
+                                          port=t.port, vendor_hint=b.hint,
+                                          **_connect_kwargs(b.mod.show_batch, connect_timeout))
             batch = R.as_batch(cmd_results)
             result_json = json.dumps(batch.to_list())
             duration_ms = int((time.time() - start_time) * 1000)
@@ -579,6 +637,7 @@ def run_for_target(
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
     seq: int = 0,
+    connect_timeout: Optional[int] = DEFAULT_CONNECT_TIMEOUT,
 ) -> RunResult:
     """
     Synchronous public API for library users. `expected_diff` is the diff a
@@ -586,7 +645,9 @@ def run_for_target(
     produces it again. `seq` is a job entry's place among the entries for the
     same device (0 for the first): with `save_dir` the first is saved as
     `<name>.output` and a later one as `<name>.<seq+1>.output`, `.json` for
-    a batch.
+    a batch. `connect_timeout` bounds the TCP connect and the SSH banner on
+    the three SSH transports (never more than `session_timeout`); a connect
+    phase that runs out is tried again after a short pause.
     Returns: (device_name, success, output_text, duration_ms)
     """
     return _run_for_target_sync(
@@ -606,6 +667,7 @@ def run_for_target(
         expected_diff=expected_diff,
         payload_text=payload_text,
         seq=seq,
+        connect_timeout=connect_timeout,
     )
 
 
@@ -636,6 +698,7 @@ async def run_for_target_async(
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
     seq: int = 0,
+    connect_timeout: Optional[int] = DEFAULT_CONNECT_TIMEOUT,
 ) -> RunResult:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -659,6 +722,7 @@ async def run_for_target_async(
         expected_diff=expected_diff,
         payload_text=payload_text,
         seq=seq,
+        connect_timeout=connect_timeout,
     )
 
 

@@ -6,8 +6,9 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh.errors import NotAppliedError
-from hssh.runner import _retry_loop, _with_retry, is_permanent_failure, _backoff
+from hssh.errors import ConnectTimeoutError, NotAppliedError
+from hssh.runner import (CONNECT_BACKOFF, _retry_loop, _with_retry, is_connect_failure, is_connect_timeout,
+                         is_permanent_failure, _backoff)
 
 
 @pytest.mark.parametrize("message", [
@@ -28,14 +29,21 @@ def test_permanent_failures_are_recognised(message):
 
 
 @pytest.mark.parametrize("message", [
-    "ssh exit 255: ssh: connect to host 192.0.2.1 port 22: Connection timed out",
     "Connection refused by 10.0.1.1.",
     "ssh: connect to host r1 port 22: No route to host",
     "ssh: connect to host r1 port 22: Network is unreachable",
     "[Errno None] Unable to connect to port 22 on 10.0.1.1",
+    # #126: the SSH transports say what the OS answered
+    "connection refused by 10.0.1.1:22",
+    "no route to host 10.91.0.252:22",
+    "network is unreachable for 10.0.1.1:22",
+    "NETCONF connect failed: no route to host 10.91.0.252:830",
+    "cannot resolve r1.lab",
 ])
-def test_unreachable_is_permanent_for_the_run(message):
-    """A connect-phase failure has already spent the full ConnectTimeout."""
+def test_a_clear_answer_in_the_connect_phase_is_permanent_for_the_run(message):
+    """Refused, no route, a name that does not resolve: the same call gets
+    the same answer. (A connect phase that got no answer at all is tried
+    again: see the #126 tests below.)"""
     assert is_permanent_failure(Exception(message))
 
 
@@ -166,7 +174,7 @@ def test_workers_actually_run_in_parallel(tmp_path):
 
 
 @pytest.mark.parametrize("message", [
-    "NETCONF connect failed: ConnectTimeoutError(10.0.0.1)",
+    "NETCONF connect failed: connection refused by 10.0.0.1:830",
     "NETCONF connect failed: ConnectRefusedError(10.0.0.1)",
     "NETCONF connect failed: ConnectUnknownHostError(r1.lab.example)",
     "NETCONF connect failed: ConnectAuthError(10.0.0.1)",
@@ -174,7 +182,8 @@ def test_workers_actually_run_in_parallel(tmp_path):
 ])
 def test_pyez_connect_failures_are_permanent(message):
     """PyEZ names the connect phase by exception class and the junos driver
-    wraps that in NotAppliedError. Neither coat may hide a dead router."""
+    wraps that in NotAppliedError. Neither coat may hide a clear answer; only
+    the connect phase running out (#126) is tried again."""
     assert is_permanent_failure(NotAppliedError(message))
 
 
@@ -210,16 +219,91 @@ def test_rejected_command_is_permanent(message):
     assert is_permanent_failure(Exception(message))
 
 
-def test_dead_router_edit_is_attempted_once(monkeypatch):
-    """NotAppliedError is the one failure an edit may retry, but a connect
-    timeout inside it is still a dead router: one timeout, not three plus backoff."""
+def test_an_edit_to_a_router_that_refuses_is_attempted_once(monkeypatch):
+    """NotAppliedError is the one failure an edit may retry, but a router
+    that refused the connect will refuse it again: one attempt, not three
+    plus backoff. (One that did not answer at all is tried again: #126.)"""
     monkeypatch.setattr(time, "sleep", lambda _s: None)
     calls = []
 
     def boom():
         calls.append(1)
-        raise NotAppliedError("NETCONF connect failed: ConnectTimeoutError(10.0.0.1)")
+        raise NotAppliedError("NETCONF connect failed: connection refused by 10.0.0.1:830")
 
     with pytest.raises(NotAppliedError):
         _retry_loop(boom, "r1", True, 3, lambda e: isinstance(e, NotAppliedError))
     assert len(calls) == 1
+
+
+# --- #126: a connect phase that ran out is tried again, after a short pause ------------
+
+@pytest.mark.parametrize("message", [
+    "TCP connect to 10.0.0.1:22 timed out after 3s",
+    "no SSH banner from 10.0.0.1:22 within 3s",
+    "NETCONF connect failed: TCP connect to 10.0.0.1:830 timed out after 3s",
+    "NETCONF connect failed: no SSH banner from [2001:db8::1]:830 within 3s",
+    "ssh exit 255: ssh: connect to host 192.0.2.1 port 22: Connection timed out",     # OpenSSH's own ConnectTimeout
+    "kex_exchange_identification: Connection timed out during banner exchange",
+])
+def test_a_connect_phase_that_ran_out_is_a_connect_failure_and_not_permanent(message):
+    """No TCP answer, or no banner, within --connect-timeout: nothing was
+    sent, and a booting box or a busy sshd may answer the next attempt. On
+    junos and openssh this was permanent ("netconf connect failed",
+    "connection timed out")."""
+    for exc in (RuntimeError(message), NotAppliedError(message), ConnectTimeoutError(message)):
+        assert is_connect_timeout(exc) and is_connect_failure(exc) and not is_permanent_failure(exc), exc
+    assert is_connect_timeout(ConnectTimeoutError("the class says it, whatever the words"))
+
+
+@pytest.mark.parametrize("message", [
+    "Command timed out after 50s: show version",
+    "no SSH session to 10.0.0.1 within 30s: the banner came, but key exchange did not finish",
+    "connection refused by 10.0.0.1:22",
+    "TCP connect to 10.0.0.1:22 failed: Operation not permitted",
+    "'show tcp connect to x timed out' was refused by the device: error: syntax error",
+])
+def test_anything_else_is_not_a_connect_timeout(message):
+    assert not is_connect_timeout(RuntimeError(message))
+
+
+def test_a_connect_phase_that_ran_out_is_tried_again_after_a_short_pause(monkeypatch, capsys):
+    """0.5 s and then 1 s: three attempts at the defaults (3 s each,
+    --retries 2) take about 10 s. Every other failure keeps its pauses."""
+    pauses = []
+    monkeypatch.setattr(time, "sleep", pauses.append)
+    calls = []
+
+    def dead():
+        calls.append(1)
+        raise ConnectTimeoutError("TCP connect to 10.0.0.1:22 timed out after 3s")
+
+    with pytest.raises(ConnectTimeoutError):
+        _with_retry(dead, "r1", False, 3)
+    assert len(calls) == 3 and pauses == [0.5, 1]
+    out = capsys.readouterr().out
+    assert "RETRY 1/2 in 0.5s (TCP connect to 10.0.0.1:22 timed out after 3s)" in out
+    assert "RETRY 2/2 in 1s (TCP connect to 10.0.0.1:22 timed out after 3s)" in out
+    pauses.clear()
+
+    def slow():
+        raise RuntimeError("Command timed out after 50s: show version")
+
+    with pytest.raises(RuntimeError):
+        _with_retry(slow, "r1", True, 3)
+    assert pauses == [1, 3]
+    assert [_backoff(n, CONNECT_BACKOFF) for n in (1, 2, 9)] == [0.5, 1, 1]
+
+
+def test_an_edit_whose_connect_phase_ran_out_is_tried_again(monkeypatch):
+    """Nothing was sent, so it is safe for an edit too: a connect phase that
+    ran out is a NotAppliedError, the one failure an edit may retry."""
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = []
+
+    def dead():
+        calls.append(1)
+        raise ConnectTimeoutError("NETCONF connect failed: no SSH banner from 10.0.0.1:830 within 3s")
+
+    with pytest.raises(ConnectTimeoutError):
+        _retry_loop(dead, "r1", True, 3, lambda e: isinstance(e, NotAppliedError))
+    assert len(calls) == 3

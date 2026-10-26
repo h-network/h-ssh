@@ -34,7 +34,9 @@ has to be separate.
 """
 
 import json
+import math
 import os
+import re
 import select
 import shlex
 import shutil
@@ -48,8 +50,9 @@ from .. import drivers
 from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
-from ..errors import NotAppliedError
+from ..errors import ConnectTimeoutError, NotAppliedError
 from .cli import Cli, edit_policy, refuse_commit_lines
+from .connect import DEFAULT as DEFAULT_CONNECT_TIMEOUT, budget, no_banner, tcp_timed_out, where
 
 AVAILABLE = shutil.which("ssh") is not None
 
@@ -153,14 +156,17 @@ class _AskPass:
         return False
 
 
-def _base_opts(session_timeout: int, port: Optional[int],
+def _base_opts(connect_timeout, port: Optional[int],
                control_path: Optional[str], have_password: bool) -> List[str]:
+    """ssh's options. `connect_timeout` is the connect phase's seconds:
+    OpenSSH's ConnectTimeout bounds the TCP connect and the banner exchange
+    together, as --connect-timeout does (#126)."""
     known_hosts = os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
     opts = [
         "-o", "StrictHostKeyChecking=%s" % _HOST_KEY_POLICY,
         "-o", "UserKnownHostsFile=%s" % known_hosts,
         "-o", "LogLevel=ERROR",
-        "-o", "ConnectTimeout=%d" % int(session_timeout),
+        "-o", "ConnectTimeout=%d" % max(1, math.ceil(connect_timeout)),
         "-o", "NumberOfPasswordPrompts=1",
     ]
     if have_password:
@@ -186,6 +192,14 @@ def _base_opts(session_timeout: int, port: Optional[int],
 # the first connection prints "Authenticated to HOST" and "Entering interactive
 # session", a command riding the ControlMaster prints "master session id".
 _SESSION_UP = ("Authenticated to ", "Entering interactive session", "master session id")
+# ...and how far the connect phase got: the TCP connect, or a proxy command
+# standing in for it (ProxyJump too), then the device's banner.
+_CONNECTED = ("Connection established", "Executing proxy")
+_BANNER = "Remote protocol version"
+_CONNECTING = re.compile(r"Connecting to \S+(?: \[[^\]]*\])? port (\d+)\.")
+# OpenSSH's words when its own ConnectTimeout runs out before this module's clock.
+_SSH_NO_BANNER = "timed out during banner exchange"
+_SSH_TCP_TIMEOUT = re.compile(r"connect to host \S+ port \d+: Connection timed out")
 # Lines of that log that are chatter, not a diagnostic.
 _CHATTER = ("debug", "OpenSSH_", "Authenticated to ", "Transferred: ", "Bytes per second: ",
             "Warning: Permanently added ")
@@ -213,9 +227,43 @@ def _phase(log: str) -> str:
     """How far the session got, from ssh's log."""
     if "Connection established" not in log:
         return "no TCP connection"
-    if "Remote protocol version" not in log:
+    if _BANNER not in log:
         return "connected, but no SSH banner came"
     return "the banner came, but key exchange or authentication did not finish"
+
+
+def _where(host: str, port: Optional[int], log: str) -> str:
+    """HOST:PORT for a message: the port ssh says it connected to (the
+    ~/.ssh/config may set one), else the one given, else 22."""
+    m = _CONNECTING.search(log)
+    return where(host, m.group(1) if m else (port or 22))
+
+
+def _past_banner(log: str) -> bool:
+    """The device's banner is in ssh's log, or a session is: the connect phase is over."""
+    return _BANNER in log or any(marker in log for marker in _SESSION_UP)
+
+
+def _ran_out(host: str, port: Optional[int], log: str, seconds) -> ConnectTimeoutError:
+    """The connect phase ran out on this module's clock: no TCP connection
+    by then (nothing in the log says one was made), or a connection and no
+    banner."""
+    at = _where(host, port, log)
+    if any(marker in log for marker in _CONNECTED):
+        return ConnectTimeoutError(no_banner(at, seconds))
+    return ConnectTimeoutError(tcp_timed_out(at, seconds))
+
+
+def _ssh_ran_out(host: str, port: Optional[int], log: str, seconds) -> Optional[ConnectTimeoutError]:
+    """The same, when ssh's own ConnectTimeout fired first and ssh ended
+    the session itself; None for any other end."""
+    if any(marker in log for marker in _SESSION_UP):
+        return None
+    if _SSH_NO_BANNER in log:
+        return ConnectTimeoutError(no_banner(_where(host, port, log), seconds))
+    if _SSH_TCP_TIMEOUT.search(log):
+        return ConnectTimeoutError(tcp_timed_out(_where(host, port, log), seconds))
+    return None
 
 
 def _read(path: str) -> str:
@@ -235,24 +283,27 @@ def _unlink(path: str) -> None:
 
 def _exec(host: str, user: str, askpass, cmd: str,
           session_timeout: int, command_timeout: int, port: Optional[int],
-          control_path: Optional[str]) -> _Result:
+          control_path: Optional[str], connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> _Result:
     """Run one command through ssh. ConnectTimeout bounds the TCP connect and
     the banner, nothing in OpenSSH bounds the key exchange after it (L9), so
     the session has --session-timeout from the start to be up, judged by ssh's
-    own -v log, and the command has --command-timeout from that moment."""
+    own -v log, and the command has --command-timeout from that moment. The
+    connect phase has --connect-timeout from the start (#126), on the same
+    clock: a ConnectTimeoutError when it runs out, whichever clock fires."""
+    connect_s = budget(connect_timeout, session_timeout)
     # "--" ends the options: a host that starts with "-" is still the host,
     # which matters for a library caller that passes no user.
     fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
     os.close(fd)
     argv = (["ssh", "-n", "-v", "-E", log_path]
-            + _base_opts(session_timeout, port, control_path, askpass.passwd is not None)
+            + _base_opts(connect_s, port, control_path, askpass.passwd is not None)
             + ["--", "%s@%s" % (user, host) if user else host, cmd])
     try:
         with tempfile.TemporaryFile() as outf, tempfile.TemporaryFile() as errf:
             proc = subprocess.Popen(argv, stdout=outf, stderr=errf, env=askpass.env,
                                     stdin=subprocess.DEVNULL)
             try:
-                _wait(proc, host, cmd, log_path, session_timeout, command_timeout)
+                _wait(proc, host, cmd, log_path, session_timeout, command_timeout, connect_s, port)
             except BaseException:
                 proc.kill()
                 proc.wait()
@@ -260,6 +311,10 @@ def _exec(host: str, user: str, askpass, cmd: str,
             outf.seek(0)
             errf.seek(0)
             log = _read(log_path)
+            if proc.returncode != 0:
+                late = _ssh_ran_out(host, port, log, connect_s)
+                if late is not None:
+                    raise late
             return _Result(argv, proc.returncode,
                            outf.read().decode("utf-8", "replace"),
                            errf.read().decode("utf-8", "replace"),
@@ -271,12 +326,16 @@ def _exec(host: str, user: str, askpass, cmd: str,
             pass
 
 
-def _wait(proc, host: str, cmd: str, log_path: str, session_timeout: int, command_timeout: int) -> None:
-    deadline = time.monotonic() + session_timeout
+def _wait(proc, host: str, cmd: str, log_path: str, session_timeout: int, command_timeout: int,
+          connect_timeout=None, port: Optional[int] = None) -> None:
+    started = time.monotonic()
+    deadline = started + session_timeout
+    connect_by = None if connect_timeout is None else started + connect_timeout
     session_up = False
     while True:
+        until = deadline if connect_by is None else min(deadline, connect_by)
         try:
-            proc.wait(timeout=min(_POLL, max(0.0, deadline - time.monotonic())))
+            proc.wait(timeout=min(_POLL, max(0.0, until - time.monotonic())))
             return
         except subprocess.TimeoutExpired:
             pass
@@ -284,8 +343,14 @@ def _wait(proc, host: str, cmd: str, log_path: str, session_timeout: int, comman
             log = _read(log_path)
             if any(marker in log for marker in _SESSION_UP):
                 session_up = True
+                connect_by = None
                 deadline = time.monotonic() + command_timeout
                 continue
+            if connect_by is not None:
+                if _past_banner(log):
+                    connect_by = None
+                elif time.monotonic() >= connect_by:
+                    raise _ran_out(host, port, log, connect_timeout)
         if time.monotonic() >= deadline:
             if not session_up:
                 raise RuntimeError("no SSH session to %s within %ds: %s"
@@ -345,26 +410,34 @@ class ProcessChannel:
     key, a host key that changed), is the error, not a bare "connection
     closed"."""
 
-    def __init__(self, proc, host: str, log_path: str, argv: List[str]):
+    def __init__(self, proc, host: str, log_path: str, argv: List[str], port: Optional[int] = None,
+                 connect_timeout=None):
         self.proc = proc
         self.host = host
         self.log_path = log_path
         self.argv = argv
         self.closed = False
         self._log = None          # the log as it stood when the channel was closed
+        # The connect phase (#126): the device's banner is due in ssh's log
+        # by connect_by; None once it is there, or with no clock at all.
+        self.port = port
+        self.connect_timeout = connect_timeout
+        self.connect_by = None if connect_timeout is None else time.monotonic() + connect_timeout
+        self.ran_out: Optional[ConnectTimeoutError] = None     # why the connect phase failed, if it did
 
     @classmethod
     def open(cls, host: str, user: str, askpass, session_timeout: int,
-             port: Optional[int]) -> "ProcessChannel":
+             port: Optional[int], connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> "ProcessChannel":
         """Start `ssh -tt` to the device with stdin and stdout piped. ssh
         authenticates before the engine reads a byte, through askpass with a
         password; -v to the -E log says how far it got. The terminal is
         vt100, as the paramiko shell asks for, so the device dresses its
         output the same way on both transports."""
+        connect_s = budget(connect_timeout, session_timeout)
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
         os.close(fd)
         argv = (["ssh", "-tt", "-v", "-E", log_path]
-                + _base_opts(session_timeout, port, None, askpass.passwd is not None)
+                + _base_opts(connect_s, port, None, askpass.passwd is not None)
                 + ["--", "%s@%s" % (user, host) if user else host])
         env = askpass.env
         env["TERM"] = "vt100"
@@ -374,15 +447,25 @@ class ProcessChannel:
         except OSError as exc:
             _unlink(log_path)
             raise RuntimeError("SSH transport failed: %s" % exc) from exc
-        return cls(proc, host, log_path, argv)
+        return cls(proc, host, log_path, argv, port=port, connect_timeout=connect_s)
 
     def recv(self, n: int, timeout: float) -> bytes:
-        try:
-            ready, _, _ = select.select([self.proc.stdout], [], [], max(0.0, timeout))
-        except (OSError, ValueError) as e:            # the pipe is closed
-            raise ConnectionError(f"connection lost: {e}") from e
-        if not ready:
+        end = time.monotonic() + max(0.0, timeout)
+        while True:
+            wait = end - time.monotonic()
+            if self.connect_by is not None:
+                wait = min(wait, self.connect_by - time.monotonic())
+            try:
+                ready, _, _ = select.select([self.proc.stdout], [], [], max(0.0, wait))
+            except (OSError, ValueError) as e:            # the pipe is closed
+                raise ConnectionError(f"connection lost: {e}") from e
+            if ready:
+                break
+            if self.connect_by is not None and time.monotonic() >= self.connect_by:
+                self._connect_phase_over()
+                continue
             raise TimeoutError(f"nothing from {self.host} within {timeout:.1f}s")
+        self.connect_by = None                        # something came: the phase is over either way
         try:
             data = os.read(self.proc.stdout.fileno(), n)
         except OSError as e:
@@ -393,6 +476,18 @@ class ProcessChannel:
         if why:
             raise ConnectionError(why)
         return b""
+
+    def _connect_phase_over(self) -> None:
+        """The connect phase's clock ran out: fine when ssh's log has the
+        device's banner (or a session) by now, else the session is abandoned
+        here, as the exec's is. The engine sees a lost connection; `ran_out`
+        keeps the reason for the caller."""
+        log = _read(self.log_path)
+        if _past_banner(log):
+            self.connect_by = None
+            return
+        self.ran_out = _ran_out(self.host, self.port, log, self.connect_timeout)
+        raise ConnectionError(str(self.ran_out))
 
     def _ended(self) -> Optional[str]:
         """Why ssh's stdout closed, in OpenSSH's words, when ssh exited other
@@ -405,6 +500,10 @@ class ProcessChannel:
         if self.proc.returncode == 0:
             return None
         log = _read(self.log_path)
+        if self.connect_timeout is not None:
+            self.ran_out = _ssh_ran_out(self.host, self.port, log, self.connect_timeout)
+            if self.ran_out is not None:
+                return str(self.ran_out)
         return _describe_failure(self.host, _Result(self.argv, self.proc.returncode, "", "",
                                                     _own_lines(log), log))
 
@@ -453,24 +552,28 @@ class ProcessChannel:
 
 
 def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout: int,
-                   port: Optional[int], dialect: Dialect):
+                   port: Optional[int], dialect: Dialect, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """(channel, session): a CLI session at the device's own prompt on the
     pty of a fresh `ssh -tt`; the caller closes both (closing the channel
     ends the process). The askpass helper lives only until the prompt is
     seen: ssh has authenticated by then. login() has session_timeout for the
-    connect, the authentication and the banner together; when that runs out
-    before ssh got a session the error says how far ssh came, as the exec
-    path's does, and otherwise which line the device stopped at."""
+    connect, the authentication and the banner together, of which the TCP
+    connect and the banner have connect_timeout (the channel's clock, #126);
+    when either runs out before ssh got a session the error says how far
+    ssh came, as the exec path's does, and otherwise which line the device
+    stopped at."""
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
     with _AskPass(passwd) as askpass:
-        channel = ProcessChannel.open(host, user, askpass, session_timeout, port)
+        channel = ProcessChannel.open(host, user, askpass, session_timeout, port, connect_timeout)
         session = Cli(channel, dialect, session_timeout)
         try:
             session.login(user, passwd)
         except BaseException as exc:
             log = channel.log()
             channel.close()
+            if channel.ran_out is not None:
+                raise channel.ran_out from exc
             if isinstance(exc, NotAppliedError) and not any(marker in log for marker in _SESSION_UP):
                 raise RuntimeError("no SSH session to %s within %ds: %s"
                                    % (host, session_timeout, _phase(log))) from exc
@@ -481,7 +584,7 @@ def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout:
 def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[str],
                   session_timeout: int, command_timeout: int,
                   port: Optional[int] = None, edit: bool = False,
-                  dialect: Optional[Dialect] = None) -> str:
+                  dialect: Optional[Dialect] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """One exec per command. The reply counts as well as the exit status: a
     CLI that answers "error: ..." or "% ..." (or whatever the dialect's
     `refused` says) and exits 0 has refused the line (M6), and the edit stops
@@ -495,10 +598,16 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
     try:
         with _AskPass(passwd) as askpass:
             outputs = []
-            for cmd in commands:
+            for i, cmd in enumerate(commands):
                 try:
                     proc = _exec(host, user, askpass, cmd, session_timeout,
-                                 command_timeout, port, control_path)
+                                 command_timeout, port, control_path, connect_timeout)
+                except ConnectTimeoutError as exc:
+                    if edit and i:
+                        # The lines before it were applied: no longer
+                        # nothing-was-sent, so the edit is not tried again.
+                        raise RuntimeError(f"{exc}; the {i} line(s) before it were applied") from exc
+                    raise
                 except OSError as exc:
                     raise RuntimeError("SSH transport failed: %s" % exc)
                 if proc.returncode != 0:
@@ -536,17 +645,21 @@ def _close_master(host: str, user: str, control_path: Optional[str],
 
 
 def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
-         command_timeout: int, port: int = None, vendor_hint: str = None) -> str:
+         command_timeout: int, port: int = None, vendor_hint: str = None,
+         connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """One show command on an exec; a reply the dialect's CLI opens with a
-    refusal is a failure, not output."""
+    refusal is a failure, not output. `connect_timeout` bounds the TCP
+    connect and the SSH banner, never more than `session_timeout` (every
+    function here that connects takes it)."""
     return _run_commands(host, user, passwd, [cmd], session_timeout,
-                         command_timeout, port=port, dialect=_dialect(vendor_hint))
+                         command_timeout, port=port, dialect=_dialect(vendor_hint),
+                         connect_timeout=connect_timeout)
 
 
 def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
          command_timeout: int, commit_confirmed: int = None, port: int = None,
          vendor_hint: str = None, dry_run: bool = False,
-         expected_diff: Optional[str] = None) -> R.EditResult:
+         expected_diff: Optional[str] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> R.EditResult:
     """Push configuration.
 
     The none dialect (the plain `openssh` driver) runs each line as its own
@@ -571,14 +684,15 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
         edit_policy(d, vendor_hint or "openssh", dry_run, None, expected_diff)
         commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
         return _run_commands(host, user, passwd, commands, session_timeout,
-                             command_timeout, port=port, edit=True, dialect=d)
+                             command_timeout, port=port, edit=True, dialect=d,
+                             connect_timeout=connect_timeout)
     if d.cli is None:
         raise ValueError(f"{vendor_hint}: the {d.title} dialect has no CLI to type at; "
                          "nothing was sent to the device")
     edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
     if d.cli.has_candidate:
         refuse_commit_lines(payload)
-    channel, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    channel, session = _shell_session(host, user, passwd, session_timeout, port, d, connect_timeout)
     try:
         if d.cli.has_candidate:
             return session.edit_candidate(payload, dry_run=dry_run, confirmed_minutes=commit_confirmed or 0,
@@ -591,8 +705,12 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
-               port: int = None, vendor_hint: str = None) -> List[dict]:
-    """Execute multiple commands over one multiplexed SSH connection."""
+               port: int = None, vendor_hint: str = None,
+               connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
+    """Execute multiple commands over one multiplexed SSH connection. A
+    connect phase that runs out ends the batch as one failure, as on the
+    other transports, where a batch has one connection: each command after
+    it would cost another connect timeout for the same silence (#126)."""
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
@@ -605,7 +723,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
             for cmd in cmds:
                 try:
                     proc = _exec(host, user, askpass, cmd, session_timeout,
-                                 command_timeout, port, control_path)
+                                 command_timeout, port, control_path, connect_timeout)
                     refused = refused_reply(proc.stderr, proc.stdout, dialect=d) if proc.returncode == 0 else None
                     if proc.returncode != 0:
                         results.append({"command": cmd, "ok": False,
@@ -616,6 +734,8 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                     else:
                         results.append({"command": cmd, "ok": True,
                                         "output": _format(cmd, proc)})
+                except ConnectTimeoutError:
+                    raise
                 except Exception as exc:
                     results.append({"command": cmd, "ok": False, "error": str(exc)})
             return R.BatchResult(results)
@@ -625,7 +745,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
 
 def confirm(host: str, user: str, passwd: str, session_timeout: int, command_timeout: int,
             port: int = None, vendor_hint: str = "junos@openssh",
-            comment: Optional[str] = None) -> R.EditResult:
+            comment: Optional[str] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> R.EditResult:
     """Confirm a pending commit-confirmed on a Junos device through the
     OpenSSH client: `show system commit` must show one waiting, then
     configure exclusive, a bare `commit` (`commit comment "…"` with a
@@ -634,7 +754,7 @@ def confirm(host: str, user: str, passwd: str, session_timeout: int, command_tim
     d = _dialect(vendor_hint)
     if d.cli is None or not d.cli.has_candidate or d.commit_pending is None:
         raise ValueError(f"confirm is only for a Junos dialect, not {vendor_hint}; nothing was sent")
-    channel, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    channel, session = _shell_session(host, user, passwd, session_timeout, port, d, connect_timeout)
     try:
         return session.confirm(command_timeout, comment)
     finally:
@@ -645,7 +765,7 @@ def confirm(host: str, user: str, passwd: str, session_timeout: int, command_tim
 def show_structured(host: str, user: str, passwd: str, cmd: str,
                     session_timeout: int, command_timeout: int,
                     port: int = None, vendor_hint: str = None,
-                    binding: Optional[dict] = None):
+                    binding: Optional[dict] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """A command's own JSON, for a dialect whose CLI renders one: EOS answers
     `<cmd> | json` with the data its text would show, so an exec runs that
     and the reply is parsed. `binding` is the field map the NETCONF driver
@@ -660,7 +780,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
     full = f"{cmd} | json"
     with _AskPass(passwd) as askpass:
         try:
-            proc = _exec(host, user, askpass, full, session_timeout, command_timeout, port, None)
+            proc = _exec(host, user, askpass, full, session_timeout, command_timeout, port, None, connect_timeout)
         except OSError as exc:
             raise RuntimeError("SSH transport failed: %s" % exc)
     if proc.returncode != 0:
@@ -676,8 +796,8 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
 
 
 def ssh_command_line(host: str, user: str, cmd: str, session_timeout: int = 8,
-                     port: int = None) -> str:
+                     port: int = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """The exact command line this module would run, for logs and bug reports."""
-    argv = (["ssh", "-n"] + _base_opts(session_timeout, port, None, False)
+    argv = (["ssh", "-n"] + _base_opts(budget(connect_timeout, session_timeout), port, None, False)
             + ["--", "%s@%s" % (user, host) if user else host, cmd])
     return " ".join(shlex.quote(part) for part in argv)

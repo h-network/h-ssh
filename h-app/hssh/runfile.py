@@ -46,6 +46,7 @@ RUN_KEYS: Dict[str, tuple] = {
     "retries": ("retries", int),
     "workers": ("workers", int),
     "session_timeout": ("session_timeout", int),
+    "connect_timeout": ("connect_timeout", int),
     "command_timeout": ("command_timeout", int),
     "dry_run": ("dry_run", bool),
     "commit_confirmed": ("commit_confirmed", int),

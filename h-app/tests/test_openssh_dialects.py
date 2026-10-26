@@ -17,7 +17,7 @@ from hssh import drivers, runner
 from hssh.core import Target
 from hssh.drivers import contract
 from hssh.drivers import results as R
-from hssh.errors import NotAppliedError, NothingToConfirmError
+from hssh.errors import ConnectTimeoutError, NotAppliedError, NothingToConfirmError
 from hssh.transports import openssh
 
 FAKE_SSH = r'''
@@ -56,7 +56,14 @@ def say(text):
     os.write(1, text.encode())
 
 
-log("debug1: Connecting to 10.0.0.1 port 22.\ndebug1: Connection established.\n")
+log("debug1: Connecting to 10.0.0.1 port 22.\n")
+if os.environ.get("FAKE_SSH_HANG") == "tcp":          # the TCP connect gets no answer
+    time.sleep(30)
+    sys.exit(255)
+log("debug1: Connection established.\n")
+if os.environ.get("FAKE_SSH_HANG") == "silent":       # connected, and no banner
+    time.sleep(30)
+    sys.exit(255)
 if os.environ.get("FAKE_SSH_HANG") == "kex":
     log("debug1: Remote protocol version 2.0, remote software version fake\n")
     time.sleep(30)
@@ -453,6 +460,33 @@ def test_a_login_that_gets_no_session_or_no_prompt_is_bounded_by_the_session_tim
         openssh.edit("10.0.0.1", "lab", "hunter2", "set system host-name test\n", 1, 10, vendor_hint="junos@openssh")
     assert time.monotonic() - started < 8              # the wait, one Enter, the wait again: about 2 s each
     assert len(procs) == 2 and all(p.returncode is not None for p in procs)     # neither ssh was left behind
+
+
+@pytest.mark.parametrize("hang, said", [("tcp", "TCP connect to 10.0.0.1:22 timed out after 1s"),
+                                        ("silent", "no SSH banner from 10.0.0.1:22 within 1s")])
+def test_a_shell_whose_connect_phase_runs_out_is_given_up_at_the_connect_timeout(device, monkeypatch, hang, said):
+    """#126: the pty session had the whole session timeout for this. Now the
+    channel keeps the connect phase's clock, says which part ran out, and it
+    is a NotAppliedError: nothing was typed, the runner may try again."""
+    procs = []
+    real = subprocess.Popen
+
+    def spy(argv, **kwargs):
+        proc = real(argv, **kwargs)
+        if "-tt" in argv:
+            procs.append((argv, proc))
+        return proc
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    device.knobs(hang=hang)
+    started = time.monotonic()
+    with pytest.raises(ConnectTimeoutError) as failed:
+        openssh.edit("10.0.0.1", "lab", "hunter2", "set system host-name test\n", 30, 10,
+                     vendor_hint="junos@openssh", connect_timeout=1)
+    assert str(failed.value) == said and isinstance(failed.value, NotAppliedError)
+    assert time.monotonic() - started < 3.0
+    assert device.typed == []
+    (argv, proc), = procs
+    assert "ConnectTimeout=1" in argv and proc.returncode is not None      # and the ssh was not left behind
 
 
 def test_the_process_channel_times_out_echoes_closes_and_reads_sshs_verdict(tmp_path):

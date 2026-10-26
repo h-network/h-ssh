@@ -314,10 +314,14 @@ def test_a_failed_connect_closes_the_client(monkeypatch):
     assert closes == [1]
 
 
-def test_every_phase_of_the_connect_has_the_session_timeout_the_channel_open_too(monkeypatch):
+def test_every_phase_of_the_connect_has_a_timeout_the_channel_open_too(monkeypatch):
     """paramiko gives connect, banner, auth and the channel open each their
     own clock; the last one defaults to an hour. A device that authenticates
-    and then never answers the shell's channel open held a worker that long."""
+    and then never answers the shell's channel open held a worker that long.
+    The TCP connect and the banner share --connect-timeout (#126); the
+    negotiation, the key exchange, auth and the channel open have the
+    session timeout."""
+    import socket
     seen = {}
 
     class Recording(paramiko.SSHClient):
@@ -328,7 +332,19 @@ def test_every_phase_of_the_connect_has_the_session_timeout_the_channel_open_too
             return exec_result(b"ok")
     monkeypatch.setattr(ssh, "paramiko", FakeParamiko(Recording))
     ssh.show("10.0.0.1", "u", "p", "show version", 7, 10)
-    assert (seen["timeout"], seen["banner_timeout"], seen["auth_timeout"], seen["channel_timeout"]) == (7.0, 7.0, 7.0, 7.0)
+    assert (seen["timeout"], seen["auth_timeout"], seen["channel_timeout"]) == (3.0, 7.0, 7.0)
+    a, b = socket.socketpair()
+    try:
+        t = seen["transport_factory"](a)
+        assert 2.0 < t.banner_timeout <= 3.0                  # what is left of the connect phase
+        assert t.handshake_timeout == 7.0 and t._hssh_negotiation == 7.0
+        t.banner_timeout = 15                                 # connect()'s own assignment lands nowhere
+        assert t.banner_timeout <= 3.0
+    finally:
+        a.close()
+        b.close()
+    ssh.show("10.0.0.1", "u", "p", "show version", 2, 10, connect_timeout=5)
+    assert seen["timeout"] == 2.0                             # never more than the session timeout
 
 # --- #45: every wait in exec is bounded ----------------------------------------
 

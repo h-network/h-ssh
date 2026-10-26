@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hssh import runner, drivers
 from hssh.core import Target, read_set_file_for_device
-from hssh.errors import AmbiguousCommitError, NotAppliedError
+from hssh.errors import AmbiguousCommitError, ConnectTimeoutError, NotAppliedError
 from hssh.transports import netconf
 
 
@@ -113,6 +113,15 @@ def test_not_applied_is_retried(monkeypatch):
     v = FakeVendor([NotAppliedError("lock held"), NotAppliedError("lock held"), "COMMIT OK"])
     _, ok, _, _ = run(monkeypatch, "junos", v)
     assert ok and len(v.edit_calls) == 3
+
+
+def test_an_edit_whose_connect_phase_ran_out_is_retried(monkeypatch):
+    """#126: no TCP answer or no banner in time is a NotAppliedError: nothing
+    was sent. It used to fail the edit at once, the device left unchanged."""
+    v = FakeVendor([ConnectTimeoutError("NETCONF connect failed: TCP connect to 10.0.0.1:830 timed out after 3s"),
+                    "COMMIT OK"])
+    _, ok, out, _ = run(monkeypatch, "junos", v)
+    assert ok and "COMMIT OK" in out and len(v.edit_calls) == 2
 
 
 def test_not_applied_still_respects_the_attempt_budget(monkeypatch):
@@ -245,10 +254,11 @@ def test_rollback_reaches_the_driver_with_number_and_flags(monkeypatch):
     v = RollbackVendor()
     _, ok, out, _ = run_rollback(monkeypatch, "junos", v, n=3, dry_run=True, commit_confirmed=None)
     assert ok and "ROLLBACK 3" in out
-    assert v.rollback_calls == [{"n": 3, "dry_run": True, "cc": None}]
+    # the connect timeout too, the runner's default (#126): the driver takes keywords
+    assert v.rollback_calls == [{"n": 3, "dry_run": True, "cc": None, "connect_timeout": 3}]
     v = RollbackVendor()
     run_rollback(monkeypatch, "junos", v, n=3, expected_diff="- x")
-    assert v.rollback_calls == [{"n": 3, "dry_run": False, "cc": None, "expected_diff": "- x"}]
+    assert v.rollback_calls == [{"n": 3, "dry_run": False, "cc": None, "expected_diff": "- x", "connect_timeout": 3}]
 
 
 def test_rollback_is_refused_where_the_transport_cannot(monkeypatch):

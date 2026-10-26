@@ -281,6 +281,22 @@ def test_a_wedged_device_does_not_poison_later_runs(monkeypatch):
         never.set()
 
 
+def test_the_connect_timeout_reaches_every_device_and_is_3_by_default(monkeypatch):
+    """#126: Fleet(connect_timeout=) is the CLI's --connect-timeout, its default too."""
+    got = []
+
+    def show(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, connect_timeout=None):
+        got.append((host, connect_timeout))
+        return "fine"
+    install(monkeypatch, show=show)
+    with Fleet(HOSTS, transport="junos", user="u") as fleet:
+        assert fleet.connect_timeout == 3
+        assert all(r.ok for r in fleet.show("show version"))
+    with Fleet(HOSTS, transport="junos", user="u", connect_timeout=7) as fleet:
+        assert all(r.ok for r in fleet.show("show version"))
+    assert sorted(got) == sorted([(h, 3) for h in HOSTS] + [(h, 7) for h in HOSTS])
+
+
 def test_the_budget_counts_the_transports_connect_phases():
     fleet = Fleet(["R1:10.0.0.1:junos", "R2:10.0.0.2:ssh", "R3:10.0.0.3:ios@openssh", "R4:10.0.0.4:telnet-ios"],
                   user="u", session_timeout=2, command_timeout=3, retries=1)
@@ -1615,7 +1631,7 @@ def test_a_transport_traceback_stays_off_stderr_unless_the_caller_set_up_logging
                 raise EOFError()
             except EOFError:
                 logging.getLogger(name).error("Error reading SSH protocol banner", exc_info=True)
-        raise RuntimeError(f"no SSH banner from {host}:22 within 1s (sshd busy, or filtered)")
+        raise RuntimeError(f"no SSH banner from {host}:22 within 1s")
 
     install(monkeypatch, show=show)
     transports = [logging.getLogger(name) for name in ("paramiko", "ncclient")]
@@ -1747,6 +1763,8 @@ def test_duplicates_and_bad_arguments_are_refused_before_anything_runs(monkeypat
         Fleet(HOSTS, user="u", workers=1000)
     with pytest.raises(ValueError, match="session_timeout must be at least 1, got 0"):
         Fleet(HOSTS, user="u", session_timeout=0)
+    with pytest.raises(ValueError, match="connect_timeout must be at least 1, got 0"):
+        Fleet(HOSTS, user="u", connect_timeout=0)
     with pytest.raises(ValueError, match="command_timeout must be an integer, not 0.5"):
         Fleet(HOSTS, user="u", command_timeout=0.5)
     with pytest.raises(ValueError, match="command_timeout must be an integer, not '20'"):
