@@ -531,7 +531,7 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | *(none)* | one status line per device, plus the verdict and diff under it for edits |
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
-| `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure; with `--diff` the objects come in target order and each device that answered has a `diff` against the baseline (`(baseline)` on the baseline itself) |
+| `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure; with `--diff` on a show or a batch the objects come in target order and, when two or more are `ok`, each of those has a `diff` against the first of them, the baseline (`(baseline)` on the baseline itself) |
 | `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string |
 
 A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
@@ -983,7 +983,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (937 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (939 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

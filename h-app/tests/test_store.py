@@ -218,6 +218,28 @@ def test_grep_field_diff_history_slowest(tmp_path, capsys):
     assert rc == 0 and lines[1].split()[:2] == ["5000", "r2"] and len(lines) == 3
 
 
+@pytest.mark.parametrize("before, after", [
+    ("Model: vmx\r\nJunos: x\r\n", "Model: vmx\nJunos: x"),
+    ("Model: vmx\nJunos: x", "Model: vmx\nJunos: x\n"),
+], ids=["crlf", "last-newline"])
+def test_the_readers_diff_compares_lines_not_their_line_endings(tmp_path, capsys, before, after):
+    """`h-ssh-store diff` compares the lines of two replies, not how they end:
+    CRLF against LF, or a newline after the last line against none, is no
+    difference (exit 0, nothing printed). h-ssh's own rows end in LF with no
+    newline after the last line; these come in through the Store API."""
+    path = tmp_path / "runs.db"
+    s = Store(str(path))
+    runs = []
+    for reply in (before, after):
+        run = s.begin_run("show", ["-sC", "show version"], "lab", 1, "1.0.0", command="show version")
+        s.add_entry(run, {**SHOW, "output": reply}, "show version")
+        s.finish_run(run, 1, 0, 0)
+        runs.append(run)
+    s.close()
+    rc, out, _ = reader(capsys, path, "diff", "r1", *runs)
+    assert rc == 0 and out == ""
+
+
 def test_export_csv_and_jsonl(tmp_path, capsys):
     """The rows as they are: CSV with a header (the batch's two commands are two
     rows, a failure keeps its error), JSON Lines with the same keys, --all for

@@ -1456,8 +1456,8 @@ async def main() -> int:
 
         # The run log is written as the results land: a SIGTERM, an exception
         # later in the loop or an OOM loses nothing already reported. It holds
-        # the payloads and edit diffs the audit log holds, and the replies, so
-        # it gets the same redaction and file mode.
+        # the replies and the edit diffs (and an -eC payload, as its command),
+        # so it gets the audit log's redaction and file mode.
         if args.log:
             try:
                 secure_append(args.log, json.dumps(redact_values({
@@ -1563,7 +1563,8 @@ async def main() -> int:
     # one would run into the line put in after it.
     ok_results = []
     if args.diff and mode in ["show", "show-batch"]:
-        json_results[:] = [r for _, r in sorted(zip(given_at, json_results), key=lambda p: p[0])]
+        # Every result has its place: one without is an error, not a device left out.
+        json_results[:] = [r for _, r in sorted(zip(given_at, json_results, strict=True), key=lambda p: p[0])]
         ok_results = [r for r in json_results if r["ok"]]
         if len(ok_results) >= 2:
             baseline = ok_results[0]
