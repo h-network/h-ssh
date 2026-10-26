@@ -35,7 +35,7 @@ import sqlite3
 import stat
 import sys
 import time
-from typing import Iterable, List, Optional
+from typing import Iterable, Iterator, List, Optional
 
 ENV_VAR = "HSSH_STORE"
 DEFAULT = "h-ssh.db"          # in the directory h-ssh runs from: the evidence sits with the job
@@ -143,7 +143,7 @@ class Store:
                                  f"(--store PATH or {ENV_VAR} for another file)")
             uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
             try:
-                self.conn = sqlite3.connect(uri, uri=True)
+                self.conn = self._open_readonly(uri, path)
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         else:
@@ -194,6 +194,25 @@ class Store:
                 raise StoreError(f"{path}: not a regular file")
         finally:
             os.close(fd)
+
+    @staticmethod
+    def _open_readonly(uri: str, path: str) -> sqlite3.Connection:
+        """The reader never writes the store, but a WAL reader wants a -shm
+        file beside it, and a directory the reader cannot write to (an
+        archived job directory, a read-only mount) refuses to let it make
+        one: 'attempt to write a readonly database' at the first read. A
+        finished store has no -wal file and nothing a -shm would track, so
+        it is read as it is (immutable). One a run is still writing has
+        both files beside it and reads through them as usual."""
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            return conn
+        except sqlite3.Error as e:
+            conn.close()
+            if "readonly" in str(e).lower() and not os.path.exists(path + "-wal"):
+                return sqlite3.connect(uri + "&immutable=1", uri=True)
+            raise
 
     def close(self) -> None:
         try:
@@ -313,7 +332,10 @@ class Store:
 
     def results(self, run_id: Optional[str] = None, device: Optional[str] = None,
                 command: Optional[str] = None, ok: Optional[bool] = None,
-                order: str = "run_id, device, seq", limit: Optional[int] = None) -> List[sqlite3.Row]:
+                order: str = "run_id, device, seq", limit: Optional[int] = None) -> Iterator[sqlite3.Row]:
+        """The matching rows in order, as the cursor: a row is read when it
+        is asked for, so grep, field and export hold one row at a time,
+        not the store."""
         where, params = [], []
         if run_id:
             where.append("run_id = ?")
@@ -333,7 +355,7 @@ class Store:
         sql += f" ORDER BY {order}"
         if limit:
             sql += " LIMIT %d" % int(limit)
-        return self.conn.execute(sql, params).fetchall()
+        return self.conn.execute(sql, params)
 
     def output(self, run_id: str, device: str, seq: int = 0) -> sqlite3.Row:
         row = self.conn.execute("SELECT * FROM results WHERE run_id = ? AND device = ? AND seq = ?",
@@ -492,22 +514,31 @@ def cmd_export(store: Store, args) -> int:
     row. One run (default: the last) or --all; --out writes a file."""
     run_id = None if args.all else store.resolve_run(args.run)
     rows = store.results(run_id=run_id, device=args.device, command=args.command)
-    out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
+    if args.out:
+        try:
+            out = open(args.out, "w", newline="", encoding="utf-8")
+        except OSError as e:
+            raise StoreError(f"--out {args.out}: {e.strerror or e}") from e
+    else:
+        out = sys.stdout
+    written = 0
     try:
         if args.format == "csv":
             writer = csv.writer(out)
             writer.writerow(EXPORT_FIELDS)
             for r in rows:
                 writer.writerow([r[f] for f in EXPORT_FIELDS])
+                written += 1
         else:
             for r in rows:
                 out.write(json.dumps({f: r[f] for f in EXPORT_FIELDS}, ensure_ascii=False) + "\n")
+                written += 1
     finally:
         if args.out:
             out.close()
     if args.out:
-        print(f"{len(rows)} rows written to {args.out}", file=sys.stderr)
-    return 0 if rows else 1
+        print(f"{written} rows written to {args.out}", file=sys.stderr)
+    return 0 if written else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -566,7 +597,29 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _stdout_gone() -> None:
+    """The reader of our output closed it (`| head`, also `2>&1 | head`).
+    Point both fds at /dev/null so the interpreter's final flush does not
+    fail a second time."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        for stream in (sys.stdout, sys.stderr):
+            os.dup2(devnull, stream.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        return _main(argv)
+    except BrokenPipeError:
+        # `h-ssh-store ... | head`: the reader has what it wanted. Not an
+        # error of ours, and not a traceback, as with h-ssh itself.
+        _stdout_gone()
+        return 0
+
+
+def _main(argv: Optional[List[str]]) -> int:
     args = build_parser().parse_args(argv)
     try:
         store = Store(_store_path(args), readonly=True)
@@ -574,7 +627,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     try:
-        return args.fn(store, args)
+        rc = args.fn(store, args)
+        sys.stdout.flush()          # a reader that left shows up here, not at interpreter exit
+        return rc
     except StoreError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2

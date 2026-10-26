@@ -263,6 +263,132 @@ def test_the_reader_looks_where_the_run_wrote(tmp_path, capsys, monkeypatch):
     assert store_main(["runs"]) == 2                       # the variable beats the config file
 
 
+def test_the_reader_reads_rows_as_it_goes_not_the_store_into_memory(tmp_path, capsys):
+    """results() hands back the cursor: grep, field and export take one row
+    at a time, so a store of hundreds of megabytes costs the reader no more
+    memory than a small one (fetchall() held every matching row)."""
+    path = tmp_path / "runs.db"
+    filled(path)
+    seen = {"fetchall": 0, "rows": 0}
+
+    class Cursor(sqlite3.Cursor):
+        def __next__(self):
+            seen["rows"] += 1
+            return super().__next__()
+
+        def fetchall(self):
+            seen["fetchall"] += 1
+            return super().fetchall()
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, params=()):
+            factory = Cursor if sql.startswith("SELECT * FROM results") else sqlite3.Cursor
+            return self.cursor(factory).execute(sql, params)
+
+    store = Store(str(path), readonly=True)
+    store.conn.close()
+    store.conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, factory=Connection)
+    store.conn.row_factory = sqlite3.Row
+    first = next(iter(store.results()))                      # one row asked for: one row read
+    assert first["device"] == "r1" and seen == {"fetchall": 0, "rows": 1}
+    parser = store_module.build_parser()
+    assert store_module.cmd_export(store, parser.parse_args(["export", "--all", "--out", str(tmp_path / "rows.csv")])) == 0
+    assert "5 rows written" in capsys.readouterr().err       # counted as they were written
+    assert store_module.cmd_grep(store, parser.parse_args(["grep", "junos:", "-i"])) == 0
+    assert store_module.cmd_field(store, parser.parse_args(["field", "0.user"])) == 0
+    assert seen["fetchall"] == 0 and seen["rows"] > 5
+    store.close()
+
+
+def test_an_export_out_file_that_cannot_be_opened_is_an_error_line_not_a_traceback(tmp_path, capsys):
+    """--out into a directory that is not there, onto a directory, into one
+    that cannot be written: one ERROR line and exit 2, as every other
+    failure of the reader."""
+    filled(tmp_path / "s.db")
+    rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--out", str(tmp_path / "missing" / "rows.csv"))
+    assert rc == 2 and out == "" and err.startswith("ERROR: --out ") and "rows.csv: No such file or directory" in err
+    rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--out", str(tmp_path))
+    assert rc == 2 and "ERROR: --out" in err and "Is a directory" in err
+    if os.geteuid() != 0:                                     # root writes anywhere
+        ro = tmp_path / "ro"
+        ro.mkdir(mode=0o500)
+        rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--out", str(ro / "rows.csv"))
+        assert rc == 2 and "ERROR: --out" in err and "Permission denied" in err
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes anywhere")
+def test_a_finished_store_in_a_directory_the_reader_cannot_write_is_still_read(tmp_path, capsys):
+    """An archived job directory, a read-only mount: the file is plain SQLite
+    and the reader reads it where the run wrote it. A WAL reader wants a
+    -shm file beside the store, which such a directory refuses; a finished
+    store has no -wal left and is read as it is instead. One a run is still
+    writing has both files beside it and is read through them."""
+    archived = tmp_path / "archived"
+    archived.mkdir()
+    r1, r2, r3 = filled(archived / "h-ssh.db")
+    assert sorted(p.name for p in archived.iterdir()) == ["h-ssh.db"]       # finished: no -wal, no -shm
+    archived.chmod(0o555)
+    try:
+        rc, out, err = reader(capsys, archived / "h-ssh.db", "runs")
+        assert rc == 0 and err == "" and [ln.split()[0] for ln in out.splitlines()[1:]] == [r3, r2, r1]
+        rc, out, _ = reader(capsys, archived / "h-ssh.db", "grep", "junos:", "-i")
+        assert rc == 0 and "Junos: 23.2" in out
+        rc, out, _ = reader(capsys, archived / "h-ssh.db", "export", "--all", "--format", "jsonl")
+        assert rc == 0 and len(out.splitlines()) == 5
+        assert sorted(p.name for p in archived.iterdir()) == ["h-ssh.db"]   # nothing was left beside it
+    finally:
+        archived.chmod(0o755)
+    live = tmp_path / "live"
+    live.mkdir()
+    writer = Store(str(live / "h-ssh.db"))
+    run = writer.begin_run("show", ["-sC", "show version"], "lab", 1, "1.0.0")
+    writer.add(run, "r7", 0, "show version", True, output="Junos: 24.4\n")   # committed, sits in the -wal
+    assert (live / "h-ssh.db-wal").exists()
+    live.chmod(0o555)
+    try:
+        rc, out, _ = reader(capsys, live / "h-ssh.db", "grep", "junos:", "-i")
+        assert rc == 0 and "Junos: 24.4" in out                            # read through the -wal, not past it
+    finally:
+        live.chmod(0o755)
+        writer.close()
+
+
+def test_a_reader_that_stops_early_is_exit_0_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """`h-ssh-store ... | head`: the pipe closes under the reader. Exit 0,
+    not a word about it, and stdout parked on /dev/null so the interpreter's
+    final flush does not fail a second time (that was exit 120), as h-ssh
+    itself does."""
+    filled(tmp_path / "s.db")
+    dups = []
+    monkeypatch.setattr(os, "dup2", lambda a, b: dups.append(b))
+
+    class Gone:
+        """A pipe whose reader left: the write fails, or only the flush
+        (a short reply sits in the buffer until the end)."""
+        def __init__(self, at):
+            self.at = at
+
+        def write(self, s):
+            if self.at == "write":
+                raise BrokenPipeError
+            return len(s)
+
+        def flush(self):
+            if self.at == "flush":
+                raise BrokenPipeError
+
+        def fileno(self):
+            return 1
+
+    for at, argv in (("write", ["export", "--all", "--format", "jsonl"]), ("write", ["grep", "junos", "-i"]),
+                     ("flush", ["slowest"])):
+        dups.clear()
+        monkeypatch.setattr(sys, "stdout", Gone(at))
+        rc = store_main(["--store", str(tmp_path / "s.db"), *argv])
+        assert rc == 0 and capsys.readouterr().err == "" and dups[:1] == [1], (at, argv)
+
+
+
 # --- through the CLI ----------------------------------------------------------------
 
 def run_cli(monkeypatch, capsys, argv, fake=None):

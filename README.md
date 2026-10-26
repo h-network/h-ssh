@@ -603,6 +603,13 @@ A run is named by its id or any unique prefix of it (`20261024-1730` when only o
 Anything else is a `sqlite3 runs.db` query away: the schema is two tables, documented at the top of
 `hssh/store.py`.
 
+The reader only reads: a finished store in a directory it cannot write to (an archived job directory,
+a read-only mount) is read as it is; `grep`, `field` and `export` take the rows as they come, so a
+store of hundreds of megabytes costs no more memory than a small one; and a reader that stops early
+(`h-ssh-store ... | head`) exits 0 with no traceback, as `h-ssh` does. What the reader cannot do (no
+store at the path, a run that matches nothing or several, an `--out` file it cannot open) is one
+`ERROR:` line on stderr and exit 2.
+
 ```console
 $ h-ssh --devices core.csv -sC "show bgp summary"
 $ h-ssh-store runs
@@ -982,7 +989,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (926 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (930 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
