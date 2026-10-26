@@ -28,7 +28,7 @@ from .core import (
 
     path_inside,
 )
-from .runner import run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only
+from .runner import run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
@@ -507,7 +507,9 @@ async def main() -> int:
                         help="Show output as the router's own JSON or XML reply, through its RPC "
                              "translation of the command (junos only; default: text)")
     parser.add_argument("--save-output", type=str,
-                        help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted)")
+                        help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted): "
+                             "NAME.output, or NAME.json for a batch; a job's later entries for one device go to "
+                             "NAME.2.output, NAME.3.output, ... in file order")
     parser.add_argument("--log", type=str,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
     parser.add_argument("--store", type=str,
@@ -654,6 +656,32 @@ async def main() -> int:
         except ValueError as e:
             print(f"ERROR: job file: {e}", file=sys.stderr)
             return 2
+        # A device may be named in several entries: seq_of counts them per
+        # device in file order, 0 for the first. The one count is both the
+        # entry's store seq (its own row, so a device a job names twice does
+        # not have its first row replaced by its second; a batch's commands
+        # count up the same way) and, with --save-output, its own file
+        # (R1.output, R1.2.output, R1.3.output, ...). It moves on by one an
+        # entry because a job entry is one row (a show or an edit); an entry
+        # that wrote several rows would have to move it on by as many.
+        seq_of, counted = [], {}
+        for je in job_entries:
+            assert je.mode in ("show", "edit-cmd"), f"job entry mode {je.mode!r}: seq counts one row an entry"
+            seq_of.append(counted.get(je.target.name, 0))
+            counted[je.target.name] = seq_of[-1] + 1
+        if args.save_output:
+            # R1's second entry is R1.2.output, which is also the file of a
+            # device named R1.2: one result would replace the other. Refused
+            # with the job file's other mistakes, before the password prompt.
+            saved_as = {}
+            for t, seq in zip(targets, seq_of):
+                whose = f"{t.name}'s entry {seq + 1}" if seq else t.name
+                fname = save_name(t.name, seq)
+                if fname in saved_as:
+                    print(f"ERROR: --save-output: {saved_as[fname]} and {whose} would both be saved as {fname}; "
+                          "rename one of the devices. Nothing was sent.", file=sys.stderr)
+                    return 2
+                saved_as[fname] = whose
         has_edits = any(e.mode.startswith("edit") for e in job_entries)
         mode = "job"
         for je in job_entries:
@@ -1095,16 +1123,6 @@ async def main() -> int:
     # job mode) travels with its result, so a job that names one device in
     # two entries never has the second read as the first.
     units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
-    # Each entry keeps its own store row: seq counts up per device in file
-    # order (a batch's commands do the same), so a device a job names twice
-    # does not have its first row replaced by its second. It moves on by one
-    # an entry because a job entry is one row (a show or an edit); an entry
-    # that wrote several rows would have to move it on by as many.
-    seq_of, counted = [], {}
-    for t, je in units:
-        assert je is None or je.mode in ("show", "edit-cmd"), f"job entry mode {je.mode!r}: seq counts one row an entry"
-        seq_of.append(counted.get(t.name, 0))
-        counted[t.name] = seq_of[-1] + 1
 
     def _audit_aborted(error):
         """One audit line per unit for a run the operator did not confirm."""
@@ -1245,7 +1263,7 @@ async def main() -> int:
         return host_locks.setdefault(host, asyncio.Lock())
 
     async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
-                           started=None):
+                           started=None, seq=0):
         async with _host_lock(t.host), sem:
             if started is not None:
                 started()        # from here on the device may be touched
@@ -1302,6 +1320,7 @@ async def main() -> int:
                 structured_binding=binding,
                 fmt=args.format,
                 expected_diff=expected_diff,
+                seq=seq,
             )
 
     started = set()      # unit indices whose device may already be in play
@@ -1314,7 +1333,7 @@ async def main() -> int:
         mark = lambda: started.add(i)
         if je is not None:
             result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
-                                        started=mark)
+                                        started=mark, seq=seq_of[i])
         else:
             result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark)
         if not isinstance(result, RunResult):
@@ -1506,8 +1525,11 @@ async def main() -> int:
         if store_run is not None:
             store_tried += 1
             try:
+                # A job entry's row is at its place among its device's entries:
+                # seq_of, the count its --save-output file is named by as well.
                 store.add_entry(store_run, entry, sent,
-                                fmt=args.format if dev_mode in ("show", "show-batch") else "text", seq=seq_of[i])
+                                fmt=args.format if dev_mode in ("show", "show-batch") else "text",
+                                seq=seq_of[i] if je else 0)
                 # SQLite writes into a deleted or replaced file without a
                 # word; one stat per result says so as it happens, not at the end.
                 gone = store.still_there() if store_reason is None else None

@@ -177,6 +177,15 @@ class RunResult(tuple):
                 f"result={type(self.result).__name__ if self.result is not None else None}, error={self.error!r})")
 
 
+def save_name(name: str, seq: int = 0, ext: str = "output") -> str:
+    """The --save-output file of one result: `<name>.output` (`.json` for a
+    batch). A job may name one device in several entries; seq is the
+    entry's place among them in file order, so the first keeps
+    `<name>.output` and the later ones are `<name>.2.output`,
+    `<name>.3.output`, and so on."""
+    return f"{name}.{ext}" if not seq else f"{name}.{seq + 1}.{ext}"
+
+
 def error_line(text: str) -> Optional[str]:
     """The failure as the CLI always read it: what follows the last line
     starting with "ERROR:", stripped; None when there is no such line."""
@@ -334,6 +343,7 @@ def _run_for_target_sync(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
+    seq: int = 0,
 ) -> RunResult:
     """
     Execute task on a single target device (internal sync implementation).
@@ -507,7 +517,7 @@ def _run_for_target_sync(
             result_json = json.dumps(batch.to_list())
             duration_ms = int((time.time() - start_time) * 1000)
             if save_dir:
-                secure_write(str(path_inside(save_dir, f"{name}.json")), result_json)
+                secure_write(str(path_inside(save_dir, save_name(name, seq, "json"))), result_json)
             if safety_gate is not None:
                 safety_gate.release_device(host)
             return RunResult(name, batch.ok, result_json, duration_ms, result=batch, error=batch.first_error)
@@ -519,7 +529,7 @@ def _run_for_target_sync(
         duration_ms = int((time.time() - start_time) * 1000)
 
         if save_dir:
-            secure_write(str(path_inside(save_dir, f"{name}.output")), final_out)
+            secure_write(str(path_inside(save_dir, save_name(name, seq))), final_out)
 
         if safety_gate is not None:
             safety_gate.release_device(host)
@@ -538,7 +548,7 @@ def _run_for_target_sync(
         final_out = "\n".join(output).strip() + "\n"
         duration_ms = int((time.time() - start_time) * 1000)
         if save_dir:
-            secure_write(str(path_inside(save_dir, f"{name}.output")), final_out)
+            secure_write(str(path_inside(save_dir, save_name(name, seq))), final_out)
         return RunResult(name, False, final_out, duration_ms, error=error_line(final_out))
 
 
@@ -568,11 +578,15 @@ def run_for_target(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
+    seq: int = 0,
 ) -> RunResult:
     """
     Synchronous public API for library users. `expected_diff` is the diff a
     dry run showed; an edit or rollback is then committed only if the device
-    produces it again.
+    produces it again. `seq` is a job entry's place among the entries for the
+    same device (0 for the first): with `save_dir` the first is saved as
+    `<name>.output` and a later one as `<name>.<seq+1>.output`, `.json` for
+    a batch.
     Returns: (device_name, success, output_text, duration_ms)
     """
     return _run_for_target_sync(
@@ -591,6 +605,7 @@ def run_for_target(
         fmt=fmt,
         expected_diff=expected_diff,
         payload_text=payload_text,
+        seq=seq,
     )
 
 
@@ -620,6 +635,7 @@ async def run_for_target_async(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
+    seq: int = 0,
 ) -> RunResult:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -642,6 +658,7 @@ async def run_for_target_async(
         fmt=fmt,
         expected_diff=expected_diff,
         payload_text=payload_text,
+        seq=seq,
     )
 
 
