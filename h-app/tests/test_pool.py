@@ -179,7 +179,7 @@ def test_close_uses_a_short_timeout_and_tears_down_a_stuck_transport():
         _session = Session()
 
     dev._conn = Conn()
-    netconf._close(dev)
+    netconf._close(dev).join(2)                 # the close runs in its helper thread
     assert dev.timeout_at_close == netconf.SHORT_TIMEOUT
     assert Stuck.torn_down
 
@@ -734,3 +734,57 @@ def test_a_probe_that_times_out_still_means_dead(pooled, monkeypatch):
     show()
     assert pooled.stats["opens"] == 2 and pooled.stats["discards"] == 1
     assert devices()[0].closed and not devices()[1].closed
+
+
+# --- #113: the collection waits for the closes it is there for ----------------------
+
+def _recording_close(order):
+    """The junos closer only starts a thread (#98): a close that takes its
+    ~100 ms on the device and says when it is done."""
+    class SlowClose(FakeDevice):
+        def close(self):
+            time.sleep(0.1)
+            super().close()
+            order.append("closed")
+    return SlowClose
+
+
+def test_close_all_collects_after_the_closes_it_started(pooled, monkeypatch):
+    """close_all() collected right after _drop(), which only starts the close
+    threads: the collection ran with every session still open, and the
+    descriptor of #58 was held until Python's next full collection."""
+    order = []
+    netconf.JunosDevice = _recording_close(order)
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: order.append("collected"))
+    for host in ("10.0.0.1", "10.0.0.2", "10.0.0.3"):
+        show(host=host)
+    pool.close_all(shutdown=False)
+    assert order == ["closed"] * 3 + ["collected"]
+    assert netconf.wait_for_closes(timeout=0) == 0      # nothing left in flight
+
+
+def test_the_reaper_collects_after_the_closes_it_started(pooled, monkeypatch):
+    order = []
+    netconf.JunosDevice = _recording_close(order)
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: order.append("collected"))
+    show()
+    show(host="10.0.0.2")
+    assert pooled.reap(now=time.time() + 301) == 2
+    assert order == ["closed", "closed", "collected"]
+
+
+def test_close_all_closes_on_its_own_clock_when_the_system_refuses_the_close_thread(pooled, monkeypatch):
+    """The pool logged the closer's RuntimeError and went on: the session
+    stayed open on the router, and the never-started thread made every
+    later wait_for_closes() raise."""
+    show()
+    real_start = threading.Thread.start
+
+    def start(self):
+        if self.name == "hssh-netconf-close":
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    pool.close_all(shutdown=False)
+    assert devices()[0]._closed and pooled.live() == 0
+    assert not netconf._CLOSES and netconf.wait_for_closes() == 0

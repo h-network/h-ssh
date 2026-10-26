@@ -241,18 +241,31 @@ _CLOSES: "set[threading.Thread]" = set()
 _CLOSES_LOCK = threading.Lock()
 
 
-def _close(dev) -> None:
+def _close(dev) -> Optional[threading.Thread]:
     """Close the session beside the work, not on the worker's clock.
 
     <close-session> and its acknowledgement are ~100 ms of waiting on the
     device, a quarter of what a show costs per device; a worker used to
     spend it before moving to its next device. A helper thread waits
     instead, the device still sees a clean NETCONF close, and
-    wait_for_closes() at the end of a run joins what is still in flight."""
+    wait_for_closes() at the end of a run joins what is still in flight.
+    Returns that thread, for a caller that must see the close through (the
+    pool, before it collects what a close leaves behind); None when the
+    close ran here."""
     t = threading.Thread(target=_close_now, args=(dev,), name="hssh-netconf-close", daemon=True)
     with _CLOSES_LOCK:
         _CLOSES.add(t)
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        # The system refused the thread (ulimit -u, a container's pids.max).
+        # Close here instead, on the caller's clock: ~100 ms, never the
+        # result, and no entry in the set that nobody can join (#113).
+        with _CLOSES_LOCK:
+            _CLOSES.discard(t)
+        _close_now(dev)
+        return None
+    return t
 
 
 def _close_now(dev) -> None:
@@ -279,7 +292,10 @@ def wait_for_closes(timeout: float = 1.0) -> int:
     with _CLOSES_LOCK:
         pending = list(_CLOSES)
     for t in pending:
-        t.join(max(0.0, deadline - time.monotonic()))
+        try:
+            t.join(max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            pass    # not started yet: _close() is between adding it and start()
     return sum(1 for t in pending if t.is_alive())
 
 

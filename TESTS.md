@@ -4,7 +4,7 @@ Two kinds of evidence: the unit suite, which needs no devices and runs on every 
 request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
 code state they were run on.
 
-## Unit Tests — 926/926 passed
+## Unit Tests — 931/931 passed
 
 `pip install -e '.[dev]' && pytest` from the checkout root (`feat/fleet`, 2026-10-25, with the dialect /
 transport / driver split of #80–#84 complete, the store hardening and the `Fleet` library API). The standalone review of `develop` (18
@@ -44,12 +44,12 @@ telnet runs against a scripted server on localhost.
 | test_input_validation.py | 34 | #62: wrong input is refused with a named reason before anything runs — numeric flags and config keys out of range, ports, BOM inventories, a `--config` that is not a file, `--save-output` on a file, a closed stdout, whitespace commands, unknown job keys, lines without `=`, wide CSV rows, a target that still says `arista` |
 | test_job_pool.py | 4 | #57: a job's entries share one NETCONF session per device |
 | test_job.py | 20 | `--job` files and stdin, `default_vendor`, same device twice (entries carried with their results) |
-| test_junos.py | 55 | the NETCONF transport (`hssh/transports/netconf.py`) over a fake PyEZ: show, batch, the session close off the caller's clock (a helper thread, `wait_for_closes()` at the end of a run), edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `confirm()` under the lock, `guarded_commit()` and its history check, `expected_diff`, a timer that cannot be armed refused before any session, `statement not found` the one load warning ignored |
+| test_junos.py | 57 | the NETCONF transport (`hssh/transports/netconf.py`) over a fake PyEZ: show, batch, the session close off the caller's clock (a helper thread, `wait_for_closes()` at the end of a run; a close thread the system refuses is closed on the caller and never costs the result, an entry never started is skipped — #113), edit sequence, dry-run, commit-confirmed, the commit edge cases, `rollback()`, `begin()`/`Transaction`, comments, `confirm()` under the lock, `guarded_commit()` and its history check, `expected_diff`, a timer that cannot be armed refused before any session, `statement not found` the one load warning ignored |
 | test_openssh_dialects.py | 26 | #83: `junos@openssh`, `ios@openssh`, `nxos@openssh`, `eos@openssh` — shows on an exec like the plain `openssh` driver, edits and confirms through the CLI engine on `ssh -tt`, against a fake `ssh` on PATH |
 | test_openssh.py | 27 | the OpenSSH-binary transport, `SSH_ASKPASS`, ControlMaster, `--` before the host, the session clock read from ssh's `-v` log |
 | test_output_hygiene.py | 11 | #63: a closed stdout (`\| head`) is not an error, paramiko's transport tracebacks stay off the screen, the confirm reminder prints only for timers that are running, a confirm with nothing pending commits nothing |
 | test_packaging.py | 1 | wheel contents: `hssh/`, the dialects' JSON libraries next to them, no top-level `commands/` |
-| test_pool.py | 51 | session pool: reuse per `(host, port, user, credential)`, stale detection and probe, discard rules on every edit failure, reopen-once for reads, threads never share a session, reaper, `close_all`, re-entrancy, a nested borrow never closes the session under an open transaction |
+| test_pool.py | 54 | session pool: reuse per `(host, port, user, credential)`, stale detection and probe, discard rules on every edit failure, reopen-once for reads, threads never share a session, reaper, `close_all`, re-entrancy, a nested borrow never closes the session under an open transaction, the collection that frees a closed session's descriptors (#58) runs after the closes `close_all`/the reaper started, not before them, and a refused close thread still closes the session (#113) |
 | test_profiles.py | 4 | `--profile NAME`: a batch file by name, yours in `~/.h-ssh/profiles` before the shipped `junos-health`/`junos-snapshot`, with or without `.txt`, a path taken as given; run exactly like `--batch`; `--profile` with `--batch` or an unknown name is exit 2; `--list-profiles` lists yours then the shipped ones with their command counts and descriptions |
 | test_raw.py | 10 | `--raw` output contract and the JSON output shape |
 | test_retry.py | 42 | failure classification (PyEZ connect phase by its prefix, `invalid` narrowed, a rejected command permanent), backoff, the attempt budget, workers clamped and really parallel, edits retried only on `NotAppliedError` |
