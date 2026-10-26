@@ -702,21 +702,24 @@ class _Run:
         with self._lock:
             if self.ended:
                 return
-            self.settle()
-            self.ended = True
+            # The run is over even when a filter made a store-loss warning an
+            # error, while settling or while closing the row: the consumer
+            # wakes, the next run gets in.
             try:
-                for task in self.pending:
-                    if task.future is not None:
-                        task.future.cancel()
-                skipped = len(self.pending)
-                ok = sum(1 for r in self.done if r.ok)
-                self._close_store_row(ok, len(self.done) - ok, skipped, interrupted and skipped > 0)
+                self.settle()
             finally:
-                # The run is over even when a filter made a store-loss
-                # warning an error: the consumer wakes, the next run gets in.
-                if self.stop.cancel():           # wakes a consumer waiting on the run's futures
-                    self.stop.set_running_or_notify_cancel()
-                self.fleet._forget(self)
+                self.ended = True
+                try:
+                    for task in self.pending:
+                        if task.future is not None:
+                            task.future.cancel()
+                    skipped = len(self.pending)
+                    ok = sum(1 for r in self.done if r.ok)
+                    self._close_store_row(ok, len(self.done) - ok, skipped, interrupted and skipped > 0)
+                finally:
+                    if self.stop.cancel():       # wakes a consumer waiting on the run's futures
+                        self.stop.set_running_or_notify_cancel()
+                    self.fleet._forget(self)
 
 
 def _finish_all(run: _Run, tasks: List[_Task]) -> None:
@@ -863,8 +866,9 @@ class Fleet:
     back once it is collected, as a dropped ThreadPoolExecutor does. That
     can wait for the garbage collector's next pass: a device call that
     raised leaves its frames in a reference cycle, and they hold the Fleet;
-    so does a run it left open (not recorded, so close() is still the way
-    to end one). With no logging set up, paramiko's and ncclient's
+    so do the first Fleet of a process, whose workers import the transport,
+    and a run it left open (not recorded, so close() is still the way to
+    end one). With no logging set up, paramiko's and ncclient's
     tracebacks stay off stderr (each gets a NullHandler, as the CLI gives
     it); set logging up and they go where it sends them."""
 

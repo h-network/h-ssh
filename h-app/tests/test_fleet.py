@@ -1188,6 +1188,48 @@ def test_a_store_loss_a_filter_makes_an_error_still_ends_the_run(monkeypatch, tm
             assert len(again) == 3 and all(r.ok for r in again)
 
 
+def test_a_store_write_that_raises_while_close_settles_still_ends_the_run(monkeypatch, tmp_path):
+    """Under an 'error' warnings filter, a result that had returned but was
+    never iterated, and that the store could not keep, raised out of end()
+    before the run was ended: a consumer polled for good and the run row
+    stayed open. The run ends whatever settling it raised."""
+    release, returned = threading.Event(), threading.Event()
+
+    def show(host, user, passwd, cmd, *a, **kw):
+        if host == "10.0.0.2":
+            returned.set()
+        else:
+            release.wait(10)
+        return f"{cmd} on {host}"
+    install(monkeypatch, show=show)
+    real_add = Store.add_entry
+
+    def add_entry(self, run_id, entry, *a, **kw):
+        if entry["device"] == "10.0.0.2":
+            raise sqlite3.OperationalError("disk I/O error")
+        return real_add(self, run_id, entry, *a, **kw)
+    monkeypatch.setattr(Store, "add_entry", add_entry)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            fleet = Fleet([f"10.0.0.{i}" for i in range(1, 6)], transport="junos", user="u", workers=2,
+                          retries=0, store=str(tmp_path / "runs.db"))
+            res = fleet.show("show version")
+            assert returned.wait(2)
+            settled = next(t for t in res._run.tasks if t.target.host == "10.0.0.2")
+            assert wait_for(lambda: settled.future.done())      # returned, never iterated
+            with pytest.raises(RuntimeWarning, match="disk I/O error"):
+                fleet.close()
+        assert res._run.ended
+        reader = threading.Thread(target=lambda: list(res), daemon=True)
+        reader.start()
+        reader.join(3)
+        assert not reader.is_alive(), "iterating the closed run's results never ended"
+        assert res.not_kept == 1 and res.store_error == "disk I/O error"
+    finally:
+        release.set()
+
+
 def test_a_batch_is_one_row_per_command_and_an_open_store_is_left_open(monkeypatch, tmp_path):
     install(monkeypatch, show_batch=lambda host, user, passwd, cmds, *a, **kw:
             [{"command": c, "ok": c != "show nothing", **({"output": f"{c} on {host}"} if c != "show nothing"

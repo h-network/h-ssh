@@ -807,8 +807,8 @@ The library reads no environment variable and no config file; that is the CLI's 
   `async with Fleet(...)` and `aclose()` do the same off the event loop. A Fleet dropped without `close()` lets
   its threads go and gives its share of the session pool back once it is collected, as a dropped
   `ThreadPoolExecutor` ends its workers. That can wait for the garbage collector's next pass: a device call that
-  raised leaves its frames in a reference cycle, and they hold the Fleet; so does a run it left open, which is not
-  recorded, so `close()` is still what ends one;
+  raised leaves its frames in a reference cycle, and they hold the Fleet; so do the first Fleet of a process, whose
+  workers import the transport, and a run it left open, which is not recorded, so `close()` is still what ends one;
 - `store=`, a path or an open `hssh.store.Store` (one Store may be shared by several Fleets on several threads:
   it takes one write at a time), keeps every result as the CLI's store does (one run row, its command line
   `Fleet.show show bgp summary`; one result row per device, per command for a batch), written from the thread
@@ -990,7 +990,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (946 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (947 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
