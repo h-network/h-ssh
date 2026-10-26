@@ -96,6 +96,35 @@ def _identity(path: str):
     return (st.st_dev, st.st_ino)
 
 
+def _settled(path: str):
+    """The file at `path` as it stands (device, inode, size, mtime) when it
+    is the whole store: no WAL frames beside it (no -wal, or the empty one
+    a reader leaves) and no rollback journal. None when something waits
+    beside it that SQLite would apply first: committed rows in a -wal, a
+    crashed transaction's journal."""
+    try:
+        if os.path.lexists(path + "-journal"):
+            return None
+        if os.path.exists(path + "-wal") and os.path.getsize(path + "-wal"):
+            return None
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _no_shm(e: sqlite3.Error) -> bool:
+    """The read-only open failed for want of a -shm beside the store: a
+    directory the reader cannot write to does not let SQLite make one
+    (SQLITE_READONLY_DIRECTORY; SQLITE_CANTOPEN beside the empty -wal a
+    reader left). Python 3.10 gives the message only."""
+    name = getattr(e, "sqlite_errorname", None)
+    if name is not None:
+        return name in ("SQLITE_READONLY_DIRECTORY", "SQLITE_CANTOPEN")
+    text = str(e).lower()
+    return "readonly" in text or "unable to open" in text
+
+
 def _wal(conn, timeout: float = WAL_SWITCH_TIMEOUT) -> None:
     """Put the file in WAL mode, once. Switching needs an exclusive lock and
     SQLite does not wait for it (no busy handler for this pragma), so two
@@ -137,13 +166,13 @@ class Store:
 
     def __init__(self, path: str, readonly: bool = False):
         self.path = path
+        self._as_is = None          # (file, what it was) for a store read as it is
         if readonly:
             if not os.path.exists(path):
                 raise StoreError(f"no store at {path}: no run has been kept here "
                                  f"(--store PATH or {ENV_VAR} for another file)")
-            uri = pathlib.Path(path).resolve().as_uri() + "?mode=ro"
             try:
-                self.conn = self._open_readonly(uri, path)
+                self.conn = self._open_readonly(str(pathlib.Path(path).resolve()))
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         else:
@@ -178,6 +207,18 @@ class Store:
             return "the store file was replaced during the run"
         return None
 
+    def written_while_read(self) -> bool:
+        """A store read as it is has neither locks nor a snapshot: a writer
+        that came meanwhile (a run, an --every tick, a cleanup) moves pages
+        under the reader, which then misses or repeats rows without an
+        error. True when the file is no longer what it was at the open, or
+        has WAL frames or a journal beside it now. A store read the usual
+        way is SQLite's to keep consistent: always False."""
+        if self._as_is is None:
+            return False
+        resolved, then = self._as_is
+        return _settled(resolved) != then
+
     @staticmethod
     def _create_private(path: str) -> None:
         """The file is made 0600 before SQLite ever opens it, and must be a
@@ -195,24 +236,29 @@ class Store:
         finally:
             os.close(fd)
 
-    @staticmethod
-    def _open_readonly(uri: str, path: str) -> sqlite3.Connection:
+    def _open_readonly(self, resolved: str) -> sqlite3.Connection:
         """The reader never writes the store, but a WAL reader wants a -shm
         file beside it, and a directory the reader cannot write to (an
-        archived job directory, a read-only mount) refuses to let it make
-        one: 'attempt to write a readonly database' at the first read. A
-        finished store has no -wal file and nothing a -shm would track, so
-        it is read as it is (immutable). One a run is still writing has
-        both files beside it and reads through them as usual."""
+        archived job directory, a read-only mount, another user's) does not
+        let it make one: 'attempt to write a readonly database' at the first
+        read. With nothing waiting beside it (_settled), the file is the
+        whole store and is read as it is (immutable): no -shm, and no locks
+        either, so written_while_read() looks again at the end. WAL frames
+        or a journal beside it keep the error: read past them, the store
+        would miss committed rows or show uncommitted ones. SQLite looks
+        beside the file itself, so `resolved` has its symlinks followed."""
+        uri = pathlib.Path(resolved).as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         try:
             conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
             return conn
         except sqlite3.Error as e:
             conn.close()
-            if "readonly" in str(e).lower() and not os.path.exists(path + "-wal"):
-                return sqlite3.connect(uri + "&immutable=1", uri=True)
-            raise
+            then = _settled(resolved) if _no_shm(e) else None
+            if then is None:
+                raise
+            self._as_is = (resolved, then)
+            return sqlite3.connect(uri + "&immutable=1", uri=True)
 
     def close(self) -> None:
         try:
@@ -335,7 +381,8 @@ class Store:
                 order: str = "run_id, device, seq", limit: Optional[int] = None) -> Iterator[sqlite3.Row]:
         """The matching rows in order, as the cursor: a row is read when it
         is asked for, so grep, field and export hold one row at a time,
-        not the store."""
+        not the store. A cursor is read once, has no len() and is always
+        true: list() it to keep the rows."""
         where, params = [], []
         if run_id:
             where.append("run_id = ?")
@@ -508,10 +555,29 @@ EXPORT_FIELDS = ("run_id", "device", "seq", "host", "vendor", "command", "ts", "
                  "error", "format", "output")
 
 
+def _part_of_store(store: Store, out: str) -> Optional[str]:
+    """What of the store `out` names, if anything: the file itself (as
+    typed, through a symlink or a hard link), or one SQLite keeps beside
+    it. Opened for writing, it would empty the store under the reader."""
+    try:
+        if os.path.samefile(out, store.path):
+            return "the store itself"
+    except OSError:
+        pass                            # nothing at --out yet: a new file, unless named as one beside the store
+    real, base = os.path.realpath(out), os.path.realpath(store.path)
+    for side in ("-wal", "-shm", "-journal"):
+        if real == base + side:
+            return f"the store's {side} file"
+    return None
+
+
 def cmd_export(store: Store, args) -> int:
     """The rows as they are, for a spreadsheet or a notebook: CSV (Excel opens
     it; a multi-line reply stays one quoted cell) or JSON Lines, one object a
     row. One run (default: the last) or --all; --out writes a file."""
+    part = _part_of_store(store, args.out) if args.out else None
+    if part:
+        raise StoreError(f"--out {args.out}: that is {part}")
     run_id = None if args.all else store.resolve_run(args.run)
     rows = store.results(run_id=run_id, device=args.device, command=args.command)
     if args.out:
@@ -523,19 +589,24 @@ def cmd_export(store: Store, args) -> int:
         out = sys.stdout
     written = 0
     try:
-        if args.format == "csv":
-            writer = csv.writer(out)
-            writer.writerow(EXPORT_FIELDS)
-            for r in rows:
-                writer.writerow([r[f] for f in EXPORT_FIELDS])
-                written += 1
-        else:
-            for r in rows:
-                out.write(json.dumps({f: r[f] for f in EXPORT_FIELDS}, ensure_ascii=False) + "\n")
-                written += 1
-    finally:
-        if args.out:
-            out.close()
+        try:
+            if args.format == "csv":
+                writer = csv.writer(out)
+                writer.writerow(EXPORT_FIELDS)
+                for r in rows:
+                    writer.writerow([r[f] for f in EXPORT_FIELDS])
+                    written += 1
+            else:
+                for r in rows:
+                    out.write(json.dumps({f: r[f] for f in EXPORT_FIELDS}, ensure_ascii=False) + "\n")
+                    written += 1
+        finally:
+            if args.out:
+                out.close()             # the rest of the buffer is written here: a full disk may say so only now
+    except OSError as e:
+        if not args.out:
+            raise                       # stdout: a reader that left (`| head`) is main()'s business
+        raise StoreError(f"--out {args.out}: {e.strerror or e}") from e
     if args.out:
         print(f"{written} rows written to {args.out}", file=sys.stderr)
     return 0 if written else 1
@@ -610,12 +681,13 @@ def _stdout_gone() -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """The reader's exit code. A reader of the output that left in the middle
+    (`h-ssh-store ... | head`) has what it wanted: exit 0, not a traceback,
+    as with h-ssh itself. One that left after the last row shows only at the
+    final flush, and the command's own verdict stands (failed, diff)."""
     try:
         return _main(argv)
     except BrokenPipeError:
-        # `h-ssh-store ... | head`: the reader has what it wanted. Not an
-        # error of ours, and not a traceback, as with h-ssh itself.
-        _stdout_gone()
         return 0
 
 
@@ -624,21 +696,47 @@ def _main(argv: Optional[List[str]]) -> int:
     try:
         store = Store(_store_path(args), readonly=True)
     except StoreError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
+        return _error(str(e))
+    error = None
     try:
         rc = args.fn(store, args)
-        sys.stdout.flush()          # a reader that left shows up here, not at interpreter exit
-        return rc
     except StoreError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
+        rc, error = 2, str(e)
     except sqlite3.Error as e:
-        print(f"ERROR: {store.path}: {e}", file=sys.stderr)
-        return 2
+        rc, error = 2, f"{store.path}: {e}"
     finally:
+        moved = store.written_while_read()
         store.close()
+    if moved:
+        # What was read may miss or repeat rows, and a read the move cut
+        # short says 'malformed' of a store that is not: the write is the news.
+        rc, error = 2, (f"{store.path} was written while it was read as it is; "
+                        "the output may miss or repeat rows, read it again")
+    try:
+        sys.stdout.flush()          # a reader that left after the last row: the verdict stands
+    except BrokenPipeError:
+        pass
+    return _error(error) if error else rc
+
+
+def _error(text: str) -> int:
+    """One ERROR line on stderr, exit 2. A reader that took stderr with it
+    (`2>&1 | head`) left after the verdict, and the verdict stands."""
+    try:
+        print(f"ERROR: {text}", file=sys.stderr)
+    except BrokenPipeError:
+        pass
+    return 2
 
 
 def main_sync() -> None:
-    sys.exit(main())
+    rc = main()
+    try:
+        # A reader that left takes nothing more: what is still buffered goes
+        # to /dev/null rather than fail the interpreter's flush at exit
+        # (exit 120, 'Exception ignored').
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except BrokenPipeError:
+        _stdout_gone()
+    sys.exit(rc)
