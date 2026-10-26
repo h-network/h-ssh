@@ -9,7 +9,7 @@ comment line is the description --list-profiles shows.
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from .core import read_failure
+from .core import is_dir, is_file, read_failure
 
 SHIPPED_DIR = Path(__file__).parent / "profiles"
 
@@ -20,14 +20,15 @@ def user_dir() -> Path:
 
 def profile_path(name: str) -> Path:
     """The file behind a profile name: yours first, then the shipped one. A
-    name with a slash is a path and taken as given, like --batch."""
+    name with a slash is a path and taken as given, like --batch. A directory
+    on the way that may not be searched is its OSError, not 'no profile'."""
     if "/" in name:
         path = Path(name).expanduser()
-        if not path.is_file():
+        if not is_file(path):
             raise ValueError(f"profile {name!r}: no such file")
         return path
     for candidate in (user_dir() / f"{name}.txt", user_dir() / name, SHIPPED_DIR / f"{name}.txt"):
-        if candidate.is_file():
+        if is_file(candidate):
             return candidate
     shipped = ", ".join(n for n, _, _, _ in listing()) or "none"
     raise ValueError(f"no profile {name!r}: not in {user_dir()} and not shipped (have: {shipped}); "
@@ -54,10 +55,10 @@ def listing() -> List[Tuple[str, str, Optional[int], str]]:
     None for its commands and the reason as its description."""
     seen, out = set(), []
     for origin, directory in (("yours", user_dir()), ("shipped", SHIPPED_DIR)):
-        if not directory.is_dir():
+        if not is_dir(directory):
             continue
         for path in sorted(directory.iterdir()):
-            if not path.is_file() or path.name.startswith("."):
+            if path.name.startswith(".") or not is_file(path):
                 continue
             name = path.name[:-4] if path.name.endswith(".txt") else path.name
             if name in seen:

@@ -531,7 +531,7 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
 | `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure |
-| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2) |
+| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2), under `--dry-run` too |
 
 A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
 no traceback, and whatever had landed stands. paramiko's transport thread logs a full traceback when
@@ -927,9 +927,10 @@ One session per `(host, port, user, credential)` — a digest of the password is
 call with a different or wrong password never rides a session another credential opened. Calls against
 the same router from several threads queue on that session; different routers run in parallel as before. A session is dropped, never handed to
 the next caller, when something left it in doubt: a commit whose outcome is unknown, a rollback or
-unlock that failed, an RPC timeout, or the router closing it. A read (`show`, `show_structured`,
-`show_batch`, and `rpc`/`rpc_batch` for a `show …` command or `get-*` RPC) that finds its reused
-session dead opens a new one and runs once more; any other RPC (`request-*`, …) and an edit never do —
+unlock that failed, an RPC timeout, or the router closing it. A read (`show_structured`, and `show`,
+`show_batch`, `rpc` and `rpc_batch` for a `show …` command or `get-*` RPC, every one of a batch) that
+finds its reused session dead opens a new one and runs once more; any other command (`request …`,
+`request-*`, …) and an edit never do —
 an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll), so size `ulimit -n` for the sessions you keep; what a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
 
 ## Package structure
@@ -983,7 +984,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (951 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (958 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

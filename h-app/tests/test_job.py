@@ -161,3 +161,15 @@ def test_a_job_show_is_one_line_of_text_and_an_edit_plain_text(tmp_path):
         assert str(e.value).endswith("a command is one line of text" if "show" in entry else "a payload is plain text")
     job_file.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "edit": "set a b\nset c d"}]))
     assert load_jobs(str(job_file))[0].command == "set a b\nset c d"
+
+
+def test_a_job_show_loses_its_closing_line_break(tmp_path):
+    """#110 review: `"show": "show version\\n"` ran before #110 and was then
+    refused for its line break; it is stripped, as a run file's commands are.
+    What is left of a show of whitespace is nothing, and refused as such."""
+    job_file = tmp_path / "job.json"
+    job_file.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": " show version\n"}]))
+    assert load_jobs(str(job_file))[0].command == "show version"
+    job_file.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": " \n"}]))
+    with pytest.raises(ValueError, match=re.escape("Job entry 0 (R1): 'show' is empty")):
+        load_jobs(str(job_file))

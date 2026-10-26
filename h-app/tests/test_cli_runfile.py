@@ -360,3 +360,22 @@ def test_a_command_of_the_run_file_is_one_line_of_text(monkeypatch, capsys, tmp_
     rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
     assert rc == 2 and drv.batches == []
     assert f"ERROR: run file '{f}' commands: a line break in 'show route\\nrequest system reboot'; a command is one line of text." in err
+
+
+def test_the_show_of_a_run_file_is_stripped_and_its_errors_name_the_file(monkeypatch, capsys, tmp_path):
+    """#110 review: a YAML block (`show: |`) ends its value with a line break,
+    which ran before #110 and was then refused as "-sC has a line break", a
+    flag nobody typed. The show is stripped like `commands`; what is still
+    wrong is said as the file's key."""
+    f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nshow: |\n  show version\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+    assert rc == 0 and drv.shows == [("10.0.0.1", "show version", None)], err
+    for body, text in (("show: \"show version\\nrequest system reboot\"",
+                        "'show' has a line break ('show version\\nrequest system reboot'); a command is one line of text"),
+                       ("show: \"  \"", "'show' is empty"),
+                       ("edit: \"set system host-name x\\e\"\ndry_run: true",
+                        "'edit' has an ESC ('set system host-name x\\x1b'); a payload is plain text")):
+        f = write(tmp_path, "run.yaml", f"devices: [R1:10.0.0.1:junos]\nuser: u\n{body}\n")
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+        assert rc == 2 and drv.shows == drv.edits == [], err
+        assert f"ERROR: run file '{f}': {text}" in err and "-sC" not in err and "-eC" not in err

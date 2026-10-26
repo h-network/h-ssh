@@ -3,6 +3,7 @@
 import csv
 import json
 import re
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -343,15 +344,20 @@ def parse_jobs(data, default_vendor: str = "ssh") -> List[JobEntry]:
         has_edit = "edit" in item
         if has_show == has_edit:
             raise ValueError(f"Job entry {i} ({target.name}): must have exactly one of 'show' or 'edit'")
-        # As for -sC and -eC: a show is one line of text, an edit plain text.
+        # As for -sC and -eC: a show is one line of text (stripped, as a run
+        # file's commands are, so a closing line break is not part of it),
+        # an edit plain text.
         key = "show" if has_show else "edit"
-        what = control_character(item[key], line_breaks=has_edit)
+        command = item[key].strip() if has_show else item[key]
+        if has_show and not command:
+            raise ValueError(f"Job entry {i} ({target.name}): 'show' is empty")
+        what = control_character(command, line_breaks=has_edit)
         if what:
-            raise ValueError(f"Job entry {i} ({target.name}): '{key}' has {what} ({item[key]!r}); "
+            raise ValueError(f"Job entry {i} ({target.name}): '{key}' has {what} ({command!r}); "
                              f"{'a command is one line of text' if has_show else 'a payload is plain text'}")
 
         if has_show:
-            entries.append(JobEntry(target=target, mode="show", command=item["show"]))
+            entries.append(JobEntry(target=target, mode="show", command=command))
         else:
             entries.append(JobEntry(target=target, mode="edit-cmd", command=item["edit"]))
 
@@ -374,6 +380,27 @@ def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
     if not lines:
         raise ValueError(f"Empty config after filtering: {path}")
     return "\n".join(lines) + "\n"
+
+
+def is_file(path: Path) -> bool:
+    """Path.is_file() the same on every Python: False when nothing is there,
+    and any other reason the path cannot be looked at (a directory on the way
+    that may not be searched) raised, to be said and not taken for 'not
+    found'. Path.is_file() raises that on 3.12; newer ones say False."""
+    return _stat_is(path, stat.S_ISREG)
+
+
+def is_dir(path: Path) -> bool:
+    """is_file() for a directory."""
+    return _stat_is(path, stat.S_ISDIR)
+
+
+def _stat_is(path: Path, kind) -> bool:
+    try:
+        mode = path.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError, ValueError):     # nothing there, or a NUL in the name
+        return False
+    return kind(mode)
 
 
 def read_failure(e: Exception) -> str:

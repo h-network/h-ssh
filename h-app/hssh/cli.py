@@ -24,7 +24,7 @@ from .core import (
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, parse_jobs, resolve_target_port, check_unique,
-    check_confirm_minutes, control_character, read_failure,
+    check_confirm_minutes, control_character, read_failure, is_file,
 
     path_inside,
 )
@@ -562,7 +562,7 @@ async def main() -> int:
         except OSError as e:                 # a directory on the way that may not be searched
             print(f"ERROR reading profile '{args.profile}' ({e.filename}): {read_failure(e)}", file=sys.stderr)
             return 2
-    args.batch_commands = None   # an inline batch, only a run file sets it
+    args.batch_commands = None   # the batch: a run file's commands, or the --batch/--profile file's lines read below
     args.jobs_data = None        # job entries from a run file
 
     # A run file sits between the command line and the config file: a flag
@@ -708,7 +708,7 @@ async def main() -> int:
         if args.batch:
             source = f"profile '{args.profile}' ({args.batch})" if args.profile else f"batch file '{args.batch}'"
             try:
-                if not Path(args.batch).is_file():
+                if not is_file(Path(args.batch)):
                     print(f"ERROR: batch file not found: {args.batch}", file=sys.stderr)
                     return 2
                 args.batch_commands = read_command_file_lines(Path(args.batch))
@@ -893,18 +893,28 @@ async def main() -> int:
                   file=sys.stderr)
             return 2
 
-    # --format turns a command into an RPC and sends it with no gate at all,
-    # so under it a show, and every line of a batch (a file, a profile, a
-    # run file's commands), must be a read: refused here, before any I/O,
-    # by the runner's rule. A job's show entries are held to it by the runner.
-    if args.format != "text" and not job_entries:
-        for vendor in sorted({t.vendor for t in targets}):
-            dialect = drivers.get(vendor).dialect
-            for raw in ([args.show_command] if args.show_command else args.batch_commands or []):
-                resolved = resolve_command(raw, vendor)
-                if not is_read(dialect, resolved):
-                    print(f"ERROR: {reads_only(args.format, resolved)}", file=sys.stderr)
-                    return 2
+    # A shortcut is sent as its file says, resolved per vendor, so the command
+    # it stands for is held to the rule of one typed: one line of text (a
+    # job's shows too). --format turns a command into an RPC and sends it
+    # with no gate at all, so under it a show, and every line of a batch (a
+    # file, a profile, a run file's commands), must also be a read, in a dry
+    # run as well. Both refused here, before any I/O, by the runner's rules;
+    # a job's show entries are held to reads by the runner.
+    if job_entries:
+        sends = [(je.command, je.target.vendor) for je in job_entries if je.mode == "show"]
+    else:
+        sends = [(raw, vendor) for vendor in sorted({t.vendor for t in targets})
+                 for raw in ([args.show_command] if args.show_command else args.batch_commands or [])]
+    for raw, vendor in dict.fromkeys(sends):
+        resolved = str(resolve_command(raw, vendor))
+        what = control_character(resolved) if resolved != raw else None
+        if what:
+            print(f"ERROR: shortcut {raw!r} ({vendor}) has {what} ({resolved!r}); a command is one line of text.",
+                  file=sys.stderr)
+            return 2
+        if args.format != "text" and not job_entries and not is_read(drivers.get(vendor).dialect, resolved):
+            print(f"ERROR: {reads_only(args.format, resolved)}", file=sys.stderr)
+            return 2
 
     # Everything the run will write is proven writable before the first
     # device is touched: an audit log found unwritable after the commits
@@ -1052,7 +1062,7 @@ async def main() -> int:
         if batch_cmds:
             print(f"Batch: {len(batch_cmds)} commands from {args.batch or 'the run file'}")
         print(f"Targets: {len(targets)}")
-        devices = len({(t.host, t.port) for t in targets})     # a job lists one device in several entries
+        devices = len({(t.host, resolve_target_port(t)) for t in targets})   # a job may list a device more than once
         waves = -(-devices // args.workers)
         if waves > 4 and args.workers < 64 and not fd_note:
             # Workers stay at 8 by default; a fleet run is told what it costs

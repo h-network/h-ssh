@@ -369,14 +369,15 @@ def _run_for_target_sync(
             # A show that is not a read (`request system reboot`, `clear bgp
             # neighbor`) is sent once: a timeout after it must not mean two
             # more reboots. --format turns the text into an RPC and sends it
-            # with no gate at all, so there it is refused outright.
+            # with no gate at all, so there it is refused outright, in a dry
+            # run too (it says what the run would do).
             read = is_read(b.dialect, show_cmd)
             attempts = max_attempts if read else 1
+            if fmt != "text" and not read:
+                raise ValueError(reads_only(fmt, show_cmd))
             if dry_run:
                 result = f"DRY-RUN show: {show_cmd}"
             elif fmt != "text":
-                if not read:
-                    raise ValueError(reads_only(fmt, show_cmd))
                 # The router's own JSON or XML for the command, through its
                 # RPC translation. Only the NETCONF driver can do that; a
                 # transport that cannot refuses here, before any device I/O.
@@ -483,15 +484,15 @@ def _run_for_target_sync(
                 raise ValueError("No batch commands provided.")
             # The show rule, for the list: one line that acts on the device
             # makes the whole batch a single attempt, and under --format it
-            # is refused outright, before any I/O.
+            # is refused outright, before any I/O, in a dry run too.
             acting = [c for c in batch_cmds if not is_read(b.dialect, c)]
             if acting:
                 max_attempts = 1
+                if fmt != "text":
+                    raise ValueError(reads_only(fmt, acting[0]))
             if dry_run:
                 cmd_results = [{"command": c, "ok": True, "output": f"DRY-RUN show: {c}"} for c in batch_cmds]
             elif fmt != "text":
-                if acting:
-                    raise ValueError(reads_only(fmt, acting[0]))
                 cmd_results = _with_retry(_rpc_call(b, batch=True), name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
                                           port=t.port, vendor_hint=b.hint, fmt=fmt)

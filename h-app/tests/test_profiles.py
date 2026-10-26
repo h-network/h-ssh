@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -140,9 +141,15 @@ def test_a_profile_without_read_permission_is_said_so_and_still_listed(home, mon
         locked.chmod(0o600)
 
 
-def test_a_profile_or_batch_behind_a_directory_that_may_not_be_read_is_said_so(home, monkeypatch, capsys):
+@pytest.mark.parametrize("pathlib", ["as this Python has it", "as newer Pythons have it"])
+def test_a_profile_or_batch_behind_a_directory_that_may_not_be_read_is_said_so(home, monkeypatch, capsys, pathlib):
     """The same behind a directory that may not be searched or read, where
-    the check that the file is there raised before it was ever opened."""
+    the check that the file is there raised before it was ever opened; and
+    on a Python whose Path.is_file() says False there instead of raising,
+    as newer ones do, where it was 'not found' (#110 review)."""
+    if pathlib == "as newer Pythons have it":
+        monkeypatch.setattr(Path, "is_file", lambda self, **kw: os.path.isfile(self))
+        monkeypatch.setattr(Path, "is_dir", lambda self, **kw: os.path.isdir(self))
     shut = home / "shut"
     shut.mkdir()
     batch = shut / "cmds.txt"

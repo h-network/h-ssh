@@ -398,13 +398,13 @@ def _show_mod(calls, fail_times=2):
     return Mod
 
 
-def _show(monkeypatch, mod, cmd, fmt="text"):
+def _show(monkeypatch, mod, cmd, fmt="text", dry_run=False):
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
         show_cmd=cmd, edit_cmd=None, config_dir=None, broadcast_file=None,
         user="u", passwd="p", session_timeout=5, command_timeout=30,
-        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3, fmt=fmt)
+        dry_run=dry_run, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3, fmt=fmt)
 
 
 def test_a_read_is_retried_but_a_request_is_sent_once(monkeypatch):
@@ -460,13 +460,13 @@ def _batch_mod(calls, fail_times=2):
     return Mod
 
 
-def _batch(monkeypatch, mod, cmds, fmt="text"):
+def _batch(monkeypatch, mod, cmds, fmt="text", dry_run=False):
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show-batch",
         show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None,
         user="u", passwd="p", session_timeout=5, command_timeout=30,
-        dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3, fmt=fmt,
+        dry_run=dry_run, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3, fmt=fmt,
         batch_cmds=cmds)
 
 
@@ -489,6 +489,22 @@ def test_format_refuses_a_batch_with_a_line_that_is_not_a_read(monkeypatch):
     assert not ok and calls == [] and "runs reads only" in out and "'request system reboot'" in out
     _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls, fail_times=0), ["show version", "get-system-uptime-information"], fmt="xml")
     assert ok and calls == [("rpc", ["show version", "get-system-uptime-information"])]
+
+
+def test_a_dry_run_under_format_refuses_what_the_run_would_refuse(monkeypatch):
+    """The CLI refuses `--dry-run --format json -sC "request system reboot"`
+    before any device; run_for_target said DRY-RUN and ok. A dry run says
+    what the run would do, and the run would refuse it (#110 review)."""
+    calls = []
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls, fail_times=0), "request system reboot", fmt="json", dry_run=True)
+    assert not ok and calls == [] and "runs reads only" in out and "DRY-RUN" not in out
+    _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls, fail_times=0), ["show version", "request system reboot"],
+                           fmt="xml", dry_run=True)
+    assert not ok and calls == [] and "runs reads only" in out and "'request system reboot'" in out
+    _, ok, out, _ = _show(monkeypatch, _show_mod(calls, fail_times=0), "show version", fmt="json", dry_run=True)
+    assert ok and calls == [] and "DRY-RUN show: show version" in out          # a read is a dry run as before
+    _, ok, out, _ = _batch(monkeypatch, _batch_mod(calls, fail_times=0), ["show version", "request system reboot"], dry_run=True)
+    assert ok and calls == []                                                    # and as text, nothing is refused
 
 
 def test_is_read_command():
