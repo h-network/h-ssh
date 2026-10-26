@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, NamedTuple, Optional, Tuple
 
-from .errors import NotAppliedError
+from .errors import LocalError, NotAppliedError
 from .audit import secure_write
 from .core import Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines
 from .safety import SafetyGate
@@ -68,6 +68,7 @@ _PERMANENT = (
     "no authentication methods available",   # paramiko: no password, no key, no agent
     "contains invalid characters",           # OpenSSH refuses the user or host name
     "malformed known_hosts line",            # the pin file cannot be parsed
+    "locked by another h-ssh run",           # ssh: the pin file, past the session timeout
     "no ssh session",                        # openssh: the session never opened within --session-timeout
 )
 
@@ -82,6 +83,7 @@ _CONNECT_PHASE = (
     "ssh protocol banner",
     "connection timed out",
     "no ssh session",
+    "key exchange did not finish",          # the paramiko transports: banner, then no key exchange
 )
 
 
@@ -100,8 +102,9 @@ def is_connect_failure(exc_or_text) -> bool:
 
 
 def _is_local_error(exc) -> bool:
-    """True for failures raised before any device I/O: validation and missing files."""
-    return isinstance(exc, (ValueError, FileNotFoundError))
+    """True for failures raised before any device I/O: validation, missing
+    files, and refusals made on this machine (a pin file another run holds)."""
+    return isinstance(exc, (ValueError, FileNotFoundError, LocalError))
 
 
 def _say(text: str) -> None:
@@ -172,6 +175,15 @@ class RunResult(tuple):
     def __repr__(self):
         return (f"RunResult(name={self[0]!r}, ok={self[1]!r}, duration_ms={self[3]!r}, "
                 f"result={type(self.result).__name__ if self.result is not None else None}, error={self.error!r})")
+
+
+def save_name(name: str, seq: int = 0, ext: str = "output") -> str:
+    """The --save-output file of one result: `<name>.output` (`.json` for a
+    batch). A job may name one device in several entries; seq is the
+    entry's place among them in file order, so the first keeps
+    `<name>.output` and the later ones are `<name>.2.output`,
+    `<name>.3.output`, and so on."""
+    return f"{name}.{ext}" if not seq else f"{name}.{seq + 1}.{ext}"
 
 
 def error_line(text: str) -> Optional[str]:
@@ -291,6 +303,20 @@ def _rpc_call(b: Bound, batch=False):
     return fn
 
 
+def is_read(dialect, command: str) -> bool:
+    """The dialect's read rule, except that a string with a line break is
+    never a read: the exec channel hands every line to the shell, so a
+    retry would run all of them again. The CLI's --format gate asks this too."""
+    return "\n" not in command and "\r" not in command and dialect.is_read(command)
+
+
+def reads_only(fmt: str, command: str) -> str:
+    """The refusal of a command that is not a read under --format, which
+    turns the text into an RPC and sends it with no gate at all."""
+    return (f"--format {fmt} runs reads only (show …, get-*); {command!r} would act on "
+            "the device with no confirmation. Nothing was sent.")
+
+
 def _run_for_target_sync(
     t: Target,
     transport: str,
@@ -317,6 +343,7 @@ def _run_for_target_sync(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
+    seq: int = 0,
 ) -> RunResult:
     """
     Execute task on a single target device (internal sync implementation).
@@ -355,16 +382,15 @@ def _run_for_target_sync(
             # A show that is not a read (`request system reboot`, `clear bgp
             # neighbor`) is sent once: a timeout after it must not mean two
             # more reboots. --format turns the text into an RPC and sends it
-            # with no gate at all, so there it is refused outright.
-            read = b.dialect.is_read(show_cmd)
+            # with no gate at all, so there it is refused outright, in a dry
+            # run too (it says what the run would do).
+            read = is_read(b.dialect, show_cmd)
             attempts = max_attempts if read else 1
+            if fmt != "text" and not read:
+                raise ValueError(reads_only(fmt, show_cmd))
             if dry_run:
                 result = f"DRY-RUN show: {show_cmd}"
             elif fmt != "text":
-                if not read:
-                    raise ValueError(
-                        f"--format {fmt} runs reads only (show …, get-*); {show_cmd!r} would act on "
-                        "the device with no confirmation. Nothing was sent.")
                 # The router's own JSON or XML for the command, through its
                 # RPC translation. Only the NETCONF driver can do that; a
                 # transport that cannot refuses here, before any device I/O.
@@ -467,10 +493,16 @@ def _run_for_target_sync(
             output.append(typed.rstrip())
 
         elif mode == "show-batch":
-            if batch_cmds and not all(b.dialect.is_read(c) for c in batch_cmds):
-                max_attempts = 1
             if not batch_cmds:
                 raise ValueError("No batch commands provided.")
+            # The show rule, for the list: one line that acts on the device
+            # makes the whole batch a single attempt, and under --format it
+            # is refused outright, before any I/O, in a dry run too.
+            acting = [c for c in batch_cmds if not is_read(b.dialect, c)]
+            if acting:
+                max_attempts = 1
+                if fmt != "text":
+                    raise ValueError(reads_only(fmt, acting[0]))
             if dry_run:
                 cmd_results = [{"command": c, "ok": True, "output": f"DRY-RUN show: {c}"} for c in batch_cmds]
             elif fmt != "text":
@@ -485,7 +517,7 @@ def _run_for_target_sync(
             result_json = json.dumps(batch.to_list())
             duration_ms = int((time.time() - start_time) * 1000)
             if save_dir:
-                secure_write(str(path_inside(save_dir, f"{name}.json")), result_json)
+                secure_write(str(path_inside(save_dir, save_name(name, seq, "json"))), result_json)
             if safety_gate is not None:
                 safety_gate.release_device(host)
             return RunResult(name, batch.ok, result_json, duration_ms, result=batch, error=batch.first_error)
@@ -497,7 +529,7 @@ def _run_for_target_sync(
         duration_ms = int((time.time() - start_time) * 1000)
 
         if save_dir:
-            secure_write(str(path_inside(save_dir, f"{name}.output")), final_out)
+            secure_write(str(path_inside(save_dir, save_name(name, seq))), final_out)
 
         if safety_gate is not None:
             safety_gate.release_device(host)
@@ -516,7 +548,7 @@ def _run_for_target_sync(
         final_out = "\n".join(output).strip() + "\n"
         duration_ms = int((time.time() - start_time) * 1000)
         if save_dir:
-            secure_write(str(path_inside(save_dir, f"{name}.output")), final_out)
+            secure_write(str(path_inside(save_dir, save_name(name, seq))), final_out)
         return RunResult(name, False, final_out, duration_ms, error=error_line(final_out))
 
 
@@ -546,11 +578,15 @@ def run_for_target(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
+    seq: int = 0,
 ) -> RunResult:
     """
     Synchronous public API for library users. `expected_diff` is the diff a
     dry run showed; an edit or rollback is then committed only if the device
-    produces it again.
+    produces it again. `seq` is a job entry's place among the entries for the
+    same device (0 for the first): with `save_dir` the first is saved as
+    `<name>.output` and a later one as `<name>.<seq+1>.output`, `.json` for
+    a batch.
     Returns: (device_name, success, output_text, duration_ms)
     """
     return _run_for_target_sync(
@@ -569,6 +605,7 @@ def run_for_target(
         fmt=fmt,
         expected_diff=expected_diff,
         payload_text=payload_text,
+        seq=seq,
     )
 
 
@@ -598,6 +635,7 @@ async def run_for_target_async(
     fmt: str = "text",
     expected_diff: Optional[str] = None,
     payload_text: Optional[str] = None,
+    seq: int = 0,
 ) -> RunResult:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -620,6 +658,7 @@ async def run_for_target_async(
         fmt=fmt,
         expected_diff=expected_diff,
         payload_text=payload_text,
+        seq=seq,
     )
 
 

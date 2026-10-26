@@ -1,5 +1,6 @@
 """Default-mode output for edits, the commit-confirmed reminder, the
---show-diff flow, a job that names one device twice, and the --log file."""
+--show-diff flow, a job that names one device twice (and the file
+--save-output keeps of each entry), and the --log file."""
 import asyncio
 import builtins
 import json
@@ -42,15 +43,17 @@ def test_edit_result_without_a_diff_is_one_line():
 
 
 def run_cli(monkeypatch, capsys, tmp_path, argv, result=None, driver=None,
-            target="R1:10.0.0.1:junos", prog="./h-app/h-ssh.py"):
+            target="R1:10.0.0.1:junos", prog="./h-app/h-ssh.py", password="p"):
     """Run main() in-process against a fake junos driver; nothing is contacted.
     The fake answers every edit with `result`, or is `driver` when a test
-    needs to record calls. Returns (rc, stdout, stderr)."""
+    needs to record calls; `password` is HSSH_PASSWORD (None: not set).
+    Returns (rc, stdout, stderr)."""
     fake = driver or types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: result)
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
-    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    if password is not None:
+        monkeypatch.setenv("HSSH_PASSWORD", password)
     monkeypatch.setattr(sys, "argv", [
         prog, "--config", os.devnull, "--user", "u",
         *(["--target", target] if target else []), *argv])
@@ -151,13 +154,13 @@ class JobDriver:
         return head + "\n\n" + DIFF
 
 
-def run_job(monkeypatch, capsys, tmp_path, job, *extra, driver=None):
+def run_job(monkeypatch, capsys, tmp_path, job, *extra, driver=None, password="p"):
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     job_file = tmp_path / "job.json"
     job_file.write_text(json.dumps(job))
     driver = driver or JobDriver()
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--job", str(job_file), *extra],
-                           driver=driver, target=None)
+                           driver=driver, target=None, password=password)
     return rc, out, err, driver
 
 
@@ -213,6 +216,110 @@ def test_job_entries_for_one_host_take_turns_at_the_safety_gate(monkeypatch, cap
     assert all(e["ok"] for e in json.loads(out)) and '"skipped": 0' in err
 
 
+class EchoDriver(JobDriver):
+    """Answers a show with the command and the host, so a saved file says
+    which entry it holds; a command in `fail` is refused instead."""
+
+    def __init__(self, fail=()):
+        super().__init__()
+        self.fail = fail
+
+    def show(self, host, user, passwd, cmd, *a, **kw):
+        self.calls.append(("show", host, cmd))
+        if cmd in self.fail:
+            raise RuntimeError(f"syntax error: {cmd}")
+        return f"{cmd} on {host}\n"
+
+
+def test_save_output_keeps_a_file_for_every_job_entry(monkeypatch, capsys, tmp_path):
+    """Every result went to <name>.output, so a job that named R1 three times
+    kept only its last entry (#116). The first keeps R1.output, the later
+    ones are R1.2.output and R1.3.output, counted per device in file order;
+    a job that names each device once keeps the old names."""
+    save = tmp_path / "out"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show chassis alarms"},
+    ], "--json", "--save-output", str(save), driver=EchoDriver())
+    assert rc == 0, err
+    saved = {p.name: p.read_text() for p in save.iterdir()}
+    assert sorted(saved) == ["R1.2.output", "R1.3.output", "R1.output", "R2.output"]
+    assert saved["R1.output"].endswith("\n\nshow version on 10.0.0.1\n")
+    assert saved["R1.2.output"].endswith("\n\nshow interfaces terse on 10.0.0.1\n")
+    assert saved["R1.3.output"].endswith("\n\nshow chassis alarms on 10.0.0.1\n")
+    assert saved["R2.output"].endswith("\n\nshow version on 10.0.0.2\n")
+    once = tmp_path / "once"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R2:10.0.0.2:junos", "edit": "set system host-name R2-new"},
+    ], "--json", "-y", "--save-output", str(once), driver=EchoDriver())
+    assert rc == 0, err
+    assert sorted(p.name for p in once.iterdir()) == ["R1.output", "R2.output"]
+
+
+def test_a_failed_job_entry_saves_its_error_in_its_own_file(monkeypatch, capsys, tmp_path):
+    """The error goes to the entry's file as before, no longer over the file
+    of the device's entry before it."""
+    save = tmp_path / "out"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show bogus"},
+    ], "--json", "--save-output", str(save), driver=EchoDriver(fail={"show bogus"}))
+    assert rc == 1
+    assert (save / "R1.output").read_text().endswith("\n\nshow version on 10.0.0.1\n")
+    assert (save / "R1.2.output").read_text().endswith("\n\nERROR: syntax error: show bogus\n")
+
+
+def test_a_jobs_store_rows_and_saved_files_count_a_devices_entries_alike(monkeypatch, capsys, tmp_path):
+    """The store numbers a device's job entries (seq 0, 1, 2) and --save-output
+    names their files (R1.output, R1.2.output, R1.3.output). One count feeds
+    both, so the entry the store keeps at seq k is the one saved in the
+    device's (k+1)th file, a failed entry included."""
+    import sqlite3
+    db, save = tmp_path / "runs.db", tmp_path / "out"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show bogus"},
+    ], "--json", "--store", str(db), "--save-output", str(save), driver=EchoDriver(fail={"show bogus"}))
+    assert rc == 1
+    con = sqlite3.connect(str(db))
+    try:
+        rows = con.execute("SELECT device, seq, command FROM results ORDER BY device, seq").fetchall()
+    finally:
+        con.close()
+    assert rows == [("R1", 0, "show version"), ("R1", 1, "show interfaces terse"), ("R1", 2, "show bogus"),
+                    ("R2", 0, "show version")]
+    files = {"R1": ["R1.output", "R1.2.output", "R1.3.output"], "R2": ["R2.output"]}
+    for device, seq, command in rows:
+        assert command in (save / files[device][seq]).read_text()
+
+
+def test_a_job_entry_saved_over_another_devices_file_is_refused(monkeypatch, capsys, tmp_path):
+    """R1's second entry is saved as R1.2.output, which is also the file of a
+    device named R1.2: one result would replace the other. Refused with the
+    job file's other mistakes, before the password prompt, the store, the
+    directory and the banner; without --save-output the job runs."""
+    job = [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1.2:10.0.0.2:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
+    ]
+    save, db, asked = tmp_path / "out", tmp_path / "s.db", []
+    monkeypatch.setattr(cli, "_tty", lambda stream: True)
+    monkeypatch.setattr(cli, "_ask", lambda prompt, secret=False: asked.append(prompt) or "typed")
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--store", str(db), "--save-output", str(save),
+                                   driver=EchoDriver(), password=None)
+    assert rc == 2 and driver.calls == [] and asked == [] and out == ""
+    assert not save.exists() and not db.exists()
+    assert "R1.2 and R1's entry 2 would both be saved as R1.2.output" in err and "Nothing was sent" in err
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--json", driver=EchoDriver())
+    assert rc == 0 and len(driver.calls) == 3
+
+
 # --- --show-diff: what is committed is what was shown ----------------------------
 
 class PreviewDriver:
@@ -222,13 +329,15 @@ class PreviewDriver:
     (`commit_diff`, or the payload's diff again when None)."""
     AVAILABLE = True
 
-    def __init__(self, commit_diff=None):
+    def __init__(self, commit_diff=None, paint=""):
         self.commit_diff = commit_diff
+        # What the device puts in its diff ahead of the line (an escape
+        # sequence): an -eC payload may not carry one (#110), a reply may.
+        self.paint = paint
         self.calls = []
 
-    @staticmethod
-    def diff_of(payload):
-        return "[edit system]\n+   " + payload.strip() + ";"
+    def diff_of(self, payload):
+        return "[edit system]\n+   " + self.paint + payload.strip() + ";"
 
     def edit(self, host, user, passwd, payload, *a, dry_run=False, expected_diff=None, **kw):
         self.calls.append({"payload": payload, "dry_run": dry_run, "expected_diff": expected_diff})
@@ -279,6 +388,33 @@ def test_show_diff_refuses_a_diff_that_changed_after_the_preview(monkeypatch, ca
     assert "ERROR: diff changed since preview; nothing committed" in out
     assert "Done. Failures: 1" in out
     assert [c["dry_run"] for c in driver.calls] == [True, False]
+
+
+def test_show_diff_commits_and_audits_alike_whether_stdout_is_a_terminal_or_a_pipe(monkeypatch, capsys, tmp_path):
+    """On a terminal the diff the commit had to find again was the sanitised
+    one, which a device that put an escape sequence in its diff never gives
+    again: 'diff changed since preview; nothing committed'. The preview's
+    audit entry was the sanitised text too. Both are the reply as it came
+    (#111); only the preview as printed is sanitised, for the stream it is
+    printed on: with --json, stderr."""
+    payload = "set interfaces ge-0/0/0 description red"
+    for tty in (False, True):
+        answer(monkeypatch, "y")
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+        audit = tmp_path / f"audit-{tty}.jsonl"
+        driver = PreviewDriver(paint="\x1b[31m")
+        rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", payload, "--show-diff", "--audit-log", str(audit)],
+                               driver=driver)
+        assert rc == 0 and "COMMIT OK" in out, (tty, out)
+        assert driver.calls[1]["expected_diff"] == driver.diff_of(payload)
+        preview = json.loads(audit.read_text().splitlines()[0])
+        assert preview["dry_run"] is True and driver.diff_of(payload) in preview["diff"], tty
+        assert ("\x1b" in out) is not tty
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)          # --json | jq, the previews on a terminal
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", payload, "--show-diff", "-y", "--json"],
+                           driver=PreviewDriver(paint="\x1b[31m"))
+    assert rc == 0 and "description red" in err and "\x1b" not in err
 
 
 def test_a_config_file_edited_after_the_preview_changes_nothing(monkeypatch, capsys, tmp_path):
@@ -526,3 +662,102 @@ def test_output_shown_on_a_terminal_has_its_escape_sequences_removed(monkeypatch
     driver = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "Hostname: R1\x1b[2J\x1b]0;owned\x07\nModel: vmx\n")
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-sC", "show version", "--raw"], driver=driver)
     assert rc == 0 and "\x1b" not in out and "Hostname: R1" in out and "Model: vmx" in out
+
+
+def test_a_diff_on_a_terminal_keeps_each_diff_line_on_a_line_of_its_own(monkeypatch, capsys, tmp_path):
+    """--diff is made from the replies as they came (#111), where VT, FF and
+    NEL end a line. The whole diff was then sanitised for a terminal: the
+    line end went with the rest, and a removed line ran into the context
+    line before it (' vt-ff', unchanged to the eye). Each diff line is
+    sanitised on its own, so a terminal is shown the lines a pipe gets."""
+    replies = {"10.0.0.1": "line1\nvt\x0bff\nnel\x85old\nend\n", "10.0.0.2": "line1\nvt\x0bgg\nnel\x85new\nend\n"}
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show x\n")
+    driver = types.SimpleNamespace(
+        AVAILABLE=True, show=lambda host, *a, **kw: replies[host],
+        show_batch=lambda host, user, passwd, cmds, *a, **kw: [{"command": c, "ok": True, "output": replies[host]}
+                                                             for c in cmds])
+    for argv in (["-sC", "show x"], ["--batch", str(batch)]):
+        block = {}
+        for tty in (False, True):
+            monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+            rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--target", "R2:10.0.0.2:junos", "--workers", "1",
+                                                                   *argv, "--diff"], driver=driver)
+            assert rc == 0, err
+            block[tty] = out[out.index("--- Diff"):out.index("--- End diff")]
+        assert block[True] == block[False], argv
+        assert {"vt", "-ff", "+gg", "nel", "-old", "+new"} <= {ln.strip() for ln in block[True].splitlines()}, argv
+
+
+EVIL = "\x1b]0;owned\x07desc \x1b[2J\x1b[31mred\x1b[0m\x07 \x9b2Jgone"
+
+
+class EvilDriver:
+    """A junos fake whose every reply carries an OSC retitle, a clear-screen,
+    colour, BEL and an 8-bit CSI; a show's first line changes call by call.
+    With `fail`, a batch is refused whole, in the same words."""
+    AVAILABLE = True
+
+    def __init__(self, fail=False):
+        self.calls, self.fail = 0, fail
+
+    def show(self, host, *a, **kw):
+        self.calls += 1
+        return f"uptime {self.calls} on {host}\n{EVIL}\n"
+
+    def show_batch(self, host, user, passwd, cmds, *a, **kw):
+        if self.fail:
+            raise RuntimeError(f"refused by the device: {EVIL}")
+        return [{"command": c, "ok": True, "output": f"{c} on {host}\n{EVIL}"} for c in cmds]
+
+    def edit(self, *a, **kw):
+        return f"COMMIT OK\n\nDIFF:\n[edit system]\n+   host-name {EVIL};"
+
+
+R2 = ["--target", "R2:10.0.0.2:junos", "--workers", "1"]
+SCREENS = {
+    "show -v": ["-sC", "show version", "-v"],
+    "show --raw": ["-sC", "show version", "--raw"],
+    "batch --raw": ["--batch", "BATCH", "--raw"],
+    "batch -v": ["--batch", "BATCH", "-v"],
+    "failed batch -v": ["--batch", "BATCH", "-v", "--retries", "0"],
+    "edit verdict": ["-y", "-eC", "set system host-name x"],
+    "--diff": [*R2, "-sC", "show version", "--diff"],
+    "--batch --diff": [*R2, "--batch", "BATCH", "--diff"],
+    "--every tick": ["--every", "5", "--times", "2", "-sC", "show version"],
+    "--show-diff preview": ["-eC", "set system host-name x", "--show-diff"],
+}
+
+
+@pytest.mark.parametrize("shape", SCREENS)
+def test_a_reply_reaches_a_terminal_without_what_it_would_act_on_and_a_pipe_as_it_came(shape, monkeypatch,
+                                                                                        capsys, tmp_path):
+    """Every place h-ssh prints a reply (#47): stdout a terminal gets no ESC,
+    BEL or 8-bit CSI, stdout a pipe gets the reply byte for byte. The record
+    is the reply as it came (#111) and each print sanitises for itself, so a
+    print that forgets puts the device's escape sequences on the screen."""
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\nshow route\n")
+    monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull, "--user", "u",
+                                      "--target", "R1:10.0.0.1:junos",
+                                      *[str(batch) if a == "BATCH" else a for a in SCREENS[shape]]])
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(cli, "_watch_sleep", lambda seconds: None)
+    for tty in (True, False):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+        if shape == "--show-diff preview":
+            answer(monkeypatch, "n")                          # the preview alone, nothing committed
+        monkeypatch.setattr(cli, "check_reachability", _reachable)
+        driver = PreviewDriver(paint=EVIL) if shape == "--show-diff preview" else EvilDriver(fail=shape == "failed batch -v")
+        monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
+        with pytest.raises(SystemExit) as e:
+            cli.main_sync()
+        out, err = capsys.readouterr()
+        assert e.value.code == (1 if shape == "failed batch -v" else 0), err
+        assert "desc" in out and "gone" in out, (shape, tty)
+        if tty:
+            assert not any(c in out for c in "\x1b\x07\x9b"), shape
+        else:
+            assert EVIL in out, shape

@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .core import check_port
+from .core import check_port, control_character
 
 try:  # PyYAML comes along with junos-eznc; a JSON run file needs nothing
     import yaml
@@ -191,6 +191,18 @@ def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, 
             if not value or not all(isinstance(c, str) and c.strip() for c in value):
                 raise ValueError(f"run file '{path}': 'commands' must be a non-empty list of command strings")
             value = [c.strip() for c in value]
+        if key in ("show", "edit"):
+            # -sC's and -eC's rules, said as the file's: a show is one line
+            # of text (stripped like `commands`, so the line break a YAML
+            # block ends with is not part of it), an edit plain text.
+            if key == "show":
+                value = value.strip()
+            if not value.strip():
+                raise ValueError(f"run file '{path}': '{key}' is empty")
+            what = control_character(value, line_breaks=key == "edit")
+            if what:
+                raise ValueError(f"run file '{path}': '{key}' has {what} ({value!r}); "
+                                 f"{'a command is one line of text' if key == 'show' else 'a payload is plain text'}")
         if key == "jobs":
             if not value or not all(isinstance(j, dict) for j in value):
                 raise ValueError(f"run file '{path}': 'jobs' must be a non-empty list of job entries")

@@ -13,14 +13,20 @@ the exec channel for `<cmd> | json`.
 Host keys follow the same HSSH_HOST_KEY_POLICY as the openssh transport. The
 default, accept-new, trusts a host on first contact and pins its key in
 ~/.h-ssh/known_hosts; from then on a different key is refused before any
-credential is sent. ~/.ssh/known_hosts is read as well, never written: paramiko
-saves by rewriting the whole file, which would flatten the comments, markers
-and hashed entries OpenSSH keeps there.
+credential is sent. A pin is written to a new file that is renamed over the
+old one, so a reader never sees a part of it. ~/.ssh/known_hosts is read as
+well, never written: it is OpenSSH's. Its @revoked keys are refused, and its
+@cert-authority lines are passed over: paramiko cannot check a host
+certificate.
 """
 
+import base64
 import fcntl
+import functools
 import json
 import socket
+import stat
+import tempfile
 import time
 import os
 import threading
@@ -31,6 +37,7 @@ from .. import drivers
 from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
+from ..errors import LocalError
 from .cli import Cli, edit_policy, refuse_commit_lines
 
 try:
@@ -69,24 +76,39 @@ def _known_hosts() -> str:
 class _PinPolicy:
     """accept-new: an unknown host is trusted once and its key pinned."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, timeout: float = 30.0):
         self.path = path
+        self.timeout = timeout      # how long another run may hold the lock with nothing pinned
 
     def missing_host_key(self, client, hostname, key):
         # The thread lock serialises this process's workers; the file lock
         # serialises processes, so two h-ssh runs pinning at once cannot
-        # rewrite the file over each other's pins.
+        # rewrite the file over each other's pins. The host is looked up
+        # again in the file as it is now: a pin another run wrote since this
+        # connection read the file is checked, never pinned over.
         with _PIN_LOCK:
-            fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+            fd = _locked(self.path, fcntl.LOCK_EX, self.timeout)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                keys = client.get_host_keys()
-                keys.load(self.path)  # merge what other processes pinned meanwhile
-                keys.add(hostname, key.get_name(), key)
-                keys.save(self.path)
-                # `keys` is the process's shared copy of the file (see
-                # _parsed); it now matches what was just written.
-                _PINS[self.path] = (_signature(self.path), keys)
+                old = os.fstat(fd)
+                signature, text = _read(fd)
+                cached = _PINS.get(self.path)
+                if cached is not None and cached[0] == signature:
+                    # The file as this process parsed it last; a copy, as
+                    # connections are reading the shared one.
+                    keys = paramiko.HostKeys()
+                    keys._entries = list(cached[1]._entries)
+                else:
+                    keys, _ = _parse(text, self.path, system=False)
+                pinned = keys.lookup(hostname)
+                if pinned is None:
+                    if text and not text.endswith("\n"):
+                        text += "\n"
+                    signature = _save(self.path, f"{text}{hostname} {key.get_name()} {key.get_base64()}\n", old)
+                    keys.add(hostname, key.get_name(), key)
+                elif pinned.get(key.get_name()) != key:
+                    raise paramiko.BadHostKeyException(hostname, key, list(pinned.values())[0])
+                # The process's shared copy of the file (see _parsed), as it now is.
+                _PINS[self.path] = (signature, keys, frozenset())
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
@@ -105,54 +127,237 @@ class _RejectPolicy:
 # connection until the file changes. Parsing is ~50 µs a line; done again for
 # every connection, under the lock, a 250-device fleet spent 250 × 13 ms in
 # a row on its own pin file, and the cost grew with the square of the fleet.
-_PINS: dict = {}            # path -> (signature, HostKeys)
+_PINS: dict = {}            # path -> (signature, HostKeys, revoked key blobs)
+
+
+def _stamp(st):
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
 def _signature(path: str):
     try:
-        st = os.stat(path)
+        return _stamp(os.stat(path))
     except OSError:
         return None
-    return (st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def _parsed(path: str) -> "paramiko.HostKeys":
-    """The file's keys, parsed once and shared until the file changes; a
-    missing file is no keys. Caller holds _PIN_LOCK."""
+# The pin file as it was when a wait for its lock last gave up, by path. A
+# wait that finds the lock still held on that same file gives up at once: the
+# workers queued behind the one that waited do not each wait a session
+# timeout in turn for a run that has not moved since.
+_GAVE_UP: dict = {}         # path -> signature
+
+
+def _locked(path: str, op: int, timeout: float) -> int:
+    """An fd on our pin file, flock()ed with `op`: LOCK_SH to read it,
+    LOCK_EX to pin. Caller holds _PIN_LOCK, and the wait starts there: the
+    time queued behind this run's own pins is no other run's doing. Another
+    run holds the lock as long as a pin takes, and every pin changes the
+    file, so the wait goes on while the file does. A lock held `timeout`
+    seconds with the file as it was (a run stopped with Ctrl-Z in the middle
+    of a pin) is an error that says so, not a wait with no end. A pin
+    replaces the file (see _save), so a lock won on the file it replaced is
+    let go and taken again on the new one."""
+    pause = 0.001
+    seen = _signature(path)
+    deadline = time.monotonic() + timeout
+    while True:
+        fd = os.open(path, (os.O_RDWR if op == fcntl.LOCK_EX else os.O_RDONLY) | os.O_CREAT, 0o600)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, op | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    current = _signature(path)
+                    if current != seen:             # the holder pinned: it is alive
+                        seen, deadline = current, time.monotonic() + timeout
+                    elif time.monotonic() >= deadline or (path in _GAVE_UP and _GAVE_UP[path] == current):
+                        _GAVE_UP[path] = current
+                        raise LocalError(f"{path} is locked by another h-ssh run (one stopped with Ctrl-Z "
+                                           "while it pinned?); resume or end it") from None
+                    time.sleep(pause)
+                    pause = min(pause * 2, 0.05)
+            held, now = os.fstat(fd), os.stat(path)
+            if (held.st_dev, held.st_ino) == (now.st_dev, now.st_ino):
+                _GAVE_UP.pop(path, None)
+                return fd
+        except FileNotFoundError:
+            pass                # removed under us: open it again
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+
+
+def _read(fd: int):
+    """(signature, text) of the file open on fd. A byte that is not UTF-8
+    is kept as it is (surrogateescape), so _save writes it back unchanged.
+    The signature is the file's before the read: stamped after it, a line
+    OpenSSH appended to ~/.ssh/known_hosts in between was cached as read,
+    for good. A file that changed during the read gets a signature equal to
+    nothing, so what was read is matched with no file and no parse."""
+    before = _stamp(os.fstat(fd))
+    with open(fd, "rb", closefd=False) as f:
+        data = f.read()
+    signature = before if _stamp(os.fstat(fd)) == before else object()
+    return signature, data.decode("utf-8", "surrogateescape")
+
+
+def _save(path: str, text: str, old: os.stat_result):
+    """Write the pin file anew and rename it over the old one: a reader has
+    the old file or the new one, never a part. (paramiko's save truncated
+    the file and wrote it again; a run reading in between saw no pins.)
+    The new file keeps the old one's (`old`) mode, and its owner and group
+    as far as this user may set them. Returns the new file's signature."""
+    target = os.path.realpath(path)         # a pin file that is a symlink stays one
+    fd, tmp = tempfile.mkstemp(prefix=".known_hosts.", dir=os.path.dirname(target))
+    try:
+        with open(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+            for uid in (old.st_uid, -1):
+                try:
+                    os.fchown(fd, uid, old.st_gid)
+                    break
+                except OSError:
+                    pass
+            try:
+                os.fchmod(fd, stat.S_IMODE(old.st_mode))
+            except OSError:
+                pass            # a file system without modes: mkstemp's 0600 stays
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+            signature = _stamp(os.fstat(f.fileno()))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return signature
+
+
+class _UnknownKeyType(ValueError):
+    pass
+
+
+def _hashed(name: str) -> bool:
+    """A hashed host name as paramiko reads one: |1|salt|hash, each 20 bytes."""
+    parts = name.split("|")
+    try:
+        return len(parts) == 4 and all(len(base64.b64decode(p, validate=True)) == 20 for p in parts[2:])
+    except ValueError:
+        return False
+
+
+def _entry(line: str):
+    """The pin on a known_hosts line (its marker taken off) as paramiko's
+    HostKeyEntry; ValueError saying why for a line that holds none."""
+    fields = line.split()
+    if len(fields) < 3:
+        raise ValueError("expected host, key type and key")
+    names, kind, blob = fields[:3]
+    if any(n.startswith("|1|") and not _hashed(n) for n in names.split(",")):
+        raise ValueError("a hashed host name that is not |1|salt|hash")
+    try:
+        base64.b64decode(blob, validate=True)
+    except ValueError:
+        raise ValueError("the key is not base64") from None
+    try:
+        entry = paramiko.hostkeys.HostKeyEntry.from_line(f"{names} {kind} {blob}")
+    except Exception:
+        raise ValueError(f"the key does not decode as {kind}") from None
+    if entry is None:
+        raise _UnknownKeyType(f"unknown key type {kind}")
+    return entry
+
+
+def _parse(text: str, path: str, system: bool):
+    """(HostKeys, revoked key blobs) of a known_hosts file's text.
+
+    paramiko's own load() drops a line it cannot use without a word: the host
+    it pinned counts as unknown, is pinned again on trust, and the line goes
+    at the next save; a hashed name with a bad salt fails every lookup with
+    an empty AssertionError. Here such a line is a refusal that names it.
+    ~/.ssh/known_hosts (system) is OpenSSH's and read as OpenSSH reads it:
+    a line that holds no key OpenSSH or paramiko can use is passed over, and
+    so are @cert-authority lines (paramiko cannot check a host certificate)
+    and lines with a marker OpenSSH does not have. Its @revoked keys are
+    returned, to be refused whenever a server presents one; an @revoked line
+    that cannot be read is still a refusal: a revocation is never dropped.
+    A line ends at a newline only, as OpenSSH reads it (splitlines() ended
+    one at a form feed too)."""
+    keys = paramiko.HostKeys()
+    revoked = set()
+    for n, raw in enumerate(text.split("\n"), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        marker = line.split(None, 1)[0] if line.startswith("@") else ""
+        if system and marker not in ("", "@revoked"):
+            continue        # @cert-authority, or a marker OpenSSH does not have and passes over
+        try:
+            if marker and not system:
+                raise ValueError("markers are read from ~/.ssh/known_hosts only")
+            entry = _entry(line[len(marker):])
+        except ValueError as e:
+            # OpenSSH passes such a line over; a revoked key of a type
+            # paramiko does not know is not one paramiko can be shown.
+            if system and (not marker or isinstance(e, _UnknownKeyType)):
+                continue
+            raise ValueError(f"{path}: malformed known_hosts line {n}: {line!r} ({e}); "
+                             "fix or remove it") from None
+        if marker:
+            revoked.add(entry.key.asbytes())
+        else:
+            keys._entries.append(entry)     # as load() does, less its O(n²) de-duplication
+    return keys, frozenset(revoked)
+
+
+def _parsed(path: str, system: bool, timeout: float):
+    """(HostKeys, revoked) of a known_hosts file, parsed once and shared
+    until the file changes; a missing file is none. Our own pin file is read
+    under a shared file lock: a save in progress is waited for (see _locked,
+    `timeout` the session timeout), not read half done. Caller holds
+    _PIN_LOCK."""
     signature = _signature(path)
     cached = _PINS.get(path)
     if cached is not None and cached[0] == signature:
-        return cached[1]
-    keys = paramiko.HostKeys()
-    if signature is not None:
-        keys.load(path)
-    _PINS[path] = (signature, keys)
-    return keys
-
-
-def _load_pins(client, known_hosts: str) -> None:
-    """~/.ssh/known_hosts (read only) and h-ssh's own pin file. A line that
-    cannot be parsed is a refusal, not a skip: the pin it was meant to hold
-    is unknown, and retrying the file cannot change it."""
-    system = str(Path.home() / ".ssh" / "known_hosts")
-    for path in (system, known_hosts):
+        return cached[1], cached[2]
+    if signature is None:
+        keys, revoked = paramiko.HostKeys(), frozenset()
+    else:
+        fd = os.open(path, os.O_RDONLY) if system else _locked(path, fcntl.LOCK_SH, timeout)
         try:
-            with _PIN_LOCK:
-                keys = _parsed(path)
-        except (paramiko.hostkeys.InvalidHostKey, paramiko.SSHException, ValueError) as exc:
-            line = getattr(exc, "line", None)
-            shown = f": {line.strip()!r}" if isinstance(line, str) and line.strip() else ""
-            raise ValueError(f"{path}: malformed known_hosts line{shown}; fix or remove it") from exc
-        # What load_system_host_keys()/load_host_keys() would have filled,
-        # without parsing the file for this client alone.
-        if path == known_hosts:
-            client._host_keys = keys
-            client._host_keys_filename = known_hosts
-        else:
-            client._system_host_keys = keys
+            signature, text = _read(fd)
+        finally:
+            os.close(fd)        # and with it the lock
+        keys, revoked = _parse(text, path, system)
+    _PINS[path] = (signature, keys, revoked)
+    return keys, revoked
 
 
-def _host_key_policy(known_hosts: str):
+def _load_pins(client, known_hosts: str, timeout: float = 30.0) -> frozenset:
+    """~/.ssh/known_hosts (read only) and h-ssh's own pin file; returns the
+    keys ~/.ssh/known_hosts marks @revoked. A pin file line that cannot be
+    parsed is a refusal, not a skip: the pin it was meant to hold is
+    unknown, and retrying the file cannot change it. Another run's lock on
+    the pin file is waited for as _locked says, `timeout` being the session
+    timeout."""
+    system = str(Path.home() / ".ssh" / "known_hosts")
+    with _PIN_LOCK:
+        system_keys, revoked = _parsed(system, system=True, timeout=timeout)
+        keys, _ = _parsed(known_hosts, system=False, timeout=timeout)
+    # What load_system_host_keys()/load_host_keys() would have filled,
+    # without parsing the file for this client alone.
+    client._system_host_keys = system_keys
+    client._host_keys = keys
+    client._host_keys_filename = known_hosts
+    return revoked
+
+
+def _host_key_policy(known_hosts: str, timeout: float = 30.0):
     """The missing-host-key policy HSSH_HOST_KEY_POLICY asks for.
 
     Only an unknown host is a policy matter. A pinned host that presents a
@@ -160,7 +365,7 @@ def _host_key_policy(known_hosts: str):
     """
     policy = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
     if policy == "accept-new":
-        return _PinPolicy(known_hosts)
+        return _PinPolicy(known_hosts, timeout)
     if policy == "yes":
         return _RejectPolicy()
     if policy == "no":
@@ -169,18 +374,56 @@ def _host_key_policy(known_hosts: str):
                        % policy)
 
 
+class _RevokedKey(Exception):
+    """The server presented a key ~/.ssh/known_hosts marks @revoked."""
+
+
+if AVAILABLE:
+    class _Transport(paramiko.Transport):
+        """paramiko's Transport with what SSHClient.connect() cannot be
+        told: the key exchange gets the session timeout, not a fixed 15 s
+        after the banner, and a key ~/.ssh/known_hosts marks @revoked is
+        refused the moment it arrives, before any pin is looked at or any
+        credential sent, whatever the policy."""
+
+        def __init__(self, sock, handshake_timeout=15.0, revoked=frozenset(), **kw):
+            super().__init__(sock, **kw)
+            self.handshake_timeout = handshake_timeout
+            self._hssh_revoked = revoked
+
+        def get_remote_server_key(self):
+            key = super().get_remote_server_key()
+            if key.asbytes() in self._hssh_revoked:
+                raise _RevokedKey()
+            return key
+
+
+# What a connect that stopped between the server's banner and the end of the
+# key exchange says. paramiko says EOFError('') (its handshake timer, or the
+# server closing) or 'No existing session' (start_client() ran out of time and
+# connect() asked for the server's key anyway), and the FAIL line was empty.
+_KEX_UNFINISHED = "the banner came, but key exchange did not finish"
+
+
+def _kex_unfinished(t, exc) -> bool:
+    """True when connect() stopped in the key exchange with nothing to say
+    for itself."""
+    if t is None or not t.remote_version or t.initial_kex_done:
+        return False
+    return isinstance(exc, EOFError) or str(exc) == "No existing session"
+
+
 def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
              port: Optional[int]):
     """A connected SSHClient, host key checked, ready for exec_command."""
     if not AVAILABLE:
         raise RuntimeError("paramiko not available in this environment.")
 
+    session_timeout_float = float(session_timeout)
     known_hosts = _known_hosts()
     client = paramiko.SSHClient()
-    _load_pins(client, known_hosts)
-    client.set_missing_host_key_policy(_host_key_policy(known_hosts))
-
-    session_timeout_float = float(session_timeout)
+    revoked = _load_pins(client, known_hosts, session_timeout_float)
+    client.set_missing_host_key_policy(_host_key_policy(known_hosts, session_timeout_float))
 
     conn_params = {
         "hostname": host,
@@ -193,6 +436,10 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
         # paramiko would wait an hour for a device that authenticates and
         # then says nothing. (A show's exec channel has the command timeout.)
         "channel_timeout": session_timeout_float,
+        # connect() takes no handshake_timeout: the key exchange had a fixed
+        # 15 s after the banner, whatever --session-timeout said.
+        "transport_factory": functools.partial(_Transport, handshake_timeout=session_timeout_float,
+                                               revoked=revoked),
     }
 
     if passwd is not None:
@@ -203,21 +450,33 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
         conn_params["look_for_keys"] = True
         conn_params["allow_agent"] = True
 
+    started = time.monotonic()
     try:
         client.connect(**conn_params)
+    except _RevokedKey:
+        client.close()
+        raise RuntimeError("Host key verification failed for %s: its key is marked @revoked "
+                           "in ~/.ssh/known_hosts." % host) from None
     except paramiko.BadHostKeyException as exc:
         client.close()
         raise RuntimeError(
             "Host key verification failed for %s: the key is not the one pinned. "
             "If the device was re-keyed, remove its line from %s (or ~/.ssh/known_hosts)."
             % (host, known_hosts)) from exc
-    except paramiko.SSHException as exc:
+    except (paramiko.SSHException, EOFError) as exc:
+        kex = _kex_unfinished(client.get_transport(), exc)
         client.close()
         if "no authentication methods available" in str(exc).lower():
             # paramiko found nothing to offer: no password, no ~/.ssh/id_*, no agent key.
             raise RuntimeError(
                 "No authentication methods available for %s@%s: no password was given and "
                 "no key was found in ~/.ssh or from an agent." % (user, host)) from exc
+        if kex:
+            elapsed = time.monotonic() - started
+            if elapsed < session_timeout_float / 2:
+                raise RuntimeError(f"{host} dropped the session before login after {elapsed:.1f}s "
+                                   f"({_KEX_UNFINISHED})") from exc
+            raise RuntimeError(f"no SSH session to {host} within {session_timeout}s: {_KEX_UNFINISHED}") from exc
         raise
     except BaseException:
         # A refused login or a dropped handshake leaves a Transport thread

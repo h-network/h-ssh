@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -219,6 +220,105 @@ def test_cli_diff_compares_the_pretty_printed_json(monkeypatch, capsys):
     assert '-  "host": "10.0.0.' in other["diff"] and '+  "host": "10.0.0.' in other["diff"]
 
 
+class TwoRouters(FakeVendor):
+    """R1 and R2, each with its own reply to every show, ended with a newline
+    as a router ends it; the CLI trims a reply, so its last line has none."""
+
+    def __init__(self, r1, r2):
+        super().__init__()
+        self.by_host = {"10.0.0.1": r1, "10.0.0.2": r2}
+
+    def show(self, host, user, passwd, cmd, st, ct, port=None, vendor_hint=None):
+        return self.by_host[host]
+
+    def show_batch(self, host, user, passwd, cmds, st, ct, port=None, vendor_hint=None):
+        return [{"command": c, "ok": True, "output": self.by_host[host]} for c in cmds]
+
+
+VMX = "Model: vmx\nJunos: 24.2R1-S2.5\n"
+
+# R1's reply, R2's, and the hunk of R2 against R1: the last line changed (a
+# new release), a line added after it (one more peer), or the line after it
+# taken away (one peer fewer).
+LAST_LINE = {
+    "changed": (VMX, "Model: vmx\nJunos: 23.4R2.13\n",
+                "@@ -1,2 +1,2 @@\n Model: vmx\n-Junos: 24.2R1-S2.5\n+Junos: 23.4R2.13"),
+    "added": (VMX, VMX + "Peer: 10.9.9.8\n",
+              "@@ -1,2 +1,3 @@\n Model: vmx\n Junos: 24.2R1-S2.5\n+Peer: 10.9.9.8"),
+    "removed": (VMX + "Peer: 10.9.9.8\n", VMX,
+                "@@ -1,3 +1,2 @@\n Model: vmx\n Junos: 24.2R1-S2.5\n-Peer: 10.9.9.8"),
+}
+
+TWO = [*R1, "--target", "R2:10.0.0.2:junos"]
+
+
+def answers_last(monkeypatch, last):
+    """The runner as it is, except that device `last` answers only once the
+    other one has, and some turns of the event loop later, so the other's
+    answer is taken in first: a slower router, made certain."""
+    other_in = asyncio.Event()
+
+    async def run(**kw):
+        result = await runner.run_for_target_async(**kw)
+        if kw["t"].name != last:
+            other_in.set()
+            return result
+        await other_in.wait()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        return result
+
+    monkeypatch.setattr(cli, "run_for_target_async", run)
+
+
+def show_or_batch(tmp_path, batch):
+    if not batch:
+        return ["-sC", "show version"]
+    cmds = tmp_path / "cmds.txt"
+    cmds.write_text("show version\n")
+    return ["--batch", str(cmds)]
+
+
+@pytest.mark.parametrize("batch", [False, True], ids=["show", "batch"])
+def test_cli_diff_baseline_is_the_first_device_given_whoever_answers_first(monkeypatch, capsys, tmp_path, batch):
+    """R1 is given first and is the baseline whether it answers first or last,
+    and --json lists it first: one command line diffs the same way every run,
+    in --json and on screen."""
+    what = show_or_batch(tmp_path, batch)
+    r1, r2, _ = LAST_LINE["changed"]
+    diffs = []
+    for last in ("R1", "R2"):
+        answers_last(monkeypatch, last)
+        rc, out, _ = run_cli(monkeypatch, capsys, TwoRouters(r1, r2), *what, "--diff", "--json", *TWO)
+        results = json.loads(out)
+        assert rc == 0 and [e["device"] for e in results] == ["R1", "R2"] and results[0]["diff"] == "(baseline)"
+        diffs.append(results[1]["diff"])
+        answers_last(monkeypatch, last)
+        rc, out, _ = run_cli(monkeypatch, capsys, TwoRouters(r1, r2), *what, "--diff", *TWO)
+        assert rc == 0 and "--- Diff (baseline: R1) ---" in out and "  R1 vs R2:" in out
+    assert diffs[0] == diffs[1]
+    diff = diffs[0][0]["diff"] if batch else diffs[0]
+    assert "-Junos: 24.2R1-S2.5" in diff and "+Junos: 23.4R2.13" in diff      # R1's line is the one taken away
+
+
+@pytest.mark.parametrize("shape", LAST_LINE)
+@pytest.mark.parametrize("batch", [False, True], ids=["show", "batch"])
+def test_cli_diff_treats_the_trimmed_last_line_like_any_other(monkeypatch, capsys, tmp_path, batch, shape):
+    """A trimmed reply has no newline after its last line; the diff still
+    takes it as a line like any other, in the --json field and on screen.
+    Changed, it is a line taken away and a line put in, a line each; left as
+    it was, with a line added or taken away after it, it is no change."""
+    r1, r2, hunk = LAST_LINE[shape]
+    diff = "--- R1\n+++ R2\n" + hunk
+    what = show_or_batch(tmp_path, batch)
+    rc, out, _ = run_cli(monkeypatch, capsys, TwoRouters(r1, r2), *what, "--diff", "--json", *TWO)
+    got = {e["device"]: e for e in json.loads(out)}["R2"]["diff"]
+    assert rc == 0 and (got[0]["diff"] if batch else got) == diff
+    rc, out, _ = run_cli(monkeypatch, capsys, TwoRouters(r1, r2), *what, "--diff", *TWO)
+    indent = " " * (6 if batch else 4)
+    assert rc == 0 and "".join(f"{indent}{ln}\n" for ln in diff.split("\n")) in out
+
+
 def test_cli_job_show_entries_are_data_and_edit_entries_text(monkeypatch, capsys, tmp_path):
     job = tmp_path / "job.json"
     job.write_text(json.dumps([
@@ -250,6 +350,24 @@ def test_cli_format_is_refused_where_nothing_is_shown(monkeypatch, capsys, tmp_p
         v = FakeVendor()
         rc, _, err = run_cli(monkeypatch, capsys, v, "--format", "json", *argv)
         assert rc == 2 and "--format goes with a show" in err and v.calls == []
+
+
+def test_cli_a_batch_under_format_is_reads_only_before_any_device(monkeypatch, capsys, tmp_path):
+    """#110: -sC "request system reboot" was refused under --format; a --batch
+    line like it went to rpc_batch with the rest. Both are now a usage error
+    before anything is opened or sent; as text the line is sent, once."""
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\nrequest system reboot\n")
+    for argv in (["--batch", str(batch), "--format", "json"], ["--batch", str(batch), "--format", "xml"],
+                 ["-sC", "request system reboot", "--format", "json"]):
+        v = FakeVendor()
+        rc, _, err = run_cli(monkeypatch, capsys, v, *argv, *R1)
+        assert rc == 2 and v.calls == [], err
+        assert "runs reads only (show …, get-*); 'request system reboot' would act on the device" in err
+        assert not Path(os.environ["HSSH_STORE"]).exists()             # no run was kept: none began
+    v = FakeVendor()
+    rc, _, err = run_cli(monkeypatch, capsys, v, "--batch", str(batch), *R1)
+    assert rc == 0 and v.calls == [("show_batch", ["show version", "request system reboot"], None)], err
 
 
 def test_structured_and_format_is_a_usage_error():
