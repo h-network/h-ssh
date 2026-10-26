@@ -41,11 +41,14 @@ def test_todays_names_are_aliases_of_canonical_drivers():
     assert drivers.get("ssh").name == "none@ssh"
 
 
-def test_every_name_is_unique_and_listed():
+def test_every_name_is_unique_and_listed(installed):
     names = drivers.names()
-    assert len(names) == len(set(names)) == 24
+    assert len(names) == len(set(names))
     assert set(names) == set(drivers.ALIASES) | set(drivers.DRIVERS)
-    assert len(drivers.DRIVERS) == 16
+    # 16 built-in drivers, 24 names: a subset of the registry, not the total (#110)
+    builtin = [a for d in drivers.BUILTIN for a in d.aliases] + [d.name for d in drivers.BUILTIN]
+    assert len(drivers.BUILTIN) == 16 and len(builtin) == len(set(builtin)) == 24
+    assert set(builtin) | installed <= set(names)
     # every alias is some driver's, and a driver's aliases are all listed
     assert sorted(drivers.ALIASES) == sorted(a for d in drivers.DRIVERS.values() for a in d.aliases)
     for name in OWN_NAME_ONLY:
@@ -53,13 +56,16 @@ def test_every_name_is_unique_and_listed():
         assert name not in drivers.ALIASES
 
 
-def test_the_built_ins_are_the_registry_and_say_so():
-    assert list(drivers.DRIVERS.values()) == list(drivers.BUILTIN)
+def test_the_built_ins_lead_the_registry_and_say_so(installed):
+    # first and in order; a driver package installed next to h-ssh comes after them (#110)
+    assert list(drivers.DRIVERS.values())[:len(drivers.BUILTIN)] == list(drivers.BUILTIN)
     assert set(drivers.SOURCES) == set(drivers.DRIVERS)
     for driver in drivers.BUILTIN:
         assert drivers.DRIVERS[driver.name] is driver
         assert drivers.SOURCES[driver.name] == "built-in"
-    assert drivers.BROKEN == {}
+    assert installed <= set(drivers.DRIVERS)
+    assert all(drivers.SOURCES[n] != "built-in" for n in list(drivers.DRIVERS)[len(drivers.BUILTIN):])
+    assert "builtin" not in drivers.BROKEN          # h-ssh's own; another package may be broken (#110)
 
 
 def test_a_retired_name_gets_its_line_and_an_unknown_one_the_list():

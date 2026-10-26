@@ -120,19 +120,26 @@ class ConnectionPool:
         self._idle_timeout = value
 
     def enable(self, idle_timeout: Optional[float] = None) -> None:
-        """Start reusing sessions. Idempotent."""
+        """Start reusing sessions. Idempotent. A cleanup thread the system
+        refuses (ulimit -u, memory) is the caller's error and the pool
+        stays off: on without its reaper, no idle session would ever close."""
         with self._pool_lock:
             if idle_timeout is not None:
                 self._idle_timeout = idle_timeout
             if self._enabled:
                 return
-            self._enabled = True
             token = object()
-            self._cleanup_token = token
-            self._cleanup_thread = threading.Thread(
+            thread = threading.Thread(
                 target=self._cleanup_loop, args=(token,), daemon=True, name="hssh-pool-cleanup"
             )
-            self._cleanup_thread.start()
+            self._cleanup_token = token
+            try:
+                thread.start()
+            except BaseException:
+                self._cleanup_token = None
+                raise
+            self._cleanup_thread = thread
+            self._enabled = True
             log.info("Connection pool enabled (idle_timeout=%ds)", self._idle_timeout)
 
     def disable(self) -> None:

@@ -238,6 +238,25 @@ def test_batch_on_a_dead_reused_session_is_rerun_on_a_fresh_one(pooled):
     assert devices()[1].cli_calls == ["show a", "show b"]
 
 
+def test_a_command_that_is_not_a_read_is_not_sent_again_on_a_fresh_session(pooled):
+    """show() and show_batch() reopened a dead reused session and ran again
+    whatever the command, so a job's second entry or a Fleet's second run
+    could send `request system reboot` twice; rpc() never did. Only a read
+    runs once more, and a string with a line break is none (#110 review)."""
+    for cmd in ("request system reboot", "show version\nrequest system reboot"):
+        show()                                   # a session, reused below
+        FakeDevice.cli_outputs = {cmd: netconf.TransportError("closed")}
+        with pytest.raises(netconf.TransportError):
+            show(cmd=cmd)
+        assert devices()[-1].closed and devices()[-1].cli_calls == ["show version", cmd]
+    show()
+    FakeDevice.cli_outputs = {"request system reboot": netconf.TransportError("closed")}
+    with pytest.raises(netconf.TransportError):
+        netconf.show_batch("10.0.0.1", "u", None, ["show a", "request system reboot"], 5, 30)
+    assert devices()[-1].closed and devices()[-1].cli_calls == ["show version", "show a", "request system reboot"]
+    assert len(devices()) == 3 and pooled.live() == 0
+
+
 def test_batch_keeps_going_after_a_timeout_but_drops_the_session(pooled):
     FakeDevice.cli_outputs = {"show b": rpc_timeout("show b")}
     res = netconf.show_batch("10.0.0.1", "u", None, ["show a", "show b", "show c"], 5, 30)
