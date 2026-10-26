@@ -624,6 +624,24 @@ A run is named by its id or any unique prefix of it (`20261024-1730` when only o
 Anything else is a `sqlite3 runs.db` query away: the schema is two tables, documented at the top of
 `hssh/store.py`.
 
+The reader never writes the store, though where it may, SQLite leaves an empty `-wal` and a `-shm`
+beside it. A finished store in a directory the reader cannot write to (an archived job directory, a
+read-only mount, another user's directory) is read as it is, without SQLite's locks; one with WAL
+frames or a rollback journal still beside it is not, since the file alone is not the whole store (a
+run killed before it closed the store leaves rows in its `-wal`: the error says to copy the store with
+its `-wal` to a directory you can write). A run that writes such a store while it is read could make
+rows go missing or repeat, so the reader looks again when it is done and says so: `ERROR: PATH was
+written while it was read as it is; the output may miss or repeat rows, read it again`, exit 2.
+`grep`, `field` and `export` take the rows as they come, so a store of hundreds of megabytes costs no
+more memory than a small one. They read while they print, so one left open on a store a run is
+writing (`h-ssh-store grep ... | less` beside an `--every` watch) keeps SQLite from recycling the run's
+`-wal`: it grows by what the run writes meanwhile, and goes when a run closes the store after the
+reader has exited. A reader that stops early (`h-ssh-store ... | head`) is no traceback, as with
+`h-ssh`: exit 0, or the verdict the command had before it printed (`failed`, `diff`, `output` of a
+failed row). What the reader cannot do (no store at the path, a run that matches nothing or several,
+an `--out` file it cannot open or write, or one that is the store itself) is one `ERROR:` line on
+stderr and exit 2.
+
 ```console
 $ h-ssh --devices core.csv -sC "show bgp summary"
 $ h-ssh-store runs
@@ -836,7 +854,11 @@ The library reads no environment variable and no config file; that is the CLI's 
   the run on their first step. What the store could not keep is counted, never raised: a write that fails is
   said once per run as a `RuntimeWarning` that names the run, and the run goes on; at the end `res.not_kept`
   says how many results were not kept and `res.store_error` why (a store file deleted or replaced under the
-  run means every result of it, and its run row is left open, as the CLI does);
+  run means every result of it, and its run row is left open, as the CLI does). Read back,
+  `Store(path, readonly=True).results()` is the SQLite cursor `h-ssh-store` streams: read once, no `len()`,
+  always true; `list()` it to keep the rows. In a directory the reader cannot write to, a finished store is
+  read as it is, without locks: once done, `written_while_read()` says whether a run wrote it meanwhile, as
+  `h-ssh-store` asks;
 - `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only, and reads
   only: on another transport, or for a command that is not a read, that is the device's failure, nothing
   sent); `to_dicts()` is JSON-serialisable, in the shape of the CLI's `--json` records.
@@ -1012,7 +1034,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1022 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1031 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
