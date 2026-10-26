@@ -298,6 +298,29 @@ def test_grep_field_diff_history_slowest(tmp_path, capsys):
     assert rc == 0 and lines[1].split()[:2] == ["5000", "r2"] and len(lines) == 3
 
 
+@pytest.mark.parametrize("before, after", [
+    ("Model: vmx\r\nJunos: x\r\n", "Model: vmx\nJunos: x"),
+    ("Model: vmx\nJunos: x", "Model: vmx\nJunos: x\n"),
+], ids=["crlf", "last-newline"])
+def test_the_readers_diff_compares_lines_not_their_line_endings(tmp_path, capsys, before, after):
+    """`h-ssh-store diff` compares the lines of two replies, not how they end:
+    CRLF against LF, or a newline after the last line against none, is no
+    difference (exit 0, nothing printed). h-ssh keeps a reply's own line
+    endings in its rows (#111) and no newline after the last line; these
+    come in through the Store API."""
+    path = tmp_path / "runs.db"
+    s = Store(str(path))
+    runs = []
+    for reply in (before, after):
+        run = s.begin_run("show", ["-sC", "show version"], "lab", 1, "1.0.0", command="show version")
+        s.add_entry(run, {**SHOW, "output": reply}, "show version")
+        s.finish_run(run, 1, 0, 0)
+        runs.append(run)
+    s.close()
+    rc, out, _ = reader(capsys, path, "diff", "r1", *runs)
+    assert rc == 0 and out == ""
+
+
 def test_export_csv_and_jsonl(tmp_path, capsys):
     """The rows as they are: CSV with a header (the batch's two commands are two
     rows, a failure keeps its error), JSON Lines with the same keys, --all for
@@ -897,6 +920,34 @@ def test_a_crlf_reply_keeps_its_line_endings_in_the_row_and_on_raw_to_a_pipe(tmp
     assert rc == 0, err
     assert out == "R1:\ninterface Gi0/1\r\n description uplink\r\n shutdown\n\n"
     assert rows(path, "SELECT output FROM results")[0]["output"] == "interface Gi0/1\r\n description uplink\r\n shutdown"
+
+
+VMX = "Model: vmx\nJunos: 24.2R1-S2.5\n"
+
+
+@pytest.mark.parametrize("before, after, hunk", [
+    (VMX, "Model: vmx\nJunos: 23.4R2.13\n", "@@ -1,2 +1,2 @@\n Model: vmx\n-Junos: 24.2R1-S2.5\n+Junos: 23.4R2.13\n"),
+    (VMX, VMX + "Peer: 10.9.9.8\n", "@@ -1,2 +1,3 @@\n Model: vmx\n Junos: 24.2R1-S2.5\n+Peer: 10.9.9.8\n"),
+    (VMX + "Peer: 10.9.9.8\n", VMX, "@@ -1,3 +1,2 @@\n Model: vmx\n Junos: 24.2R1-S2.5\n-Peer: 10.9.9.8\n"),
+], ids=["changed", "added", "removed"])
+def test_the_readers_diff_treats_the_trimmed_last_line_like_any_other(tmp_path, monkeypatch, capsys, before, after,
+                                                                       hunk):
+    """The CLI keeps a reply trimmed, with no newline after its last line;
+    `h-ssh-store diff` still takes it as a line like any other. Changed, it
+    is a line taken away and a line put in, a line each; left as it was, with
+    a line added or taken away after it, it is no change."""
+    path = tmp_path / "runs.db"
+
+    def answering(reply):
+        return types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: reply)
+
+    for reply in (before, after):
+        rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(path), "--target", "R1:10.0.0.1:junos",
+                                                     "-sC", "show version"], fake=answering(reply))
+        assert rc == 0, err
+    first, second = [r["run_id"] for r in rows(path, "SELECT run_id FROM runs ORDER BY rowid")]
+    rc, out, _ = reader(capsys, path, "diff", "R1", first, second)
+    assert rc == 1 and out == f"--- R1 {first}\n+++ R1 {second}\n" + hunk
 
 
 def test_the_store_env_var_names_the_file(tmp_path, monkeypatch, capsys):

@@ -112,7 +112,8 @@ h-ssh --user admin -sC bgp R1:10.0.1.1:junos R2:10.0.1.2:junos
 # ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows)
 h-ssh --user admin --json -sC "show version" --devices h-app/devices.csv
 
-# compare one command's output across the fleet
+# compare one command's output across the fleet: each device against the first that answered, in
+# target order (bare hosts, then --target; or the inventory's rows)
 h-ssh -sC bgp --diff R1:10.0.1.1:junos R2:10.0.1.2:junos
 
 # config change — look before you leap (no host typed: the inventory is ~/.h-ssh/devices.csv, or ./devices.csv)
@@ -560,7 +561,7 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | *(none)* | one status line per device, plus the verdict and diff under it for edits |
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
-| `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure |
+| `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure; with `--diff` on a show or a batch the objects come in target order and, when two or more are `ok`, each of those has a `diff` against the first of them, the baseline (`(baseline)` on the baseline itself) |
 | `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2), under `--dry-run` too |
 
 A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
@@ -634,7 +635,7 @@ the run wrote (`--store PATH`, `HSSH_STORE`, the config file's `store`, else `./
 | `output DEVICE [RUN] [--seq N]` | one reply, as the device gave it (`--seq` picks a batch's command or a job's entry); the error on stderr and exit 1 for a failed row |
 | `grep PATTERN [--run] [--device] [--command] [-i]` | the lines of stored replies that match a regex, with run, device and command |
 | `field PATH [--run] [--device] [--command]` | a dotted path into JSON replies (`--format json` shows, commit histories): the device's structure read, not parsed |
-| `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ |
+| `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ (lines are compared without their line endings) |
 | `history DEVICE [--command C] [--last N]` | every stored result for a device, newest first |
 | `slowest [RUN] [--last N]` | the slowest results, of a run or overall |
 | `export [RUN] [--all] [--device D] [--command C] [--format csv\|jsonl] [--out FILE]` | the rows as they are, for a spreadsheet or a notebook: CSV (a multi-line reply is one quoted cell) or JSON Lines; one run (default: the last) or the whole store. The file itself is plain SQLite, so `pandas.read_sql("SELECT * FROM results", sqlite3.connect("h-ssh.db"))` works as well |
@@ -1054,7 +1055,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1079 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1092 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

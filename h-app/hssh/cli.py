@@ -479,7 +479,8 @@ async def main() -> int:
     parser.add_argument("--times", type=_ranged_int(1, None, "--times"), default=None,
                         help="With --every: stop after this many ticks")
     parser.add_argument("--diff", action="store_true",
-                        help="Compare output across devices (show modes only, first device is baseline)")
+                        help="Compare output across devices (show modes only); the baseline is the first device "
+                             "in target order that answered (bare hosts, then --target; or the inventory's rows)")
     parser.add_argument("--raw", action="store_true",
                         help="Print only each device's output, no progress lines or headers")
     parser.add_argument("--list-commands", action="store_true",
@@ -1216,6 +1217,7 @@ async def main() -> int:
     skipped = 0                                              # held back by the safety gate (in the results)
     not_run = skipped_missing if not job_entries else 0      # no set file (--allow-missing): not in the results
     json_results = []
+    given_at = []        # each result's place in target order, for --diff
     run_start = time.time()
     store_run = None
     store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
@@ -1478,6 +1480,7 @@ async def main() -> int:
             entry["interrupted"] = True
             entry["error"] = f"interrupted while connecting: {entry['error']}"
         json_results.append(entry)
+        given_at.append(i)
 
         # What was sent to this device, for the audit log and the store: the
         # resolved show, the edit payload, the rollback, the commit history ask.
@@ -1545,7 +1548,9 @@ async def main() -> int:
                 failures += 1
 
         # The run log is written as the results land: a SIGTERM, an exception
-        # later in the loop or an OOM loses nothing already reported.
+        # later in the loop or an OOM loses nothing already reported. It holds
+        # the replies and the edit diffs (and an -eC payload, as its command),
+        # so it gets the audit log's redaction and file mode.
         if args.log:
             try:
                 secure_append(args.log, json.dumps(redact_values({
@@ -1643,24 +1648,32 @@ async def main() -> int:
     # One second in all for the closes: close_all() has already waited on its own (#113).
     _drain_closes(max(0.0, 1.0 - (time.monotonic() - closing)))
 
-    # Write structured JSONL log. It holds the same payloads, replies and
-    # diffs as the audit log, so it gets the same redaction and file mode.
-    # Cross-device diff (show modes only)
+    # Cross-device diff (show modes only). The results go back into target
+    # order: the baseline is the first device in it that answered, not the
+    # first to answer, and --json lists the devices in it, so one command
+    # line diffs the same way, and lists the same way, every run. A reply
+    # is trimmed, so its last line has no newline: lines are compared
+    # without theirs and joined with one. With the newlines kept, a last
+    # line would not match itself once a line follows it, and a changed
+    # one would run into the line put in after it.
+    ok_results = []
     if args.diff and mode in ["show", "show-batch"]:
+        # Every result has its place: one without is an error, not a device left out.
+        json_results[:] = [r for _, r in sorted(zip(given_at, json_results, strict=True), key=lambda p: p[0])]
         ok_results = [r for r in json_results if r["ok"]]
         if len(ok_results) >= 2:
             baseline = ok_results[0]
             baseline_name = baseline["device"]
 
             if mode == "show":
-                baseline_lines = document_text(baseline["output"]).splitlines(keepends=True)
+                baseline_lines = document_text(baseline["output"]).splitlines()
                 for other in ok_results[1:]:
-                    other_lines = document_text(other["output"]).splitlines(keepends=True)
+                    other_lines = document_text(other["output"]).splitlines()
                     diff_lines = list(difflib.unified_diff(
                         baseline_lines, other_lines,
-                        fromfile=baseline_name, tofile=other["device"],
+                        fromfile=baseline_name, tofile=other["device"], lineterm="",
                     ))
-                    diff_text = "".join(diff_lines).rstrip()
+                    diff_text = "\n".join(diff_lines)
                     other["diff"] = diff_text if diff_text else "(identical)"
                 baseline["diff"] = "(baseline)"
 
@@ -1673,11 +1686,11 @@ async def main() -> int:
                             continue
                         bl = baseline_map.get(cr["command"], "")
                         diff_lines = list(difflib.unified_diff(
-                            bl.splitlines(keepends=True),
-                            document_text(cr["output"]).splitlines(keepends=True),
-                            fromfile=baseline_name, tofile=other["device"],
+                            bl.splitlines(),
+                            document_text(cr["output"]).splitlines(),
+                            fromfile=baseline_name, tofile=other["device"], lineterm="",
                         ))
-                        diff_text = "".join(diff_lines).rstrip()
+                        diff_text = "\n".join(diff_lines)
                         cmd_diffs.append({
                             "command": cr["command"],
                             "diff": diff_text if diff_text else "(identical)",
@@ -1692,7 +1705,6 @@ async def main() -> int:
         # replies as they came, where VT, FF and NEL end a line, and taken out
         # of the whole text they would run a removed line into the one before.
         if args.diff and mode in ["show", "show-batch"]:
-            ok_results = [r for r in json_results if r["ok"]]
             if len(ok_results) >= 2:
                 baseline_name = ok_results[0]["device"]
                 print(f"\n--- Diff (baseline: {baseline_name}) ---\n")
