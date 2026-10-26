@@ -1,7 +1,6 @@
 """What bounds a run on this machine: the worker ceiling, and the open-file
-limit that the workers must fit under. The CLI carries the same two for now
-(hssh/cli.py); a later cleanup points it here. The library (hssh.fleet)
-reads them from here."""
+limit that the workers must fit under. The CLI (hssh.cli) and the library
+engine (hssh.fleet) both read them from here."""
 
 # A thread per in-flight device, so the ceiling is an operator's choice rather
 # than a property of the machine. Capped because each one is an ssh process.
