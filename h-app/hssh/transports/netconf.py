@@ -291,18 +291,31 @@ _CLOSES: "set[threading.Thread]" = set()
 _CLOSES_LOCK = threading.Lock()
 
 
-def _close(dev) -> None:
+def _close(dev) -> Optional[threading.Thread]:
     """Close the session beside the work, not on the worker's clock.
 
     <close-session> and its acknowledgement are ~100 ms of waiting on the
     device, a quarter of what a show costs per device; a worker used to
     spend it before moving to its next device. A helper thread waits
     instead, the device still sees a clean NETCONF close, and
-    wait_for_closes() at the end of a run joins what is still in flight."""
+    wait_for_closes() at the end of a run joins what is still in flight.
+    Returns that thread, for a caller that must see the close through (the
+    pool, before it collects what a close leaves behind); None when the
+    close ran here."""
     t = threading.Thread(target=_close_now, args=(dev,), name="hssh-netconf-close", daemon=True)
     with _CLOSES_LOCK:
         _CLOSES.add(t)
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        # The system refused the thread (ulimit -u, a container's pids.max).
+        # Close here instead, on the caller's clock: ~100 ms, never the
+        # result, and no entry in the set that nobody can join (#113).
+        with _CLOSES_LOCK:
+            _CLOSES.discard(t)
+        _close_now(dev)
+        return None
+    return t
 
 
 def _close_now(dev) -> None:
@@ -329,7 +342,10 @@ def wait_for_closes(timeout: float = 1.0) -> int:
     with _CLOSES_LOCK:
         pending = list(_CLOSES)
     for t in pending:
-        t.join(max(0.0, deadline - time.monotonic()))
+        try:
+            t.join(max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            pass    # not started yet: _close() is between adding it and start()
     return sum(1 for t in pending if t.is_alive())
 
 
@@ -424,10 +440,13 @@ def _cli(dev, cmd: str) -> str:
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
          port: int = None, vendor_hint: str = None) -> str:
-    """Execute a show command over NETCONF."""
+    """Execute a show command over NETCONF. A read finds a dead reused
+    session and runs once more on a new one; anything else (`request …`)
+    is sent once, as rpc() does."""
     _require()
-    return _on_session(host, user, passwd, session_timeout, command_timeout, port,
-                       lambda lease: _cli(lease.dev, cmd))
+    run_on = _on_session if _is_read(cmd) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port,
+                  lambda lease: _cli(lease.dev, cmd))
 
 
 def show_structured(host: str, user: str, passwd: str, cmd: str,
@@ -839,9 +858,9 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
 
     A rejected or timed-out command is reported in its own result and the
     batch goes on (after a timeout the session is not kept, a late reply may
-    still be coming). A session that dies is a failure of the whole batch:
-    reads are idempotent, so a reused session gets the same reopen-once
-    treatment as show()."""
+    still be coming). A session that dies is a failure of the whole batch;
+    a reused one gets show()'s reopen-once treatment only when every command
+    is a read, as rpc_batch() does."""
     _require()
 
     def run(lease):
@@ -857,7 +876,8 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                 results.append({"command": cmd, "ok": False, "error": str(e)})
         return R.BatchResult(results)
 
-    return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
+    run_on = _on_session if all(_is_read(c) for c in cmds) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
 
 
 def _is_cli_command(text: str) -> bool:
@@ -910,9 +930,10 @@ def _rpc_reply(dev, command: str, args: Optional[dict], fmt: str):
 
 
 def _is_read(command: str) -> bool:
-    """A get-* RPC (any "show ..." command) is a read and safe to send twice."""
+    """A get-* RPC (any "show ..." command) is a read and safe to send twice;
+    a string with a line break is not, whatever its first line says."""
     text = command.strip()
-    return text.startswith("show ") or text.startswith("get")
+    return "\n" not in text and "\r" not in text and (text.startswith("show ") or text.startswith("get"))
 
 
 def _on_session_once(host, user, passwd, session_timeout, command_timeout, port, fn):

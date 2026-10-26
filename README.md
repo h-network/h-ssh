@@ -137,7 +137,7 @@ h-ssh-store runs
 h-ssh-store output R1
 ```
 
-Targets are typed bare on the command line, before or between the flags. A host alone (`10.0.1.1`, `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on `--transport`; `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` name it (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints), an IPv6 host in brackets, `R1:[2001:db8::1]:junos`. `--target SPEC` is the same thing as a flag (repeatable; it wants the name). With any target typed the inventory file is not read; without one it is `--devices`, else `~/.h-ssh/devices.csv`, else `./devices.csv`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device.Each device is listed once: the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
+Targets are typed bare on the command line, before or between the flags. A host alone (`10.0.1.1`, `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on `--transport`; `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` name it (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints), an IPv6 host in brackets, `R1:[2001:db8::1]:junos`. `--target SPEC` is the same thing as a flag (repeatable; it wants the name). With any target typed the inventory file is not read; without one it is `--devices`, else `~/.h-ssh/devices.csv`, else `./devices.csv`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device. Each device is listed once, a device being its host and the port its transport uses, written or not (`R1:10.0.0.1:junos` and `R2:10.0.0.1:830:junos` are one router): the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (one session per entry), but not use one name for two hosts.
 
 **A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` on the target to get NETCONF, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
@@ -166,12 +166,12 @@ A password means the same on every transport: it is the credential, and no `~/.s
 
 | Flag | Mode | What it does |
 |---|---|---|
-| `-sC` | Show | Run a show/display command (or a template name). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` |
-| `-eC` | Edit command | Apply one config line to every target |
+| `-sC` | Show | Run a show/display command (or a template name): one line of text, so a line break or another control character in it is refused (exit 2). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` (exit 2, nothing sent) |
+| `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL) is refused (exit 2) |
 | `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
 | `-eB` | Edit broadcast | One config file applied to all targets |
-| `--batch` | Batch | Several show commands from a file, one connection per device |
-| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt`, or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description |
+| `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
+| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt`, or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
@@ -190,7 +190,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json -y   # the job is on stdin, so an edit cannot be confirmed there
 ```
 
-An entry may also carry `"port": 830` to override the target's port. A job with an edit entry asks the usual
+An entry may also carry `"port": 830` to override the target's port. A `show` is one line of text and an `edit` has no control character but its line breaks, as for `-sC` and `-eC`. A job with an edit entry asks the usual
 `y/N` unless `-y` is given, and the question goes to stdout, so a `--json` run wants `-y`.
 
 A device may appear in more than one entry. Its entries run one after another, in file order, so a
@@ -198,10 +198,12 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 
 ### Watching: `--every`
 
-`--every SECONDS` runs the same read again, SECONDS after the previous tick finished, until Ctrl-C or
-`--times N`. Reads only (`-sC`, `--batch`, `--profile`), and the store must be on: every tick is a run
-in the store, and the ticks are compared through it. The screen gets one line per tick and, for every
-device whose reply changed since the tick before, the difference:
+`--every SECONDS` runs the same read again, SECONDS after the previous tick finished (one second to a
+day), until Ctrl-C or `--times N`. Reads only (`-sC`, `--batch`, `--profile`), and the store must be
+on: every tick is a run in the store, and the ticks are compared through it. `--json` and `--raw` are
+refused with it: a watch prints tick lines, and a pipeline reads the ticks from the store
+(`h-ssh-store export`). The password is asked once, before the first tick. The screen gets one line
+per tick and, for every device whose reply changed since the tick before, the difference:
 
 ```
 tick 1 14:02:10: 250 OK, 0 failed; baseline kept as run 20261025-140210-3f1a
@@ -214,9 +216,18 @@ tick 2 14:02:43: 250 OK, 0 failed, 1 changed
   +10.9.9.8  65000  Active
 ```
 
-A device that fails on a tick shows as `OK -> FAIL (reason)`. The structured summary line still goes to
-stderr once per tick, and any two ticks can be compared later with `h-ssh-store diff DEVICE RUN_A RUN_B`.
-Ctrl-C between ticks stops the watch and says how many ticks are kept.
+A device that fails on a tick shows as `OK -> FAIL (reason)`. A tick the store could not keep in full
+says so on its line, in the warning's words: `baseline not kept (N of M results were not kept: why)` in
+place of the baseline's run id, `; N of M results were not kept: why` after a later tick's count; what
+the store lost is still compared, as the tick got it. With `--diff` every tick also prints how each
+device's reply differs from the first device's, as a single run does. The structured summary line
+still goes to stderr once per tick, and any two ticks can be compared later with
+`h-ssh-store diff DEVICE RUN_A RUN_B`.
+Ctrl-C between ticks stops the watch and says how many ticks are kept, and how many were not kept in
+full. The exit code is the worst tick's, in this order: `130` > `4` > `2` > `1` > `3` > `0`. A device
+that failed on one tick is exit `1` however clean the ticks after it, and a tick that cannot start ends
+the watch with `2`, as when the store was deleted or replaced since tick 1: a watch keeps all its ticks
+in one store.
 
 ## Transports
 
@@ -350,7 +361,7 @@ and nothing about connections; `hssh/dialects/ios.py` and `none.py` are the smal
 | `name` | the half of a driver name before the `@` (`ios` in `ios@ssh`), and the stem of the operator's shortcut file |
 | `title`, `description` | the name as printed to the operator, and one line on the dialect |
 | `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. Every text transport reads replies with it: a show whose reply opens with such a line is a failure, not output, and an edit stops at the line that got one. A dialect on `ssh`, `openssh` or `telnet` must have one |
-| `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*` |
+| `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*`; a command with a line break in it is never a read, whatever the dialect says |
 | `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
 | `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt). `None`: the dialect shows over those transports but cannot edit |
 | `commit_pending` | a regex whose group 1 is the minutes left on a pending commit-confirmed, as `show system commit` prints them; `-eC commit` confirms only when it finds one |
@@ -550,12 +561,14 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
 | `--json` | one object per device: `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show, a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, `error` for a failure |
-| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string |
+| `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (Junos only; every other transport refuses it, nothing sent): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2), under `--dry-run` too |
 
 A reader that stops early (`h-ssh ... | head`) is not an error: the run ends quietly with exit 0 and
 no traceback, and whatever had landed stands. paramiko's transport thread logs a full traceback when
 a device closes the connection mid-handshake; the CLI keeps that off the screen (the one FAIL line
-already says so) unless `-v` is given. A library caller configures logging as it likes.
+already says so) unless `-v` is given. Under `Fleet` it stays off stderr too while logging is not
+set up (paramiko's and ncclient's loggers get a `NullHandler`, no level is changed); set logging up
+and those records go where you send them.
 
 `--raw` is the pipe-friendly one: no banner, no progress lines, no summary. Each device gets a
 `name:` line and its output; failures and the verdict go to stderr, so for a show `--raw > out.txt`
@@ -580,21 +593,29 @@ both drop it, and `--json` reports it as its own `command` field instead of repe
 
 Every run is kept. The store is `h-ssh.db` in the directory you run from, so the evidence sits with
 the job (`cd customer-x && h-ssh ...`); `--store PATH`, `HSSH_STORE=PATH` or `store = PATH` in
-`~/.h-ssh/config` name another file, in that order of precedence, and `--no-store` keeps nothing of
-one run. One SQLite file, run after run: one row per command per device — run, device, host, driver,
-the command as sent, when, OK or not, the duration, the error, the format (`text`, `xml`, `json`) and
-the device's own reply. A show
+`~/.h-ssh/config` name another file, in that order of precedence (a leading `~` is your home directory
+in each of them), and `--no-store` keeps nothing of one run. One SQLite file, run after run: one row
+per command per device — run, device, host, driver, the command as sent, when, OK or not, the
+duration, the error, the format (`text`, `xml`, `json`) and the device's own reply. A show
 is one row, a `--batch` one row per command in order, an edit one row with the payload as the command
-and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON. A
+and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON, a
+`--job` one row per entry (a device the job names twice has `seq` 0 and 1, in file order). A
 second table, `runs`, has one row per invocation: when it started and finished, the mode, what it was
 about, the whole command line, who ran it and from where, and the counts. Everything is kept as it
 came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
-a `show configuration` keeps its hashes. The file is created 0600, opened and its tables made before
-the first device: a store that cannot be written is no run (exit 2, nothing sent), because a run
-nobody can look up afterwards is not worth having. A store that fails during the run (the disk
-fills, someone deletes or replaces the file) does not stop the devices' replies from being shown; the
-loss is said as it happens, counted at the end with its reason, and the run exits 4. A file
-overwritten in place (same inode) is the one case that goes unnoticed.
+a `show configuration` keeps its hashes; escape sequences and control characters are taken out of a
+reply as a terminal is shown it, by `h-ssh` and by `h-ssh-store` alike, never out of the record: the
+store, `--log`, `--json` and the audit log hold the same bytes whether the run was started from a
+terminal or a pipe, the reply's own line endings included (a show over SSH from a device that ends
+its lines with CRLF keeps them there and on `--raw` to a pipe; telnet hands its lines over with LF),
+and `h-ssh-store` hands a pipe or an `export --out` file the rows as they were kept. The file is
+created 0600, opened and its tables made before the first device: a store that cannot be written is
+no run (exit 2, nothing sent), because a run nobody can look up afterwards is not worth having. A
+store that fails during the run (the disk fills, someone deletes or replaces the file) does not stop
+the devices' replies from being shown; the loss is said as it happens, counted at the end with its
+reason, and the run exits 4. The store holds its directory open, so a job directory renamed during
+the run (`mv customer-x customer-x-done`) loses nothing. A file overwritten in place (same inode) is
+the one case that goes unnoticed.
 
 Writes are one transaction per device result, in WAL mode with `synchronous=NORMAL`: a row costs
 about a tenth of a millisecond, a 250-device run adds a few tens of milliseconds, the file never
@@ -608,9 +629,9 @@ the run wrote (`--store PATH`, `HSSH_STORE`, the config file's `store`, else `./
 
 | Command | Prints |
 |---|---|
-| `runs [--last N]` | the runs, newest first: id, start, mode, user, targets/ok/fail, what it was about |
+| `runs [--last N]` | the runs, newest first by the instant they started (ids and `started` are local time, which a DST fall-back puts out of order): id, start, mode, user, targets/ok/fail, what it was about |
 | `failed [RUN]` | the failed rows of a run (default: the last), with the device's error line; exit 1 when there are any |
-| `output DEVICE [RUN] [--seq N]` | one reply, as the device gave it; the error on stderr and exit 1 for a failed row |
+| `output DEVICE [RUN] [--seq N]` | one reply, as the device gave it (`--seq` picks a batch's command or a job's entry); the error on stderr and exit 1 for a failed row |
 | `grep PATTERN [--run] [--device] [--command] [-i]` | the lines of stored replies that match a regex, with run, device and command |
 | `field PATH [--run] [--device] [--command]` | a dotted path into JSON replies (`--format json` shows, commit histories): the device's structure read, not parsed |
 | `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ |
@@ -621,6 +642,24 @@ the run wrote (`--store PATH`, `HSSH_STORE`, the config file's `store`, else `./
 A run is named by its id or any unique prefix of it (`20261024-1730` when only one run started then).
 Anything else is a `sqlite3 runs.db` query away: the schema is two tables, documented at the top of
 `hssh/store.py`.
+
+The reader never writes the store, though where it may, SQLite leaves an empty `-wal` and a `-shm`
+beside it. A finished store in a directory the reader cannot write to (an archived job directory, a
+read-only mount, another user's directory) is read as it is, without SQLite's locks; one with WAL
+frames or a rollback journal still beside it is not, since the file alone is not the whole store (a
+run killed before it closed the store leaves rows in its `-wal`: the error says to copy the store with
+its `-wal` to a directory you can write). A run that writes such a store while it is read could make
+rows go missing or repeat, so the reader looks again when it is done and says so: `ERROR: PATH was
+written while it was read as it is; the output may miss or repeat rows, read it again`, exit 2.
+`grep`, `field` and `export` take the rows as they come, so a store of hundreds of megabytes costs no
+more memory than a small one. They read while they print, so one left open on a store a run is
+writing (`h-ssh-store grep ... | less` beside an `--every` watch) keeps SQLite from recycling the run's
+`-wal`: it grows by what the run writes meanwhile, and goes when a run closes the store after the
+reader has exited. A reader that stops early (`h-ssh-store ... | head`) is no traceback, as with
+`h-ssh`: exit 0, or the verdict the command had before it printed (`failed`, `diff`, `output` of a
+failed row). What the reader cannot do (no store at the path, a run that matches nothing or several,
+an `--out` file it cannot open or write, or one that is the store itself) is one `ERROR:` line on
+stderr and exit 2.
 
 ```console
 $ h-ssh --devices core.csv -sC "show bgp summary"
@@ -818,22 +857,35 @@ The library reads no environment variable and no config file; that is the CLI's 
   returned by then is a result and a store row; the run is recorded as interrupted with the rest as skipped;
   iterating its results afterwards gives what was done by then and nothing more (a call that returns later is
   dropped, its row says skipped), so the store and the script agree; a script waiting in its `for` loop wakes at
-  once, whichever thread called `close()`. A store this Fleet opened is closed, and
-  the sessions close (one still in use closes when its call returns). `async with Fleet(...)` and `aclose()`
-  do the same off the event loop;
-- `store=`, a path or an open `hssh.store.Store`, keeps every result as the CLI's store does (one run row, its
-  command line `Fleet.show show bgp summary`; one result row per device, per command for a batch), written
-  from the thread that iterates and, under `async for`, from a worker of the event loop, so SQLite never
-  blocks it; `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`)
-  that start the run on their first step. What the store could not keep is counted, never raised: a write
-  that fails is said once as a `RuntimeWarning` and the run goes on; at the end `res.not_kept` says how many
-  results were not kept and `res.store_error` why (a store file deleted or replaced under the run means every
-  result of it, and its run row is left open, as the CLI does);
-- `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only; on another
-  transport that is the device's failure, nothing sent); `to_dicts()` is JSON-serialisable, in the shape of
-  the CLI's `--json` records.
+  once, whichever thread called `close()`, and a `close()` that lands while `show()` is still opening the run's
+  store row waits for the row, records the run as interrupted, and that `show()` raises `RuntimeError`. A store
+  this Fleet opened is closed, and the sessions close (one still in use closes when its call returns); the
+  routers get up to a second in all to acknowledge that, so the sessions' descriptors are freed with them.
+  `async with Fleet(...)` and `aclose()` do the same off the event loop. A Fleet dropped without `close()` lets
+  its threads go and gives its share of the session pool back once it is collected, as a dropped
+  `ThreadPoolExecutor` ends its workers. That can wait for the garbage collector's next pass: a device call that
+  raised leaves its frames in a reference cycle, and they hold the Fleet; so do the first Fleet of a process, whose
+  workers import the transport, and a run it left open, which is not recorded, so `close()` is still what ends one;
+- `store=`, a path or an open `hssh.store.Store` (one Store may be shared by several Fleets on several threads:
+  it takes one write at a time), keeps every result as the CLI's store does (one run row, its command line
+  `Fleet.show show bgp summary`; one result row per device, per command for a batch), written from the thread
+  that iterates and, under `async for`, from a worker of the event loop, so SQLite never blocks it;
+  `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`) that start
+  the run on their first step. What the store could not keep is counted, never raised: a write that fails is
+  said once per run as a `RuntimeWarning` that names the run, and the run goes on; at the end `res.not_kept`
+  says how many results were not kept and `res.store_error` why (a store file deleted or replaced under the
+  run means every result of it, and its run row is left open, as the CLI does). Read back,
+  `Store(path, readonly=True).results()` is the SQLite cursor `h-ssh-store` streams: read once, no `len()`,
+  always true; `list()` it to keep the rows. In a directory the reader cannot write to, a finished store is
+  read as it is, without locks: once done, `written_while_read()` says whether a run wrote it meanwhile, as
+  `h-ssh-store` asks;
+- `fmt="json"` or `"xml"` asks for the router's own data through its RPC translation (NETCONF only, and reads
+  only: on another transport, or for a command that is not a read, that is the device's failure, nothing
+  sent); `to_dicts()` is JSON-serialisable, in the shape of the CLI's `--json` records.
 
-Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's). Edits keep their gates
+Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's), one line of text: the line
+break that ends a line read from a file is dropped (`fleet.batch(open(path))`), and any other line break or control
+character is a `ValueError` before anything runs. Edits keep their gates
 in the CLI (the set-syntax guard, the pre-flight check, the question) and in the transports' own
 `edit()`/`begin()` below.
 
@@ -945,10 +997,11 @@ One session per `(host, port, user, credential)` — a digest of the password is
 call with a different or wrong password never rides a session another credential opened. Calls against
 the same router from several threads queue on that session; different routers run in parallel as before. A session is dropped, never handed to
 the next caller, when something left it in doubt: a commit whose outcome is unknown, a rollback or
-unlock that failed, an RPC timeout, or the router closing it. A read (`show`, `show_structured`,
-`show_batch`, and `rpc`/`rpc_batch` for a `show …` command or `get-*` RPC) that finds its reused
-session dead opens a new one and runs once more; any other RPC (`request-*`, …) and an edit never do —
-an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll), so size `ulimit -n` for the sessions you keep; what a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
+unlock that failed, an RPC timeout, or the router closing it. A read (`show_structured`, and `show`,
+`show_batch`, `rpc` and `rpc_batch` for a `show …` command or `get-*` RPC, every one of a batch) that
+finds its reused session dead opens a new one and runs once more; any other command (`request …`,
+`request-*`, …) and an edit never do —
+an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll), so size `ulimit -n` for the sessions you keep; what a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything, once the closes it started are done, since a close runs beside the work: `close_all()` and `reap()` wait up to a second for them (`wait=` to change it), the reaper's own thread, which nothing waits on, up to ten seconds. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
 
 ## Package structure
 
@@ -1001,7 +1054,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (962 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1079 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
