@@ -198,10 +198,12 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 
 ### Watching: `--every`
 
-`--every SECONDS` runs the same read again, SECONDS after the previous tick finished, until Ctrl-C or
-`--times N`. Reads only (`-sC`, `--batch`, `--profile`), and the store must be on: every tick is a run
-in the store, and the ticks are compared through it. The screen gets one line per tick and, for every
-device whose reply changed since the tick before, the difference:
+`--every SECONDS` runs the same read again, SECONDS after the previous tick finished (one second to a
+day), until Ctrl-C or `--times N`. Reads only (`-sC`, `--batch`, `--profile`), and the store must be
+on: every tick is a run in the store, and the ticks are compared through it. `--json` and `--raw` are
+refused with it: a watch prints tick lines, and a pipeline reads the ticks from the store
+(`h-ssh-store export`). The password is asked once, before the first tick. The screen gets one line
+per tick and, for every device whose reply changed since the tick before, the difference:
 
 ```
 tick 1 14:02:10: 250 OK, 0 failed; baseline kept as run 20261025-140210-3f1a
@@ -214,9 +216,18 @@ tick 2 14:02:43: 250 OK, 0 failed, 1 changed
   +10.9.9.8  65000  Active
 ```
 
-A device that fails on a tick shows as `OK -> FAIL (reason)`. The structured summary line still goes to
-stderr once per tick, and any two ticks can be compared later with `h-ssh-store diff DEVICE RUN_A RUN_B`.
-Ctrl-C between ticks stops the watch and says how many ticks are kept.
+A device that fails on a tick shows as `OK -> FAIL (reason)`. A tick the store could not keep in full
+says so on its line, in the warning's words: `baseline not kept (N of M results were not kept: why)` in
+place of the baseline's run id, `; N of M results were not kept: why` after a later tick's count; what
+the store lost is still compared, as the tick got it. With `--diff` every tick also prints how each
+device's reply differs from the first device's, as a single run does. The structured summary line
+still goes to stderr once per tick, and any two ticks can be compared later with
+`h-ssh-store diff DEVICE RUN_A RUN_B`.
+Ctrl-C between ticks stops the watch and says how many ticks are kept, and how many were not kept in
+full. The exit code is the worst tick's, in this order: `130` > `4` > `2` > `1` > `3` > `0`. A device
+that failed on one tick is exit `1` however clean the ticks after it, and a tick that cannot start ends
+the watch with `2`, as when the store was deleted or replaced since tick 1: a watch keeps all its ticks
+in one store.
 
 ## Transports
 
@@ -990,7 +1001,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (947 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (959 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
