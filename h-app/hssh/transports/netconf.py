@@ -76,6 +76,9 @@ except ImportError:
 # deadline; paramiko's Transport reads it while the session is being set up.
 _DEADLINE = threading.local()
 
+_KEX_UNFINISHED = "the banner came, but key exchange did not finish"
+_REVOKED = "its key is marked @revoked in "
+
 
 if _paramiko is not None:
     class _DeadlineTransport(_paramiko.Transport):
@@ -108,12 +111,51 @@ if _paramiko is not None:
         handshake_timeout = _timeout("_hssh_handshake", 15)
         auth_timeout = _timeout("_hssh_auth", 30)
 
+        def start_client(self, event=None, timeout=None):
+            # A key exchange that does not finish (the deadline, or the
+            # server closing) ends in paramiko's bare EOFError, which ncclient
+            # lets through and PyEZ renders "ConnectError" with nothing after it.
+            try:
+                return super().start_client(event=event, timeout=timeout)
+            except EOFError as e:
+                if not self.remote_version or self.initial_kex_done:
+                    raise
+                raise _paramiko.SSHException(_KEX_UNFINISHED) from e
+
+    class _KnownHosts(_paramiko.HostKeys):
+        """The known_hosts ncclient checks the router's key against
+        (HSSH_NETCONF_HOSTKEY=yes), read as the ssh transport reads
+        ~/.ssh/known_hosts. paramiko's own load() refused the whole file over
+        an @cert-authority or @revoked line, which an SSH CA puts in every
+        user's file: the first is passed over, and a key the second names is
+        refused whatever else the file says."""
+
+        def __init__(self, filename=None):
+            self._revoked = {}          # key blob -> the file that revokes it
+            super().__init__(filename)
+
+        def load(self, filename):
+            from .ssh import _parse
+            with open(filename, "rb") as f:
+                text = f.read().decode("utf-8", "surrogateescape")
+            keys, revoked = _parse(text, filename, system=True)
+            self._entries.extend(keys._entries)
+            self._revoked.update(dict.fromkeys(revoked, filename))
+
+        def check(self, hostname, key):
+            where = self._revoked.get(key.asbytes())
+            if where is not None:
+                raise _paramiko.SSHException(_REVOKED + where)
+            return super().check(hostname, key)
+
     class _ParamikoForNcclient:
         """ncclient's view of the paramiko module: as it is, except that
-        Transport is the deadline-aware one. Only ncclient sees this; paramiko
-        itself and the ssh transport's SSHClient are untouched."""
+        Transport is the deadline-aware one and HostKeys reads known_hosts
+        as the ssh transport does. Only ncclient sees this; paramiko itself
+        and the ssh transport's SSHClient are untouched."""
 
         Transport = _DeadlineTransport
+        HostKeys = _KnownHosts
 
         def __init__(self, module):
             self._module = module
@@ -216,6 +258,10 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     if cause_kind == "SSHUnknownHostError" or "unknown host key" in low:
         return (f"host key verification failed for {where}: not in ~/.ssh/known_hosts, or changed "
                 "(HSSH_NETCONF_HOSTKEY=yes); nothing was sent")
+    if _REVOKED in text:
+        return f"host key verification failed for {where}: {text}; nothing was sent"
+    if "malformed known_hosts line" in low:
+        return text
     if "could not open socket" in low:
         if elapsed >= timeout - 0.5:
             return f"connect to {where} timed out after {timeout}s (filtered, or down)"
@@ -230,6 +276,10 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
         if elapsed < timeout / 2:
             return f"{where} dropped the session before login after {elapsed:.1f}s (sshd connection limit?)"
         return f"no SSH banner from {where} within {elapsed:.0f}s (sshd busy, or filtered)"
+    if _KEX_UNFINISHED in low:
+        if elapsed < timeout / 2:
+            return f"{where} dropped the session before login after {elapsed:.1f}s ({_KEX_UNFINISHED})"
+        return f"no SSH session to {where} within {timeout}s: {_KEX_UNFINISHED}"
     if "negotiation failed" in low:
         return f"SSH negotiation with {where} failed: {text.split(':', 1)[1].strip()}"
     if kind == "ConnectTimeoutError":
@@ -241,18 +291,31 @@ _CLOSES: "set[threading.Thread]" = set()
 _CLOSES_LOCK = threading.Lock()
 
 
-def _close(dev) -> None:
+def _close(dev) -> Optional[threading.Thread]:
     """Close the session beside the work, not on the worker's clock.
 
     <close-session> and its acknowledgement are ~100 ms of waiting on the
     device, a quarter of what a show costs per device; a worker used to
     spend it before moving to its next device. A helper thread waits
     instead, the device still sees a clean NETCONF close, and
-    wait_for_closes() at the end of a run joins what is still in flight."""
+    wait_for_closes() at the end of a run joins what is still in flight.
+    Returns that thread, for a caller that must see the close through (the
+    pool, before it collects what a close leaves behind); None when the
+    close ran here."""
     t = threading.Thread(target=_close_now, args=(dev,), name="hssh-netconf-close", daemon=True)
     with _CLOSES_LOCK:
         _CLOSES.add(t)
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        # The system refused the thread (ulimit -u, a container's pids.max).
+        # Close here instead, on the caller's clock: ~100 ms, never the
+        # result, and no entry in the set that nobody can join (#113).
+        with _CLOSES_LOCK:
+            _CLOSES.discard(t)
+        _close_now(dev)
+        return None
+    return t
 
 
 def _close_now(dev) -> None:
@@ -279,7 +342,10 @@ def wait_for_closes(timeout: float = 1.0) -> int:
     with _CLOSES_LOCK:
         pending = list(_CLOSES)
     for t in pending:
-        t.join(max(0.0, deadline - time.monotonic()))
+        try:
+            t.join(max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            pass    # not started yet: _close() is between adding it and start()
     return sum(1 for t in pending if t.is_alive())
 
 
@@ -374,10 +440,13 @@ def _cli(dev, cmd: str) -> str:
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
          port: int = None, vendor_hint: str = None) -> str:
-    """Execute a show command over NETCONF."""
+    """Execute a show command over NETCONF. A read finds a dead reused
+    session and runs once more on a new one; anything else (`request …`)
+    is sent once, as rpc() does."""
     _require()
-    return _on_session(host, user, passwd, session_timeout, command_timeout, port,
-                       lambda lease: _cli(lease.dev, cmd))
+    run_on = _on_session if _is_read(cmd) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port,
+                  lambda lease: _cli(lease.dev, cmd))
 
 
 def show_structured(host: str, user: str, passwd: str, cmd: str,
@@ -789,9 +858,9 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
 
     A rejected or timed-out command is reported in its own result and the
     batch goes on (after a timeout the session is not kept, a late reply may
-    still be coming). A session that dies is a failure of the whole batch:
-    reads are idempotent, so a reused session gets the same reopen-once
-    treatment as show()."""
+    still be coming). A session that dies is a failure of the whole batch;
+    a reused one gets show()'s reopen-once treatment only when every command
+    is a read, as rpc_batch() does."""
     _require()
 
     def run(lease):
@@ -807,7 +876,8 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                 results.append({"command": cmd, "ok": False, "error": str(e)})
         return R.BatchResult(results)
 
-    return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
+    run_on = _on_session if all(_is_read(c) for c in cmds) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
 
 
 def _is_cli_command(text: str) -> bool:
@@ -860,9 +930,10 @@ def _rpc_reply(dev, command: str, args: Optional[dict], fmt: str):
 
 
 def _is_read(command: str) -> bool:
-    """A get-* RPC (any "show ..." command) is a read and safe to send twice."""
+    """A get-* RPC (any "show ..." command) is a read and safe to send twice;
+    a string with a line break is not, whatever its first line says."""
     text = command.strip()
-    return text.startswith("show ") or text.startswith("get")
+    return "\n" not in text and "\r" not in text and (text.startswith("show ") or text.startswith("get"))
 
 
 def _on_session_once(host, user, passwd, session_timeout, command_timeout, port, fn):

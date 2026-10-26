@@ -170,6 +170,137 @@ def test_a_store_deleted_during_the_run_is_said_not_silently_lost(tmp_path, monk
     assert not db.exists()
 
 
+def test_a_store_opened_by_a_relative_path_is_still_itself_after_a_chdir(tmp_path, monkeypatch):
+    """still_there() stat'ed the path as given, so a library script that opened
+    Store("h-ssh.db") and chdir'ed later was told the file was deleted: every
+    result not kept, the run row left open, the file untouched. The store
+    looks the file up in the directory it held open at the open; messages
+    keep the path as given."""
+    monkeypatch.chdir(tmp_path)
+    st = Store("h-ssh.db")
+    run = st.begin_run("show", ["t"], "u", 1, "0")
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    assert st.still_there() is None and st.path == "h-ssh.db"
+    st.add_entry(run, SHOW, "show version")
+    st.finish_run(run, 1, 0, 0)
+    assert rows(tmp_path / "h-ssh.db", "SELECT finished FROM runs")[0]["finished"]
+    os.unlink(tmp_path / "h-ssh.db")                                # a real deletion is still seen from here
+    assert st.still_there() == "the store file was deleted during the run"
+    st.close()
+
+
+def test_a_dot_dot_after_a_symlinked_directory_is_the_file_sqlite_opened(tmp_path, monkeypatch, capsys):
+    """abspath() takes `link/..` away as text, where the kernel and SQLite go
+    up from wherever the link leads: the identity was bound to a file that
+    was not there, and a run that kept its row in real/x.db said the store
+    had been deleted (exit 4, the run row left open). The directory is
+    opened and made as the path names it, not normalised, so it is the one
+    the kernel and SQLite went to."""
+    (tmp_path / "real" / "sub").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "real" / "sub")
+    monkeypatch.chdir(tmp_path)
+    rc, out, err = run_cli(monkeypatch, capsys, ["--store", "link/../x.db", "--target", "R1:10.0.0.1:junos",
+                                                 "-sC", "show version"])
+    assert rc == 0 and "WARNING" not in err, err
+    run, = rows(tmp_path / "real" / "x.db", "SELECT * FROM runs")
+    assert run["finished"] is not None and len(rows(tmp_path / "real" / "x.db", "SELECT * FROM results")) == 1
+    assert not (tmp_path / "x.db").exists()
+    st = Store("link/../new/y.db")
+    assert st.still_there() is None and (tmp_path / "real" / "new" / "y.db").is_file()
+    assert not (tmp_path / "new").exists()
+    st.close()
+
+
+def test_a_job_directory_renamed_during_the_run_is_not_a_lost_store(tmp_path, monkeypatch, capsys):
+    """The identity was bound to a path string, so `mv customer-x
+    customer-x-done` while a run was in flight read as a deletion: exit 4,
+    every result not kept, the run row left open, with every row in
+    customer-x-done/h-ssh.db. The store holds its directory open and looks
+    the file up in it by name: a rename above it loses nothing, and a
+    deletion or a replacement is still said."""
+    import types
+    job = tmp_path / "customer-x"
+    job.mkdir()
+    monkeypatch.chdir(job)
+
+    def show(host, *a, **kw):
+        if job.exists():
+            job.rename(tmp_path / "customer-x-done")
+        return f"Hostname: {host}\n"
+
+    rc, out, err = run_cli(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "show version"],
+                           fake=types.SimpleNamespace(AVAILABLE=True, show=show))
+    assert rc == 0 and "WARNING" not in err, err
+    db = tmp_path / "customer-x-done" / "h-ssh.db"
+    run, = rows(db, "SELECT * FROM runs")
+    assert run["finished"] is not None and len(rows(db, "SELECT * FROM results")) == 1
+    st = Store(str(tmp_path / "customer-x-done" / "lib.db"))          # an absolute path: the same
+    archived = tmp_path / "archived"
+    (tmp_path / "customer-x-done").rename(archived)
+    assert st.still_there() is None
+    os.replace(archived / "h-ssh.db", archived / "lib.db")             # another file in its place
+    assert st.still_there() == "the store file was replaced during the run"
+    os.unlink(archived / "lib.db")
+    assert st.still_there() == "the store file was deleted during the run"
+    st.close()
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="names the open files through /proc")
+def test_a_store_lets_go_of_the_directory_it_holds_when_closed_or_dropped(tmp_path):
+    """still_there() looks the file up in its directory, which the store
+    holds open. A watch opens a store every tick: close() lets the directory
+    go (asked again, a closed store looks by the path, not through a dead fd),
+    and so does a store a script drops without closing it."""
+    import gc
+    here = os.path.realpath(tmp_path)
+
+    def held():                                          # what this process has open under tmp_path
+        names = []
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                names.append(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:
+                pass
+        return sorted(n for n in names if n == here or n.startswith(here + os.sep))
+
+    gc.collect()
+    stores = [Store(str(tmp_path / f"s{i}.db")) for i in range(3)]
+    assert held().count(here) == 3                       # each store holds the directory
+    for st in stores:
+        st.close()
+    assert held() == []                                  # still referenced: close() let go
+    assert [st.still_there() for st in stores] == [None] * 3          # asked after: by the path, not a dead fd
+    st = Store(str(tmp_path / "dropped.db"))
+    st.conn.close()
+    assert held() == [here]
+    del st, stores
+    gc.collect()
+    assert held() == []
+
+
+def test_a_store_in_a_directory_that_was_removed_is_refused_with_the_reason(tmp_path, monkeypatch, capsys):
+    """A reader started in a directory that was removed met a traceback (the
+    current directory asked for before the file was looked for) where it
+    says no run is kept there, and a run started there was a traceback too.
+    Both say why instead: the reader's `no store at`, the run's exit 2 with
+    nothing sent."""
+    import types
+    from hssh import core
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    monkeypatch.delenv("HSSH_STORE", raising=False)
+    monkeypatch.setattr(core, "get_config_path", lambda: tmp_path / "no-config")
+    assert S.main(["runs"]) == 2
+    assert "no store at h-ssh.db: no run has been kept here" in capsys.readouterr()[1]
+    sent = []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: sent.append(a) or "x")
+    rc, out, err = run_cli(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "show version"], fake=fake)
+    assert rc == 2 and "ERROR: store h-ssh.db: No such file or directory; " in err and sent == []
+
+
 def test_a_device_failure_and_a_store_loss_both_show_and_exit_4(tmp_path, monkeypatch, capsys):
     import types
     db = tmp_path / "both.db"
@@ -197,6 +328,17 @@ def test_the_banner_hints_at_more_workers_for_a_big_fleet(tmp_path, monkeypatch,
     big = [x for i in range(1, 251) for x in ("--target", f"R{i}:10.1.{i // 256}.{i % 256}:junos")]
     rc, out, err = run_cli(monkeypatch, capsys, [*big, "-sC", "show version", "--workers", "64", "--store", str(tmp_path / "h.db")])
     assert rc == 0 and "Hint:" not in out                     # 4 waves at 64: nothing more to suggest
+
+
+def test_the_hint_counts_a_device_once_however_its_port_is_written(tmp_path, monkeypatch, capsys):
+    """#110 review: a job may name a device with its port and without it (one
+    router since #110); the hint counted the port as typed, so twice."""
+    jobs = [{"target": f"R{i}:10.0.0.{i}{port}:junos", "show": "show version"} for i in range(1, 6) for port in ("", ":830")]
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps(jobs))
+    rc, out, err = run_cli(monkeypatch, capsys, ["--job", str(job), "--workers", "1", "--store", str(tmp_path / "h.db")])
+    assert rc == 0, err
+    assert "Hint: 5 devices at 1 workers is 5 waves; --workers 64 would be 1 (one session per router either way)" in out
 
 
 def test_a_store_may_be_written_from_another_thread_than_the_one_that_opened_it(tmp_path):
