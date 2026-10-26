@@ -289,18 +289,20 @@ a host known only through its CA is an unknown host here (`accept-new` pins its 
 transport checks the certificate). A pin is written to a new file renamed over the old one, with the
 old one's mode and group and its other lines byte for byte, under a file lock a reading run waits for,
 and the host is looked up again under that lock: a host another run pinned meanwhile is checked
-against that pin, never pinned over. Another run's lock is waited for `--session-timeout` at most (a
-run stopped with Ctrl-Z in the middle of a pin keeps it); then the device fails, not retried, with
-`~/.h-ssh/known_hosts is locked by another h-ssh run`. A line of `~/.h-ssh/known_hosts` that holds no
-pin — too few fields, a key that is not base64 or not a key of its type, a key type paramiko does not
-know, a hashed name that is not `|1|salt|hash`, a marker — is not dropped, which would pin that host
-again on trust: the connection is refused before anything is sent, naming the file, the line number
-and the line. In `~/.ssh/known_hosts` such a line is passed over, as OpenSSH passes it over; an
-`@revoked` line that cannot be read, or a marker OpenSSH does not have, is refused the same way, so a
-revocation is never dropped. The key exchange gets `--session-timeout`, not paramiko's fixed 15 s;
-one that has not finished by then is `no SSH session to HOST within Ns: the banner came, but key
-exchange did not finish`, as on `openssh`, and is not retried; a server that drops the session there
-is named the same way and retried.
+against that pin, never pinned over. Another run's lock is waited for as long as that run keeps
+pinning, since every pin changes the file; one held for `--session-timeout` with the file unchanged (a
+run stopped with Ctrl-Z in the middle of a pin) fails the device, not retried, with
+`~/.h-ssh/known_hosts is locked by another h-ssh run`, and the devices queued behind it fail with it
+rather than wait again. A line of `~/.h-ssh/known_hosts` that holds no pin — too few fields, a key
+that is not base64 or not a key of its type, a key type paramiko does not know, a hashed name that is
+not `|1|salt|hash`, a marker — is not dropped, which would pin that host again on trust: the
+connection is refused before anything is sent, naming the file, the line number and the line. In
+`~/.ssh/known_hosts` such a line is passed over, as OpenSSH passes it over, and so is a marker OpenSSH
+does not have; an `@revoked` line that cannot be read is refused the same way, so a revocation is
+never dropped. The key exchange gets `--session-timeout`, not paramiko's fixed 15 s; one that has not
+finished by then is `no SSH session to HOST within Ns: the banner came, but key exchange did not
+finish`, as on `openssh`, and is not retried; a server that drops the session there is named the same
+way and retried.
 
 ### `openssh` — for hosts where you cannot install anything
 
@@ -635,9 +637,9 @@ classified before anything is retried:
 
 | Failure | Behaviour |
 |---|---|
-| Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh` and `telnet*` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker) |
+| Unreachable — timed out, refused, no route, network unreachable | fail immediately on `junos` and `openssh`; on `ssh` and `telnet*` a connect timeout or an unresolvable name is still retried (the socket's bare `timed out` / `Name or service not known` matches no marker); a key exchange that `--session-timeout` ran out on after the banner is not, on `ssh` either (`no SSH session to HOST within Ns: the banner came, but key exchange did not finish`) |
 | Authentication, host key, rejected command (and an unresolvable name on `junos`/`openssh`) | fail immediately |
-| The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
+| The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a pin file another h-ssh run keeps locked (`ssh`: `~/.h-ssh/known_hosts is locked by another h-ssh run`), a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
 | Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2) |
 
 The split is whether a connection was established. A connect-phase failure has already spent the
@@ -999,7 +1001,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (951 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (959 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

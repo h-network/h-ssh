@@ -77,7 +77,7 @@ class _PinPolicy:
 
     def __init__(self, path: str, timeout: float = 30.0):
         self.path = path
-        self.timeout = timeout      # the most a pin waits for another run's lock
+        self.timeout = timeout      # how long another run may hold the lock with nothing pinned
 
     def missing_host_key(self, client, hostname, key):
         # The thread lock serialises this process's workers; the file lock
@@ -85,13 +85,19 @@ class _PinPolicy:
         # rewrite the file over each other's pins. The host is looked up
         # again in the file as it is now: a pin another run wrote since this
         # connection read the file is checked, never pinned over.
-        deadline = time.monotonic() + self.timeout
         with _PIN_LOCK:
-            fd = _locked(self.path, fcntl.LOCK_EX, deadline)
+            fd = _locked(self.path, fcntl.LOCK_EX, self.timeout)
             try:
                 old = os.fstat(fd)
                 signature, text = _read(fd)
-                keys, _ = _parse(text, self.path, system=False)
+                cached = _PINS.get(self.path)
+                if cached is not None and cached[0] == signature:
+                    # The file as this process parsed it last; a copy, as
+                    # connections are reading the shared one.
+                    keys = paramiko.HostKeys()
+                    keys._entries = list(cached[1]._entries)
+                else:
+                    keys, _ = _parse(text, self.path, system=False)
                 pinned = keys.lookup(hostname)
                 if pinned is None:
                     if text and not text.endswith("\n"):
@@ -134,14 +140,26 @@ def _signature(path: str):
         return None
 
 
-def _locked(path: str, op: int, deadline: float) -> int:
+# The pin file as it was when a wait for its lock last gave up, by path. A
+# wait that finds the lock still held on that same file gives up at once: the
+# workers queued behind the one that waited do not each wait a session
+# timeout in turn for a run that has not moved since.
+_GAVE_UP: dict = {}         # path -> signature
+
+
+def _locked(path: str, op: int, timeout: float) -> int:
     """An fd on our pin file, flock()ed with `op`: LOCK_SH to read it,
-    LOCK_EX to pin. Another run holds the lock as long as a pin takes; one
-    that still holds it at `deadline` (stopped with Ctrl-Z in the middle of
-    a pin) is an error that says so, not a wait with no end. A pin replaces
-    the file (see _save), so a lock won on the file it replaced is let go
-    and taken again on the new one."""
+    LOCK_EX to pin. Caller holds _PIN_LOCK, and the wait starts there: the
+    time queued behind this run's own pins is no other run's doing. Another
+    run holds the lock as long as a pin takes, and every pin changes the
+    file, so the wait goes on while the file does. A lock held `timeout`
+    seconds with the file as it was (a run stopped with Ctrl-Z in the middle
+    of a pin) is an error that says so, not a wait with no end. A pin
+    replaces the file (see _save), so a lock won on the file it replaced is
+    let go and taken again on the new one."""
     pause = 0.001
+    seen = _signature(path)
+    deadline = time.monotonic() + timeout
     while True:
         fd = os.open(path, (os.O_RDWR if op == fcntl.LOCK_EX else os.O_RDONLY) | os.O_CREAT, 0o600)
         try:
@@ -150,13 +168,18 @@ def _locked(path: str, op: int, deadline: float) -> int:
                     fcntl.flock(fd, op | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
-                    if time.monotonic() >= deadline:
+                    current = _signature(path)
+                    if current != seen:             # the holder pinned: it is alive
+                        seen, deadline = current, time.monotonic() + timeout
+                    elif time.monotonic() >= deadline or (path in _GAVE_UP and _GAVE_UP[path] == current):
+                        _GAVE_UP[path] = current
                         raise RuntimeError(f"{path} is locked by another h-ssh run (one stopped with Ctrl-Z "
                                            "while it pinned?); resume or end it") from None
                     time.sleep(pause)
                     pause = min(pause * 2, 0.05)
             held, now = os.fstat(fd), os.stat(path)
             if (held.st_dev, held.st_ino) == (now.st_dev, now.st_ino):
+                _GAVE_UP.pop(path, None)
                 return fd
         except FileNotFoundError:
             pass                # removed under us: open it again
@@ -168,10 +191,16 @@ def _locked(path: str, op: int, deadline: float) -> int:
 
 def _read(fd: int):
     """(signature, text) of the file open on fd. A byte that is not UTF-8
-    is kept as it is (surrogateescape), so _save writes it back unchanged."""
+    is kept as it is (surrogateescape), so _save writes it back unchanged.
+    The signature is the file's before the read: stamped after it, a line
+    OpenSSH appended to ~/.ssh/known_hosts in between was cached as read,
+    for good. A file that changed during the read gets a signature equal to
+    nothing, so what was read is matched with no file and no parse."""
+    before = _stamp(os.fstat(fd))
     with open(fd, "rb", closefd=False) as f:
         data = f.read()
-    return _stamp(os.fstat(fd)), data.decode("utf-8", "surrogateescape")
+    signature = before if _stamp(os.fstat(fd)) == before else object()
+    return signature, data.decode("utf-8", "surrogateescape")
 
 
 def _save(path: str, text: str, old: os.stat_result):
@@ -252,24 +281,24 @@ def _parse(text: str, path: str, system: bool):
     an empty AssertionError. Here such a line is a refusal that names it.
     ~/.ssh/known_hosts (system) is OpenSSH's and read as OpenSSH reads it:
     a line that holds no key OpenSSH or paramiko can use is passed over, and
-    so are @cert-authority lines (paramiko cannot check a host certificate).
-    Its @revoked keys are returned, to be refused whenever a server presents
-    one; an @revoked line that cannot be read, or a marker OpenSSH does not
-    have, is still a refusal: a revocation is never dropped."""
+    so are @cert-authority lines (paramiko cannot check a host certificate)
+    and lines with a marker OpenSSH does not have. Its @revoked keys are
+    returned, to be refused whenever a server presents one; an @revoked line
+    that cannot be read is still a refusal: a revocation is never dropped.
+    A line ends at a newline only, as OpenSSH reads it (splitlines() ended
+    one at a form feed too)."""
     keys = paramiko.HostKeys()
     revoked = set()
-    for n, raw in enumerate(text.splitlines(), 1):
+    for n, raw in enumerate(text.split("\n"), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         marker = line.split(None, 1)[0] if line.startswith("@") else ""
-        if system and marker == "@cert-authority":
-            continue
+        if system and marker not in ("", "@revoked"):
+            continue        # @cert-authority, or a marker OpenSSH does not have and passes over
         try:
             if marker and not system:
                 raise ValueError("markers are read from ~/.ssh/known_hosts only")
-            if marker not in ("", "@revoked"):
-                raise ValueError(f"unknown marker {marker}")
             entry = _entry(line[len(marker):])
         except ValueError as e:
             # OpenSSH passes such a line over; a revoked key of a type
@@ -285,11 +314,12 @@ def _parse(text: str, path: str, system: bool):
     return keys, frozenset(revoked)
 
 
-def _parsed(path: str, system: bool, deadline: float):
+def _parsed(path: str, system: bool, timeout: float):
     """(HostKeys, revoked) of a known_hosts file, parsed once and shared
     until the file changes; a missing file is none. Our own pin file is read
-    under a shared file lock: a save in progress is waited for (until
-    `deadline`, see _locked), not read half done. Caller holds _PIN_LOCK."""
+    under a shared file lock: a save in progress is waited for (see _locked,
+    `timeout` the session timeout), not read half done. Caller holds
+    _PIN_LOCK."""
     signature = _signature(path)
     cached = _PINS.get(path)
     if cached is not None and cached[0] == signature:
@@ -297,7 +327,7 @@ def _parsed(path: str, system: bool, deadline: float):
     if signature is None:
         keys, revoked = paramiko.HostKeys(), frozenset()
     else:
-        fd = os.open(path, os.O_RDONLY) if system else _locked(path, fcntl.LOCK_SH, deadline)
+        fd = os.open(path, os.O_RDONLY) if system else _locked(path, fcntl.LOCK_SH, timeout)
         try:
             signature, text = _read(fd)
         finally:
@@ -312,12 +342,12 @@ def _load_pins(client, known_hosts: str, timeout: float = 30.0) -> frozenset:
     keys ~/.ssh/known_hosts marks @revoked. A pin file line that cannot be
     parsed is a refusal, not a skip: the pin it was meant to hold is
     unknown, and retrying the file cannot change it. Another run's lock on
-    the pin file is waited for `timeout` seconds at most."""
+    the pin file is waited for as _locked says, `timeout` being the session
+    timeout."""
     system = str(Path.home() / ".ssh" / "known_hosts")
-    deadline = time.monotonic() + timeout
     with _PIN_LOCK:
-        system_keys, revoked = _parsed(system, system=True, deadline=deadline)
-        keys, _ = _parsed(known_hosts, system=False, deadline=deadline)
+        system_keys, revoked = _parsed(system, system=True, timeout=timeout)
+        keys, _ = _parsed(known_hosts, system=False, timeout=timeout)
     # What load_system_host_keys()/load_host_keys() would have filled,
     # without parsing the file for this client alone.
     client._system_host_keys = system_keys

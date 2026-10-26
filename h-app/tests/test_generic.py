@@ -716,7 +716,7 @@ def test_the_pin_files_are_parsed_once_per_process_not_per_connection(home, monk
     assert all(c.get_host_keys().lookup("10.0.0.1") for c in clients)      # and every client has the pins
 
     key2 = paramiko.ECDSAKey.generate()
-    T._PinPolicy(str(pins)).missing_host_key(clients[0], "10.0.0.2", key2)  # pins under the lock: one merge parse
+    T._PinPolicy(str(pins)).missing_host_key(clients[0], "10.0.0.2", key2)  # pins under the lock, from the shared parse
     seen = len(parses)
     late = paramiko.SSHClient()
     T._load_pins(late, str(pins))
@@ -750,6 +750,25 @@ def _pins_with(home, *lines):
     pins.parent.mkdir(mode=0o700, exist_ok=True)
     pins.write_text("".join(line + "\n" for line in lines))
     return pins
+
+
+def _another_run_pins(pins, host, key, held, goes_on=False):
+    """Another run's pin, its lock held on `held`: a new file with the line
+    added, renamed over the old one, and the old one's lock let go. One
+    that goes on to its next pin at once has the new file locked before it
+    lands, and gets it back."""
+    new = pins.with_name("known_hosts.new")
+    f = open(new, "w")
+    if goes_on:
+        fcntl.flock(f, fcntl.LOCK_EX)
+    f.write(pins.read_text() + _key_line(host, key) + "\n")
+    f.flush()
+    os.replace(new, pins)
+    fcntl.flock(held, fcntl.LOCK_UN)
+    held.close()
+    if goes_on:
+        return f
+    f.close()
 
 
 def test_a_reader_waits_for_a_save_in_progress_and_sees_the_whole_file(home):
@@ -837,6 +856,113 @@ def test_a_pin_file_another_run_keeps_locked_fails_the_connection_within_the_ses
     assert offline.auth_calls == [] and pins.read_text() == ""
 
 
+def test_the_time_queued_behind_this_runs_own_pins_is_not_counted_against_another_runs_lock(home):
+    """The session timeout for another run's lock ran from before the
+    thread lock: a worker queued behind its own run's pins for longer than
+    that failed at its first sight of another run's lock, for good, with
+    the message that blames a stopped run. 4 runs of 50 workers pinning at
+    once at --session-timeout 1 lost 200 of 800 devices that way. The wait
+    starts when the worker holds the thread lock; reading the pins and
+    pinning alike."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    calls = (lambda: ssh._load_pins(paramiko.SSHClient(), str(pins), 1.0),
+             lambda: ssh._PinPolicy(str(pins), 1.0).missing_host_key(paramiko.SSHClient(), "10.0.0.9", key))
+    for theirs, call in zip(("10.0.0.2", "10.0.0.3"), calls):
+        failed = []
+
+        def run(call):
+            try:
+                call()
+            except Exception as e:
+                failed.append(e)
+        worker = threading.Thread(target=run, args=(call,), daemon=True)
+        with ssh._PIN_LOCK:                           # this run's other workers, pinning for 1.3 s
+            worker.start()
+            _time.sleep(1.3)
+            other = open(pins, "r+")
+            fcntl.flock(other, fcntl.LOCK_EX)         # and another run starts a pin
+        _time.sleep(0.2)
+        _another_run_pins(pins, theirs, key, other)
+        worker.join(5)
+        assert failed == [] and not worker.is_alive()
+    assert [line.split()[0] for line in pins.read_text().splitlines()] == ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.9"]
+
+
+def test_a_run_that_keeps_pinning_is_waited_for_past_the_session_timeout(home):
+    """Every pin another run makes changes the file, so a lock held through
+    a string of them is a run at work, not one stopped with Ctrl-Z. The wait
+    gave up a session timeout after it began, however busy the other run
+    was, and the device failed for good. It goes on while the file keeps
+    changing."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    failed = []
+
+    def pin():
+        try:
+            ssh._PinPolicy(str(pins), 1.0).missing_host_key(paramiko.SSHClient(), "10.0.0.9", key)
+        except Exception as e:
+            failed.append(e)
+    held = open(pins, "r+")
+    fcntl.flock(held, fcntl.LOCK_EX)
+    worker = threading.Thread(target=pin, daemon=True)
+    worker.start()
+    theirs = ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+    for host in theirs:                               # 1.5 s of pins, the lock never let go
+        _time.sleep(0.5)
+        held = _another_run_pins(pins, host, key, held, goes_on=True)
+    fcntl.flock(held, fcntl.LOCK_UN)
+    held.close()
+    worker.join(5)
+    assert failed == [] and not worker.is_alive()
+    assert [line.split()[0] for line in pins.read_text().splitlines()] == ["10.0.0.1", *theirs, "10.0.0.9"]
+
+
+def test_the_workers_queued_behind_a_stopped_run_give_up_with_the_first_not_one_timeout_each(home):
+    """The wait for another run's lock starts when a worker holds the
+    thread lock, so the workers queued there behind a run stopped with
+    Ctrl-Z would wait a session timeout each, in turn: 8 workers, 8 s at
+    --session-timeout 1. Once one has waited it out on an unchanged file,
+    the rest give up at once. Once the run lets go, the next connection
+    reads the pins at once, and another run's pin is waited for again."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    failed = []
+
+    def connect(i):
+        started = _time.monotonic()
+        try:
+            if i % 2:
+                ssh._PinPolicy(str(pins), 1.0).missing_host_key(paramiko.SSHClient(), f"10.0.1.{i}", key)
+            else:
+                ssh._load_pins(paramiko.SSHClient(), str(pins), 1.0)
+        except RuntimeError as e:
+            failed.append((_time.monotonic() - started, str(e)))
+    workers = [threading.Thread(target=connect, args=(i,), daemon=True) for i in range(8)]
+    with open(pins, "r+") as stopped:
+        fcntl.flock(stopped, fcntl.LOCK_EX)
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(10)
+    stuck = f"{pins} is locked by another h-ssh run (one stopped with Ctrl-Z while it pinned?); resume or end it"
+    assert [error for _, error in failed] == [stuck] * 8
+    assert max(took for took, _ in failed) < 2.5, sorted(round(took, 2) for took, _ in failed)
+    client = paramiko.SSHClient()
+    ssh._load_pins(client, str(pins), 1.0)                                    # resumed: read at once
+    other = open(pins, "r+")
+    fcntl.flock(other, fcntl.LOCK_EX)                                         # a pin of another run's, the file as it was
+    theirs = threading.Timer(0.3, _another_run_pins, (pins, "10.0.0.3", key, other))
+    theirs.start()
+    ssh._PinPolicy(str(pins), 1.0).missing_host_key(client, "10.0.0.2", key)  # waited for, not given up on
+    theirs.join(5)
+    assert [line.split()[0] for line in pins.read_text().splitlines()] == ["10.0.0.1", "10.0.0.3", "10.0.0.2"]
+
+
 def test_a_host_another_run_pins_during_this_handshake_is_checked_against_that_pin(offline, home, monkeypatch):
     """G1: the pin policy merged the file and then add()ed the key this
     server presented, over a pin another run had written since this one
@@ -877,23 +1003,60 @@ def test_a_pin_is_saved_by_replacing_the_file_whole(offline, home, tmp_path):
     assert pin_file(home).is_symlink() and shared.read_text().splitlines()[2].startswith("10.0.0.3 ")
 
 
-def test_a_pin_keeps_the_files_mode_its_group_and_every_byte_of_the_other_lines(offline, home):
+def test_a_pin_keeps_the_files_mode_and_every_byte_of_the_other_lines(offline, home):
     """A pin wrote the text it had read, a byte that is not UTF-8 replaced,
-    into a new 0600 file of the pinning user's: a pin file shared 0640 with
-    a group lost that group, and a Latin-1 comment came back changed. The
-    new file has the old one's mode and group, and every line but the new
-    one as it was."""
+    into a new 0600 file: a pin file shared 0640 lost its group's read, and
+    a Latin-1 comment came back changed. The new file has the old one's
+    mode, and every line but the new one as it was."""
     key = paramiko.ECDSAKey.generate()
     pins = _pins_with(home)
     before = b"# caf\xe9: the lab's pins\n" + _key_line("10.0.0.9", key).encode() + b"\n"
     pins.write_bytes(before)
     pins.chmod(0o640)
-    group = next((g for g in os.getgroups() if g != pins.stat().st_gid), pins.stat().st_gid)
-    os.chown(pins, -1, group)
     ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
     after = pins.read_bytes()
     assert after.startswith(before) and after[len(before):].startswith(b"10.0.0.1 ecdsa-sha2-nistp256 ")
-    assert stat.S_IMODE(pins.stat().st_mode) == 0o640 and pins.stat().st_gid == group
+    assert stat.S_IMODE(pins.stat().st_mode) == 0o640
+
+
+def test_a_pin_keeps_the_files_group(offline, home):
+    """A pin file shared through its group went to the pinning user's own
+    group at the first pin. The new file has the old one's group: another
+    of this user's groups, or, as root (CI's containers), any other."""
+    pins = _pins_with(home)
+    mine = pins.stat().st_gid
+    others = [g for g in os.getgroups() if g != mine] or ([65534 if mine != 65534 else 1] if os.geteuid() == 0 else [])
+    if not others:
+        pytest.skip("this user has no other group to give the pin file")
+    os.chown(pins, -1, others[0])
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert pins.read_text().startswith("10.0.0.1 ") and pins.stat().st_gid == others[0]
+
+
+def test_a_pin_parses_the_pin_file_only_when_another_run_changed_it(home, monkeypatch):
+    """Every pin parsed the whole pin file again, one key object a line,
+    holding the thread lock and the file lock, even when this process held
+    the parse of that very file: 60-100 ms a pin at 3000 pins, one after
+    another. A pin starts from the parse this process holds, and parses
+    again a file another run changed."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, *(_key_line(f"192.168.0.{i}", key) for i in range(20)))
+    ssh._PINS.clear()
+    parses = []
+    real_parse = ssh._parse
+    monkeypatch.setattr(ssh, "_parse", lambda text, path, system: parses.append(path) or real_parse(text, path, system))
+    ssh._load_pins(paramiko.SSHClient(), str(pins))
+    for host in ("10.0.0.1", "10.0.0.2"):
+        ssh._PinPolicy(str(pins)).missing_host_key(paramiko.SSHClient(), host, key)
+    assert parses == [str(pins)]                                              # the first read's, no more
+    with open(pins, "a") as other:                                            # another run pins, in place
+        other.write(_key_line("10.0.0.3", key) + "\n")
+    ssh._PinPolicy(str(pins)).missing_host_key(paramiko.SSHClient(), "10.0.0.4", key)
+    assert parses == [str(pins)] * 2
+    client = paramiko.SSHClient()
+    ssh._load_pins(client, str(pins))
+    assert parses == [str(pins)] * 2
+    assert all(client.get_host_keys().lookup(h) for h in ("192.168.0.19", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"))
 
 
 def test_a_cert_authority_line_in_the_system_file_is_passed_over_and_the_rest_still_counts(offline, home):
@@ -922,9 +1085,9 @@ def test_a_line_of_the_system_file_that_holds_no_key_is_passed_over_as_openssh_d
     """~/.ssh/known_hosts is OpenSSH's, and OpenSSH passes over a line it
     cannot read: one damaged line, for any host, refused every connection
     here while ssh itself and the openssh transport worked. The file's
-    other lines still count. An @revoked line that cannot be read, or a
-    marker OpenSSH does not have, is still refused: a revocation is never
-    dropped."""
+    other lines still count, and a line with a marker OpenSSH does not have
+    is passed over as OpenSSH passes it over. An @revoked line that cannot
+    be read is still refused: a revocation is never dropped."""
     key = paramiko.ECDSAKey.generate()
     system = home / ".ssh" / "known_hosts"
     system.parent.mkdir(mode=0o700)
@@ -940,12 +1103,90 @@ def test_a_line_of_the_system_file_that_holds_no_key_is_passed_over_as_openssh_d
     offline.server_key = paramiko.ECDSAKey.generate()
     with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.9"):
         ssh.show("10.0.0.9", "admin", "s3cret", "show version", 5, 10)
-    for line, why in ((f"@revoked * {key.get_name()}", "expected host, key type and key"),
-                      (f"@revokd * {key.get_name()} {key.get_base64()}", "unknown marker @revokd")):
-        system.write_text(line + "\n")
-        with pytest.raises(ValueError) as refused:
-            ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
-        assert str(refused.value) == f"{system}: malformed known_hosts line 1: {line!r} ({why}); fix or remove it"
+    unreadable = f"@revoked * {key.get_name()}"
+    system.write_text(unreadable + "\n")
+    with pytest.raises(ValueError) as refused:
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert str(refused.value) == (f"{system}: malformed known_hosts line 1: {unreadable!r} "
+                                  "(expected host, key type and key); fix or remove it")
+    system.write_text(f"@revokd * {offline.server_key.get_name()} {offline.server_key.get_base64()}\n")
+    ssh.show("10.0.0.2", "admin", "s3cret", "show version", 5, 10)       # no marker of OpenSSH's: passed over
+    assert "10.0.0.2 ecdsa-sha2-nistp256 " in pin_file(home).read_text()
+
+
+def _a_line_lands_during_the_next_read(monkeypatch, path, line, before_the_read=False):
+    """The ssh transport's next read of `path`, with `line` appended to the
+    file meanwhile by a writer that takes no lock (OpenSSH, a hand edit):
+    just after the read, or just before it once it has begun. Returns a
+    list that holds True once it has landed."""
+    real_open, landed = open, []
+
+    def land():
+        with real_open(path, "a") as writer:
+            writer.write(line + "\n")
+        landed.append(True)
+
+    class Reading:
+        def __init__(self, f):
+            self.f = f
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.f.close()
+
+        def read(self):
+            if before_the_read:
+                land()
+            data = self.f.read()
+            if not before_the_read:
+                land()
+            return data
+
+    def opening(file, mode="r", *args, **kw):
+        f = real_open(file, mode, *args, **kw)
+        if mode == "rb" and isinstance(file, int) and not landed and os.fstat(file).st_ino == path.stat().st_ino:
+            return Reading(f)
+        return f
+    monkeypatch.setattr(ssh, "open", opening, raising=False)
+    return landed
+
+
+def test_a_line_openssh_adds_while_the_file_is_read_is_seen_by_the_next_connection(offline, home, monkeypatch):
+    """The parse of ~/.ssh/known_hosts was stamped after the read: a line
+    OpenSSH appended in between was in the stamp but not in the parse, so
+    that host stayed unknown here for the rest of the process (pinned
+    again under accept-new, refused under yes; a Fleet lives long). The
+    stamp is taken before the read, and a file that changed during it is
+    read again by the next connection."""
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir(mode=0o700)
+    system.write_text(_key_line("10.0.0.1", offline.server_key) + "\n")
+    landed = _a_line_lands_during_the_next_read(monkeypatch, system, _key_line("10.0.0.2", offline.server_key))
+    monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "yes")
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)       # reads the file; OpenSSH appends meanwhile
+    ssh.show("10.0.0.2", "admin", "s3cret", "show version", 5, 10)       # known: the line is read
+    assert landed and pin_file(home).read_text() == ""
+
+
+def test_a_pin_parses_a_file_that_changed_while_it_read_it_not_the_copy_it_holds(home, monkeypatch):
+    """A pin starts from the parse this process holds when the file is the
+    one parsed. A line added by hand, with no lock, as the pin reads the
+    file is in the text the pin saves; had the read been taken for the
+    file the parse came from, this process's copy would lack it, and that
+    host would be pinned here again on trust. A read during which the file
+    changed is parsed."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    ssh._load_pins(paramiko.SSHClient(), str(pins))
+    landed = _a_line_lands_during_the_next_read(monkeypatch, pins, _key_line("10.0.0.2", key), before_the_read=True)
+    ssh._PinPolicy(str(pins)).missing_host_key(paramiko.SSHClient(), "10.0.0.3", key)
+    client = paramiko.SSHClient()
+    ssh._load_pins(client, str(pins))
+    assert landed and client.get_host_keys().lookup("10.0.0.2") is not None
+    assert [line.split()[0] for line in pins.read_text().splitlines()] == ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
 
 
 class _Sshd(paramiko.ServerInterface):
@@ -1087,6 +1328,22 @@ def test_a_bad_salt_fails_the_device_once_and_says_which_line(offline, home, cap
     assert ok is False
     assert f"ERROR: {pin_file(home)}: malformed known_hosts line 1: '|1|AAAA|" in out
     assert "RETRY" not in capsys.readouterr().out
+
+
+def test_a_form_feed_in_a_comment_does_not_end_the_line(offline, home):
+    """The pin file was split with splitlines(), which also ends a line at
+    a form feed (and \\x1c-\\x1e, \\x85, U+2028 and U+2029): a comment with
+    one in it refused every connection over a 'damaged' line made of its
+    second half, and every line after it was named with the wrong number.
+    A line ends at a newline only, as OpenSSH reads it."""
+    pins = _pins_with(home, "# lab pins\x0cpage 2", _key_line("10.0.0.1", offline.server_key))
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)       # known: nothing refused, nothing pinned
+    assert pins.read_text().count("10.0.0.1 ") == 1
+    pins.write_text(pins.read_text() + "10.0.0.2 ssh-ed25519\n")
+    with pytest.raises(ValueError) as refused:
+        ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert str(refused.value) == (f"{pins}: malformed known_hosts line 3: '10.0.0.2 ssh-ed25519' "
+                                  "(expected host, key type and key); fix or remove it")
 
 
 def test_the_key_exchange_has_the_session_timeout_too_not_paramikos_fixed_15_s(monkeypatch):
