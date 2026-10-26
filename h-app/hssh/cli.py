@@ -37,6 +37,7 @@ from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .store import Store, StoreError, ENV_VAR as STORE_ENV, DEFAULT as STORE_DEFAULT, where as store_where
 from .store import _identity as store_identity
+from .screen import terminal_safe, is_terminal as _tty
 from . import __version__
 from . import drivers
 
@@ -63,24 +64,6 @@ def list_vendors_lines():
 _RESULT_HEADER_KEYS = ("DEVICE:", "HOST:", "MODE:", "VENDOR:")
 
 
-# What a terminal would act on rather than show: C0 controls other than tab
-# and newline, DEL, C1 controls, and every ESC sequence (CSI, OSC, the rest).
-_TERMINAL_CONTROLS = re.compile(
-    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"   # CSI (7- or 8-bit) … final byte
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"   # OSC … BEL or ST
-    r"|\x1b[@-Z\\-_]"                    # two-byte ESC sequences
-    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
-
-
-def terminal_safe(text: str) -> str:
-    """Device output as it may be shown on the operator's terminal: a device
-    (or a description field) cannot repaint, hide or retitle anything.
-    Files keep the raw bytes; this is for the screen only."""
-    if not text:
-        return text
-    return _TERMINAL_CONTROLS.sub("", text)
-
-
 def strip_result_header(out_text: str, command: str = None) -> str:
     """Return just what the device said.
 
@@ -88,17 +71,28 @@ def strip_result_header(out_text: str, command: str = None) -> str:
     line, and text transports echo the command as '$ cmd'. Both are framing for
     the human-readable view; --raw wants neither.
     """
-    lines = out_text.splitlines()
+    # On "\n" alone: splitlines() also breaks on NEL, VT, FF and the Unicode
+    # separators, and the join would turn each into LF, so the record would
+    # no longer be the reply as it came.
+    lines = out_text.split("\n")
     i = 0
     while i < len(lines) and lines[i].startswith(_RESULT_HEADER_KEYS):
         i += 1
     if i and i < len(lines) and not lines[i].strip():
         i += 1
+    return strip_echo("\n".join(lines[i:]), command)
+
+
+def strip_echo(text: str, command: str = None) -> str:
+    """One command's reply without the '$ cmd' echo a text transport opens
+    it with. A batch's replies have no runner header to lose, so a reply
+    that opens like one ('MODE: active-standby') keeps that line."""
+    lines = text.split("\n")
     # Only drop the echo when it is exactly the command we sent, so device
     # output that happens to start with '$ ' survives intact.
-    if command and i < len(lines) and lines[i] == "$ %s" % command:
-        i += 1
-    return "\n".join(lines[i:]).strip("\n")
+    if command and lines[0] == "$ %s" % command:
+        lines = lines[1:]
+    return "\n".join(lines).strip("\n")
 
 
 def document_text(output) -> str:
@@ -217,15 +211,6 @@ def _ask(prompt: str, secret: bool = False) -> str:
     finally:
         if previous is not None:
             signal.signal(signal.SIGINT, previous)
-
-
-def _tty(stream) -> bool:
-    """Is this a terminal? False for a closed or absent stream (`>&-` leaves
-    sys.stdout as None) instead of a traceback."""
-    try:
-        return bool(stream is not None and stream.isatty())
-    except (AttributeError, ValueError, OSError):
-        return False
 
 
 class _Parser(argparse.ArgumentParser):
@@ -1109,6 +1094,16 @@ async def main() -> int:
     # job mode) travels with its result, so a job that names one device in
     # two entries never has the second read as the first.
     units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
+    # Each entry keeps its own store row: seq counts up per device in file
+    # order (a batch's commands do the same), so a device a job names twice
+    # does not have its first row replaced by its second. It moves on by one
+    # an entry because a job entry is one row (a show or an edit); an entry
+    # that wrote several rows would have to move it on by as many.
+    seq_of, counted = [], {}
+    for t, je in units:
+        assert je is None or je.mode in ("show", "edit-cmd"), f"job entry mode {je.mode!r}: seq counts one row an entry"
+        seq_of.append(counted.get(t.name, 0))
+        counted[t.name] = seq_of[-1] + 1
 
     def _audit_aborted(error):
         """One audit line per unit for a run the operator did not confirm."""
@@ -1339,17 +1334,16 @@ async def main() -> int:
         for coro in asyncio.as_completed(previews):
             i, res = await coro
             name, ok, out_text = res.name, res.ok, res.text
-            if _tty(sys.stdout):
-                out_text = terminal_safe(out_text)
-            # stdout stays the JSON array in --json mode; the previews go to stderr
-            print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=sys.stderr if json_mode else sys.stdout)
-            print(out_text.rstrip(), file=sys.stderr if json_mode else sys.stdout)
+            # stdout stays the JSON array in --json mode; the previews go to
+            # stderr, sanitised when that stream is a terminal. What is kept
+            # (the diff the commit must find again, the audit entry) is the reply.
+            stream = sys.stderr if json_mode else sys.stdout
+            print(f"\n--- {name}: {'diff' if ok else 'FAILED'} ---", file=stream)
+            print((terminal_safe(out_text) if _tty(stream) else out_text).rstrip(), file=stream)
             if ok:
-                # The diff the commit must find again; "" when the preview said
-                # NO CHANGES. On a terminal it is the diff as shown, control
-                # sequences stripped, as it always was.
-                diff = res.result.diff if isinstance(res.result, R.EditResult) else ""
-                expected[i] = terminal_safe(diff) if _tty(sys.stdout) else diff
+                # The diff the commit must find again, as the device gave it;
+                # "" when the preview said NO CHANGES.
+                expected[i] = res.result.diff if isinstance(res.result, R.EditResult) else ""
             else:
                 preview_failed.append(name)
             if args.audit_log:
@@ -1385,6 +1379,12 @@ async def main() -> int:
     tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
     screen = _tty(sys.stdout)     # control sequences are stripped for a terminal, kept for a pipe
 
+    def _screen(text: str) -> str:
+        """Device text as it goes to stdout: a terminal gets it with what it
+        would act on taken out, a pipe gets it as it came. The record (the
+        store, --log, --json) is the reply as it came either way."""
+        return terminal_safe(text) if screen else text
+
     interrupted = False
     log_cmd = (batch_cmds or show_cmd or edit_cmd or args.edit_broadcast
                or (args.edit_dir and f"dir:{args.edit_dir}") or "job")
@@ -1415,8 +1415,7 @@ async def main() -> int:
 
     async for i, res in _completed():
         name, ok, out_text, duration_ms = res
-        if screen:
-            out_text = terminal_safe(out_text)
+        shown = _screen(out_text)
         t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
         dev_mode = je.mode if je else mode
@@ -1445,7 +1444,7 @@ async def main() -> int:
                 for cr in cmd_results:
                     # Only text carries the echo; a --format json reply is data.
                     if cr.get("ok") and isinstance(cr.get("output"), str):
-                        cr["output"] = strip_result_header(cr["output"], cr["command"])
+                        cr["output"] = strip_echo(cr["output"], cr["command"])
                 entry["commands"] = cmd_results
                 if not ok:
                     for cr in cmd_results:
@@ -1505,7 +1504,7 @@ async def main() -> int:
             store_tried += 1
             try:
                 store.add_entry(store_run, entry, sent,
-                                fmt=args.format if dev_mode in ("show", "show-batch") else "text")
+                                fmt=args.format if dev_mode in ("show", "show-batch") else "text", seq=seq_of[i])
                 # SQLite writes into a deleted or replaced file without a
                 # word; one stat per result says so as it happens, not at the end.
                 gone = store.still_there() if store_reason is None else None
@@ -1565,7 +1564,7 @@ async def main() -> int:
                     print(f"{name}:")
                     for cr in cmd_results:
                         if cr.get("ok"):
-                            print(strip_result_header(document_text(cr["output"]), cr["command"]))
+                            print(_screen(strip_echo(document_text(cr["output"]), cr["command"])))
                         else:
                             print(f"{name}: {cr.get('command')}: {cr.get('error')}", file=sys.stderr)
                     print()
@@ -1574,7 +1573,7 @@ async def main() -> int:
             elif ok:
                 resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
                 print(f"{name}:")
-                print(strip_result_header(out_text, resolved_cmd))
+                print(strip_result_header(shown, resolved_cmd))
                 print()
             else:
                 # stdout stays device output only, so failures go to stderr.
@@ -1599,7 +1598,7 @@ async def main() -> int:
                         for cr in cmd_results:
                             print(f"\n--- {name}: {cr.get('command')} ---")
                             if cr.get("ok"):
-                                print(document_text(cr.get("output", "")))
+                                print(_screen(document_text(cr.get("output", ""))))
                             else:
                                 print(f"  ERROR: {cr.get('error')}")
                             print(f"--- end ---")
@@ -1612,7 +1611,7 @@ async def main() -> int:
                     print(f"[{timestamp}] {name:16s} {status}")
                     if args.verbose:
                         print(f"\n--- Output from {name} ---")
-                        print(out_text)
+                        print(shown)
                         print(f"--- End of {name} ---\n")
                     elif not ok and res.error is not None:
                         print(f"  ERROR: {res.error}")
@@ -1622,10 +1621,10 @@ async def main() -> int:
 
                 if args.verbose:
                     print(f"\n--- Output from {name} ---")
-                    print(out_text)
+                    print(shown)
                     print(f"--- End of {name} ---\n")
                 elif ok and (dev_mode.startswith("edit") or dev_mode == "rollback"):
-                    print(format_edit_result(out_text))
+                    print(format_edit_result(shown))
                 elif not ok and res.error is not None:
                     print(f"  ERROR: {res.error}")
 
@@ -1687,7 +1686,9 @@ async def main() -> int:
     if json_mode:
         print(json.dumps(json_results, indent=2))
     else:
-        # Print diff output
+        # Print diff output, sanitised a line at a time: the diff is of the
+        # replies as they came, where VT, FF and NEL end a line, and taken out
+        # of the whole text they would run a removed line into the one before.
         if args.diff and mode in ["show", "show-batch"]:
             ok_results = [r for r in json_results if r["ok"]]
             if len(ok_results) >= 2:
@@ -1701,7 +1702,7 @@ async def main() -> int:
                             print(f"    (identical)\n")
                         else:
                             for ln in diff_text.splitlines():
-                                print(f"    {ln}")
+                                print(f"    {_screen(ln)}")
                             print()
                     elif mode == "show-batch":
                         print(f"  {baseline_name} vs {other['device']}:")
@@ -1711,7 +1712,7 @@ async def main() -> int:
                                 print(f"      (identical)")
                             else:
                                 for ln in cd["diff"].splitlines():
-                                    print(f"      {ln}")
+                                    print(f"      {_screen(ln)}")
                         print()
                 print("--- End diff ---")
 
@@ -1886,6 +1887,7 @@ def _watch_report(store, run_id: str, previous: Optional[dict], tick: int, ok: i
             changed.append((r, p))
     print(f"tick {tick} {stamp}: {ok} OK, {failed} failed, {len(changed)} changed" + (f"; {lost}" if lost else ""),
           flush=True)
+    safe = terminal_safe if _tty(sys.stdout) else (lambda text: text)      # the rows are the replies as they came
     for r, p in changed:
         command = (r["command"] or "").strip().splitlines()[0] if (r["command"] or "").strip() else ""
         head = f"--- {r['device']}: {command[:60]}"
@@ -1895,10 +1897,10 @@ def _watch_report(store, run_id: str, previous: Optional[dict], tick: int, ok: i
         if r["ok"] != p["ok"]:
             error = (r["error"] or "").strip().splitlines()[0] if r["error"] else ""
             head += f": {'OK' if p['ok'] else 'FAIL'} -> {'OK' if r['ok'] else 'FAIL'}" + (f" ({error})" if error else "")
-        print(head)
+        print(safe(head))
         a, b = (p["output"] or "").splitlines(), (r["output"] or "").splitlines()
         for line in difflib.unified_diff(a, b, fromfile=p["ts"][:19], tofile=r["ts"][:19], lineterm="", n=1):
-            print("  " + line)
+            print("  " + safe(line))
     sys.stdout.flush()
     return rows
 

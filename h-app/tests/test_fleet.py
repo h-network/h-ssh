@@ -1354,6 +1354,58 @@ def test_two_fleets_on_one_store_from_two_threads_keep_every_row(monkeypatch, tm
     store.close()
 
 
+def test_one_reply_is_the_same_row_whether_fleet_or_the_cli_kept_it(monkeypatch, tmp_path, capsys):
+    """Fleet still joined the reply's splitlines(), which the CLI no longer
+    does (#111): CR, NEL, VT, FF and U+2028/9 became LF in a Fleet row and
+    stayed in a CLI row, so `h-ssh-store diff` between the two said the
+    device had changed when it had not. A show and a batch's commands alike."""
+    from tests.test_store import run_cli
+    reply = ("interface Gi0/1\r\n description \x1b[31muplink\x1b[0m\x07\r\n"
+             "nel\x85vt\x0bff\x0cls\u2028ps\u2029end\r\n shutdown \r\n")
+    fake = install(monkeypatch, show=lambda *a, **kw: reply,
+                   show_batch=lambda host, user, passwd, cmds, *a, **kw:
+                   [{"command": c, "ok": True, "output": f"$ {c}\n{reply}"} for c in cmds])
+    with Fleet(["R1:10.0.0.1:junos"], user="u", store=str(tmp_path / "fleet.db")) as fleet:
+        assert all(r.ok for r in fleet.show("show version"))
+        assert all(r.ok for r in fleet.batch(["show version", "show route"]))
+    batch = tmp_path / "batch.txt"
+    batch.write_text("show version\nshow route\n")
+    for argv in (["-sC", "show version"], ["--batch", str(batch)]):
+        rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(tmp_path / "cli.db"),
+                                                     "--target", "R1:10.0.0.1:junos", *argv], fake=fake)
+        assert rc == 0, err
+    sql = ("SELECT runs.mode, seq, results.command, format, output FROM results JOIN runs USING (run_id) "
+           "ORDER BY runs.rowid, seq")
+    kept = rows(tmp_path / "fleet.db", sql)
+    assert kept == rows(tmp_path / "cli.db", sql) and [r["mode"] for r in kept] == ["show", "show-batch", "show-batch"]
+    assert kept[0]["output"] == reply.rstrip()                    # a show: framed without its trailing whitespace
+    assert kept[1]["output"] == kept[2]["output"] == reply.rstrip("\n")   # a batch's command: the echo dropped
+
+
+def test_a_batch_reply_that_opens_like_the_runners_header_is_kept_whole(monkeypatch, tmp_path, capsys):
+    """The CLI put each batch command's reply through the stripper of the
+    runner's header, which takes leading DEVICE:/HOST:/MODE:/VENDOR: lines
+    away: a reply that opens 'MODE: active-standby' lost that line in the
+    row, --json and --raw, and no longer matched the row Fleet kept. A
+    command's reply loses only the '$ cmd' echo, whoever keeps it."""
+    from tests.test_store import run_cli
+    reply = "MODE: active-standby\nVENDOR: none\nnode0 primary"
+    fake = install(monkeypatch, show_batch=lambda host, user, passwd, cmds, *a, **kw:
+                   [{"command": c, "ok": True, "output": f"{reply}\n"} for c in cmds])      # no echo, as NETCONF
+    with Fleet(["R1:10.0.0.1:junos"], user="u", store=str(tmp_path / "fleet.db")) as fleet:
+        assert all(r.ok for r in fleet.batch(["show chassis cluster status"]))
+    batch = tmp_path / "batch.txt"
+    batch.write_text("show chassis cluster status\n")
+    argv = ["--store", str(tmp_path / "cli.db"), "--target", "R1:10.0.0.1:junos", "--batch", str(batch)]
+    rc, out, err = run_cli(monkeypatch, capsys, [*argv, "--json"], fake=fake)
+    assert rc == 0, err
+    assert json.loads(out)[0]["commands"][0]["output"] == reply
+    rc, out, err = run_cli(monkeypatch, capsys, [*argv, "--raw"], fake=fake)
+    assert rc == 0 and out == f"R1:\n{reply}\n\n", err
+    assert [r["output"] for r in rows(tmp_path / "fleet.db", "SELECT output FROM results")] == [reply]
+    assert [r["output"] for r in rows(tmp_path / "cli.db", "SELECT output FROM results")] == [reply, reply]
+
+
 def test_a_run_the_caller_never_finished_is_recorded_as_interrupted(monkeypatch, tmp_path):
     release, started = threading.Event(), threading.Event()
     install(monkeypatch, show=holding(release, started, hosts={"10.0.0.2", "10.0.0.3"}))

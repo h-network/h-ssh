@@ -17,8 +17,9 @@ and finished, the mode, the command line, who ran it, the counts).
 `results`: one row per command on one device, unique on (run_id, device,
 seq): a show is seq 0, a batch is seq 0..n-1 in the batch's order, an edit
 is seq 0 with the payload as the command and the device's verdict (the diff,
-or the commit line) as the output. `format` says what the output is: text,
-xml or json as the device was asked for; a commit history is json.
+or the commit line) as the output; a job that names one device in several
+entries gives them seq 0, 1, ... in file order. `format` says what the output
+is: text, xml or json as the device was asked for; a commit history is json.
 """
 
 import argparse
@@ -36,7 +37,10 @@ import stat
 import sys
 import threading
 import time
+import weakref
 from typing import Iterable, List, Optional
+
+from .screen import is_terminal, terminal_safe
 
 ENV_VAR = "HSSH_STORE"
 DEFAULT = "h-ssh.db"          # in the directory h-ssh runs from: the evidence sits with the job
@@ -47,9 +51,9 @@ WAL_SWITCH_TIMEOUT = 5.0      # seconds the first run on a new file may wait to 
 
 def where(flag: Optional[str] = None, config: Optional[dict] = None) -> str:
     """The store a run writes and the reader reads: --store, else HSSH_STORE,
-    else the config file's `store`, else h-ssh.db in the current directory."""
-    return (flag or os.environ.get(ENV_VAR) or (config or {}).get(CONFIG_KEY)
-            or os.path.expanduser(DEFAULT))
+    else the config file's `store`, else h-ssh.db in the current directory.
+    A leading `~` is the home directory in each of them."""
+    return os.path.expanduser(flag or os.environ.get(ENV_VAR) or (config or {}).get(CONFIG_KEY) or DEFAULT)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -88,13 +92,34 @@ CREATE INDEX IF NOT EXISTS results_command ON results(command);
 """
 
 
-def _identity(path: str):
-    """What makes the file at `path` this file: device and inode; None if nothing is there."""
+def _identity(path: str, dir_fd: Optional[int] = None):
+    """What makes the file at `path` this file: device and inode; None if nothing is there.
+    With `dir_fd`, `path` is a name in that directory."""
     try:
-        st = os.stat(path)
+        st = os.stat(path, dir_fd=dir_fd)
     except OSError:
         return None
     return (st.st_dev, st.st_ino)
+
+
+# A directory held for still_there(). O_PATH (Linux) needs no read permission
+# on it, only the search permission the path to the file needs anyway.
+_DIRECTORY = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0)
+
+
+def _hold_directory(path: str):
+    """(the file's name, an fd on the directory `path` names it in): what the
+    file is looked up by. (path, None) when the directory cannot be opened:
+    the file is then looked up by the path as given."""
+    try:
+        return os.path.basename(path), os.open(os.path.dirname(path) or ".", _DIRECTORY)
+    except OSError:
+        return path, None
+
+
+def _let_go(fd: Optional[int]) -> None:
+    if fd is not None:
+        os.close(fd)
 
 
 def _wal(conn, timeout: float = WAL_SWITCH_TIMEOUT) -> None:
@@ -168,14 +193,22 @@ class Store:
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         self.conn.row_factory = sqlite3.Row
-        self.identity = _identity(path)
+        # The file is looked up by its name in its directory, which is held
+        # open from here: a library script that chdirs, a `..` after a
+        # symlinked directory and a job directory renamed during the run all
+        # still lead to the file SQLite opened; a path string would not.
+        # Messages keep the path as given.
+        self._where = _hold_directory(path)
+        self._release_dir = weakref.finalize(self, _let_go, self._where[1])
+        self.identity = _identity(*self._where)
         self._writing = threading.Lock()
 
     def still_there(self) -> Optional[str]:
-        """None while the path still leads to the file this store opened, else
-        why not. SQLite goes on writing to a deleted or replaced file without
-        a word, so a run asks before it says its results are kept."""
-        now = _identity(self.path)
+        """None while the file this store opened is still where it was opened
+        (its name in its directory), else why not. SQLite goes on writing to a
+        deleted or replaced file without a word, so a run asks before it says
+        its results are kept."""
+        now = _identity(*self._where)
         if now is None:
             return "the store file was deleted during the run"
         if now != self.identity:
@@ -185,10 +218,14 @@ class Store:
     @staticmethod
     def _create_private(path: str) -> None:
         """The file is made 0600 before SQLite ever opens it, and must be a
-        regular file (no following a planted symlink into another file)."""
-        directory = os.path.dirname(os.path.abspath(path))
+        regular file (no following a planted symlink into another file). Its
+        directory is made from the path as given, not normalised: abspath()
+        takes `link/..` away as text, where the kernel (and SQLite) go up from
+        wherever the link leads."""
+        directory = os.path.dirname(path)
         try:
-            os.makedirs(directory, mode=0o700, exist_ok=True)
+            if directory:
+                os.makedirs(directory, mode=0o700, exist_ok=True)
             flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(path, flags, 0o600)
         except OSError as e:
@@ -206,6 +243,8 @@ class Store:
                 self.conn.close()
             except sqlite3.Error:
                 pass
+        self._where = (self.path, None)         # once closed, the fd's number may be another file's
+        self._release_dir()
 
     # --- writing ------------------------------------------------------------
 
@@ -252,33 +291,37 @@ class Store:
             (run_id, device, seq, host, vendor, command, ts or _now(), 1 if ok else 0,
              duration_ms, error, fmt, output))
 
-    def add_entry(self, run_id: str, entry: dict, command: str, fmt: str = "text") -> int:
+    def add_entry(self, run_id: str, entry: dict, command: str, fmt: str = "text", seq: int = 0) -> int:
         """The rows of one device's result as the CLI builds it (`entry`: the
         --json record): a batch is one row per command in its order; anything
         else one row, with `command` what was sent (the resolved show, the
         edit payload, `rollback N`, `show system commit`) and the output the
-        reply, the diff, or the commit history as JSON. One transaction per
-        device result, however many rows. Returns the rows written."""
+        reply, the diff, or the commit history as JSON. `seq` is the first
+        row's (a batch's commands follow at seq + 1, ...): 0, or in a job that
+        names one device in several entries, the entry's place among them,
+        which is enough because a job entry is one row (a show or an edit).
+        One transaction per device result, however many rows. Returns the
+        rows written."""
         device, host, vendor = entry["device"], entry.get("host"), entry.get("vendor")
         duration = entry.get("duration_ms")
         with self._writing, self.conn:
             if "commands" in entry and isinstance(entry["commands"], list) and entry["commands"]:
-                for seq, cr in enumerate(entry["commands"]):
+                for i, cr in enumerate(entry["commands"]):
                     out = cr.get("output")
-                    self._row(run_id, device, seq, cr.get("command", ""), bool(cr.get("ok")),
-                              duration if seq == 0 else None, cr.get("error"),
+                    self._row(run_id, device, seq + i, cr.get("command", ""), bool(cr.get("ok")),
+                              duration if i == 0 else None, cr.get("error"),
                               out if isinstance(out, str) or out is None else json.dumps(out),
                               fmt if isinstance(out, str) else "json", host, vendor)
                 return len(entry["commands"])
             if "commits" in entry:
                 output = json.dumps(entry["commits"]) if entry.get("ok") else None
-                self._row(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+                self._row(run_id, device, seq, command, bool(entry.get("ok")), duration, entry.get("error"),
                           output, "json", host, vendor)
                 return 1
             output = entry.get("output")
             if output is not None and not isinstance(output, str):
                 output, fmt = json.dumps(output), "json"
-            self._row(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+            self._row(run_id, device, seq, command, bool(entry.get("ok")), duration, entry.get("error"),
                       output, fmt, host, vendor)
             return 1
 
@@ -290,12 +333,17 @@ class Store:
 
     # --- reading ------------------------------------------------------------
 
+    # Newest first by the instant: `started` carries its UTC offset, and across
+    # a DST fall-back the local-time strings (and the run ids made of them)
+    # sort the wrong way round. The ids stay as they are; the order is not theirs.
+    NEWEST_FIRST = "datetime(started) DESC, rowid DESC"
+
     def runs(self, last: int = 20) -> List[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM runs ORDER BY started DESC, rowid DESC LIMIT ?",
+        return self.conn.execute(f"SELECT * FROM runs ORDER BY {self.NEWEST_FIRST} LIMIT ?",
                                  (last,)).fetchall()
 
     def last_run_id(self) -> Optional[str]:
-        row = self.conn.execute("SELECT run_id FROM runs ORDER BY started DESC, rowid DESC LIMIT 1").fetchone()
+        row = self.conn.execute(f"SELECT run_id FROM runs ORDER BY {self.NEWEST_FIRST} LIMIT 1").fetchone()
         return row["run_id"] if row else None
 
     def resolve_run(self, run: Optional[str]) -> str:
@@ -362,6 +410,13 @@ def _store_path(args) -> str:
     return where(args.store, config)
 
 
+def _shown_on(stream):
+    """How the reader prints stored text to `stream`: on a terminal, what the
+    terminal would act on is taken out, as h-ssh does with a reply; a pipe or
+    a file gets the bytes as they were kept."""
+    return terminal_safe if is_terminal(stream) else (lambda text: text)
+
+
 def _table(rows: Iterable[Iterable[str]], head: Iterable[str]) -> List[str]:
     rows = [tuple(str(c) for c in r) for r in rows]
     head = tuple(head)
@@ -391,7 +446,9 @@ def cmd_runs(store: Store, args) -> int:
 
 def cmd_failed(store: Store, args) -> int:
     run_id = store.resolve_run(args.run)
-    rows = [(r["device"], r["seq"], _short_cmd(r["command"]), (r["error"] or "").strip().splitlines()[0] if r["error"] else "-")
+    shown = _shown_on(sys.stdout)
+    rows = [(r["device"], r["seq"], _short_cmd(r["command"]),
+             shown((r["error"] or "").strip().splitlines()[0]) if r["error"] else "-")
             for r in store.results(run_id=run_id, ok=False)]
     print(f"run {run_id}: {len(rows)} failed")
     if rows:
@@ -403,9 +460,10 @@ def cmd_output(store: Store, args) -> int:
     run_id = store.resolve_run(args.run)
     row = store.output(run_id, args.device, args.seq)
     if row["output"] is not None:
-        sys.stdout.write(row["output"] if row["output"].endswith("\n") else row["output"] + "\n")
+        text = _shown_on(sys.stdout)(row["output"])
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
     if not row["ok"]:
-        print(f"ERROR: {row['error'] or 'failed'}", file=sys.stderr)
+        print(f"ERROR: {_shown_on(sys.stderr)(row['error'] or 'failed')}", file=sys.stderr)
         return 1
     return 0
 
@@ -416,12 +474,13 @@ def cmd_grep(store: Store, args) -> int:
     except re.error as e:
         raise StoreError(f"bad pattern {args.pattern!r}: {e}")
     run_id = store.resolve_run(args.run) if args.run else None
+    shown = _shown_on(sys.stdout)
     hits = 0
     for r in store.results(run_id=run_id, device=args.device, command=args.command, ok=True):
         for line in (r["output"] or "").splitlines():
             if pattern.search(line):
                 hits += 1
-                print(f"{r['run_id']}  {r['device']}  {_short_cmd(r['command'], 32)}: {line.rstrip()}")
+                print(f"{r['run_id']}  {r['device']}  {_short_cmd(r['command'], 32)}: {shown(line.rstrip())}")
     return 0 if hits else 1
 
 
@@ -443,6 +502,7 @@ def cmd_field(store: Store, args) -> int:
     """A dotted path into a JSON reply (a `--format json` show, or a commit
     history): the device's own structure, read, not parsed."""
     run_id = store.resolve_run(args.run) if args.run else None
+    as_shown = _shown_on(sys.stdout)
     shown = 0
     for r in store.results(run_id=run_id, device=args.device, command=args.command, ok=True):
         if r["format"] != "json" or not r["output"]:
@@ -456,7 +516,7 @@ def cmd_field(store: Store, args) -> int:
             continue
         shown += 1
         text = value if isinstance(value, str) else json.dumps(value)
-        print(f"{r['run_id']}  {r['device']}  {args.path} = {text}")
+        print(f"{r['run_id']}  {r['device']}  {args.path} = {as_shown(text)}")
     return 0 if shown else 1
 
 
@@ -465,6 +525,11 @@ def cmd_diff(store: Store, args) -> int:
     ra, rb = store.output(a, args.device, args.seq), store.output(b, args.device, args.seq)
     la, lb = (ra["output"] or "").splitlines(keepends=True), (rb["output"] or "").splitlines(keepends=True)
     diff = list(difflib.unified_diff(la, lb, fromfile=f"{args.device} {a}", tofile=f"{args.device} {b}"))
+    if is_terminal(sys.stdout):
+        # What the terminal would act on taken out, and each diff line on a
+        # screen line of its own: VT, FF and NEL end a line here and go with
+        # the rest, and a reply's last line has no newline of its own.
+        diff = [ln if ln.endswith("\n") else ln + "\n" for ln in map(terminal_safe, diff)]
     sys.stdout.writelines(diff)
     if diff and not diff[-1].endswith("\n"):
         print()
@@ -474,7 +539,8 @@ def cmd_diff(store: Store, args) -> int:
 def cmd_history(store: Store, args) -> int:
     rows = [(r["ts"][:19], r["run_id"], r["seq"], _short_cmd(r["command"]), "OK" if r["ok"] else "FAIL",
              r["duration_ms"] if r["duration_ms"] is not None else "-")
-            for r in store.results(device=args.device, command=args.command, order="ts DESC, seq", limit=args.last)]
+            for r in store.results(device=args.device, command=args.command,
+                                   order="datetime(ts) DESC, seq, rowid DESC", limit=args.last)]
     print("\n".join(_table(rows, ("when", "run", "seq", "command", "verdict", "ms"))))
     return 0
 
@@ -495,19 +561,25 @@ EXPORT_FIELDS = ("run_id", "device", "seq", "host", "vendor", "command", "ts", "
 def cmd_export(store: Store, args) -> int:
     """The rows as they are, for a spreadsheet or a notebook: CSV (Excel opens
     it; a multi-line reply stays one quoted cell) or JSON Lines, one object a
-    row. One run (default: the last) or --all; --out writes a file."""
+    row. One run (default: the last) or --all; --out writes a file. Printed
+    to a terminal, the text is shown as `output` shows it."""
     run_id = None if args.all else store.resolve_run(args.run)
     rows = store.results(run_id=run_id, device=args.device, command=args.command)
     out = open(args.out, "w", newline="", encoding="utf-8") if args.out else sys.stdout
+    shown = _shown_on(out)
+
+    def cells(r):
+        return [shown(r[f]) if isinstance(r[f], str) else r[f] for f in EXPORT_FIELDS]
+
     try:
         if args.format == "csv":
             writer = csv.writer(out)
             writer.writerow(EXPORT_FIELDS)
             for r in rows:
-                writer.writerow([r[f] for f in EXPORT_FIELDS])
+                writer.writerow(cells(r))
         else:
             for r in rows:
-                out.write(json.dumps({f: r[f] for f in EXPORT_FIELDS}, ensure_ascii=False) + "\n")
+                out.write(json.dumps(dict(zip(EXPORT_FIELDS, cells(r))), ensure_ascii=False) + "\n")
     finally:
         if args.out:
             out.close()
@@ -531,7 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("output", help="one device's reply from a run")
     s.add_argument("device")
     s.add_argument("run", nargs="?", help="run id or a unique prefix; default: the last run")
-    s.add_argument("--seq", type=int, default=0, help="which command of a batch (default 0)")
+    s.add_argument("--seq", type=int, default=0, help="which command of a batch, or entry of a job (default 0)")
     s.set_defaults(fn=cmd_output)
     s = sub.add_parser("grep", help="lines of stored output that match a regex")
     s.add_argument("pattern")
@@ -550,7 +622,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("device")
     s.add_argument("run_a")
     s.add_argument("run_b")
-    s.add_argument("--seq", type=int, default=0)
+    s.add_argument("--seq", type=int, default=0, help="which command of a batch, or entry of a job (default 0)")
     s.set_defaults(fn=cmd_diff)
     s = sub.add_parser("history", help="every stored result for a device, newest first")
     s.add_argument("device")

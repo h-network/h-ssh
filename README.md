@@ -574,21 +574,29 @@ both drop it, and `--json` reports it as its own `command` field instead of repe
 
 Every run is kept. The store is `h-ssh.db` in the directory you run from, so the evidence sits with
 the job (`cd customer-x && h-ssh ...`); `--store PATH`, `HSSH_STORE=PATH` or `store = PATH` in
-`~/.h-ssh/config` name another file, in that order of precedence, and `--no-store` keeps nothing of
-one run. One SQLite file, run after run: one row per command per device — run, device, host, driver,
-the command as sent, when, OK or not, the duration, the error, the format (`text`, `xml`, `json`) and
-the device's own reply. A show
+`~/.h-ssh/config` name another file, in that order of precedence (a leading `~` is your home directory
+in each of them), and `--no-store` keeps nothing of one run. One SQLite file, run after run: one row
+per command per device — run, device, host, driver, the command as sent, when, OK or not, the
+duration, the error, the format (`text`, `xml`, `json`) and the device's own reply. A show
 is one row, a `--batch` one row per command in order, an edit one row with the payload as the command
-and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON. A
+and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON, a
+`--job` one row per entry (a device the job names twice has `seq` 0 and 1, in file order). A
 second table, `runs`, has one row per invocation: when it started and finished, the mode, what it was
 about, the whole command line, who ran it and from where, and the counts. Everything is kept as it
 came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
-a `show configuration` keeps its hashes. The file is created 0600, opened and its tables made before
-the first device: a store that cannot be written is no run (exit 2, nothing sent), because a run
-nobody can look up afterwards is not worth having. A store that fails during the run (the disk
-fills, someone deletes or replaces the file) does not stop the devices' replies from being shown; the
-loss is said as it happens, counted at the end with its reason, and the run exits 4. A file
-overwritten in place (same inode) is the one case that goes unnoticed.
+a `show configuration` keeps its hashes; escape sequences and control characters are taken out of a
+reply as a terminal is shown it, by `h-ssh` and by `h-ssh-store` alike, never out of the record: the
+store, `--log`, `--json` and the audit log hold the same bytes whether the run was started from a
+terminal or a pipe, the reply's own line endings included (a show over SSH from a device that ends
+its lines with CRLF keeps them there and on `--raw` to a pipe; telnet hands its lines over with LF),
+and `h-ssh-store` hands a pipe or an `export --out` file the rows as they were kept. The file is
+created 0600, opened and its tables made before the first device: a store that cannot be written is
+no run (exit 2, nothing sent), because a run nobody can look up afterwards is not worth having. A
+store that fails during the run (the disk fills, someone deletes or replaces the file) does not stop
+the devices' replies from being shown; the loss is said as it happens, counted at the end with its
+reason, and the run exits 4. The store holds its directory open, so a job directory renamed during
+the run (`mv customer-x customer-x-done`) loses nothing. A file overwritten in place (same inode) is
+the one case that goes unnoticed.
 
 Writes are one transaction per device result, in WAL mode with `synchronous=NORMAL`: a row costs
 about a tenth of a millisecond, a 250-device run adds a few tens of milliseconds, the file never
@@ -602,9 +610,9 @@ the run wrote (`--store PATH`, `HSSH_STORE`, the config file's `store`, else `./
 
 | Command | Prints |
 |---|---|
-| `runs [--last N]` | the runs, newest first: id, start, mode, user, targets/ok/fail, what it was about |
+| `runs [--last N]` | the runs, newest first by the instant they started (ids and `started` are local time, which a DST fall-back puts out of order): id, start, mode, user, targets/ok/fail, what it was about |
 | `failed [RUN]` | the failed rows of a run (default: the last), with the device's error line; exit 1 when there are any |
-| `output DEVICE [RUN] [--seq N]` | one reply, as the device gave it; the error on stderr and exit 1 for a failed row |
+| `output DEVICE [RUN] [--seq N]` | one reply, as the device gave it (`--seq` picks a batch's command or a job's entry); the error on stderr and exit 1 for a failed row |
 | `grep PATTERN [--run] [--device] [--command] [-i]` | the lines of stored replies that match a regex, with run, device and command |
 | `field PATH [--run] [--device] [--command]` | a dotted path into JSON replies (`--format json` shows, commit histories): the device's structure read, not parsed |
 | `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ |
@@ -1004,7 +1012,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (997 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1022 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

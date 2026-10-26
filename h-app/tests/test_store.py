@@ -243,6 +243,33 @@ def test_runs_failed_and_output(tmp_path, capsys):
     assert rc == 0 and json.loads(out)[0]["user"] == "lab"
 
 
+def test_the_last_run_is_the_one_that_started_last_across_a_dst_fall_back(tmp_path, monkeypatch, capsys):
+    """Europe/Amsterdam, 2026-10-25: 02:40 CEST comes thirty minutes before
+    02:10 CET. Run ids and `started` are local time, so as strings the earlier
+    run sorts last; the reader orders by the instant, which the stored offset
+    gives it. The ids stay as they are."""
+    real = store_module._now
+    clock = ["2026-10-25T02:40:00+02:00", "2026-10-25T02:10:00+01:00"]
+    monkeypatch.setattr(store_module, "_now", lambda: clock.pop(0) if clock else real())
+    path = tmp_path / "runs.db"
+    s = Store(str(path))
+    summer = s.begin_run("show", ["a"], "u", 1, "0", run_id="20261025-024000-aaaa")
+    winter = s.begin_run("show", ["b"], "u", 1, "0", run_id="20261025-021000-bbbb")   # the later run
+    s.add(summer, "r1", 0, "show version", True, 1, None, "summer", ts="2026-10-25T02:40:01+02:00")
+    s.add(winter, "r1", 0, "show version", True, 1, None, "winter", ts="2026-10-25T02:10:01+01:00")
+    s.close()
+    r = Store(str(path), readonly=True)
+    assert r.last_run_id() == winter and r.resolve_run(None) == winter
+    assert [x["run_id"] for x in r.runs()] == [winter, summer]
+    r.close()
+    rc, out, _ = reader(capsys, path, "runs")
+    assert rc == 0 and [ln.split()[0] for ln in out.splitlines()[1:]] == [winter, summer]
+    rc, out, _ = reader(capsys, path, "output", "r1")          # no run given: the last one
+    assert rc == 0 and out == "winter\n"
+    rc, out, _ = reader(capsys, path, "history", "r1")
+    assert rc == 0 and [ln.split()[1] for ln in out.splitlines()[1:]] == [winter, summer]
+
+
 def test_grep_field_diff_history_slowest(tmp_path, capsys):
     path = tmp_path / "runs.db"
     r1, r2, r3 = filled(path)
@@ -293,6 +320,40 @@ def test_export_csv_and_jsonl(tmp_path, capsys):
     assert len(list(csv.DictReader(target.read_text().splitlines()))) == 4     # r1: a show, two batch rows, a history
     rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--all", "--device", "nobody")
     assert rc == 1 and out.strip() == ",".join(store_module.EXPORT_FIELDS)     # a header and nothing else
+
+
+def test_the_reader_shows_a_terminal_no_escape_sequences_and_a_pipe_the_rows_as_kept(tmp_path, monkeypatch, capsys):
+    """The rows are the replies as they came (#111), so `h-ssh-store output`
+    on a terminal wrote a device's OSC retitle and clear-screen to it, which
+    h-ssh itself never shows. On a terminal the reader takes out what the
+    terminal would act on, wherever it prints a row's text; a pipe and
+    `export --out` get the rows as they were kept."""
+    evil = "\x1b]0;pwned-title\x07desc \x1b[2J\x1b[31mred\x1b[0m \x9b2Jgone"
+    path = tmp_path / "runs.db"
+    s = Store(str(path))
+    a = s.begin_run("show", ["-sC", "show version"], "u", 3, "0", run_id="20261026-100000-aaaa")
+    s.add(a, "R1", 0, "show version", True, 1, None, f"Hostname: R1\n{evil}\nModel: vmx")
+    s.add(a, "R2", 0, "show version", False, 1, f"refused: {evil}")
+    s.add(a, "R3", 0, "show version", True, 1, None, json.dumps({"descr": evil}), fmt="json")
+    b = s.begin_run("show", ["-sC", "show version"], "u", 1, "0", run_id="20261026-110000-bbbb")
+    s.add(b, "R1", 0, "show version", True, 1, None, f"Hostname: R1\n{evil}\nModel: mx")
+    s.close()
+    for tty, seen in ((True, "desc red gone"), (False, evil)):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: tty)
+        for argv in (("output", "R1", a), ("output", "R2", a), ("grep", "desc", "--device", "R1"),
+                     ("field", "descr"), ("failed", a), ("diff", "R1", a, b), ("export", a)):
+            _, out, err = reader(capsys, path, *argv)
+            assert seen in out + err, argv
+            if tty:
+                assert not any(c in out + err for c in "\x1b\x07\x9b"), argv
+        _, out, _ = reader(capsys, path, "export", a, "--format", "jsonl")
+        assert json.loads(out.splitlines()[0])["output"] == f"Hostname: R1\n{seen}\nModel: vmx"
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    rc, out, _ = reader(capsys, path, "diff", "R1", a, b)             # each diff line on a screen line
+    assert rc == 1 and "-Model: vmx\n+Model: mx\n" in out
+    rc, out, err = reader(capsys, path, "export", a, "--out", str(tmp_path / "rows.csv"))
+    assert rc == 0 and out == "" and evil in (tmp_path / "rows.csv").read_text()   # a file is not a terminal
 
 
 def test_the_reader_looks_where_the_run_wrote(tmp_path, capsys, monkeypatch):
@@ -380,6 +441,73 @@ def test_a_batch_is_one_row_per_command_and_a_failure_is_the_devices_line(tmp_pa
     assert rc == 1 and "show nothing" in capsys.readouterr()[0]
 
 
+def test_a_job_that_names_one_device_twice_keeps_a_row_per_entry(tmp_path, monkeypatch, capsys):
+    """Every job entry was written at seq 0, so a device named in two entries
+    kept only the row of whichever finished last: run row 3/3, two rows. Now
+    seq counts up per device in file order, as a batch's commands do."""
+    path = tmp_path / "runs.db"
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"},
+    ]))
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda host, user, passwd, cmd, *a, **kw: f"{cmd} on {host}\n")
+    rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(path), "--job", str(job), "--json"], fake=fake)
+    assert rc == 0, err
+    assert len(json.loads(out)) == 3
+    got = rows(path, "SELECT device, seq, command, output FROM results ORDER BY device, seq")
+    assert [(r["device"], r["seq"], r["command"], r["output"]) for r in got] == [
+        ("R1", 0, "show version", "show version on 10.0.0.1"),
+        ("R1", 1, "show interfaces terse", "show interfaces terse on 10.0.0.1"),
+        ("R2", 0, "show version", "show version on 10.0.0.2")]
+    run = rows(path, "SELECT * FROM runs")[0]
+    assert run["mode"] == "job" and (run["targets"], run["ok"], run["failed"]) == (3, 3, 0)
+    rc, out, _ = reader(capsys, path, "output", "R1", "--seq", "1")
+    assert rc == 0 and out == "show interfaces terse on 10.0.0.1\n"
+
+
+def test_the_row_is_the_reply_as_it_came_whether_stdout_is_a_terminal_or_a_pipe(tmp_path, monkeypatch, capsys):
+    """The row (and --log) was built from the text as shown: on a terminal
+    the escape sequences, BEL and C1 bytes were gone; on a pipe splitlines()
+    had turned NEL, VT, FF and the Unicode separators into LF. The record is
+    the reply as it came either way; only the screen is sanitised."""
+    reply = "Hostname: R1\x1b[31m red\x1b[0m\x07 bell\nnel\x85vt\x0bff\x0cls\u2028ps\u2029end\nModel: vmx\n"
+    kept = reply.rstrip("\n")                   # the runner frames the reply and drops the newline at its end
+    assert cli.strip_result_header("DEVICE: R1\nHOST:   10.0.0.1\nMODE:   show\nVENDOR: junos\n\n" + kept) == kept
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: reply)
+    for where, tty in (("pipe", False), ("terminal", True)):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)      # the CLI asks the stream it has at run time
+        db, log = tmp_path / f"{where}.db", tmp_path / f"{where}.jsonl"
+        rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(db), "--target", "R1:10.0.0.1:junos",
+                                                     "-sC", "show version", "-v", "--log", str(log)], fake=fake)
+        assert rc == 0, err
+        assert rows(db, "SELECT output FROM results")[0]["output"] == kept, where
+        assert json.loads(log.read_text())["output"] == kept, where
+        assert "Hostname: R1" in out and "Model: vmx" in out
+        if tty:
+            assert not any(c in out for c in ("\x1b", "\x07", "\x85", "\x0b", "\x0c")), where
+        else:
+            assert "\x1b[31m red\x1b[0m\x07 bell" in out, where
+
+
+def test_a_crlf_reply_keeps_its_line_endings_in_the_row_and_on_raw_to_a_pipe(tmp_path, monkeypatch, capsys):
+    """An exec channel that ends its lines with CRLF (an IOS-shaped device)
+    came out LF in the record and on --raw, from a splitlines(). The reply's
+    own line endings are kept; only the line end after its last line goes,
+    with the runner's framing."""
+    reply = "interface Gi0/1\r\n description uplink\r\n shutdown\r\n"
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: reply)
+    monkeypatch.setitem(drivers.MODULES, "ios@ssh", fake)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: False)
+    path = tmp_path / "runs.db"
+    rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(path), "--target", "R1:10.0.0.1:ios@ssh",
+                                                 "-sC", "show running-config interface Gi0/1", "--raw"], fake=fake)
+    assert rc == 0, err
+    assert out == "R1:\ninterface Gi0/1\r\n description uplink\r\n shutdown\n\n"
+    assert rows(path, "SELECT output FROM results")[0]["output"] == "interface Gi0/1\r\n description uplink\r\n shutdown"
+
+
 def test_the_store_env_var_names_the_file(tmp_path, monkeypatch, capsys):
     path = tmp_path / "runs.db"
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(
@@ -441,6 +569,34 @@ def test_the_config_file_can_name_the_store(tmp_path, monkeypatch, capsys):
                                       "--target", "R1:10.0.0.1:junos", "-sC", "show version"])
     assert asyncio.run(cli.main()) == 0 and (tmp_path / "flag.db").is_file()
     assert len(rows(tmp_path / "env.db", "SELECT * FROM runs")) == 1
+
+
+def test_a_tilde_in_the_config_or_the_variable_means_home(tmp_path, monkeypatch, capsys):
+    """`store = ~/.h-ssh/runs.db` made a directory called `~` where the run
+    started, and the reader followed it there, so nobody noticed."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HSSH_STORE", raising=False)
+    assert store_module.where(None, {"store": "~/.h-ssh/runs.db"}) == str(home / ".h-ssh" / "runs.db")
+    assert store_module.where("~/flag.db") == str(home / "flag.db")
+    monkeypatch.setenv("HSSH_STORE", "~/env.db")
+    assert store_module.where() == str(home / "env.db")
+    monkeypatch.delenv("HSSH_STORE")
+    cfg = tmp_path / "config"
+    cfg.write_text("store = ~/.h-ssh/runs.db\n")
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "ok"))
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", str(cfg), "--user", "u", "--target", "R1:10.0.0.1:junos",
+                                      "-sC", "show version"])
+    assert asyncio.run(cli.main()) == 0
+    assert (home / ".h-ssh" / "runs.db").is_file() and not (tmp_path / "~").exists()
+    capsys.readouterr()
+    monkeypatch.setenv("HSSH_STORE", "~/.h-ssh/runs.db")           # the reader expands it the same way
+    assert store_main(["runs"]) == 0 and "show version" in capsys.readouterr()[0]
 
 
 def test_no_store_keeps_nothing_and_contradicts_store(tmp_path, monkeypatch, capsys):
