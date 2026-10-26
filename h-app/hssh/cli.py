@@ -24,11 +24,11 @@ from .core import (
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, parse_jobs, resolve_target_port, check_unique,
-    check_confirm_minutes,
+    check_confirm_minutes, control_character, read_failure, is_file,
 
     path_inside,
 )
-from .runner import run_for_target_async, is_connect_failure, RunResult, error_line
+from .runner import run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
@@ -545,7 +545,12 @@ async def main() -> int:
     bare_hosts = list(args.hosts)
     args.target = (bare_hosts + list(args.target or [])) or None
     if args.list_profiles:
-        for line in profiles.listing_lines():
+        try:
+            lines = profiles.listing_lines()
+        except OSError as e:                 # a profiles directory that may not be read
+            print(f"ERROR reading {e.filename}: {read_failure(e)}", file=sys.stderr)
+            return 2
+        for line in lines:
             print(line)
         return 0
     if args.profile:
@@ -559,7 +564,10 @@ async def main() -> int:
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
-    args.batch_commands = None   # an inline batch, only a run file sets it
+        except OSError as e:                 # a directory on the way that may not be searched
+            print(f"ERROR reading profile '{args.profile}' ({e.filename}): {read_failure(e)}", file=sys.stderr)
+            return 2
+    args.batch_commands = None   # the batch: a run file's commands, or the --batch/--profile file's lines read below
     args.jobs_data = None        # job entries from a run file
 
     # A run file sits between the command line and the config file: a flag
@@ -588,10 +596,21 @@ async def main() -> int:
         print(f"ERROR: {get_config_path() if args.config is None else args.config}: {e}", file=sys.stderr)
         return 2
 
-    # A command made of whitespace is a typo, not a request.
+    # A command made of whitespace is a typo, not a request; one with a
+    # control character in it is not a command: a line break in -sC would
+    # run two lines (and a retry both again), a NUL or an ESC is not text.
+    # An edit payload is lines, so -eC keeps its line breaks.
     for flag, value in (("-sC", args.show_command), ("-eC", args.edit_command)):
-        if value is not None and not value.strip():
+        if value is None:
+            continue
+        if not value.strip():
             print(f"ERROR: {flag} is empty.", file=sys.stderr)
+            return 2
+        what = control_character(value, line_breaks=flag == "-eC")
+        if what:
+            print(f"ERROR: {flag} has {what} ({value!r}); "
+                  f"{'a command is one line of text' if flag == '-sC' else 'a payload is plain text'}.",
+                  file=sys.stderr)
             return 2
 
     if args.list_vendors:
@@ -688,9 +707,28 @@ async def main() -> int:
             if not Path(args.edit_broadcast).is_file():
                 print(f"ERROR: broadcast file not found: {args.edit_broadcast}", file=sys.stderr)
                 return 2
+        # The batch is read here, with the run's other files and before the
+        # password prompt: a file that cannot be read is said so, not a
+        # traceback; a line with a control character is not a command.
         if args.batch:
-            if not Path(args.batch).is_file():
-                print(f"ERROR: batch file not found: {args.batch}", file=sys.stderr)
+            source = f"profile '{args.profile}' ({args.batch})" if args.profile else f"batch file '{args.batch}'"
+            try:
+                if not is_file(Path(args.batch)):
+                    print(f"ERROR: batch file not found: {args.batch}", file=sys.stderr)
+                    return 2
+                args.batch_commands = read_command_file_lines(Path(args.batch))
+            except (OSError, UnicodeDecodeError) as e:
+                print(f"ERROR reading {source}: {read_failure(e)}", file=sys.stderr)
+                return 2
+            if not args.batch_commands:
+                print("ERROR: batch file is empty after filtering.", file=sys.stderr)
+                return 2
+        else:
+            source = f"run file '{args.run}' commands"
+        for cmd in args.batch_commands or ():
+            what = control_character(cmd)
+            if what:
+                print(f"ERROR: {source}: {what} in {cmd!r}; a command is one line of text.", file=sys.stderr)
                 return 2
 
         # Load targets. A target that doesn't declare a vendor gets
@@ -882,6 +920,29 @@ async def main() -> int:
                   "drop one of them (every tick is in the store for h-ssh-store).", file=sys.stderr)
             return 2
 
+    # A shortcut is sent as its file says, resolved per vendor, so the command
+    # it stands for is held to the rule of one typed: one line of text (a
+    # job's shows too). --format turns a command into an RPC and sends it
+    # with no gate at all, so under it a show, and every line of a batch (a
+    # file, a profile, a run file's commands), must also be a read, in a dry
+    # run as well. Both refused here, before any I/O, by the runner's rules;
+    # a job's show entries are held to reads by the runner.
+    if job_entries:
+        sends = [(je.command, je.target.vendor) for je in job_entries if je.mode == "show"]
+    else:
+        sends = [(raw, vendor) for vendor in sorted({t.vendor for t in targets})
+                 for raw in ([args.show_command] if args.show_command else args.batch_commands or [])]
+    for raw, vendor in dict.fromkeys(sends):
+        resolved = str(resolve_command(raw, vendor))
+        what = control_character(resolved) if resolved != raw else None
+        if what:
+            print(f"ERROR: shortcut {raw!r} ({vendor}) has {what} ({resolved!r}); a command is one line of text.",
+                  file=sys.stderr)
+            return 2
+        if args.format != "text" and not job_entries and not is_read(drivers.get(vendor).dialect, resolved):
+            print(f"ERROR: {reads_only(args.format, resolved)}", file=sys.stderr)
+            return 2
+
     # Everything the run will write is proven writable before the first
     # device is touched: an audit log found unwritable after the commits
     # landed records nothing, and a safety gate that cannot keep its file
@@ -1003,12 +1064,7 @@ async def main() -> int:
         show_cmd = args.show_command
         edit_cmd = args.edit_command
         if args.batch_commands:
-            batch_cmds = list(args.batch_commands)
-        elif args.batch:
-            batch_cmds = read_command_file_lines(Path(args.batch))
-            if not batch_cmds:
-                print("ERROR: batch file is empty after filtering.", file=sys.stderr)
-                return 2
+            batch_cmds = list(args.batch_commands)      # the file's lines, or the run file's list
 
         if not json_mode and (args.every is None or not _WATCH["tick"]):
             # Report resolution once per vendor actually present, not per device,
@@ -1041,7 +1097,7 @@ async def main() -> int:
         if batch_cmds:
             print(f"Batch: {len(batch_cmds)} commands from {args.batch or 'the run file'}")
         print(f"Targets: {len(targets)}")
-        devices = len({(t.host, t.port) for t in targets})     # a job lists one device in several entries
+        devices = len({(t.host, resolve_target_port(t)) for t in targets})   # a job may list a device more than once
         waves = -(-devices // args.workers)
         if waves > 4 and args.workers < 64 and not fd_note:
             # Workers stay at 8 by default; a fleet run is told what it costs

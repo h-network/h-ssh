@@ -199,6 +199,17 @@ def test_the_banner_hints_at_more_workers_for_a_big_fleet(tmp_path, monkeypatch,
     assert rc == 0 and "Hint:" not in out                     # 4 waves at 64: nothing more to suggest
 
 
+def test_the_hint_counts_a_device_once_however_its_port_is_written(tmp_path, monkeypatch, capsys):
+    """#110 review: a job may name a device with its port and without it (one
+    router since #110); the hint counted the port as typed, so twice."""
+    jobs = [{"target": f"R{i}:10.0.0.{i}{port}:junos", "show": "show version"} for i in range(1, 6) for port in ("", ":830")]
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps(jobs))
+    rc, out, err = run_cli(monkeypatch, capsys, ["--job", str(job), "--workers", "1", "--store", str(tmp_path / "h.db")])
+    assert rc == 0, err
+    assert "Hint: 5 devices at 1 workers is 5 waves; --workers 64 would be 1 (one session per router either way)" in out
+
+
 def test_a_store_may_be_written_from_another_thread_than_the_one_that_opened_it(tmp_path):
     """A library caller opens the store where it builds the fleet and writes it
     from the thread that consumes the results. One writer at a time is still

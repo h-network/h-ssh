@@ -155,6 +155,20 @@ def test_check_unique_names_the_duplicate():
         check_unique([T("R1", "10.0.0.1"), T("R1", "10.0.0.2")], allow_repeats=True)
 
 
+def test_check_unique_compares_the_port_the_transport_will_use():
+    """#110: a port left to the default and the same port typed are one device."""
+    with pytest.raises(ValueError, match="host 10.0.0.1:830 is listed under two names: 'R1' and 'R2'"):
+        check_unique([T("R1", "10.0.0.1"), T("R2", "10.0.0.1", 830)])
+    with pytest.raises(ValueError, match="host 10.0.0.1 is listed under two names: 'R2' and 'R1'"):
+        check_unique([T("R2", "10.0.0.1", 830), T("R1", "10.0.0.1")])          # the port as typed
+    with pytest.raises(ValueError, match="device 'R1' \\(10.0.0.1\\) is listed twice"):
+        check_unique([T("R1", "10.0.0.1"), T("R1", "10.0.0.1", 830)])
+    check_unique([T("R1", "10.0.0.1"), T("R1", "10.0.0.1", 830)], allow_repeats=True)     # a job: the same device, twice
+    with pytest.raises(ValueError, match="device name 'R1' is used for two hosts: 10.0.0.1:830 and 10.0.0.1:22"):
+        check_unique([T("R1", "10.0.0.1"), Target(name="R1", host="10.0.0.1", vendor="ssh")])
+    check_unique([T("R1", "10.0.0.1"), Target(name="R2", host="10.0.0.1", vendor="ssh")])   # NETCONF and SSH: two devices
+
+
 def test_duplicates_in_an_inventory_and_inline_targets_are_refused(monkeypatch, capsys, tmp_path):
     f = tmp_path / "d.csv"
     f.write_text("R1,10.0.0.1,junos\nR1,10.0.0.1,junos\n")

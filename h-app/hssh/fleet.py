@@ -57,7 +57,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterable, Iterator, List, Optional, Union
 
 from . import drivers, limits, pool
-from .core import Target, check_unique, load_devices_csv, parse_bare_target
+from .core import Target, check_unique, control_character, load_devices_csv, parse_bare_target
 from .drivers import results as R
 from .runner import RunResult, _backoff, run_for_target
 from .store import Store
@@ -283,6 +283,18 @@ def _as_targets(spec, transport: str) -> List[Target]:
             raise TypeError("a target is a Target, a host, a name:host[:vendor][:port] string or a "
                             f"Path to an inventory file, not {type(item).__name__}")
     return targets
+
+
+def _one_line(what: str, command: str) -> str:
+    """The command as sent: one line of text. The line break that ends a
+    line read from a file is dropped, as the CLI drops it from a batch
+    file's lines; any other control character, a line break inside
+    included, is a ValueError."""
+    line = command[:-1].removesuffix("\r") if command.endswith("\n") else command
+    found = control_character(line)
+    if found:
+        raise ValueError(f"{what}: {found} in {command!r}; a command is one line of text")
+    return line
 
 
 def _check_int(name: str, value, low: int, high: Optional[int] = None) -> int:
@@ -915,17 +927,22 @@ class Fleet:
     # --- reads --------------------------------------------------------------
 
     def show(self, command: str, fmt: str = "text") -> Results:
-        """`command` on every device, sent as typed. The devices start now;
-        iterate the Results for what they said. `fmt` "json" or "xml" asks
-        for the router's own data (NETCONF only; refused elsewhere as that
-        device's failure, nothing sent)."""
+        """`command` on every device, sent as typed: one line of text, so a
+        line break or another control character in it is a ValueError
+        before anything runs (the one that ends a line read from a file is
+        dropped). The devices start now; iterate the Results for what they
+        said. `fmt` "json" or "xml" asks for the router's own data
+        (NETCONF only, and reads only: anything else is that device's
+        failure, nothing sent)."""
         run = self._prepare("show", command, fmt)
         run.start()
         return Results(run)
 
     def batch(self, commands: Iterable[str], fmt: str = "text") -> Results:
         """Several commands on every device, each device on one session;
-        every result carries one answer per command, in this order."""
+        every result carries one answer per command, in this order. Each
+        command is held to show()'s rules, `fmt` included, so the lines of
+        an open file may be passed as they are."""
         run = self._prepare("show-batch", commands, fmt)
         run.start()
         return Results(run)
@@ -953,12 +970,14 @@ class Fleet:
         if mode == "show":
             if not isinstance(command, str) or not command.strip():
                 raise ValueError("show needs a command")
+            command = _one_line("show", command)
         else:
             if isinstance(command, str):
                 raise TypeError("batch takes a list of commands; show() takes one")
             command = list(command)
             if not command or any(not isinstance(c, str) or not c.strip() for c in command):
                 raise ValueError("batch needs commands, none of them empty")
+            command = [_one_line("batch", c) for c in command]
         if fmt not in FORMATS:
             raise ValueError(f"fmt must be one of {', '.join(FORMATS)}, not {fmt!r}")
         if self._closed:

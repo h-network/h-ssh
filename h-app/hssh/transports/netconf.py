@@ -374,10 +374,13 @@ def _cli(dev, cmd: str) -> str:
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
          port: int = None, vendor_hint: str = None) -> str:
-    """Execute a show command over NETCONF."""
+    """Execute a show command over NETCONF. A read finds a dead reused
+    session and runs once more on a new one; anything else (`request …`)
+    is sent once, as rpc() does."""
     _require()
-    return _on_session(host, user, passwd, session_timeout, command_timeout, port,
-                       lambda lease: _cli(lease.dev, cmd))
+    run_on = _on_session if _is_read(cmd) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port,
+                  lambda lease: _cli(lease.dev, cmd))
 
 
 def show_structured(host: str, user: str, passwd: str, cmd: str,
@@ -789,9 +792,9 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
 
     A rejected or timed-out command is reported in its own result and the
     batch goes on (after a timeout the session is not kept, a late reply may
-    still be coming). A session that dies is a failure of the whole batch:
-    reads are idempotent, so a reused session gets the same reopen-once
-    treatment as show()."""
+    still be coming). A session that dies is a failure of the whole batch;
+    a reused one gets show()'s reopen-once treatment only when every command
+    is a read, as rpc_batch() does."""
     _require()
 
     def run(lease):
@@ -807,7 +810,8 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                 results.append({"command": cmd, "ok": False, "error": str(e)})
         return R.BatchResult(results)
 
-    return _on_session(host, user, passwd, session_timeout, command_timeout, port, run)
+    run_on = _on_session if all(_is_read(c) for c in cmds) else _on_session_once
+    return run_on(host, user, passwd, session_timeout, command_timeout, port, run)
 
 
 def _is_cli_command(text: str) -> bool:
@@ -860,9 +864,10 @@ def _rpc_reply(dev, command: str, args: Optional[dict], fmt: str):
 
 
 def _is_read(command: str) -> bool:
-    """A get-* RPC (any "show ..." command) is a read and safe to send twice."""
+    """A get-* RPC (any "show ..." command) is a read and safe to send twice;
+    a string with a line break is not, whatever its first line says."""
     text = command.strip()
-    return text.startswith("show ") or text.startswith("get")
+    return "\n" not in text and "\r" not in text and (text.startswith("show ") or text.startswith("get"))
 
 
 def _on_session_once(host, user, passwd, session_timeout, command_timeout, port, fn):
