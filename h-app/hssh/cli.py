@@ -489,7 +489,8 @@ async def main() -> int:
     parser.add_argument("--times", type=_ranged_int(1, None, "--times"), default=None,
                         help="With --every: stop after this many ticks")
     parser.add_argument("--diff", action="store_true",
-                        help="Compare output across devices (show modes only; the first device given is the baseline)")
+                        help="Compare output across devices (show modes only); the baseline is the first device "
+                             "in target order that answered (bare hosts, then --target; or the inventory's rows)")
     parser.add_argument("--raw", action="store_true",
                         help="Print only each device's output, no progress lines or headers")
     parser.add_argument("--list-commands", action="store_true",
@@ -1130,7 +1131,7 @@ async def main() -> int:
     skipped = 0                                              # held back by the safety gate (in the results)
     not_run = skipped_missing if not job_entries else 0      # no set file (--allow-missing): not in the results
     json_results = []
-    given_at = []        # each result's place in the inventory, for --diff's baseline
+    given_at = []        # each result's place in target order, for --diff
     run_start = time.time()
     store_run = None
     store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
@@ -1454,7 +1455,9 @@ async def main() -> int:
                 failures += 1
 
         # The run log is written as the results land: a SIGTERM, an exception
-        # later in the loop or an OOM loses nothing already reported.
+        # later in the loop or an OOM loses nothing already reported. It holds
+        # the payloads and edit diffs the audit log holds, and the replies, so
+        # it gets the same redaction and file mode.
         if args.log:
             try:
                 secure_append(args.log, json.dumps(redact_values({
@@ -1550,16 +1553,18 @@ async def main() -> int:
         pool.disable()
     _drain_closes()
 
-    # Write structured JSONL log. It holds the same payloads, replies and
-    # diffs as the audit log, so it gets the same redaction and file mode.
-    # Cross-device diff (show modes only). The baseline is the first device
-    # given that answered, not the first to answer, so one command line
-    # diffs the same way every run. A reply's last line has no newline: the
-    # lines are diffed without theirs and joined with one, or a removed last
-    # line would run into the line added after it.
+    # Cross-device diff (show modes only). The results go back into target
+    # order: the baseline is the first device in it that answered, not the
+    # first to answer, and --json lists the devices in it, so one command
+    # line diffs the same way, and lists the same way, every run. A reply
+    # is trimmed, so its last line has no newline: lines are compared
+    # without theirs and joined with one. With the newlines kept, a last
+    # line would not match itself once a line follows it, and a changed
+    # one would run into the line put in after it.
     ok_results = []
     if args.diff and mode in ["show", "show-batch"]:
-        ok_results = [r for _, r in sorted(zip(given_at, json_results), key=lambda p: p[0]) if r["ok"]]
+        json_results[:] = [r for _, r in sorted(zip(given_at, json_results), key=lambda p: p[0])]
+        ok_results = [r for r in json_results if r["ok"]]
         if len(ok_results) >= 2:
             baseline = ok_results[0]
             baseline_name = baseline["device"]

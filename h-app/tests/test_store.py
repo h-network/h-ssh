@@ -327,23 +327,32 @@ def test_a_batch_is_one_row_per_command_and_a_failure_is_the_devices_line(tmp_pa
     assert rc == 1 and "show nothing" in capsys.readouterr()[0]
 
 
-def test_the_readers_diff_puts_a_changed_last_line_on_two_lines(tmp_path, monkeypatch, capsys):
+VMX = "Model: vmx\nJunos: 24.2R1-S2.5\n"
+
+
+@pytest.mark.parametrize("before, after, hunk", [
+    (VMX, "Model: vmx\nJunos: 23.4R2.13\n", "@@ -1,2 +1,2 @@\n Model: vmx\n-Junos: 24.2R1-S2.5\n+Junos: 23.4R2.13\n"),
+    (VMX, VMX + "Peer: 10.9.9.8\n", "@@ -1,2 +1,3 @@\n Model: vmx\n Junos: 24.2R1-S2.5\n+Peer: 10.9.9.8\n"),
+    (VMX + "Peer: 10.9.9.8\n", VMX, "@@ -1,3 +1,2 @@\n Model: vmx\n Junos: 24.2R1-S2.5\n-Peer: 10.9.9.8\n"),
+], ids=["changed", "added", "removed"])
+def test_the_readers_diff_treats_the_trimmed_last_line_like_any_other(tmp_path, monkeypatch, capsys, before, after,
+                                                                       hunk):
     """The CLI keeps a reply trimmed, with no newline after its last line;
-    `h-ssh-store diff` still gives the line taken away and the line put in a
-    line each."""
+    `h-ssh-store diff` still takes it as a line like any other. Changed, it
+    is a line taken away and a line put in, a line each; left as it was, with
+    a line added or taken away after it, it is no change."""
     path = tmp_path / "runs.db"
 
-    def on(release):
-        return types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: f"Model: vmx\nJunos: {release}\n")
+    def answering(reply):
+        return types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: reply)
 
-    for release in ("24.2R1-S2.5", "23.4R2.13"):
+    for reply in (before, after):
         rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(path), "--target", "R1:10.0.0.1:junos",
-                                                     "-sC", "show version"], fake=on(release))
+                                                     "-sC", "show version"], fake=answering(reply))
         assert rc == 0, err
     first, second = [r["run_id"] for r in rows(path, "SELECT run_id FROM runs ORDER BY rowid")]
     rc, out, _ = reader(capsys, path, "diff", "R1", first, second)
-    assert rc == 1 and out == (f"--- R1 {first}\n+++ R1 {second}\n@@ -1,2 +1,2 @@\n"
-                               " Model: vmx\n-Junos: 24.2R1-S2.5\n+Junos: 23.4R2.13\n")
+    assert rc == 1 and out == f"--- R1 {first}\n+++ R1 {second}\n" + hunk
 
 
 def test_the_store_env_var_names_the_file(tmp_path, monkeypatch, capsys):
