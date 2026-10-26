@@ -604,8 +604,10 @@ class _Run:
         fleet = self.fleet
         if task.started is None:
             ms = 0
-            error = (f"not started: every worker thread ({fleet.workers}) is held by a call to a device "
-                     "that has not returned")
+            # Said as of the decision: a later iteration may report it once
+            # the held call has returned
+            error = (f"not started: every worker thread ({fleet.workers}) was held by a call to a device "
+                     "that had not returned")
         else:
             fleet._stuck_hold(task)
             if task.future is not None and task.future.done():   # it returned just now: not stuck after all
@@ -702,15 +704,19 @@ class _Run:
                 return
             self.settle()
             self.ended = True
-            for task in self.pending:
-                if task.future is not None:
-                    task.future.cancel()
-            skipped = len(self.pending)
-            ok = sum(1 for r in self.done if r.ok)
-            self._close_store_row(ok, len(self.done) - ok, skipped, interrupted and skipped > 0)
-        if self.stop.cancel():                   # wakes a consumer waiting on the run's futures
-            self.stop.set_running_or_notify_cancel()
-        self.fleet._forget(self)
+            try:
+                for task in self.pending:
+                    if task.future is not None:
+                        task.future.cancel()
+                skipped = len(self.pending)
+                ok = sum(1 for r in self.done if r.ok)
+                self._close_store_row(ok, len(self.done) - ok, skipped, interrupted and skipped > 0)
+            finally:
+                # The run is over even when a filter made a store-loss
+                # warning an error: the consumer wakes, the next run gets in.
+                if self.stop.cancel():           # wakes a consumer waiting on the run's futures
+                    self.stop.set_running_or_notify_cancel()
+                self.fleet._forget(self)
 
 
 def _finish_all(run: _Run, tasks: List[_Task]) -> None:
@@ -845,21 +851,22 @@ class Fleet:
     seconds to answer, and what has returned by then is a result and a store
     row; the run is recorded as interrupted with the rest as skipped, and
     its Results give what was done by then and nothing more (a call that
-    returns later is dropped: its row says skipped). A close() that catches
-    a run still being started waits for its store row, and that show()
-    raises RuntimeError("this Fleet is closed") with the row recorded as
-    interrupted. The sessions close (one still in use closes when its call
-    returns), a store this Fleet opened is closed. Nothing waits on a device
-    beyond `wait`; the worker threads are daemon threads, so a call that
-    never returns keeps its thread and nothing else. `async with`, and
-    `aclose()`, do the same off the event loop. A Fleet dropped without
-    close() gives its threads and the session pool back when its last
-    reference goes, as a dropped ThreadPoolExecutor does; a run it left
-    open keeps it until the garbage collector's next pass, and is not
-    recorded, so close() is still the way to end one. With no logging
-    set up, paramiko's and ncclient's tracebacks stay off stderr (each gets
-    a NullHandler, as the CLI gives it); set logging up and they go where
-    it sends them."""
+    returns later is dropped: its row says skipped). A close() that lands
+    while show() is still opening the run's store row waits for the row,
+    records the run as interrupted, and that show() raises
+    RuntimeError("this Fleet is closed"). The sessions close (one still in
+    use closes when its call returns), a store this Fleet opened is closed.
+    Nothing waits on a device beyond `wait`; the worker threads are daemon
+    threads, so a call that never returns keeps its thread and nothing
+    else. `async with`, and `aclose()`, do the same off the event loop. A
+    Fleet dropped without close() gives its threads and the session pool
+    back once it is collected, as a dropped ThreadPoolExecutor does. That
+    can wait for the garbage collector's next pass: a device call that
+    raised leaves its frames in a reference cycle, and they hold the Fleet;
+    so does a run it left open (not recorded, so close() is still the way
+    to end one). With no logging set up, paramiko's and ncclient's
+    tracebacks stay off stderr (each gets a NullHandler, as the CLI gives
+    it); set logging up and they go where it sends them."""
 
     def __init__(self, targets, transport: str = "ssh", user: Optional[str] = None,
                  passwd: Optional[str] = None, workers: int = 32, session_timeout: int = 30,
@@ -1039,9 +1046,13 @@ class Fleet:
                 self._finalizer.detach()     # the steps below are the finalizer's work, done now
         try:
             if run is not None:
-                if wait and wait > 0:
-                    run.wait_for_inflight(wait)
-                run.end(interrupted=True)
+                try:
+                    if wait and wait > 0:
+                        run.wait_for_inflight(wait)
+                finally:
+                    # A Ctrl-C during the grace too: its queue is cancelled
+                    # already, and nothing but this ends the run.
+                    run.end(interrupted=True)
         finally:
             try:
                 if workers is not None:

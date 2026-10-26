@@ -162,13 +162,36 @@ def test_a_run_is_found_by_its_id_or_a_unique_prefix_or_as_the_last(tmp_path):
         Store(str(tmp_path / "missing.db"), readonly=True)
 
 
-def test_two_threads_writing_one_store_keep_every_row(tmp_path):
+def writers_meet(monkeypatch, seconds=1.0):
+    """Store._row made to wait inside its transaction, once, for a second
+    writer to come in too; the list returned gets a name when two met
+    there. One transaction at a time keeps it empty (the first waits out
+    `seconds` and commits, the second only then gets in). Two writers
+    inside one transaction meet whatever the scheduler does, on one CPU as
+    on many."""
+    meet, met = threading.Barrier(2, timeout=seconds), []
+    real_row = Store._row
+
+    def row(self, *a, **kw):
+        try:
+            meet.wait()
+            met.append(threading.current_thread().name)
+            meet.abort()                     # once is proof enough
+        except threading.BrokenBarrierError:
+            pass                             # nobody came in, or it is over
+        return real_row(self, *a, **kw)
+    monkeypatch.setattr(Store, "_row", row)
+    return met
+
+
+def test_two_threads_writing_one_store_keep_every_row(tmp_path, monkeypatch):
     """One Store written from two threads at once (two Fleets sharing it):
     one connection takes one transaction at a time, so a write waits for
     the other's commit instead of sharing its statement and losing rows."""
     path = tmp_path / "shared.db"
     st = Store(str(path))
     runs = [st.begin_run("show", ["t"], "u", 300, "0") for _ in range(2)]
+    met = writers_meet(monkeypatch)
     errors = []
 
     def writer(run):
@@ -185,6 +208,7 @@ def test_two_threads_writing_one_store_keep_every_row(tmp_path):
     for t in threads:
         t.join(30)
     st.close()
+    assert met == []                                 # never two writers inside one transaction
     assert errors == []
     assert rows(path, "SELECT COUNT(*) AS n FROM results")[0]["n"] == 600
     assert all(r["finished"] for r in rows(path, "SELECT * FROM runs"))
