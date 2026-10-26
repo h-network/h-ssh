@@ -400,7 +400,7 @@ def test_pinning_takes_a_file_lock_so_two_processes_keep_each_others_pins(offlin
         return real(fd, op)
     monkeypatch.setattr(ssh.fcntl, "flock", recording)
     ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
-    assert fcntl.LOCK_EX in locks and fcntl.LOCK_UN in locks
+    assert any(op & fcntl.LOCK_EX for op in locks) and fcntl.LOCK_UN in locks
     assert pin_file(home).read_text().startswith("10.0.0.1 ")
 
 
@@ -738,6 +738,7 @@ def test_the_pin_files_are_parsed_once_per_process_not_per_connection(home, monk
 
 import base64
 import fcntl
+import re
 
 
 def _key_line(host, key):
@@ -777,6 +778,63 @@ def test_a_reader_waits_for_a_save_in_progress_and_sees_the_whole_file(home):
         fcntl.flock(saving, fcntl.LOCK_UN)
     reader.join(5)
     assert seen["keys"].lookup("10.0.0.1")["ecdsa-sha2-nistp256"] == key
+
+
+def test_a_pin_that_waited_on_a_file_another_run_replaced_lands_in_the_new_one(home):
+    """G1: a pin waits for the lock on the file it opened, while the run
+    holding that lock renames a new file over it. Pinning into the old file
+    would save over the other run's pin, and the next contact would pin
+    that host again on trust. The lock is taken again on the new file."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home, _key_line("10.0.0.1", key))
+    ssh._PINS.clear()
+    with open(pins, "r+") as old:                     # another run, half-way through a pin
+        fcntl.flock(old, fcntl.LOCK_EX)
+        pinning = threading.Thread(daemon=True, target=lambda: ssh._PinPolicy(str(pins)).missing_host_key(
+            paramiko.SSHClient(), "10.0.0.3", key))
+        pinning.start()
+        pinning.join(0.5)
+        assert pinning.is_alive()                     # waiting for the lock
+        new = pins.with_name("known_hosts.new")
+        new.write_text(_key_line("10.0.0.1", key) + "\n" + _key_line("10.0.0.2", key) + "\n")
+        os.replace(new, pins)                         # its pin lands
+        fcntl.flock(old, fcntl.LOCK_UN)
+    pinning.join(5)
+    assert [line.split()[0] for line in pins.read_text().splitlines()] == ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+
+
+def test_a_pin_file_another_run_keeps_locked_fails_the_connection_within_the_session_timeout(offline, home):
+    """A run stopped with Ctrl-Z in the middle of a pin keeps the pin file
+    locked. Another run waited for it with no end, holding this process's
+    pin lock while it did, so every one of its workers hung. Reading the
+    pins and pinning wait the session timeout at most, and then fail once,
+    in words, with nothing sent."""
+    pins = _pins_with(home)
+    ssh._PINS.clear()
+
+    def connect():
+        """(seconds, what ssh.show raised), or None while it is still waiting."""
+        done = []
+
+        def run():
+            started = _time.monotonic()
+            try:
+                ssh.show("10.0.0.1", "admin", "s3cret", "show version", 1, 10)
+            except Exception as e:
+                done.append((_time.monotonic() - started, e))
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(5)
+        return done[0] if done else None
+    for held in (fcntl.LOCK_EX, fcntl.LOCK_SH):       # the read waits on the first, the pin on the second
+        with open(pins) as other:
+            fcntl.flock(other, held)
+            failed = connect()
+        assert failed is not None, "still waiting for the other run's lock"
+        took, error = failed
+        assert str(error) == f"{pins} is locked by another h-ssh run (one stopped with Ctrl-Z while it pinned?); resume or end it"
+        assert 1 <= took < 3 and runner.is_permanent_failure(error)
+    assert offline.auth_calls == [] and pins.read_text() == ""
 
 
 def test_a_host_another_run_pins_during_this_handshake_is_checked_against_that_pin(offline, home, monkeypatch):
@@ -819,6 +877,25 @@ def test_a_pin_is_saved_by_replacing_the_file_whole(offline, home, tmp_path):
     assert pin_file(home).is_symlink() and shared.read_text().splitlines()[2].startswith("10.0.0.3 ")
 
 
+def test_a_pin_keeps_the_files_mode_its_group_and_every_byte_of_the_other_lines(offline, home):
+    """A pin wrote the text it had read, a byte that is not UTF-8 replaced,
+    into a new 0600 file of the pinning user's: a pin file shared 0640 with
+    a group lost that group, and a Latin-1 comment came back changed. The
+    new file has the old one's mode and group, and every line but the new
+    one as it was."""
+    key = paramiko.ECDSAKey.generate()
+    pins = _pins_with(home)
+    before = b"# caf\xe9: the lab's pins\n" + _key_line("10.0.0.9", key).encode() + b"\n"
+    pins.write_bytes(before)
+    pins.chmod(0o640)
+    group = next((g for g in os.getgroups() if g != pins.stat().st_gid), pins.stat().st_gid)
+    os.chown(pins, -1, group)
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    after = pins.read_bytes()
+    assert after.startswith(before) and after[len(before):].startswith(b"10.0.0.1 ecdsa-sha2-nistp256 ")
+    assert stat.S_IMODE(pins.stat().st_mode) == 0o640 and pins.stat().st_gid == group
+
+
 def test_a_cert_authority_line_in_the_system_file_is_passed_over_and_the_rest_still_counts(offline, home):
     """G2: an @cert-authority line, which an SSH CA puts in every user's
     ~/.ssh/known_hosts, refused every connection as malformed. paramiko
@@ -839,6 +916,36 @@ def test_a_cert_authority_line_in_the_system_file_is_passed_over_and_the_rest_st
     offline.server_key = paramiko.ECDSAKey.generate()
     with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.9"):
         ssh.show("10.0.0.9", "admin", "s3cret", "show version", 5, 10)
+
+
+def test_a_line_of_the_system_file_that_holds_no_key_is_passed_over_as_openssh_does(offline, home):
+    """~/.ssh/known_hosts is OpenSSH's, and OpenSSH passes over a line it
+    cannot read: one damaged line, for any host, refused every connection
+    here while ssh itself and the openssh transport worked. The file's
+    other lines still count. An @revoked line that cannot be read, or a
+    marker OpenSSH does not have, is still refused: a revocation is never
+    dropped."""
+    key = paramiko.ECDSAKey.generate()
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir(mode=0o700)
+    system.write_text("oldbox ssh-ed25519\n"                                   # too few fields
+                      "oldbox ssh-ed25519 AAAA!!!!\n"                          # not base64
+                      "oldbox ssh-ed25519 aGVsbG8sIG5vdCBhIGtleQ==\n"          # not a key
+                      f"|1|AAAA|{base64.b64encode(b'h' * 20).decode()} {key.get_name()} {key.get_base64()}\n"
+                      + _key_line("10.0.0.9", offline.server_key) + "\n")
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert pin_file(home).read_text().startswith("10.0.0.1 ecdsa-sha2-nistp256 ")
+    ssh.show("10.0.0.9", "admin", "s3cret", "show version", 5, 10)       # known from ~/.ssh/known_hosts
+    assert "10.0.0.9" not in pin_file(home).read_text()
+    offline.server_key = paramiko.ECDSAKey.generate()
+    with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.9"):
+        ssh.show("10.0.0.9", "admin", "s3cret", "show version", 5, 10)
+    for line, why in ((f"@revoked * {key.get_name()}", "expected host, key type and key"),
+                      (f"@revokd * {key.get_name()} {key.get_base64()}", "unknown marker @revokd")):
+        system.write_text(line + "\n")
+        with pytest.raises(ValueError) as refused:
+            ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+        assert str(refused.value) == f"{system}: malformed known_hosts line 1: {line!r} ({why}); fix or remove it"
 
 
 class _Sshd(paramiko.ServerInterface):
@@ -906,6 +1013,39 @@ def test_a_key_the_system_file_marks_revoked_is_refused_before_any_credential(ss
         monkeypatch.setenv("HSSH_HOST_KEY_POLICY", policy)
         with pytest.raises(RuntimeError, match=refused):
             ssh._connect("127.0.0.1", "u", "p", 5, port)
+    assert logins == ["u"]
+
+
+def test_netconf_host_key_verification_reads_the_system_file_the_same_way(sshd, home, monkeypatch):
+    """G2 on the junos transport: with HSSH_NETCONF_HOSTKEY=yes ncclient read
+    ~/.ssh/known_hosts with paramiko's load(), and an @cert-authority or
+    @revoked line refused every session, `ConnectError for HOST:PORT:
+    ('@cert-authority ...', Error(...))`. It is read as the ssh transport
+    reads it: the CA line passed over, the file's own lines checked, a key
+    it marks @revoked refused before any password."""
+    pytest.importorskip("jnpr.junos")
+    from hssh.transports import netconf
+    port, key, logins = sshd
+    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "yes")
+    ca = paramiko.ECDSAKey.generate()
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir(mode=0o700)
+    lines = f"@cert-authority *.example.net {ca.get_name()} {ca.get_base64()}\n"
+    system.write_text(lines)
+    with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: host key verification failed for "
+                                              rf"127\.0\.0\.1:{port}: not in ~/\.ssh/known_hosts, or changed"):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == []
+    lines += _key_line(f"[127.0.0.1]:{port}", key) + "\n"
+    system.write_text(lines)
+    with pytest.raises(NotAppliedError):            # in; then refused the NETCONF subsystem, being no router
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u"]
+    system.write_text(lines + f"@revoked * {key.get_name()} {key.get_base64()}\n")
+    with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: host key verification failed for "
+                                              rf"127\.0\.0\.1:{port}: its key is marked @revoked in "
+                                              rf"{re.escape(str(system))}; nothing was sent$"):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
     assert logins == ["u"]
 
 

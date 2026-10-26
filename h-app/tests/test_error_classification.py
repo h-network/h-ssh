@@ -115,6 +115,12 @@ def _pyez(kind, cause=None, orig=None):
      "no SSH session to 10.0.0.1:830 within 10s: the banner came, but key exchange did not finish"),
     (_pyez("ConnectRefusedError", SSHError("Negotiation failed: the banner came, but key exchange did not finish")), 0.2,
      "10.0.0.1:830 dropped the session before login after 0.2s (the banner came, but key exchange did not finish)"),
+    # #114 G2: HSSH_NETCONF_HOSTKEY=yes reads ~/.ssh/known_hosts as the ssh transport does
+    (_pyez("ConnectError", orig=_Ctx("its key is marked @revoked in /h/.ssh/known_hosts")), 0.3,
+     "host key verification failed for 10.0.0.1:830: its key is marked @revoked in /h/.ssh/known_hosts; nothing was sent"),
+    (_pyez("ConnectError", orig=ValueError("/h/.ssh/known_hosts: malformed known_hosts line 2: '@revoked *' "
+                                           "(expected host, key type and key); fix or remove it")), 0.0,
+     "/h/.ssh/known_hosts: malformed known_hosts line 2: '@revoked *' (expected host, key type and key); fix or remove it"),
 ])
 def test_connect_reason_reads_the_exception_pyez_was_handling(exc, elapsed, expect):
     assert netconf._connect_reason(exc, "10.0.0.1", "u", 830, 10, elapsed) == expect
@@ -163,11 +169,11 @@ def test_a_malformed_known_hosts_line_is_refused_before_connecting(monkeypatch, 
     paramiko = pytest.importorskip("paramiko")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(os.path, "expanduser", lambda p: p.replace("~", str(tmp_path)))
-    (tmp_path / ".ssh").mkdir(mode=0o700)
-    (tmp_path / ".ssh" / "known_hosts").write_text("r1 ssh-ed25519 not-base64!!\n")
+    (tmp_path / ".h-ssh").mkdir(mode=0o700)
+    (tmp_path / ".h-ssh" / "known_hosts").write_text("r1 ssh-ed25519 not-base64!!\n")
     connected = []
     monkeypatch.setattr(paramiko.SSHClient, "connect", lambda self, **kw: connected.append(kw))
-    with pytest.raises(ValueError, match=r"\.ssh/known_hosts: malformed known_hosts line 1: 'r1 ssh-ed25519 not-base64!!' "
+    with pytest.raises(ValueError, match=r"\.h-ssh/known_hosts: malformed known_hosts line 1: 'r1 ssh-ed25519 not-base64!!' "
                                          r"\(the key is not base64\); fix or remove it"):
         ssh._connect("10.0.0.1", "u", "p", 5, None)
     assert connected == []

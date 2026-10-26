@@ -77,6 +77,7 @@ except ImportError:
 _DEADLINE = threading.local()
 
 _KEX_UNFINISHED = "the banner came, but key exchange did not finish"
+_REVOKED = "its key is marked @revoked in "
 
 
 if _paramiko is not None:
@@ -121,12 +122,40 @@ if _paramiko is not None:
                     raise
                 raise _paramiko.SSHException(_KEX_UNFINISHED) from e
 
+    class _KnownHosts(_paramiko.HostKeys):
+        """The known_hosts ncclient checks the router's key against
+        (HSSH_NETCONF_HOSTKEY=yes), read as the ssh transport reads
+        ~/.ssh/known_hosts. paramiko's own load() refused the whole file over
+        an @cert-authority or @revoked line, which an SSH CA puts in every
+        user's file: the first is passed over, and a key the second names is
+        refused whatever else the file says."""
+
+        def __init__(self, filename=None):
+            self._revoked = {}          # key blob -> the file that revokes it
+            super().__init__(filename)
+
+        def load(self, filename):
+            from .ssh import _parse
+            with open(filename, "rb") as f:
+                text = f.read().decode("utf-8", "surrogateescape")
+            keys, revoked = _parse(text, filename, system=True)
+            self._entries.extend(keys._entries)
+            self._revoked.update(dict.fromkeys(revoked, filename))
+
+        def check(self, hostname, key):
+            where = self._revoked.get(key.asbytes())
+            if where is not None:
+                raise _paramiko.SSHException(_REVOKED + where)
+            return super().check(hostname, key)
+
     class _ParamikoForNcclient:
         """ncclient's view of the paramiko module: as it is, except that
-        Transport is the deadline-aware one. Only ncclient sees this; paramiko
-        itself and the ssh transport's SSHClient are untouched."""
+        Transport is the deadline-aware one and HostKeys reads known_hosts
+        as the ssh transport does. Only ncclient sees this; paramiko itself
+        and the ssh transport's SSHClient are untouched."""
 
         Transport = _DeadlineTransport
+        HostKeys = _KnownHosts
 
         def __init__(self, module):
             self._module = module
@@ -229,6 +258,10 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     if cause_kind == "SSHUnknownHostError" or "unknown host key" in low:
         return (f"host key verification failed for {where}: not in ~/.ssh/known_hosts, or changed "
                 "(HSSH_NETCONF_HOSTKEY=yes); nothing was sent")
+    if _REVOKED in text:
+        return f"host key verification failed for {where}: {text}; nothing was sent"
+    if "malformed known_hosts line" in low:
+        return text
     if "could not open socket" in low:
         if elapsed >= timeout - 0.5:
             return f"connect to {where} timed out after {timeout}s (filtered, or down)"
