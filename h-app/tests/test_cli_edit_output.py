@@ -272,6 +272,32 @@ def test_a_failed_job_entry_saves_its_error_in_its_own_file(monkeypatch, capsys,
     assert (save / "R1.2.output").read_text().endswith("\n\nERROR: syntax error: show bogus\n")
 
 
+def test_a_jobs_store_rows_and_saved_files_count_a_devices_entries_alike(monkeypatch, capsys, tmp_path):
+    """The store numbers a device's job entries (seq 0, 1, 2) and --save-output
+    names their files (R1.output, R1.2.output, R1.3.output). One count feeds
+    both, so the entry the store keeps at seq k is the one saved in the
+    device's (k+1)th file, a failed entry included."""
+    import sqlite3
+    db, save = tmp_path / "runs.db", tmp_path / "out"
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"},
+        {"target": "R1:10.0.0.1:junos", "show": "show bogus"},
+    ], "--json", "--store", str(db), "--save-output", str(save), driver=EchoDriver(fail={"show bogus"}))
+    assert rc == 1
+    con = sqlite3.connect(str(db))
+    try:
+        rows = con.execute("SELECT device, seq, command FROM results ORDER BY device, seq").fetchall()
+    finally:
+        con.close()
+    assert rows == [("R1", 0, "show version"), ("R1", 1, "show interfaces terse"), ("R1", 2, "show bogus"),
+                    ("R2", 0, "show version")]
+    files = {"R1": ["R1.output", "R1.2.output", "R1.3.output"], "R2": ["R2.output"]}
+    for device, seq, command in rows:
+        assert command in (save / files[device][seq]).read_text()
+
+
 def test_a_job_entry_saved_over_another_devices_file_is_refused(monkeypatch, capsys, tmp_path):
     """R1's second entry is saved as R1.2.output, which is also the file of a
     device named R1.2: one result would replace the other. Refused with the
