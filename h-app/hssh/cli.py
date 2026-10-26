@@ -24,11 +24,11 @@ from .core import (
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, parse_jobs, resolve_target_port, check_unique,
-    check_confirm_minutes,
+    check_confirm_minutes, control_character, read_failure, is_file,
 
     path_inside,
 )
-from .runner import run_for_target_async, is_connect_failure, RunResult, error_line
+from .runner import run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
@@ -36,6 +36,7 @@ from .safety import SafetyGate
 from . import pool
 from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .store import Store, StoreError, ENV_VAR as STORE_ENV, DEFAULT as STORE_DEFAULT, where as store_where
+from .store import _identity as store_identity
 from .screen import terminal_safe, is_terminal as _tty
 from . import __version__
 from . import drivers
@@ -152,13 +153,16 @@ MAX_SECONDS = 86400
 
 
 def _seconds_arg(text: str) -> float:
-    """--every SECONDS: one second or more; fractions are allowed."""
+    """--every SECONDS: one second to a day (MAX_SECONDS, the timeouts'
+    ceiling too); fractions are allowed."""
     try:
         value = float(text)
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError(f"--every takes seconds, not {text!r}")
     if not value >= 1:
         raise argparse.ArgumentTypeError(f"--every takes 1 second or more, not {text}")
+    if value > MAX_SECONDS:
+        raise argparse.ArgumentTypeError(f"--every takes at most {MAX_SECONDS} seconds (a day), not {text}")
     return value
 
 
@@ -470,7 +474,8 @@ async def main() -> int:
                         help="Show detailed output for all operations")
     parser.add_argument("--every", type=_seconds_arg, metavar="SECONDS", default=None,
                         help="Watch: run the same reads again every SECONDS after the previous tick and print, per "
-                             "tick, what changed since the one before (reads only, the store on); until Ctrl-C or --times")
+                             "tick, what changed since the one before (reads only, the store on, not with --json or "
+                             "--raw; 1 to 86400 s); until Ctrl-C or --times")
     parser.add_argument("--times", type=_ranged_int(1, None, "--times"), default=None,
                         help="With --every: stop after this many ticks")
     parser.add_argument("--diff", action="store_true",
@@ -525,7 +530,12 @@ async def main() -> int:
     bare_hosts = list(args.hosts)
     args.target = (bare_hosts + list(args.target or [])) or None
     if args.list_profiles:
-        for line in profiles.listing_lines():
+        try:
+            lines = profiles.listing_lines()
+        except OSError as e:                 # a profiles directory that may not be read
+            print(f"ERROR reading {e.filename}: {read_failure(e)}", file=sys.stderr)
+            return 2
+        for line in lines:
             print(line)
         return 0
     if args.profile:
@@ -539,7 +549,10 @@ async def main() -> int:
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
-    args.batch_commands = None   # an inline batch, only a run file sets it
+        except OSError as e:                 # a directory on the way that may not be searched
+            print(f"ERROR reading profile '{args.profile}' ({e.filename}): {read_failure(e)}", file=sys.stderr)
+            return 2
+    args.batch_commands = None   # the batch: a run file's commands, or the --batch/--profile file's lines read below
     args.jobs_data = None        # job entries from a run file
 
     # A run file sits between the command line and the config file: a flag
@@ -568,10 +581,21 @@ async def main() -> int:
         print(f"ERROR: {get_config_path() if args.config is None else args.config}: {e}", file=sys.stderr)
         return 2
 
-    # A command made of whitespace is a typo, not a request.
+    # A command made of whitespace is a typo, not a request; one with a
+    # control character in it is not a command: a line break in -sC would
+    # run two lines (and a retry both again), a NUL or an ESC is not text.
+    # An edit payload is lines, so -eC keeps its line breaks.
     for flag, value in (("-sC", args.show_command), ("-eC", args.edit_command)):
-        if value is not None and not value.strip():
+        if value is None:
+            continue
+        if not value.strip():
             print(f"ERROR: {flag} is empty.", file=sys.stderr)
+            return 2
+        what = control_character(value, line_breaks=flag == "-eC")
+        if what:
+            print(f"ERROR: {flag} has {what} ({value!r}); "
+                  f"{'a command is one line of text' if flag == '-sC' else 'a payload is plain text'}.",
+                  file=sys.stderr)
             return 2
 
     if args.list_vendors:
@@ -668,9 +692,28 @@ async def main() -> int:
             if not Path(args.edit_broadcast).is_file():
                 print(f"ERROR: broadcast file not found: {args.edit_broadcast}", file=sys.stderr)
                 return 2
+        # The batch is read here, with the run's other files and before the
+        # password prompt: a file that cannot be read is said so, not a
+        # traceback; a line with a control character is not a command.
         if args.batch:
-            if not Path(args.batch).is_file():
-                print(f"ERROR: batch file not found: {args.batch}", file=sys.stderr)
+            source = f"profile '{args.profile}' ({args.batch})" if args.profile else f"batch file '{args.batch}'"
+            try:
+                if not is_file(Path(args.batch)):
+                    print(f"ERROR: batch file not found: {args.batch}", file=sys.stderr)
+                    return 2
+                args.batch_commands = read_command_file_lines(Path(args.batch))
+            except (OSError, UnicodeDecodeError) as e:
+                print(f"ERROR reading {source}: {read_failure(e)}", file=sys.stderr)
+                return 2
+            if not args.batch_commands:
+                print("ERROR: batch file is empty after filtering.", file=sys.stderr)
+                return 2
+        else:
+            source = f"run file '{args.run}' commands"
+        for cmd in args.batch_commands or ():
+            what = control_character(cmd)
+            if what:
+                print(f"ERROR: {source}: {what} in {cmd!r}; a command is one line of text.", file=sys.stderr)
                 return 2
 
         # Load targets. A target that doesn't declare a vendor gets
@@ -840,6 +883,51 @@ async def main() -> int:
                   file=sys.stderr)
             return 2
 
+    # --every's refusals come before anything is written: a watch refused
+    # here leaves no store file and no audit log behind.
+    if args.times is not None and args.every is None:
+        print("ERROR: --times goes with --every.", file=sys.stderr)
+        return 2
+    if args.every is not None:
+        if mode not in ("show", "show-batch"):
+            print("ERROR: --every watches reads (-sC, --batch, --profile), not edits, rollbacks, commit status or jobs.",
+                  file=sys.stderr)
+            return 2
+        if args.no_store:
+            print("ERROR: --every compares every tick with the one before through the store; drop --no-store "
+                  "or name a --store.", file=sys.stderr)
+            return 2
+        if args.json or args.raw:
+            # The tick lines and the diffs are the watch's output, and they
+            # are neither a JSON array nor device output: `--json --every | jq`
+            # broke at the first tick. The ticks are in the store for a pipeline.
+            print("ERROR: --every prints one line per tick and what changed, not --json or --raw output; "
+                  "drop one of them (every tick is in the store for h-ssh-store).", file=sys.stderr)
+            return 2
+
+    # A shortcut is sent as its file says, resolved per vendor, so the command
+    # it stands for is held to the rule of one typed: one line of text (a
+    # job's shows too). --format turns a command into an RPC and sends it
+    # with no gate at all, so under it a show, and every line of a batch (a
+    # file, a profile, a run file's commands), must also be a read, in a dry
+    # run as well. Both refused here, before any I/O, by the runner's rules;
+    # a job's show entries are held to reads by the runner.
+    if job_entries:
+        sends = [(je.command, je.target.vendor) for je in job_entries if je.mode == "show"]
+    else:
+        sends = [(raw, vendor) for vendor in sorted({t.vendor for t in targets})
+                 for raw in ([args.show_command] if args.show_command else args.batch_commands or [])]
+    for raw, vendor in dict.fromkeys(sends):
+        resolved = str(resolve_command(raw, vendor))
+        what = control_character(resolved) if resolved != raw else None
+        if what:
+            print(f"ERROR: shortcut {raw!r} ({vendor}) has {what} ({resolved!r}); a command is one line of text.",
+                  file=sys.stderr)
+            return 2
+        if args.format != "text" and not job_entries and not is_read(drivers.get(vendor).dialect, resolved):
+            print(f"ERROR: {reads_only(args.format, resolved)}", file=sys.stderr)
+            return 2
+
     # Everything the run will write is proven writable before the first
     # device is touched: an audit log found unwritable after the commits
     # landed records nothing, and a safety gate that cannot keep its file
@@ -859,12 +947,24 @@ async def main() -> int:
         # Every run is kept. The store is opened, and its tables made, before
         # the first device is touched: one that cannot be written is no run,
         # found out now and not after the commits landed.
+        store_path = store_where(args.store, file_config)
+        if args.every is not None and _WATCH["tick"]:
+            # A later tick of a watch. Opening a store deleted since would make
+            # a new, empty one and go on there, the ticks so far left behind.
+            found = store_identity(store_path)
+            if found != _WATCH["store"]:
+                print(f"ERROR: store {store_path}: the store file was {'deleted' if found is None else 'replaced'} "
+                      f"after tick {_WATCH['tick']}; a watch keeps all its ticks in one store, so it stops here.",
+                      file=sys.stderr)
+                return 2
         try:
-            store = Store(store_where(args.store, file_config))
+            store = Store(store_path)
         except StoreError as e:
             print(f"ERROR: store {e}; every run is kept, so a store that cannot be written is no run: "
                   f"use --store PATH for another file, or --no-store; refusing to start.", file=sys.stderr)
             return 2
+        if args.every is not None and not _WATCH["tick"]:
+            _WATCH["store"] = store.identity       # the file every later tick must find at the path
     safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
     try:
         safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
@@ -907,18 +1007,7 @@ async def main() -> int:
     # Progress chatter only. Edit pre-flight and confirmation stay visible.
     show_progress = not (json_mode or raw_mode)
 
-    if args.times is not None and args.every is None:
-        print("ERROR: --times goes with --every.", file=sys.stderr)
-        return 2
     if args.every is not None:
-        if mode not in ("show", "show-batch"):
-            print("ERROR: --every watches reads (-sC, --batch, --profile), not edits, rollbacks, commit status or jobs.",
-                  file=sys.stderr)
-            return 2
-        if store is None:
-            print("ERROR: --every compares every tick with the one before through the store; drop --no-store "
-                  "or name a --store.", file=sys.stderr)
-            return 2
         show_progress = False      # a watch prints one line per tick and what changed, not every device every time
 
     if not user:
@@ -931,7 +1020,11 @@ async def main() -> int:
         # run would otherwise go on to key authentication without a word.
         print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
         return 2
-    if not passwd:
+    if args.every is not None and _WATCH["tick"]:
+        # A later tick of a watch: the password typed (or skipped) before
+        # tick 1 is the watch's, not asked for again after every sleep.
+        passwd = _WATCH["passwd"]
+    elif not passwd:
         # No transport needs a password up front: a key or an agent may do.
         if _tty(sys.stdin):
             try:
@@ -942,6 +1035,8 @@ async def main() -> int:
                 return 2
         else:
             passwd = None
+    if args.every is not None:
+        _WATCH["passwd"] = passwd
 
     # Command shortcuts are kept unresolved here and resolved per target, since
     # each target carries its own vendor and the template library is per vendor.
@@ -954,15 +1049,11 @@ async def main() -> int:
         show_cmd = args.show_command
         edit_cmd = args.edit_command
         if args.batch_commands:
-            batch_cmds = list(args.batch_commands)
-        elif args.batch:
-            batch_cmds = read_command_file_lines(Path(args.batch))
-            if not batch_cmds:
-                print("ERROR: batch file is empty after filtering.", file=sys.stderr)
-                return 2
+            batch_cmds = list(args.batch_commands)      # the file's lines, or the run file's list
 
-        if not json_mode:
-            # Report resolution once per vendor actually present, not per device.
+        if not json_mode and (args.every is None or not _WATCH["tick"]):
+            # Report resolution once per vendor actually present, not per device,
+            # and once per watch, not between its tick lines.
             for vendor in sorted({t.vendor for t in targets}):
                 for raw in [c for c in ([show_cmd, edit_cmd] + (batch_cmds or [])) if c]:
                     resolved = resolve_command(raw, vendor)
@@ -991,7 +1082,7 @@ async def main() -> int:
         if batch_cmds:
             print(f"Batch: {len(batch_cmds)} commands from {args.batch or 'the run file'}")
         print(f"Targets: {len(targets)}")
-        devices = len({(t.host, t.port) for t in targets})     # a job lists one device in several entries
+        devices = len({(t.host, resolve_target_port(t)) for t in targets})   # a job may list a device more than once
         waves = -(-devices // args.workers)
         if waves > 4 and args.workers < 64 and not fd_note:
             # Workers stay at 8 by default; a fleet run is told what it costs
@@ -1129,6 +1220,7 @@ async def main() -> int:
     store_run = None
     store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
     store_reason = None
+    unkept = []                       # --every: those results' rows, compared as the tick got them
     if store is not None:
         try:
             about = ("\n".join(batch_cmds) if batch_cmds else
@@ -1419,6 +1511,8 @@ async def main() -> int:
             except Exception as e:
                 store_lost += 1
                 gone = str(e)
+                if args.every is not None:
+                    unkept += _watch_rows(entry, sent)
             if gone is not None and store_reason is None:
                 # The run goes on, the results are still shown; the loss is
                 # counted and said once more, with the exit code, at the end.
@@ -1704,13 +1798,15 @@ async def main() -> int:
                 store.finish_run(store_run, ok_count, failures, skipped + not_run, interrupted)
             except Exception as e:
                 print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
-        if not_kept:
-            print(f"WARNING: store {store.path}: {not_kept} of {store_tried} results were not kept: {store_reason}",
-                  file=sys.stderr)
+        lost = f"{not_kept} of {store_tried} results were not kept: {store_reason}" if not_kept else None
+        if lost:
+            print(f"WARNING: store {store.path}: {lost}", file=sys.stderr)
         if args.every is not None:
             _WATCH["tick"] += 1
-            _watch_report(store, store_run, _WATCH["previous"], _WATCH["tick"], ok_count, failures)
-            _WATCH["previous"] = store_run
+            if not lost:
+                _WATCH["kept"] += 1        # the store has all of this tick: what Ctrl-C calls kept
+            _WATCH["previous"] = _watch_report(store, store_run, _WATCH["previous"], _WATCH["tick"], ok_count,
+                                               failures, lost, unkept)
             _WATCH["every"] = args.every
             _WATCH["again"] = not interrupted and (args.times is None or _WATCH["tick"] < args.times)
     if store is not None:
@@ -1729,29 +1825,68 @@ async def main() -> int:
 
 
 # --every: the watch's state between ticks. main() runs one tick and leaves
-# `again` for main_sync(), which sleeps and runs the next.
-_WATCH = {"tick": 0, "previous": None, "again": False, "every": None}
+# `again` for main_sync(), which sleeps and runs the next; `passwd` is what
+# the prompt got before tick 1, asked once for the whole watch; `previous`
+# the tick before's rows; `store` the identity of the file tick 1 was kept
+# in; `kept` how many ticks the store kept in full.
+_WATCH = {"tick": 0, "previous": None, "again": False, "every": None, "passwd": None, "store": None, "kept": 0}
+
+# A watch exits with the worst of its ticks, in this order: interrupted,
+# results not kept, refused (a tick that cannot start ends the watch), a
+# device failed, not everything ran, fine.
+_WATCH_CODES = (130, 4, 2, 1, 3, 0)
+
+
+def _worst(a: int, b: int) -> int:
+    return min(a, b, key=lambda code: _WATCH_CODES.index(code) if code in _WATCH_CODES else len(_WATCH_CODES))
 
 
 def _watch_sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _watch_report(store, run_id: str, previous: Optional[str], tick: int, ok: int, failed: int) -> None:
+def _watch_rows(entry: dict, command: str) -> list:
+    """A device's result as the store's rows hold it (a batch is a row per
+    command), for a result the store could not keep: the watch compares it
+    all the same."""
+    def text(out):
+        return out if out is None or isinstance(out, str) else json.dumps(out)
+
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    row = {"device": entry["device"], "ts": ts}
+    if isinstance(entry.get("commands"), list) and entry["commands"]:
+        return [{**row, "seq": seq, "command": cr.get("command", ""), "ok": 1 if cr.get("ok") else 0,
+                 "error": cr.get("error"), "output": text(cr.get("output"))}
+                for seq, cr in enumerate(entry["commands"])]
+    return [{**row, "seq": 0, "command": command, "ok": 1 if entry.get("ok") else 0,
+             "error": entry.get("error"), "output": text(entry.get("output"))}]
+
+
+def _watch_report(store, run_id: str, previous: Optional[dict], tick: int, ok: int, failed: int,
+                  lost: Optional[str] = None, unkept=()) -> dict:
     """One line per tick and, for every device whose reply changed since the
     tick before, the difference: the thing a watch is for. Every tick is a
-    run in the store, so `h-ssh-store diff` can go back to any two of them."""
+    run in the store, so `h-ssh-store diff` can go back to any two of them.
+    `lost` is what the store could not keep of this tick, in the warning's
+    words, and the tick's line says it: a baseline that is not all there is
+    not called kept. `unkept` is those results' rows: compared as the tick
+    got them, so a reply the store lost hides no change and is not new on
+    the tick after. Returns this tick's rows, the next tick's `previous`."""
     stamp = time.strftime("%H:%M:%S")
+    rows = {(r["device"], r["seq"]): r for r in store.results(run_id=run_id)}
+    for r in unkept:
+        rows.setdefault((r["device"], r["seq"]), r)
     if previous is None:
-        print(f"tick {tick} {stamp}: {ok} OK, {failed} failed; baseline kept as run {run_id}", flush=True)
-        return
-    before = {(r["device"], r["seq"]): r for r in store.results(run_id=previous)}
+        kept = f"baseline not kept ({lost})" if lost else f"baseline kept as run {run_id}"
+        print(f"tick {tick} {stamp}: {ok} OK, {failed} failed; {kept}", flush=True)
+        return rows
     changed = []
-    for r in store.results(run_id=run_id):
-        p = before.get((r["device"], r["seq"]))
+    for key in sorted(rows):
+        r, p = rows[key], previous.get(key)
         if p is None or (p["ok"], p["output"], p["error"]) != (r["ok"], r["output"], r["error"]):
             changed.append((r, p))
-    print(f"tick {tick} {stamp}: {ok} OK, {failed} failed, {len(changed)} changed", flush=True)
+    print(f"tick {tick} {stamp}: {ok} OK, {failed} failed, {len(changed)} changed" + (f"; {lost}" if lost else ""),
+          flush=True)
     safe = terminal_safe if _tty(sys.stdout) else (lambda text: text)      # the rows are the replies as they came
     for r, p in changed:
         command = (r["command"] or "").strip().splitlines()[0] if (r["command"] or "").strip() else ""
@@ -1767,6 +1902,7 @@ def _watch_report(store, run_id: str, previous: Optional[str], tick: int, ok: in
         for line in difflib.unified_diff(a, b, fromfile=p["ts"][:19], tofile=r["ts"][:19], lineterm="", n=1):
             print("  " + safe(line))
     sys.stdout.flush()
+    return rows
 
 def _drain_closes(timeout: float = 1.0) -> None:
     """Sessions are closed beside the work; before the run reports, wait
@@ -1808,19 +1944,20 @@ def _stdout_gone() -> None:
 def main_sync() -> None:
     """Synchronous entry point for console_scripts and h-ssh.py."""
     rc = 0
-    _WATCH.update(tick=0, previous=None, again=False, every=None)
+    _WATCH.update(tick=0, previous=None, again=False, every=None, passwd=None, store=None, kept=0)
     try:
         rc = asyncio.run(main())
         while _WATCH["again"]:      # --every: the tick left word that another follows
             _WATCH["again"] = False
             _watch_sleep(_WATCH["every"])
-            rc = asyncio.run(main())
+            rc = _worst(rc, asyncio.run(main()))    # a tick that failed is not forgotten by a clean one after it
         sys.stdout.flush()          # a reader that left shows up here, not at interpreter exit
     except KeyboardInterrupt:
         # Ctrl-C is a normal way to stop a fleet run; a stack trace is not a
         # useful thing to print at someone who already knows what they did.
-        ticks = _WATCH["tick"]
-        print("\nInterrupted." + (f" {ticks} tick(s) kept in the store." if ticks else ""), file=sys.stderr)
+        ticks, kept = _WATCH["tick"], _WATCH["kept"]
+        said = f" {kept} tick(s) kept in the store" + (f", {ticks - kept} not kept in full" if kept < ticks else "")
+        print("\nInterrupted." + (said + "." if ticks else ""), file=sys.stderr)
         rc = 130
     except BrokenPipeError:
         # `h-ssh ... | head`: the reader has what it wanted. Not an error of
@@ -1828,6 +1965,7 @@ def main_sync() -> None:
         # far, stands.
         _stdout_gone()
     finally:
+        _WATCH["passwd"] = None     # the watch is over; its credential is not kept around
         try:
             pool.close_all()        # a job run that ended early (Ctrl-C, a crash) leaves no session open
         except Exception:

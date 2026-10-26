@@ -178,6 +178,72 @@ def test_a_whitespace_command_is_refused(monkeypatch, capsys, flag):
     assert rc == 2 and f"{flag} is empty" in err
 
 
+@pytest.mark.parametrize("cmd, what", [
+    ("show version\nrequest system reboot", "a line break"),
+    ("show version\r", "a carriage return"),
+    ("show ver\x00sion", "a NUL"),
+    ("show version\x1b[A", "an ESC"),
+    ("show version\x01", "a control character '\\x01'"),
+])
+def test_a_command_with_a_control_character_is_refused(monkeypatch, capsys, cmd, what):
+    """#110: `-sC "show version\\nrequest system reboot"` went to the device as
+    typed, classified by its first line as a read and so retried, both lines
+    each time. A command is one line of text."""
+    rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", cmd])
+    assert rc == 2 and f"ERROR: -sC has {what} ({cmd!r}); a command is one line of text." in err
+    assert "Traceback" not in err
+
+
+def test_an_edit_payload_keeps_its_line_breaks_but_no_other_control_character(monkeypatch, capsys):
+    """#110: an ESC typed into a device's CLI is a key, not configuration."""
+    async def reachable(target, timeout=2):
+        return target.name, True, "reachable"
+
+    monkeypatch.setattr(cli, "check_reachability", reachable)
+    rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-eC", "set system host-name x\x1b", "-y"])
+    assert rc == 2 and "ERROR: -eC has an ESC ('set system host-name x\\x1b'); a payload is plain text." in err
+    rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-eC",
+                                                  "set system host-name x\nset system domain-name y", "-y"])
+    assert rc == 0, err                                       # two set lines are a payload, not a mistake
+
+
+def test_a_batch_line_with_a_control_character_is_refused(monkeypatch, capsys, tmp_path):
+    """#110: a NUL or an ESC in a batch line went to every device with the rest."""
+    b = tmp_path / "cmds.txt"
+    for cmd, what in (("show ver\x00sion", "a NUL"), ("show version\x1b[A", "an ESC")):
+        b.write_text(f"show version\n{cmd}\n")
+        rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "--batch", str(b)])
+        assert rc == 2 and f"ERROR: batch file '{b}': {what} in {cmd!r}; a command is one line of text." in err
+
+
+def test_a_shortcut_that_stands_for_more_than_one_line_is_refused(monkeypatch, capsys, tmp_path):
+    """#110 review: only the typed text was checked, so a shortcut whose
+    command has a line break went to the device as two lines (and into the
+    store's command column); under --format the refusal said it would act
+    on the device. -sC, a batch line and a job's show alike."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    mine = tmp_path / ".h-ssh" / "commands"
+    mine.mkdir(parents=True)
+    (mine / "junos.json").write_text(json.dumps({"twolines": {"command": "show version\nrequest system reboot"},
+                                                 "esc": "show version\u001b[A", "ver": "show version"}))
+    two = "ERROR: shortcut 'twolines' (junos) has a line break ('show version\\nrequest system reboot'); " \
+          "a command is one line of text."
+    for extra in ([], ["--format", "json"]):
+        rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "twolines", *extra])
+        assert rc == 2 and two in err, err
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("ver\nesc\n")
+    rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "--batch", str(batch)])
+    assert rc == 2 and "ERROR: shortcut 'esc' (junos) has an ESC ('show version\\x1b[A'); a command is one line of text." in err
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": "ver"}, {"target": "R1:10.0.0.1:junos", "show": "twolines"}]))
+    rc, out, err = run_main(monkeypatch, capsys, ["--job", str(job)])
+    assert rc == 2 and two in err, err
+    assert not os.path.exists(os.environ["HSSH_STORE"])               # no run began
+    rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "ver"])
+    assert rc == 0 and "Resolved 'ver' -> 'show version' (junos)" in out, err
+
+
 def test_a_target_that_still_says_arista_is_refused_before_any_device(monkeypatch, capsys):
     """#79: eAPI is gone; the old vendor name is not 'unknown', it is retired, and the line says what to use."""
     import asyncio

@@ -222,13 +222,15 @@ class PreviewDriver:
     (`commit_diff`, or the payload's diff again when None)."""
     AVAILABLE = True
 
-    def __init__(self, commit_diff=None):
+    def __init__(self, commit_diff=None, paint=""):
         self.commit_diff = commit_diff
+        # What the device puts in its diff ahead of the line (an escape
+        # sequence): an -eC payload may not carry one (#110), a reply may.
+        self.paint = paint
         self.calls = []
 
-    @staticmethod
-    def diff_of(payload):
-        return "[edit system]\n+   " + payload.strip() + ";"
+    def diff_of(self, payload):
+        return "[edit system]\n+   " + self.paint + payload.strip() + ";"
 
     def edit(self, host, user, passwd, payload, *a, dry_run=False, expected_diff=None, **kw):
         self.calls.append({"payload": payload, "dry_run": dry_run, "expected_diff": expected_diff})
@@ -288,12 +290,12 @@ def test_show_diff_commits_and_audits_alike_whether_stdout_is_a_terminal_or_a_pi
     audit entry was the sanitised text too. Both are the reply as it came
     (#111); only the preview as printed is sanitised, for the stream it is
     printed on: with --json, stderr."""
-    payload = "set interfaces ge-0/0/0 description \x1b[31mred"
+    payload = "set interfaces ge-0/0/0 description red"
     for tty in (False, True):
         answer(monkeypatch, "y")
         monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
         audit = tmp_path / f"audit-{tty}.jsonl"
-        driver = PreviewDriver()
+        driver = PreviewDriver(paint="\x1b[31m")
         rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", payload, "--show-diff", "--audit-log", str(audit)],
                                driver=driver)
         assert rc == 0 and "COMMIT OK" in out, (tty, out)
@@ -304,7 +306,7 @@ def test_show_diff_commits_and_audits_alike_whether_stdout_is_a_terminal_or_a_pi
     monkeypatch.setattr(sys.stdout, "isatty", lambda: False)          # --json | jq, the previews on a terminal
     monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", payload, "--show-diff", "-y", "--json"],
-                           driver=PreviewDriver())
+                           driver=PreviewDriver(paint="\x1b[31m"))
     assert rc == 0 and "description red" in err and "\x1b" not in err
 
 
@@ -616,7 +618,7 @@ SCREENS = {
     "--diff": [*R2, "-sC", "show version", "--diff"],
     "--batch --diff": [*R2, "--batch", "BATCH", "--diff"],
     "--every tick": ["--every", "5", "--times", "2", "-sC", "show version"],
-    "--show-diff preview": ["-eC", f"set system host-name {EVIL}", "--show-diff"],
+    "--show-diff preview": ["-eC", "set system host-name x", "--show-diff"],
 }
 
 
@@ -641,7 +643,7 @@ def test_a_reply_reaches_a_terminal_without_what_it_would_act_on_and_a_pipe_as_i
         if shape == "--show-diff preview":
             answer(monkeypatch, "n")                          # the preview alone, nothing committed
         monkeypatch.setattr(cli, "check_reachability", _reachable)
-        driver = PreviewDriver() if shape == "--show-diff preview" else EvilDriver(fail=shape == "failed batch -v")
+        driver = PreviewDriver(paint=EVIL) if shape == "--show-diff preview" else EvilDriver(fail=shape == "failed batch -v")
         monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
         with pytest.raises(SystemExit) as e:
             cli.main_sync()

@@ -84,6 +84,27 @@ def test_the_same_device_twice_is_refused_bare_as_well(monkeypatch, capsys):
     assert rc == 2 and "inline targets" in err and seen == []
 
 
+def test_one_host_under_two_names_is_refused_however_the_port_is_written(monkeypatch, capsys, tmp_path):
+    """#110: `R1:10.0.0.1:junos` and `R2:10.0.0.1:830:junos` were two devices
+    to the duplicate guard (830 is what the first one uses too), so both ran
+    and an edit committed twice to one box."""
+    rc, out, err, seen = run(monkeypatch, capsys, ["R1:10.0.0.1:junos", "R2:10.0.0.1:830:junos", "-sC", "show version"])
+    assert rc == 2 and seen == [] and "inline targets: host 10.0.0.1:830 is listed under two names: 'R1' and 'R2'" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "--target", "R2:10.0.0.1:junos:830",
+                                                    "-sC", "show version"])
+    assert rc == 2 and seen == [] and "under two names: 'R1' and 'R2'" in err
+    rc, out, err, seen = run(monkeypatch, capsys, ["10.0.0.1", "R2:10.0.0.1:22", "-sC", "show version"])
+    assert rc == 2 and seen == [] and "host 10.0.0.1:22 is listed under two names: '10.0.0.1' and 'R2'" in err
+    csv = tmp_path / "devices.csv"
+    csv.write_text("R1,10.0.0.1,junos,\nR2,10.0.0.1,junos,830\n")
+    rc, out, err, seen = run(monkeypatch, capsys, ["--devices", str(csv), "-sC", "show version"])
+    assert rc == 2 and seen == [] and str(csv) in err and "host 10.0.0.1:830 is listed under two names: 'R1' and 'R2'" in err
+    # the same host on two ports is still two devices (NETCONF on 830, SSH on 22)
+    rc, out, err, seen = run(monkeypatch, capsys, ["R1:10.0.0.1:junos", "R2:10.0.0.1:ssh", "-sC", "show version"])
+    assert rc == 0, err
+    assert sorted(seen) == [("10.0.0.1", "junos@netconf"), ("10.0.0.1", "none@ssh")]
+
+
 def test_a_bare_ipv6_host_goes_in_brackets(monkeypatch, capsys):
     rc, out, err, seen = run(monkeypatch, capsys, ["[2001:db8::1]", "-sC", "show version"])
     assert rc == 0, err
