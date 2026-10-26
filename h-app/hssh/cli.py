@@ -87,7 +87,10 @@ def strip_result_header(out_text: str, command: str = None) -> str:
     line, and text transports echo the command as '$ cmd'. Both are framing for
     the human-readable view; --raw wants neither.
     """
-    lines = out_text.splitlines()
+    # On "\n" alone: splitlines() also breaks on NEL, VT, FF and the Unicode
+    # separators, and the join would turn each into LF, so the record would
+    # no longer be the reply as it came.
+    lines = out_text.split("\n")
     i = 0
     while i < len(lines) and lines[i].startswith(_RESULT_HEADER_KEYS):
         i += 1
@@ -1018,6 +1021,13 @@ async def main() -> int:
     # job mode) travels with its result, so a job that names one device in
     # two entries never has the second read as the first.
     units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
+    # Each entry keeps its own store row: seq counts up per device in file
+    # order (a batch's commands do the same), so a device a job names twice
+    # does not have its first row replaced by its second.
+    seq_of, counted = [], {}
+    for t, je in units:
+        seq_of.append(counted.get(t.name, 0))
+        counted[t.name] = seq_of[-1] + 1
 
     def _audit_aborted(error):
         """One audit line per unit for a run the operator did not confirm."""
@@ -1293,6 +1303,12 @@ async def main() -> int:
     tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
     screen = _tty(sys.stdout)     # control sequences are stripped for a terminal, kept for a pipe
 
+    def _screen(text: str) -> str:
+        """Device text as it goes to stdout: a terminal gets it with what it
+        would act on taken out, a pipe gets it as it came. The record (the
+        store, --log, --json) is the reply as it came either way."""
+        return terminal_safe(text) if screen else text
+
     interrupted = False
     log_cmd = (batch_cmds or show_cmd or edit_cmd or args.edit_broadcast
                or (args.edit_dir and f"dir:{args.edit_dir}") or "job")
@@ -1323,8 +1339,7 @@ async def main() -> int:
 
     async for i, res in _completed():
         name, ok, out_text, duration_ms = res
-        if screen:
-            out_text = terminal_safe(out_text)
+        shown = _screen(out_text)
         t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
         dev_mode = je.mode if je else mode
@@ -1413,7 +1428,7 @@ async def main() -> int:
             store_tried += 1
             try:
                 store.add_entry(store_run, entry, sent,
-                                fmt=args.format if dev_mode in ("show", "show-batch") else "text")
+                                fmt=args.format if dev_mode in ("show", "show-batch") else "text", seq=seq_of[i])
                 # SQLite writes into a deleted or replaced file without a
                 # word; one stat per result says so as it happens, not at the end.
                 gone = store.still_there() if store_reason is None else None
@@ -1471,7 +1486,7 @@ async def main() -> int:
                     print(f"{name}:")
                     for cr in cmd_results:
                         if cr.get("ok"):
-                            print(strip_result_header(document_text(cr["output"]), cr["command"]))
+                            print(_screen(strip_result_header(document_text(cr["output"]), cr["command"])))
                         else:
                             print(f"{name}: {cr.get('command')}: {cr.get('error')}", file=sys.stderr)
                     print()
@@ -1480,7 +1495,7 @@ async def main() -> int:
             elif ok:
                 resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
                 print(f"{name}:")
-                print(strip_result_header(out_text, resolved_cmd))
+                print(strip_result_header(shown, resolved_cmd))
                 print()
             else:
                 # stdout stays device output only, so failures go to stderr.
@@ -1505,7 +1520,7 @@ async def main() -> int:
                         for cr in cmd_results:
                             print(f"\n--- {name}: {cr.get('command')} ---")
                             if cr.get("ok"):
-                                print(document_text(cr.get("output", "")))
+                                print(_screen(document_text(cr.get("output", ""))))
                             else:
                                 print(f"  ERROR: {cr.get('error')}")
                             print(f"--- end ---")
@@ -1518,7 +1533,7 @@ async def main() -> int:
                     print(f"[{timestamp}] {name:16s} {status}")
                     if args.verbose:
                         print(f"\n--- Output from {name} ---")
-                        print(out_text)
+                        print(shown)
                         print(f"--- End of {name} ---\n")
                     elif not ok and res.error is not None:
                         print(f"  ERROR: {res.error}")
@@ -1528,10 +1543,10 @@ async def main() -> int:
 
                 if args.verbose:
                     print(f"\n--- Output from {name} ---")
-                    print(out_text)
+                    print(shown)
                     print(f"--- End of {name} ---\n")
                 elif ok and (dev_mode.startswith("edit") or dev_mode == "rollback"):
-                    print(format_edit_result(out_text))
+                    print(format_edit_result(shown))
                 elif not ok and res.error is not None:
                     print(f"  ERROR: {res.error}")
 
@@ -1606,7 +1621,7 @@ async def main() -> int:
                         if diff_text == "(identical)":
                             print(f"    (identical)\n")
                         else:
-                            for ln in diff_text.splitlines():
+                            for ln in _screen(diff_text).splitlines():
                                 print(f"    {ln}")
                             print()
                     elif mode == "show-batch":
@@ -1616,7 +1631,7 @@ async def main() -> int:
                             if cd["diff"] == "(identical)":
                                 print(f"      (identical)")
                             else:
-                                for ln in cd["diff"].splitlines():
+                                for ln in _screen(cd["diff"]).splitlines():
                                     print(f"      {ln}")
                         print()
                 print("--- End diff ---")
@@ -1751,6 +1766,7 @@ def _watch_report(store, run_id: str, previous: Optional[str], tick: int, ok: in
         if p is None or (p["ok"], p["output"], p["error"]) != (r["ok"], r["output"], r["error"]):
             changed.append((r, p))
     print(f"tick {tick} {stamp}: {ok} OK, {failed} failed, {len(changed)} changed", flush=True)
+    safe = terminal_safe if _tty(sys.stdout) else (lambda text: text)      # the rows are the replies as they came
     for r, p in changed:
         command = (r["command"] or "").strip().splitlines()[0] if (r["command"] or "").strip() else ""
         head = f"--- {r['device']}: {command[:60]}"
@@ -1760,10 +1776,10 @@ def _watch_report(store, run_id: str, previous: Optional[str], tick: int, ok: in
         if r["ok"] != p["ok"]:
             error = (r["error"] or "").strip().splitlines()[0] if r["error"] else ""
             head += f": {'OK' if p['ok'] else 'FAIL'} -> {'OK' if r['ok'] else 'FAIL'}" + (f" ({error})" if error else "")
-        print(head)
+        print(safe(head))
         a, b = (p["output"] or "").splitlines(), (r["output"] or "").splitlines()
         for line in difflib.unified_diff(a, b, fromfile=p["ts"][:19], tofile=r["ts"][:19], lineterm="", n=1):
-            print("  " + line)
+            print("  " + safe(line))
     sys.stdout.flush()
 
 def _drain_closes(timeout: float = 1.0) -> None:

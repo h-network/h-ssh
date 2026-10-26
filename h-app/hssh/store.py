@@ -17,8 +17,9 @@ and finished, the mode, the command line, who ran it, the counts).
 `results`: one row per command on one device, unique on (run_id, device,
 seq): a show is seq 0, a batch is seq 0..n-1 in the batch's order, an edit
 is seq 0 with the payload as the command and the device's verdict (the diff,
-or the commit line) as the output. `format` says what the output is: text,
-xml or json as the device was asked for; a commit history is json.
+or the commit line) as the output; a job that names one device in several
+entries gives them seq 0, 1, ... in file order. `format` says what the output
+is: text, xml or json as the device was asked for; a commit history is json.
 """
 
 import argparse
@@ -46,9 +47,9 @@ WAL_SWITCH_TIMEOUT = 5.0      # seconds the first run on a new file may wait to 
 
 def where(flag: Optional[str] = None, config: Optional[dict] = None) -> str:
     """The store a run writes and the reader reads: --store, else HSSH_STORE,
-    else the config file's `store`, else h-ssh.db in the current directory."""
-    return (flag or os.environ.get(ENV_VAR) or (config or {}).get(CONFIG_KEY)
-            or os.path.expanduser(DEFAULT))
+    else the config file's `store`, else h-ssh.db in the current directory.
+    A leading `~` is the home directory in each of them."""
+    return os.path.expanduser(flag or os.environ.get(ENV_VAR) or (config or {}).get(CONFIG_KEY) or DEFAULT)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -137,6 +138,9 @@ class Store:
 
     def __init__(self, path: str, readonly: bool = False):
         self.path = path
+        # Bound now: a library script that opens "h-ssh.db" and chdirs later
+        # still has the same file. Messages keep the path as given.
+        self.abspath = os.path.abspath(path)
         if readonly:
             if not os.path.exists(path):
                 raise StoreError(f"no store at {path}: no run has been kept here "
@@ -165,13 +169,13 @@ class Store:
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         self.conn.row_factory = sqlite3.Row
-        self.identity = _identity(path)
+        self.identity = _identity(self.abspath)
 
     def still_there(self) -> Optional[str]:
         """None while the path still leads to the file this store opened, else
         why not. SQLite goes on writing to a deleted or replaced file without
         a word, so a run asks before it says its results are kept."""
-        now = _identity(self.path)
+        now = _identity(self.abspath)
         if now is None:
             return "the store file was deleted during the run"
         if now != self.identity:
@@ -246,33 +250,36 @@ class Store:
             (run_id, device, seq, host, vendor, command, ts or _now(), 1 if ok else 0,
              duration_ms, error, fmt, output))
 
-    def add_entry(self, run_id: str, entry: dict, command: str, fmt: str = "text") -> int:
+    def add_entry(self, run_id: str, entry: dict, command: str, fmt: str = "text", seq: int = 0) -> int:
         """The rows of one device's result as the CLI builds it (`entry`: the
         --json record): a batch is one row per command in its order; anything
         else one row, with `command` what was sent (the resolved show, the
         edit payload, `rollback N`, `show system commit`) and the output the
-        reply, the diff, or the commit history as JSON. One transaction per
-        device result, however many rows. Returns the rows written."""
+        reply, the diff, or the commit history as JSON. `seq` is the first
+        row's: 0, or the entry's place among its device's entries in a job,
+        so a device the job names twice keeps both rows (a batch's commands
+        follow at seq + 1, ...). One transaction per device result, however
+        many rows. Returns the rows written."""
         device, host, vendor = entry["device"], entry.get("host"), entry.get("vendor")
         duration = entry.get("duration_ms")
         with self.conn:
             if "commands" in entry and isinstance(entry["commands"], list) and entry["commands"]:
-                for seq, cr in enumerate(entry["commands"]):
+                for i, cr in enumerate(entry["commands"]):
                     out = cr.get("output")
-                    self._row(run_id, device, seq, cr.get("command", ""), bool(cr.get("ok")),
-                              duration if seq == 0 else None, cr.get("error"),
+                    self._row(run_id, device, seq + i, cr.get("command", ""), bool(cr.get("ok")),
+                              duration if i == 0 else None, cr.get("error"),
                               out if isinstance(out, str) or out is None else json.dumps(out),
                               fmt if isinstance(out, str) else "json", host, vendor)
                 return len(entry["commands"])
             if "commits" in entry:
                 output = json.dumps(entry["commits"]) if entry.get("ok") else None
-                self._row(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+                self._row(run_id, device, seq, command, bool(entry.get("ok")), duration, entry.get("error"),
                           output, "json", host, vendor)
                 return 1
             output = entry.get("output")
             if output is not None and not isinstance(output, str):
                 output, fmt = json.dumps(output), "json"
-            self._row(run_id, device, 0, command, bool(entry.get("ok")), duration, entry.get("error"),
+            self._row(run_id, device, seq, command, bool(entry.get("ok")), duration, entry.get("error"),
                       output, fmt, host, vendor)
             return 1
 
@@ -284,12 +291,17 @@ class Store:
 
     # --- reading ------------------------------------------------------------
 
+    # Newest first by the instant: `started` carries its UTC offset, and across
+    # a DST fall-back the local-time strings (and the run ids made of them)
+    # sort the wrong way round. The ids stay as they are; the order is not theirs.
+    NEWEST_FIRST = "datetime(started) DESC, rowid DESC"
+
     def runs(self, last: int = 20) -> List[sqlite3.Row]:
-        return self.conn.execute("SELECT * FROM runs ORDER BY started DESC, rowid DESC LIMIT ?",
+        return self.conn.execute(f"SELECT * FROM runs ORDER BY {self.NEWEST_FIRST} LIMIT ?",
                                  (last,)).fetchall()
 
     def last_run_id(self) -> Optional[str]:
-        row = self.conn.execute("SELECT run_id FROM runs ORDER BY started DESC, rowid DESC LIMIT 1").fetchone()
+        row = self.conn.execute(f"SELECT run_id FROM runs ORDER BY {self.NEWEST_FIRST} LIMIT 1").fetchone()
         return row["run_id"] if row else None
 
     def resolve_run(self, run: Optional[str]) -> str:
@@ -468,7 +480,8 @@ def cmd_diff(store: Store, args) -> int:
 def cmd_history(store: Store, args) -> int:
     rows = [(r["ts"][:19], r["run_id"], r["seq"], _short_cmd(r["command"]), "OK" if r["ok"] else "FAIL",
              r["duration_ms"] if r["duration_ms"] is not None else "-")
-            for r in store.results(device=args.device, command=args.command, order="ts DESC, seq", limit=args.last)]
+            for r in store.results(device=args.device, command=args.command,
+                                   order="datetime(ts) DESC, seq, rowid DESC", limit=args.last)]
     print("\n".join(_table(rows, ("when", "run", "seq", "command", "verdict", "ms"))))
     return 0
 
@@ -525,7 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("output", help="one device's reply from a run")
     s.add_argument("device")
     s.add_argument("run", nargs="?", help="run id or a unique prefix; default: the last run")
-    s.add_argument("--seq", type=int, default=0, help="which command of a batch (default 0)")
+    s.add_argument("--seq", type=int, default=0, help="which command of a batch, or entry of a job (default 0)")
     s.set_defaults(fn=cmd_output)
     s = sub.add_parser("grep", help="lines of stored output that match a regex")
     s.add_argument("pattern")
@@ -544,7 +557,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("device")
     s.add_argument("run_a")
     s.add_argument("run_b")
-    s.add_argument("--seq", type=int, default=0)
+    s.add_argument("--seq", type=int, default=0, help="which command of a batch, or entry of a job (default 0)")
     s.set_defaults(fn=cmd_diff)
     s = sub.add_parser("history", help="every stored result for a device, newest first")
     s.add_argument("device")

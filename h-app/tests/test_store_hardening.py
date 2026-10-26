@@ -170,6 +170,25 @@ def test_a_store_deleted_during_the_run_is_said_not_silently_lost(tmp_path, monk
     assert not db.exists()
 
 
+def test_a_store_opened_by_a_relative_path_is_still_itself_after_a_chdir(tmp_path, monkeypatch):
+    """still_there() stat'ed the path as given, so a library script that opened
+    Store("h-ssh.db") and chdir'ed later was told the file was deleted: every
+    result not kept, the run row left open, the file untouched. The identity
+    is bound to the absolute path at open; messages keep the path as given."""
+    monkeypatch.chdir(tmp_path)
+    st = Store("h-ssh.db")
+    run = st.begin_run("show", ["t"], "u", 1, "0")
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")
+    assert st.still_there() is None and st.path == "h-ssh.db"
+    st.add_entry(run, SHOW, "show version")
+    st.finish_run(run, 1, 0, 0)
+    assert rows(tmp_path / "h-ssh.db", "SELECT finished FROM runs")[0]["finished"]
+    os.unlink(tmp_path / "h-ssh.db")                                # a real deletion is still seen from here
+    assert st.still_there() == "the store file was deleted during the run"
+    st.close()
+
+
 def test_a_device_failure_and_a_store_loss_both_show_and_exit_4(tmp_path, monkeypatch, capsys):
     import types
     db = tmp_path / "both.db"
