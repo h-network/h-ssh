@@ -96,17 +96,25 @@ def _identity(path: str):
     return (st.st_dev, st.st_ino)
 
 
+def _waiting(path: str) -> Optional[str]:
+    """What waits beside the store at `path` that SQLite would apply first:
+    a crashed transaction's "-journal", or a "-wal" with committed rows not
+    yet in the file (the empty one a reader leaves is nothing). None when
+    the file is the whole store."""
+    if os.path.lexists(path + "-journal"):
+        return "-journal"
+    try:
+        return "-wal" if os.path.getsize(path + "-wal") else None
+    except OSError:
+        return None
+
+
 def _settled(path: str):
     """The file at `path` as it stands (device, inode, size, mtime) when it
-    is the whole store: no WAL frames beside it (no -wal, or the empty one
-    a reader leaves) and no rollback journal. None when something waits
-    beside it that SQLite would apply first: committed rows in a -wal, a
-    crashed transaction's journal."""
+    is the whole store; None when something waits beside it."""
+    if _waiting(path):
+        return None
     try:
-        if os.path.lexists(path + "-journal"):
-            return None
-        if os.path.exists(path + "-wal") and os.path.getsize(path + "-wal"):
-            return None
         st = os.stat(path)
     except OSError:
         return None
@@ -244,9 +252,10 @@ class Store:
         read. With nothing waiting beside it (_settled), the file is the
         whole store and is read as it is (immutable): no -shm, and no locks
         either, so written_while_read() looks again at the end. WAL frames
-        or a journal beside it keep the error: read past them, the store
-        would miss committed rows or show uncommitted ones. SQLite looks
-        beside the file itself, so `resolved` has its symlinks followed."""
+        or a journal beside it keep the error (a -wal's says what to do):
+        read past them, the store would miss committed rows or show
+        uncommitted ones. SQLite looks beside the file itself, so
+        `resolved` has its symlinks followed."""
         uri = pathlib.Path(resolved).as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
         try:
@@ -254,7 +263,14 @@ class Store:
             return conn
         except sqlite3.Error as e:
             conn.close()
-            then = _settled(resolved) if _no_shm(e) else None
+            if not _no_shm(e):
+                raise
+            if _waiting(resolved) == "-wal":
+                # A run killed before its rows left the -wal, archived without the -shm.
+                raise StoreError(f"{self.path}: {e} (its -wal holds rows not yet in the file, and SQLite "
+                                 "reads them only in a directory it can write to: copy the store with "
+                                 "its -wal to one you can)") from e
+            then = _settled(resolved)
             if then is None:
                 raise
             self._as_is = (resolved, then)
@@ -456,21 +472,22 @@ def cmd_failed(store: Store, args) -> int:
     run_id = store.resolve_run(args.run)
     rows = [(r["device"], r["seq"], _short_cmd(r["command"]), (r["error"] or "").strip().splitlines()[0] if r["error"] else "-")
             for r in store.results(run_id=run_id, ok=False)]
+    args.verdict = 1 if rows else 0         # known before a line is out: main() keeps it if the reader leaves
     print(f"run {run_id}: {len(rows)} failed")
     if rows:
         print("\n".join(_table(rows, ("device", "seq", "command", "error"))))
-    return 0 if not rows else 1
+    return args.verdict
 
 
 def cmd_output(store: Store, args) -> int:
     run_id = store.resolve_run(args.run)
     row = store.output(run_id, args.device, args.seq)
+    args.verdict = 0 if row["ok"] else 1
     if row["output"] is not None:
         sys.stdout.write(row["output"] if row["output"].endswith("\n") else row["output"] + "\n")
     if not row["ok"]:
         print(f"ERROR: {row['error'] or 'failed'}", file=sys.stderr)
-        return 1
-    return 0
+    return args.verdict
 
 
 def cmd_grep(store: Store, args) -> int:
@@ -528,10 +545,11 @@ def cmd_diff(store: Store, args) -> int:
     ra, rb = store.output(a, args.device, args.seq), store.output(b, args.device, args.seq)
     la, lb = (ra["output"] or "").splitlines(keepends=True), (rb["output"] or "").splitlines(keepends=True)
     diff = list(difflib.unified_diff(la, lb, fromfile=f"{args.device} {a}", tofile=f"{args.device} {b}"))
+    args.verdict = 1 if diff else 0
     sys.stdout.writelines(diff)
     if diff and not diff[-1].endswith("\n"):
         print()
-    return 1 if diff else 0
+    return args.verdict
 
 
 def cmd_history(store: Store, args) -> int:
@@ -607,9 +625,10 @@ def cmd_export(store: Store, args) -> int:
         if not args.out:
             raise                       # stdout: a reader that left (`| head`) is main()'s business
         raise StoreError(f"--out {args.out}: {e.strerror or e}") from e
+    args.verdict = 0 if written else 1
     if args.out:
         print(f"{written} rows written to {args.out}", file=sys.stderr)
-    return 0 if written else 1
+    return args.verdict
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -681,17 +700,11 @@ def _stdout_gone() -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """The reader's exit code. A reader of the output that left in the middle
-    (`h-ssh-store ... | head`) has what it wanted: exit 0, not a traceback,
-    as with h-ssh itself. One that left after the last row shows only at the
-    final flush, and the command's own verdict stands (failed, diff)."""
-    try:
-        return _main(argv)
-    except BrokenPipeError:
-        return 0
-
-
-def _main(argv: Optional[List[str]]) -> int:
+    """The reader's exit code. A reader of the output that leaves early
+    (`h-ssh-store ... | head`) has what it wanted: no traceback, as with
+    h-ssh itself, and exit 0, or the verdict the command had before it
+    printed (failed, diff, output), whether the pipe closed in the middle
+    or only at the final flush."""
     args = build_parser().parse_args(argv)
     try:
         store = Store(_store_path(args), readonly=True)
@@ -700,6 +713,8 @@ def _main(argv: Optional[List[str]]) -> int:
     error = None
     try:
         rc = args.fn(store, args)
+    except BrokenPipeError:
+        rc = getattr(args, "verdict", 0)        # the reader left in the middle
     except StoreError as e:
         rc, error = 2, str(e)
     except sqlite3.Error as e:
@@ -713,7 +728,9 @@ def _main(argv: Optional[List[str]]) -> int:
         rc, error = 2, (f"{store.path} was written while it was read as it is; "
                         "the output may miss or repeat rows, read it again")
     try:
-        sys.stdout.flush()          # a reader that left after the last row: the verdict stands
+        # The rows go out before any ERROR line; a reader found gone here
+        # left after the last of them, and the verdict stands.
+        _flush(sys.stdout)
     except BrokenPipeError:
         pass
     return _error(error) if error else rc
@@ -729,14 +746,21 @@ def _error(text: str) -> int:
     return 2
 
 
+def _flush(stream) -> None:
+    """Out with what is still buffered. A descriptor closed before the start
+    (`>&-`) leaves Python no stream at all: None, nothing to flush."""
+    if stream is not None:
+        stream.flush()
+
+
 def main_sync() -> None:
     rc = main()
     try:
         # A reader that left takes nothing more: what is still buffered goes
         # to /dev/null rather than fail the interpreter's flush at exit
         # (exit 120, 'Exception ignored').
-        sys.stdout.flush()
-        sys.stderr.flush()
+        _flush(sys.stdout)
+        _flush(sys.stderr)
     except BrokenPipeError:
         _stdout_gone()
     sys.exit(rc)

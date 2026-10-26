@@ -387,10 +387,14 @@ def test_a_store_is_read_as_it_is_only_when_nothing_waits_beside_it(tmp_path, mo
     as it is (immutable). WAL frames or a rollback journal beside it hold
     what the file alone does not say (committed rows, a crashed
     transaction), so the refusal stands, as does any other refusal; and it
-    is beside the file itself that counts, not beside a symlink to it."""
+    is beside the file itself that counts, not beside a symlink to it.
+    Refused for its -wal (a run killed before it closed the store), the
+    store says what to do."""
     path = tmp_path / "h-ssh.db"
     r1, r2, r3 = filled(path)
     wal, journal = tmp_path / "h-ssh.db-wal", tmp_path / "h-ssh.db-journal"
+    copy_it = ("(its -wal holds rows not yet in the file, and SQLite reads them only in a directory "
+               "it can write to: copy the store with its -wal to one you can)")
     link = tmp_path / "elsewhere" / "h-ssh.db"
     link.parent.mkdir()
     link.symlink_to(path)
@@ -414,13 +418,16 @@ def test_a_store_is_read_as_it_is_only_when_nothing_waits_beside_it(tmp_path, mo
     assert opened("SQLITE_CANTOPEN", "unable to open database file").endswith("?mode=ro&immutable=1")
     assert opened(None, "unable to open database file").endswith("?mode=ro&immutable=1")
     wal.write_bytes(b"frames")                                                     # committed rows the file lacks
-    assert opened() == f"{path}: attempt to write a readonly database"
-    assert opened("SQLITE_CANTOPEN", "unable to open database file") == f"{path}: unable to open database file"
-    assert opened(at=link) == f"{link}: attempt to write a readonly database"     # beside the file, not the link
+    assert opened() == f"{path}: attempt to write a readonly database {copy_it}"
+    assert opened("SQLITE_CANTOPEN", "unable to open database file") == f"{path}: unable to open database file {copy_it}"
+    assert opened(None, "unable to open database file") == f"{path}: unable to open database file {copy_it}"
+    assert opened(at=link) == f"{link}: attempt to write a readonly database {copy_it}"   # beside the file, not the link
+    assert opened("SQLITE_BUSY", "database is locked") == f"{path}: database is locked"  # not for want of a -shm
     wal.unlink()
     journal.write_bytes(b"journal")                                                # a crashed transaction
     assert opened("SQLITE_READONLY_ROLLBACK") == f"{path}: attempt to write a readonly database"
     assert opened() == f"{path}: attempt to write a readonly database"
+    assert opened(None) == f"{path}: attempt to write a readonly database"        # Python 3.10 alike
     journal.unlink()
     assert opened("SQLITE_READONLY_ROLLBACK") == f"{path}: attempt to write a readonly database"   # not about a -shm
     assert opened("SQLITE_BUSY", "database is locked") == f"{path}: database is locked"
@@ -432,12 +439,14 @@ def test_a_store_written_while_it_was_read_as_it_is_is_an_error_not_a_quiet_answ
     writes it meanwhile (an --every tick, the owner's next job) moves pages
     under the reader, which then misses or repeats rows without a word, or
     says 'malformed' of a store that is not. The reader looks again when it
-    is done: the file changed, or WAL frames beside it now, is exit 2 with
-    the reason. A reader that came meanwhile (its empty -wal) wrote nothing."""
+    is done: the file changed (grown, rewritten in place to the same size,
+    or another file in its place), or WAL frames beside it now, is exit 2
+    with the reason, after the rows it printed. A reader that came meanwhile
+    (its empty -wal) wrote nothing."""
     path = tmp_path / "h-ssh.db"
     filled(path)
     no_room_for_a_shm(monkeypatch)
-    held = []
+    held, said = [], []
 
     def next_run(stay=False):
         writer = Store(str(path))
@@ -447,6 +456,19 @@ def test_a_store_written_while_it_was_read_as_it_is_is_an_error_not_a_quiet_answ
             held.append(writer)               # committed into its -wal, not yet into the file
         else:
             writer.close()                    # the last one out: into the file, the -wal gone
+
+    def rewritten():
+        """In place and to the same size: only the file's time says so."""
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+
+    def replaced():
+        """Another file of the same size and time in its place."""
+        st = path.stat()
+        twin = tmp_path / "twin.db"
+        twin.write_bytes(path.read_bytes())
+        os.utime(twin, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.replace(twin, path)
 
     def export_while(meanwhile):
         """export --all, with `meanwhile` done once its first row is out."""
@@ -459,7 +481,7 @@ def test_a_store_written_while_it_was_read_as_it_is_is_an_error_not_a_quiet_answ
                 return len(text)
 
             def flush(self):
-                pass
+                said.append("rows")               # what was buffered goes out
 
         monkeypatch.setattr(sys, "stdout", Out())
         rc = store_main(["--store", str(path), "export", "--all", "--format", "jsonl"])
@@ -473,6 +495,11 @@ def test_a_store_written_while_it_was_read_as_it_is_is_an_error_not_a_quiet_answ
     assert export_while(next_run) == (2, moved)
     assert export_while(lambda: next_run(stay=True)) == (2, moved)
     held.pop().close()
+    assert export_while(rewritten) == (2, moved)
+    assert export_while(replaced) == (2, moved)
+    said.clear()
+    monkeypatch.setattr(sys, "stderr", types.SimpleNamespace(write=said.append, flush=lambda: None))
+    assert export_while(next_run)[0] == 2 and said[:2] == ["rows", moved[:-1]]     # the rows out, then the reason
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes anywhere")
@@ -482,7 +509,9 @@ def test_a_finished_store_in_a_directory_the_reader_cannot_write_is_still_read(t
     -shm file beside the store, which such a directory refuses; a finished
     store (no -wal left, or the empty one a reader leaves) is read as it is
     instead, and nothing is left beside it. One a run is still writing has
-    both files beside it and is read through them."""
+    both files beside it and is read through them; one whose run was killed
+    with rows still in the -wal, archived without the -shm, is refused with
+    what to do, and read where SQLite may write."""
     archived = tmp_path / "archived"
     archived.mkdir()
     r1, r2, r3 = filled(archived / "h-ssh.db")
@@ -513,6 +542,20 @@ def test_a_finished_store_in_a_directory_the_reader_cannot_write_is_still_read(t
     run = writer.begin_run("show", ["-sC", "show version"], "lab", 1, "1.0.0")
     writer.add(run, "r7", 0, "show version", True, output="Junos: 24.4\n")   # committed, sits in the -wal
     assert (live / "h-ssh.db-wal").exists()
+    killed = tmp_path / "killed"                                            # the run killed there, archived
+    killed.mkdir()                                                          # without the -shm
+    for name in ("h-ssh.db", "h-ssh.db-wal"):
+        (killed / name).write_bytes((live / name).read_bytes())
+    killed.chmod(0o555)
+    try:
+        rc, out, err = reader(capsys, killed / "h-ssh.db", "grep", "junos:", "-i")
+        assert rc == 2 and out == "" and err.startswith(f"ERROR: {killed / 'h-ssh.db'}: ")
+        assert err.endswith("(its -wal holds rows not yet in the file, and SQLite reads them only in a "
+                            "directory it can write to: copy the store with its -wal to one you can)\n")
+    finally:
+        killed.chmod(0o755)
+    rc, out, _ = reader(capsys, killed / "h-ssh.db", "grep", "junos:", "-i")     # where SQLite may write
+    assert rc == 0 and "Junos: 24.4" in out
     live.chmod(0o555)
     try:
         rc, out, _ = reader(capsys, live / "h-ssh.db", "grep", "junos:", "-i")
@@ -523,9 +566,9 @@ def test_a_finished_store_in_a_directory_the_reader_cannot_write_is_still_read(t
 
 
 class Gone:
-    """stdout on a pipe whose reader left: the write fails, or only the
-    flush (a short reply sits in the buffer until the end). What was not
-    taken stays in the buffer, so every later flush fails too."""
+    """stdout (or stderr) on a pipe whose reader left: the write fails, or
+    only the flush (a short reply sits in the buffer until the end). What
+    was not taken stays in the buffer, so every later flush fails too."""
     def __init__(self, at):
         self.at = at
 
@@ -565,22 +608,50 @@ def test_a_reader_that_stops_early_is_exit_0_not_a_traceback(tmp_path, monkeypat
         parked.clear()
 
 
-def test_a_reader_that_left_after_the_last_row_keeps_the_verdict(tmp_path, monkeypatch, capsys):
-    """The pipe found closed only at the final flush: the command had its
-    verdict, and it stands, as h-ssh's does ('there are failures', 'they
-    differ'), so `set -o pipefail` never reads either as a clean 0."""
-    r1, r2, r3 = filled(tmp_path / "s.db")
-    parked = []
+def test_a_reader_that_left_keeps_the_verdict_the_command_already_had(tmp_path, monkeypatch, capsys):
+    """`failed`, `diff` and `output` know their verdict before they print
+    ('there are failures', 'they differ', 'the row failed'), and it stands
+    whether the pipe closed in the middle (a long list into `| head`) or is
+    found closed at the final flush, as h-ssh's does: `set -o pipefail`
+    never reads it as a clean 0. So does the exit code of a line on stderr
+    that went with the pipe (`2>&1 | head`), an ERROR line's 2 included."""
+    path = tmp_path / "s.db"
+    r1, r2, r3 = filled(path)
+    out, parked = sys.stdout, []
     monkeypatch.setattr(os, "dup2", lambda fd, to: parked.append(to))
-    for argv, verdict in ((["failed", r1], 1), (["diff", "r1", r1, r2], 1), (["slowest"], 0)):
-        argv = ["--store", str(tmp_path / "s.db"), *argv]
-        monkeypatch.setattr(sys, "stdout", Gone("flush"))
-        assert store_main(argv) == verdict and parked == [], argv
-        monkeypatch.setattr(sys, "argv", ["h-ssh-store", *argv])
-        with pytest.raises(SystemExit) as end:
-            store_module.main_sync()
-        assert end.value.code == verdict and parked[:1] == [1] and capsys.readouterr().err == "", argv
-        parked.clear()
+    for at in ("write", "flush"):
+        for argv, verdict in ((["failed", r1], 1), (["diff", "r1", r1, r2], 1), (["slowest"], 0)):
+            argv = ["--store", str(path), *argv]
+            monkeypatch.setattr(sys, "stdout", Gone(at))
+            assert store_main(argv) == verdict and parked == [], (at, argv)
+            monkeypatch.setattr(sys, "argv", ["h-ssh-store", *argv])
+            with pytest.raises(SystemExit) as end:
+                store_module.main_sync()
+            assert end.value.code == verdict and parked[:1] == [1] and capsys.readouterr().err == "", (at, argv)
+            parked.clear()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", Gone("write"))
+    for argv, verdict in ((["output", "r2", r1], 1),                         # the row failed
+                          (["output", "nobody"], 2),                         # no such row: the ERROR line
+                          (["export", "--all", "--device", "nobody", "--out", str(tmp_path / "none.csv")], 1)):
+        assert store_main(["--store", str(path), *argv]) == verdict, argv
+
+
+def test_a_reader_started_with_stdout_or_stderr_closed_is_no_traceback(tmp_path, monkeypatch):
+    """`h-ssh-store runs >&-` (or `2>&-`): a descriptor closed before the
+    start leaves Python no stream at all (None), and print() prints
+    nothing. The flushes that look for a reader that left skip it rather
+    than fail on it (that was a traceback, exit 1)."""
+    filled(tmp_path / "s.db")
+    argv = ["--store", str(tmp_path / "s.db"), "runs"]
+    monkeypatch.setattr(sys, "argv", ["h-ssh-store", *argv])
+    for stream in ("stdout", "stderr"):
+        with monkeypatch.context() as m:
+            m.setattr(sys, stream, None)
+            assert store_main(argv) == 0, stream
+            with pytest.raises(SystemExit) as end:
+                store_module.main_sync()
+            assert end.value.code == 0, stream
 
 
 # --- through the CLI ----------------------------------------------------------------
