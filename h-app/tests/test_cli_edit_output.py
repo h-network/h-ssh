@@ -43,15 +43,17 @@ def test_edit_result_without_a_diff_is_one_line():
 
 
 def run_cli(monkeypatch, capsys, tmp_path, argv, result=None, driver=None,
-            target="R1:10.0.0.1:junos", prog="./h-app/h-ssh.py"):
+            target="R1:10.0.0.1:junos", prog="./h-app/h-ssh.py", password="p"):
     """Run main() in-process against a fake junos driver; nothing is contacted.
     The fake answers every edit with `result`, or is `driver` when a test
-    needs to record calls. Returns (rc, stdout, stderr)."""
+    needs to record calls; `password` is HSSH_PASSWORD (None: not set).
+    Returns (rc, stdout, stderr)."""
     fake = driver or types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: result)
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
-    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    if password is not None:
+        monkeypatch.setenv("HSSH_PASSWORD", password)
     monkeypatch.setattr(sys, "argv", [
         prog, "--config", os.devnull, "--user", "u",
         *(["--target", target] if target else []), *argv])
@@ -152,13 +154,13 @@ class JobDriver:
         return head + "\n\n" + DIFF
 
 
-def run_job(monkeypatch, capsys, tmp_path, job, *extra, driver=None):
+def run_job(monkeypatch, capsys, tmp_path, job, *extra, driver=None, password="p"):
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     job_file = tmp_path / "job.json"
     job_file.write_text(json.dumps(job))
     driver = driver or JobDriver()
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--job", str(job_file), *extra],
-                           driver=driver, target=None)
+                           driver=driver, target=None, password=password)
     return rc, out, err, driver
 
 
@@ -272,17 +274,21 @@ def test_a_failed_job_entry_saves_its_error_in_its_own_file(monkeypatch, capsys,
 
 def test_a_job_entry_saved_over_another_devices_file_is_refused(monkeypatch, capsys, tmp_path):
     """R1's second entry is saved as R1.2.output, which is also the file of a
-    device named R1.2: one result would replace the other. Refused before
-    anything is sent; without --save-output the job runs."""
+    device named R1.2: one result would replace the other. Refused with the
+    job file's other mistakes, before the password prompt, the store, the
+    directory and the banner; without --save-output the job runs."""
     job = [
         {"target": "R1:10.0.0.1:junos", "show": "show version"},
         {"target": "R1.2:10.0.0.2:junos", "show": "show version"},
         {"target": "R1:10.0.0.1:junos", "show": "show interfaces terse"},
     ]
-    save = tmp_path / "out"
-    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--json", "--save-output", str(save),
-                                   driver=EchoDriver())
-    assert rc == 2 and driver.calls == [] and not any(save.iterdir())
+    save, db, asked = tmp_path / "out", tmp_path / "s.db", []
+    monkeypatch.setattr(cli, "_tty", lambda stream: True)
+    monkeypatch.setattr(cli, "_ask", lambda prompt, secret=False: asked.append(prompt) or "typed")
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--store", str(db), "--save-output", str(save),
+                                   driver=EchoDriver(), password=None)
+    assert rc == 2 and driver.calls == [] and asked == [] and out == ""
+    assert not save.exists() and not db.exists()
     assert "R1.2 and R1's entry 2 would both be saved as R1.2.output" in err and "Nothing was sent" in err
     rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--json", driver=EchoDriver())
     assert rc == 0 and len(driver.calls) == 3

@@ -198,7 +198,7 @@ show listed after an edit sees the edit, and each is audited with its own mode a
 `--save-output DIR` each entry is saved to a file of its own: the device's first entry keeps
 `DIR/<name>.output`, its later ones go to `DIR/<name>.2.output`, `DIR/<name>.3.output` and so on, in
 file order. A job that would put two results in one file that way (a device named `R1.2` beside a
-second `R1` entry) is refused before anything is sent (exit 2).
+second `R1` entry) is refused before the password is asked or anything is sent (exit 2).
 
 ### Watching: `--every`
 

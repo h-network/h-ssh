@@ -562,8 +562,9 @@ def run_for_target(
     Synchronous public API for library users. `expected_diff` is the diff a
     dry run showed; an edit or rollback is then committed only if the device
     produces it again. `seq` is a job entry's place among the entries for the
-    same device (0 for the first): with `save_dir` a later one is saved as
-    `<name>.<seq+1>.output`, beside the first one's `<name>.output`.
+    same device (0 for the first): with `save_dir` the first is saved as
+    `<name>.output` and a later one as `<name>.<seq+1>.output`, `.json` for
+    a batch.
     Returns: (device_name, success, output_text, duration_ms)
     """
     return _run_for_target_sync(

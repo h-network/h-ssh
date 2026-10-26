@@ -1,4 +1,5 @@
 """Runner policy for edits: dry-run, commit-confirmed, retry, and confirm."""
+import json
 import os
 import sys
 import types
@@ -380,24 +381,29 @@ def test_save_output_files_are_0600_and_raw(monkeypatch, tmp_path):
 
 def test_save_output_gives_a_later_entry_for_the_same_device_a_file_of_its_own(monkeypatch, tmp_path):
     """seq is a job entry's place among its device's entries (#116): 0 keeps
-    R1.output, 1 saves to R1.2.output and 2 to R1.3.output, an error too."""
+    R1.output, 1 saves to R1.2.output and 2 to R1.3.output, an error too. A
+    batch (a library call: a job has none) is .json the same way: 1 is R1.2.json."""
     def show(host, user, passwd, cmd, *a, **kw):
         if cmd == "show bogus":
             raise RuntimeError("syntax error: show bogus")
         return f"{cmd} on {host}\n"
-    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True, show=show))
+    def show_batch(host, user, passwd, cmds, *a, **kw):
+        return [{"command": c, "ok": True, "output": f"{c} on {host}"} for c in cmds]
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf",
+                        types.SimpleNamespace(AVAILABLE=True, show=show, show_batch=show_batch))
     save = tmp_path / "out"
+    common = dict(t=Target("R1", "10.0.0.1", "junos"), transport="junos", edit_cmd=None, config_dir=None,
+                  broadcast_file=None, user="u", passwd="p", session_timeout=5, command_timeout=30,
+                  dry_run=False, commit_confirmed=None, save_dir=str(save), quiet=True, max_attempts=1)
     for seq, cmd in ((0, "show version"), (1, "show interfaces terse"), (2, "show bogus")):
-        runner.run_for_target(
-            t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
-            show_cmd=cmd, edit_cmd=None, config_dir=None, broadcast_file=None,
-            user="u", passwd="p", session_timeout=5, command_timeout=30,
-            dry_run=False, commit_confirmed=None, save_dir=str(save), quiet=True, max_attempts=1, seq=seq)
+        runner.run_for_target(mode="show", show_cmd=cmd, seq=seq, **common)
+    runner.run_for_target(mode="show-batch", show_cmd=None, batch_cmds=["show chassis alarms"], seq=1, **common)
     saved = {p.name: p.read_text() for p in save.iterdir()}
-    assert sorted(saved) == ["R1.2.output", "R1.3.output", "R1.output"]
+    assert sorted(saved) == ["R1.2.json", "R1.2.output", "R1.3.output", "R1.output"]
     assert saved["R1.output"].endswith("\n\nshow version on 10.0.0.1\n")
     assert saved["R1.2.output"].endswith("\n\nshow interfaces terse on 10.0.0.1\n")
     assert saved["R1.3.output"].endswith("\n\nERROR: syntax error: show bogus\n")
+    assert [r["output"] for r in json.loads(saved["R1.2.json"])] == ["show chassis alarms on 10.0.0.1"]
 
 # --- #44: a show that acts on the device is sent once --------------------------
 

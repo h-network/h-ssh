@@ -646,6 +646,26 @@ async def main() -> int:
         except ValueError as e:
             print(f"ERROR: job file: {e}", file=sys.stderr)
             return 2
+        # A device may be named in several entries: seq_of counts them per
+        # device in file order, 0 for the first, and with --save-output each
+        # is saved to a file of its own (R1.output, R1.2.output, R1.3.output, ...).
+        seq_of, counted = [], {}
+        for t in targets:
+            seq_of.append(counted.get(t.name, 0))
+            counted[t.name] = seq_of[-1] + 1
+        if args.save_output:
+            # R1's second entry is R1.2.output, which is also the file of a
+            # device named R1.2: one result would replace the other. Refused
+            # with the job file's other mistakes, before the password prompt.
+            saved_as = {}
+            for t, seq in zip(targets, seq_of):
+                whose = f"{t.name}'s entry {seq + 1}" if seq else t.name
+                fname = save_name(t.name, seq)
+                if fname in saved_as:
+                    print(f"ERROR: --save-output: {saved_as[fname]} and {whose} would both be saved as {fname}; "
+                          "rename one of the devices. Nothing was sent.", file=sys.stderr)
+                    return 2
+                saved_as[fname] = whose
         has_edits = any(e.mode.startswith("edit") for e in job_entries)
         mode = "job"
         for je in job_entries:
@@ -1020,25 +1040,6 @@ async def main() -> int:
     # job mode) travels with its result, so a job that names one device in
     # two entries never has the second read as the first.
     units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
-    # A job may name one device in several entries: seq counts them per
-    # device in file order, 0 for the first, and with --save-output each is
-    # saved to a file of its own (R1.output, R1.2.output, R1.3.output, ...).
-    seq_of, counted = [], {}
-    for t, je in units:
-        seq_of.append(counted.get(t.name, 0))
-        counted[t.name] = seq_of[-1] + 1
-    if save_dir and job_entries:
-        # R1's second entry is R1.2.output, which is also the file of a
-        # device named R1.2: one result would replace the other.
-        saved_as = {}
-        for (t, _), seq in zip(units, seq_of):
-            whose = f"{t.name}'s entry {seq + 1}" if seq else t.name
-            fname = save_name(t.name, seq)
-            if fname in saved_as:
-                print(f"ERROR: --save-output: {saved_as[fname]} and {whose} would both be saved as {fname}; "
-                      "rename one of the devices. Nothing was sent.", file=sys.stderr)
-                return 2
-            saved_as[fname] = whose
 
     def _audit_aborted(error):
         """One audit line per unit for a run the operator did not confirm."""
