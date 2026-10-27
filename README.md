@@ -1123,8 +1123,13 @@ runs. `user=None` is the name you are logged in as; `passwd=None` means keys or 
 string is refused, since the transports do not agree on what it means. The timeouts are whole seconds
 (`connect_timeout` the TCP connect and the SSH banner, as `--connect-timeout`, never more than
 `session_timeout`) and `retries` the attempts after the first, with the CLI's defaults (`--retries 2`,
-`--connect-timeout 3`): one engine, one behaviour.
-The library reads no environment variable and no config file; that is the CLI's job. What it does for you:
+`--connect-timeout 3`): one engine, one behaviour. `workers` (1 to 256) and `command_timeout` default
+higher than the CLI's `--workers 8` and `--command-timeout 20`.
+Fleet takes no setting of h-ssh's own from the environment or from `~/.h-ssh/config` (no `HSSH_USER`,
+`HSSH_PASSWORD` or `HSSH_STORE`, no defaults): what it is given is what it uses. The transports under it
+still read what they always read: `HSSH_HOST_KEY_POLICY` and the known_hosts files (`ssh`, `openssh`),
+`HSSH_NETCONF_HOSTKEY` (`junos`), the ssh client's configuration (`openssh`, `junos`, the probe), and
+the pool's `HSSH_POOL_IDLE_TIMEOUT`, read when `hssh` is imported. What it does for you:
 
 - [the probe](#the-probe) before every `show()` and `batch()`, as the CLI's before every run: each box asked,
   without logging in, whether it is there (a TCP connect and the SSH banner, `connect_timeout` each, 100 at
@@ -1162,19 +1167,20 @@ The library reads no environment variable and no config file; that is the CLI's 
 - one run at a time: a second `show()` or `batch()` while devices of the previous run are still in flight
   raises `RuntimeError` (two runs would queue on the pool's per-router locks, and the time bound would then
   fail honest devices); a previous run whose devices have all returned is wrapped up first and stays readable;
-- one session per device, pooled for the Fleet's lifetime however many commands you run. The pool is
-  process-wide: the last Fleet to close turns it off only if a Fleet turned it on; a pool you enabled
-  yourself is used and left on;
+- on the `junos` (NETCONF) transport, one session per device, pooled for the Fleet's lifetime however
+  many commands you run; `ssh`, `openssh` and `telnet` have no pool and connect afresh for every
+  `show()` or `batch()`. The pool is process-wide: the last Fleet to close turns it off only if a Fleet
+  turned it on; a pool you enabled yourself is used and left on;
 - `close(wait=0)`, or leaving the `with` block, promises this much: devices not yet started are not started;
   the devices a worker is talking to get `wait` seconds to answer (a Ctrl-C handler may pass a few), and what
   returned by then is a result and a store row; the run is recorded as interrupted with the rest as skipped;
   iterating its results afterwards gives what was done by then and nothing more (a call that returns later is
-  dropped, its row says skipped), so the store and the script agree; a script waiting in its `for` loop wakes at
-  once, whichever thread called `close()`, and a `close()` that lands while `show()` is still opening the run's
+  dropped, and the run row counts it as skipped), so the store and the script agree; a script waiting in its
+  `for` loop wakes at once, whichever thread called `close()`, and a `close()` that lands while `show()` is still opening the run's
   store row waits for the row, records the run as interrupted, and that `show()` raises `RuntimeError` (one
-  that lands while the boxes are probed does the same at once). A store
-  this Fleet opened is closed, and the sessions close (one still in use closes when its call returns); the
-  routers get up to a second in all to acknowledge that, so the sessions' descriptors are freed with them.
+  that lands while the boxes are probed does the same at once). A store this Fleet opened is closed, and,
+  when this is the last Fleet on a pool a Fleet turned on, the sessions close (one still in use closes when
+  its call returns); the routers get up to a second in all to acknowledge that, so the sessions' descriptors are freed with them.
   `async with Fleet(...)` and `aclose()` do the same off the event loop. A Fleet dropped without `close()` lets
   its threads go and gives its share of the session pool back once it is collected, as a dropped
   `ThreadPoolExecutor` ends its workers. That can wait for the garbage collector's next pass: a device call that
@@ -1185,9 +1191,12 @@ The library reads no environment variable and no config file; that is the CLI's 
   `Fleet.show show bgp summary`; one result row per device, per command for a batch), written from the thread
   that iterates and, under `async for`, from a worker of the event loop, so SQLite never blocks it;
   `show_async()` and `batch_async()` are async generators (`async for r in fleet.show_async(cmd)`) that start
-  the run on their first step. What the store could not keep is counted, never raised: a write that fails is
-  said once per run as a `RuntimeWarning` that names the run, and the run goes on; at the end `res.not_kept`
-  says how many results were not kept and `res.store_error` why (a store file deleted or replaced under the
+  the run on their first step; they yield the results only, so under them a store loss is said by the
+  `RuntimeWarning` alone (for `not_kept` and `store_error`, start the run off the loop and iterate its
+  `Results`: `res = await asyncio.to_thread(fleet.show, cmd)`, then `async for r in res`). What the store
+  could not keep is counted, never raised: a write that fails is said as a `RuntimeWarning` that names the
+  run, once as it happens and once more at the end with the count (`3 of 3 results were not kept: …`),
+  and the run goes on; at the end `res.not_kept` says how many results were not kept and `res.store_error` why (a store file deleted or replaced under the
   run means every result of it, and its run row is left open, as the CLI does). Read back,
   `Store(path, readonly=True).results()` is the SQLite cursor `h-ssh-store` streams: read once, no `len()`,
   always true; `list()` it to keep the rows. In a directory the reader cannot write to, a finished store is
@@ -1197,9 +1206,13 @@ The library reads no environment variable and no config file; that is the CLI's 
   only: on another transport, or for a command that is not a read, that is the device's failure, nothing
   sent); `to_dicts()` is JSON-serialisable, in the shape of the CLI's `--json` records.
 
-Reads only, `show` and `batch`; the command is sent as typed (shortcuts are the CLI's), one line of text: the line
+`show` and `batch` only, no edits. A command is not checked to be a read: one that acts on the device
+(`request system reboot`) is sent, once and never retried, as `-sC` sends it; only `fmt="json"` or `"xml"`
+refuses it. The command is sent as typed (shortcuts are the CLI's), one line of text: the line
 break that ends a line read from a file is dropped (`fleet.batch(open(path))`), and any other line break or control
-character is a `ValueError` before anything runs. Edits keep their gates
+character is a `ValueError` before anything runs. A file is taken as it is: a blank line is a `ValueError`
+and a `#` comment is sent as a command; `fleet.batch(hssh.core.read_command_file_lines(pathlib.Path(path)))`
+reads a batch file or a profile as the CLI does. Edits keep their gates
 in the CLI (the set-syntax guard, the probe's question, the confirmation) and in the transports' own
 `edit()`/`begin()` below.
 
@@ -1231,6 +1244,10 @@ name, ok, output, ms = run_for_target(
 typed answer in `.result` (an `EditResult` with `status`, `diff`, `minutes`; a `BatchResult`; a
 `CommitStatus` with `.pending`; a show's text or data) and a failure in `.error`. The edit, batch and
 commit-status types are also still the text or list the drivers always returned (`hssh/drivers/results.py`).
+`run_for_target()` prints a progress line per device on stdout (`STARTED`, `RETRY 1/2 …`) unless you
+pass `quiet=True`, and makes up to `max_attempts=3` attempts (the first and two retries, as
+`--retries 2`; a command that is not a read is sent once). `run_for_target_async()` takes the same
+arguments for asyncio code.
 
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
 `run_for_target()` and every function of the three SSH transports take `connect_timeout=` as well (3 by default):
@@ -1245,15 +1262,19 @@ A maintenance wants to look at the diff *before* deciding, keep the candidate on
 find its commits again on the box afterwards:
 
 ```python
+from hssh.transports import netconf
+host, user = "10.0.1.1", "h-lab"
+payload = "set interfaces lo0 description C1"          # gate_says_yes() and checks_pass() are your own
+
 with netconf.begin(host, user, None, payload, 30, 20) as tx:         # lock, load, diff, commit check
     print(tx.diff)                                                   # tx.show()/tx.rpc() still work here
     if gate_says_yes(tx.diff):
         tx.commit(confirmed=10, comment="C1 cutover")                 # or tx.abort(); leaving the block aborts
 
-netconf.confirm(host, user, None, 30, 20, comment="C1 cutover (confirmed)")
-netconf.commit_status(host, user, None, 30, 20)
+netconf.commit_status(host, user, None, 30, 20)                       # before the confirm: ours is waiting
 # [{'seq': 0, 'user': 'h-lab', 'client': 'netconf', 'time': '…', 'epoch': 1792…, 'comment': 'C1 cutover',
 #   'note': 'commit confirmed, rollback in 10mins', 'pending_rollback_minutes': 10}, …]
+netconf.confirm(host, user, None, 30, 20, comment="C1 cutover (confirmed)")
 
 netconf.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
                        check=lambda: checks_pass(), comment="C1 cutover")
@@ -1261,18 +1282,23 @@ netconf.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
 # {'final': 'confirmed' | 'rolled back' | 'not confirmed' | 'not rolled back' | 'no changes', …}
 ```
 
+`begin(host, user, None, None, 30, 20, rollback=n)` opens `rollback n` the same way (a payload or
+`rollback=`, not both); its commit reads `ROLLBACK n: COMMIT OK`.
+
 `edit()`, `rollback()` and `confirm()` take `comment=` too; the device's own "rollback in N min" is what
 `pending_rollback_minutes` reports, on the latest commit only: once confirmed, a commit keeps that note in
 the history (`note`) but is no longer waiting. `confirm()` commits under the configuration lock, so someone else's
 uncommitted edits refuse it (`NotAppliedError`, nothing sent) rather than going in with the confirmation.
-`guarded_commit()` reads `show system commit` after its commit and again before it confirms or rolls back:
+With no commit-confirmed waiting (the timer expired, or it was confirmed already) `confirm()` raises
+`hssh.errors.NothingToConfirmError` and sends nothing: a plain commit there would hide that the change
+is gone. `guarded_commit()` reads `show system commit` after its commit and again before it confirms or rolls back:
 when the pending commit is no longer the one it made — another commit landed, which also confirmed it, or
 the checks outlasted the timer and the device rolled back by itself — it sends nothing and answers
 `not confirmed` / `not rolled back` with the reason, the history under `status` and, when the checks
 failed, their error under `check_error`, because a `rollback 1` at that point would re-apply the change
-that just failed its checks. A session with an open transaction stays borrowed —
-other threads wait for it, the thread holding it may keep using it, and only that thread can commit or
-abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that landed elsewhere) is
+that just failed its checks. With the pool on, a session with an open transaction stays borrowed and
+other threads wait for it. Either way the thread holding it may keep using it, and only that thread can
+commit or abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that landed elsewhere) is
 refused before anything is sent, because the session's lock belongs to the thread that opened it.
 
 ### Structured output from a script
@@ -1296,7 +1322,8 @@ fields keyed by item rather than the whole reply.
 
 ### Connection pooling
 
-Every call above opens its own NETCONF session and closes it — right for a one-shot CLI run, wasteful
+Every transport call above (`netconf.show()`, `rpc()`, `begin()`, `run_for_target()`) opens its own
+NETCONF session and closes it (a Fleet pools its own) — right for a one-shot CLI run, wasteful
 for a script that goes back to the same router twenty times. Enable the session pool once and every
 Junos call reuses the router's open session:
 
@@ -1328,18 +1355,22 @@ an edit reports `NotAppliedError` if the session died before the lock, and the u
 h-ssh/
 ├── h-app/
 │   ├── hssh/
-│   │   ├── __init__.py      # public API: Target, Fleet, run_for_target, SafetyGate, pool, drivers, transports; __version__
+│   │   ├── __init__.py      # public API: Fleet, Target, run_for_target(_async), SafetyGate, load_devices_csv and the target/job parsers, pool, drivers, transports; __version__
 │   │   ├── core.py          # Target, CSV loader, template resolver, job parser
 │   │   ├── cli.py           # argument parsing + orchestration
-│   │   ├── runner.py        # concurrent execution engine
+│   │   ├── runner.py        # one device's run: the driver call, retries and their classification, the safety gate, the typed RunResult
 │   │   ├── fleet.py         # Fleet: show/batch across the fleet from a script, results as values, pooled sessions, the store
 │   │   ├── limits.py        # the worker and probe ceilings and the open-file limit both must fit under
 │   │   ├── probe.py         # the probe: TCP connect and SSH banner per box, no login; the round trip from TCP_INFO
-│   │   ├── pool.py          # opt-in session pool for library use
+│   │   ├── pool.py          # the NETCONF session pool: opt-in for the transports, on for a Fleet's lifetime and a --job run
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
 │   │   ├── store.py         # the result store (./h-ssh.db, every run): SQLite writer and the h-ssh-store reader
-│   │   ├── errors.py        # NotAppliedError, ConnectTimeoutError, AmbiguousCommitError — what the retry logic keys on
+│   │   ├── errors.py        # NotAppliedError, ConnectTimeoutError, AmbiguousCommitError, NothingToConfirmError, LocalError — what the retry logic keys on
+│   │   ├── runfile.py       # --run FILE: a whole run in YAML or JSON, its keys named after the flags
+│   │   ├── profiles.py      # --profile and --list-profiles: named batch files, yours in ~/.h-ssh/profiles first
+│   │   ├── profiles/        # the profiles that ship: junos-health.txt, junos-snapshot.txt
+│   │   ├── screen.py        # device text on a terminal: what the terminal would act on taken out
 │   │   ├── dialects/        # what each device speaks, with its shortcut library next to it
 │   │   │   ├── base.py      # Dialect, CliSyntax, the default read rule
 │   │   │   ├── junos.py     # set-syntax guard, refusal regex, candidate CLI, commit-pending note  + junos.json
@@ -1360,10 +1391,13 @@ h-ssh/
 │   ├── tests/               # the unit suite; tests/dialects, tests/drivers, tests/transports per layer, tests/fixtures the packages the entry-point tests load
 │   ├── h-ssh.py             # CLI entry point
 │   ├── devices.csv          # example inventory
-│   ├── example_library_usage.py       # library walkthrough
+│   ├── example_library_usage.py       # the transports and the runner called directly (Fleet: see Library usage)
 │   └── custom_automation_example.py   # build on hssh: CSV loader + junos driver
-├── .github/workflows/tests.yml   # unit suite, Python 3.10–3.13
+├── .github/workflows/tests.yml   # unit suite on Python 3.10–3.13, ruff lint, a clean pip install and the installer
 ├── assets/                  # banner, badges
+├── install.sh               # the one-line installer: ~/.h-ssh/venv, h-ssh and h-ssh-store linked into ~/.local/bin; --uninstall
+├── LICENSE                  # PolyForm Noncommercial 1.0.0
+├── TRADEMARKS.md            # the h-ssh and h-network names and logo
 ├── TESTS.md                 # what was run on which code
 └── pyproject.toml           # installs the `h-ssh` and `h-ssh-store` entry points from h-app/; declares the built-in drivers under `hssh.drivers`
 ```
