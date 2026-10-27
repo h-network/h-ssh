@@ -83,9 +83,9 @@ it. Your config, inventory, shortcuts and profiles live next to the environment 
 result store is `./h-ssh.db` in the directory you run from, unless you name another), and pip's
 download cache lands in its usual place (`~/.cache/pip` on Linux). Running the same line again
 upgrades, whatever the version number says. It installs the `develop` branch; a knob on the `sh` side
-of the pipe picks another branch or tag: `curl -fsSL … | H_SSH_REF=<branch or tag> sh` (`main` lags
-behind `develop`). `H_SSH_REPO`, `H_SSH_HOME`, `H_SSH_BIN` and `H_SSH_PYTHON` are the others, see the
-script's header. Removing it:
+of the pipe picks another branch or tag: `curl -fsSL … | H_SSH_REF=main sh` for the release branch.
+`H_SSH_REPO`, `H_SSH_HOME`, `H_SSH_BIN` and `H_SSH_PYTHON` are the others, see the script's header.
+Removing it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/h-network/h-ssh/develop/install.sh | sh -s -- --uninstall
@@ -97,9 +97,9 @@ neither does an install. Read the script first if you like: a page of POSIX sh t
 paragraph says.
 
 If you already use [pipx](https://pipx.pypa.io) or [uv](https://docs.astral.sh/uv/), the same thing in
-their words: `pipx install git+https://github.com/h-network/h-ssh.git@develop` or
-`uv tool install git+https://github.com/h-network/h-ssh.git@develop` (without `@develop` they install
-`main`, the repository's default branch, which lags behind).
+their words: `pipx install git+https://github.com/h-network/h-ssh.git` or
+`uv tool install git+https://github.com/h-network/h-ssh.git` (the default branch, `develop`; add `@main`
+for the release branch).
 
 For working on h-ssh itself:
 
