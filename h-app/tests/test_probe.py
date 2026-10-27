@@ -809,6 +809,7 @@ def test_a_dead_box_a_job_only_reads_is_a_fail_and_does_not_stop_its_edit(monkey
         assert sorted(driver.calls) == sent                                 # a dry run's show is not sent
         assert "R3               FAIL\n  ERROR: probe: refused (connection refused by 10.0.0.3:830)\n" in out
         assert "Aborting" not in out and "SKIPPED" not in out and "Skipping" not in err
+        assert ("Ready to execute" not in out) if "--dry-run" in extra else ("Ready to execute on 2 device(s)." in out)
         assert '"ok": 2, "fail": 1, "skipped": 0' in err
         assert (last_run()["ok"], last_run()["failed"], last_run()["skipped"]) == (2, 1, 0)
 

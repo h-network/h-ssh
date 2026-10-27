@@ -1435,7 +1435,7 @@ async def main() -> int:
 
     if commits and not args.show_diff:
         if not json_mode:
-            print(f"\nReady to execute on {len(units) - len(leave_out)} device(s).")
+            print(f"\nReady to execute on {len(units) - len(dead)} device(s).")     # a dead box is not run
         if not args.yes:
             try:
                 confirm = input("\nProceed with changes? [y/N]: ").strip().lower()
