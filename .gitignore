@@ -1,4 +1,5 @@
 # Python virtual environment
+.venv/
 .Venv/
 venv/
 env/
@@ -49,3 +50,11 @@ wheels/
 
 # Claude Code local state (agent worktrees, local settings)
 .claude/
+
+# Local scripts and data of whoever uses h-ssh from a checkout (not part of the tool)
+scripts/
+
+# the result store a run leaves in the directory it ran from
+h-ssh.db
+h-ssh.db-wal
+h-ssh.db-shm
