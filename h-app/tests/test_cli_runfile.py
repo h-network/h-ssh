@@ -12,10 +12,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from hssh import cli, drivers, runfile
 
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 class Driver:
     """A junos driver that records what the CLI asked of it."""
     AVAILABLE = True
@@ -41,7 +37,6 @@ def run(monkeypatch, capsys, tmp_path, argv, driver=None):
     """cli.main() in-process against the fake driver; nothing is contacted."""
     drv = driver or Driver()
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", drv)
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")
@@ -282,7 +277,6 @@ def test_the_password_still_comes_from_the_prompt_or_the_environment(monkeypatch
             seen["passwd"] = passwd
             return "ok"
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", Drv())
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: False)

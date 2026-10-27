@@ -187,9 +187,9 @@ def test_retries_zero_from_config_is_honoured():
 # --- the transport default reaches the targets --------------------------------
 
 def run_main(monkeypatch, *argv, config=os.devnull):
-    """h-ssh main() in this process, with the runner and the pre-flight check
-    replaced so nothing is contacted. Returns (rc, [(name, vendor, transport)])
-    as the runner was handed the targets."""
+    """h-ssh main() in this process, with the runner replaced and the probe
+    answered by the suite's fake, so nothing is contacted. Returns (rc,
+    [(name, vendor, transport)]) as the runner was handed the targets."""
     from hssh import cli, drivers
 
     seen = []
@@ -198,11 +198,7 @@ def run_main(monkeypatch, *argv, config=os.devnull):
         seen.append((t.name, t.vendor, transport))
         return t.name, True, f"DEVICE: {t.name}\nHOST:   {t.host}\nMODE:   {mode}\nVENDOR: {t.vendor}\n\nok\n", 1
 
-    async def reachable(target, timeout=2):
-        return target.name, True, "reachable"
-
     monkeypatch.setattr(cli, "run_for_target_async", fake_run)
-    monkeypatch.setattr(cli, "check_reachability", reachable)
     for name in ("junos@netconf", "none@openssh"):
         monkeypatch.setitem(drivers.MODULES, name, types.SimpleNamespace(AVAILABLE=True))
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):

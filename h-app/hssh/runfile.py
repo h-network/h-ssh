@@ -62,6 +62,9 @@ RUN_KEYS: Dict[str, tuple] = {
     "audit_log": ("audit_log", str),
     "safety_file": ("safety_file", str),
     "allow_missing": ("allow_missing", bool),
+    "no_probe": ("no_probe", bool),
+    "slow": ("slow", (int, float)),
+    "skip_unreachable": ("skip_unreachable", bool),
 }
 
 # A file on a shared jumphost or in a git repository is the wrong home for a
@@ -134,6 +137,8 @@ def _check_type(path: str, key: str, value: Any, expected) -> None:
 
 def _kind_name(kinds) -> str:
     names = {str: "string", int: "number", bool: "boolean", list: "list"}
+    if int in kinds and float in kinds:
+        kinds = tuple(k for k in kinds if k is not float)      # a number, whole or not
     return " or ".join(names.get(k, k.__name__) for k in kinds)
 
 
@@ -184,6 +189,8 @@ def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, 
         if key == "format" and value not in FORMAT_CHOICES:
             raise ValueError(f"run file '{path}': 'format' must be one of "
                              f"{', '.join(FORMAT_CHOICES)}, not '{value}'")
+        if key == "slow" and not value > 0:
+            raise ValueError(f"run file '{path}': 'slow' must be above 0 milliseconds, not {value}")
         if key == "rollback" and not 0 <= value <= 49:
             raise ValueError(f"run file '{path}': 'rollback' takes a number from 0 to 49, not {value}")
         if key == "commit_confirmed" and not 1 <= value <= 65535:

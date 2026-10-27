@@ -40,7 +40,7 @@ class Transport:
     install: str                 # what is missing when that module says AVAILABLE = False
     default_port: int
     formats: Tuple[str, ...] = ("text",)   # device-side formats it can ask for (--format)
-    banner: Optional[bytes] = b"SSH-"   # what the port must say to be a device (pre-flight); None: open is enough
+    banner: Optional[bytes] = b"SSH-"   # what the port must say first to be a device (the probe); None: open is enough
     pooled: bool = False         # sessions can outlive one command (hssh.pool)
     frozen: bool = False         # kept working, gets nothing new
 

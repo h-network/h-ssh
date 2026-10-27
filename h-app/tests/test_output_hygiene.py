@@ -13,13 +13,8 @@ from hssh import cli, drivers, runner
 from hssh.errors import NothingToConfirmError, NotAppliedError
 
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 def run_main(monkeypatch, capsys, argv, driver):
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")

@@ -264,10 +264,6 @@ def test_no_credential_at_all_is_said_in_words(monkeypatch, tmp_path):
 
 # --- M8: Ctrl-C during a connect is interrupted, not a failed device --------------
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 def _main_cancelled_after(delay):
     async def go():
         asyncio.get_running_loop().call_later(delay, asyncio.current_task().cancel)
@@ -293,7 +289,6 @@ class _CtrlC:
 
 def _cli_env(monkeypatch, driver, name="junos@netconf"):
     monkeypatch.setitem(drivers.MODULES, name, driver)
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")

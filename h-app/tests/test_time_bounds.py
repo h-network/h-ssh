@@ -1,8 +1,10 @@
 """#66: --session-timeout and --workers bound everything that touches a
-device, the pre-flight included; a router that accepts TCP and then says
-nothing costs the session timeout, not a library default. #126: the TCP
-connect and the SSH banner have --connect-timeout, on all three SSH
-transports, and a connect phase that runs out is named and tried again."""
+device; a router that accepts TCP and then says nothing costs the session
+timeout, not a library default. #126: the TCP connect and the SSH banner
+have --connect-timeout, on all three SSH transports, and a connect phase
+that runs out is named and tried again. #127: the probe before the run
+gives its TCP connect and its banner --connect-timeout each, runs 100 boxes
+at a time whatever --workers says, and tries a box that failed once more."""
 import asyncio
 import errno
 import inspect
@@ -19,20 +21,23 @@ import time
 import types
 import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from hssh import cli, drivers, runner
+from hssh import cli, drivers, probe, runner
 from hssh.core import Target
 from hssh.errors import ConnectTimeoutError, NotAppliedError
 from hssh.runner import is_connect_failure, is_connect_timeout, is_permanent_failure
 from hssh.transports import netconf, openssh, ssh, telnet
 
 
-# --- H1: the pre-flight runs like the run ------------------------------------------
+# --- #127: the probe runs within --connect-timeout, 100 at a time --------------------
 
-def _edit_cli(monkeypatch, capsys, probe, n, extra):
+def _edit_cli(monkeypatch, capsys, attempt, n, extra):
+    """An edit of n routers through main(), each try of the probe answered
+    by `attempt`; nothing is contacted."""
     driver = types.SimpleNamespace(AVAILABLE=True,
                                    edit=lambda host, user, passwd, payload, st, ct, *a, **kw: "COMMIT OK\n")
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
-    monkeypatch.setattr(cli, "check_reachability", probe)
+    monkeypatch.setattr(probe, "attempt", attempt)
+    monkeypatch.setattr(probe, "RETRY_PAUSE", 0.01)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")
@@ -44,35 +49,47 @@ def _edit_cli(monkeypatch, capsys, probe, n, extra):
     return rc, out, err
 
 
-def test_preflight_probes_workers_at_a_time_with_the_session_timeout(monkeypatch, capsys):
-    state = {"now": 0, "peak": 0, "timeouts": set()}
+def _live(host, port):
+    return probe.Answer(probe.LIVE, connect_ms=0.3, banner_ms=7.0, banner="SSH-2.0-OpenSSH_9.6")
 
-    async def probe(target, timeout=2):
-        state["timeouts"].add(timeout)
+
+def test_the_probe_runs_100_at_a_time_whatever_the_workers_within_the_connect_timeout(monkeypatch, capsys):
+    """The old pre-flight probed --workers at a time with --session-timeout
+    for each wait (H1); the probe has a ceiling of its own and the connect
+    timeout, never more than the session timeout, as the run's connect."""
+    state = {"now": 0, "peak": 0, "seconds": set()}
+
+    async def attempt(host, port, banner, seconds):
+        state["seconds"].add(seconds)
         state["now"] += 1
         state["peak"] = max(state["peak"], state["now"])
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.2)
         state["now"] -= 1
-        return (target.name, True, "reachable")
-    rc, out, err = _edit_cli(monkeypatch, capsys, probe, 9, ["--workers", "3", "--session-timeout", "7"])
+        return _live(host, port)
+    rc, out, err = _edit_cli(monkeypatch, capsys, attempt, 150, ["--workers", "3", "--connect-timeout", "7"])
     assert rc == 0, err
-    assert state["peak"] == 3 and state["timeouts"] == {7}
-    assert "Pre-flight check: Validating device reachability (3 at a time, 7s each)" in out
+    assert state["peak"] == 100 and state["seconds"] == {7}
+    assert "Probe: 150 box(es) in " in out and ": 150 live" in out
+    state.update(peak=0, seconds=set())
+    rc, out, err = _edit_cli(monkeypatch, capsys, attempt, 3, ["--session-timeout", "5", "--connect-timeout", "7"])
+    assert rc == 0, err
+    assert state["peak"] == 3 and state["seconds"] == {5}
 
 
-def test_a_probe_that_fails_once_is_tried_again_before_the_device_is_called_unreachable(monkeypatch, capsys):
+def test_a_probe_that_fails_once_is_tried_again_before_the_box_is_called_dead(monkeypatch, capsys):
     calls = {}
 
-    async def probe(target, timeout=2):
-        calls[target.name] = calls.get(target.name, 0) + 1
-        if target.name == "R1" and calls["R1"] == 1:
-            return (target.name, False, "connection timeout")      # lost in the burst
-        if target.name == "R2":
-            return (target.name, False, "port 830 not responding")  # really down
-        return (target.name, True, "reachable")
-    rc, out, err = _edit_cli(monkeypatch, capsys, probe, 3, ["--workers", "8"])
-    assert rc == 2 and calls == {"R0": 1, "R1": 2, "R2": 2}
-    assert "[PASS] R1" in out and "[FAIL] R2" in out and "1 device(s) unreachable: R2" in out
+    async def attempt(host, port, banner, seconds):
+        calls[host] = calls.get(host, 0) + 1
+        if host == "10.0.0.2" and calls[host] == 1:
+            return probe.Answer(probe.TIMED_OUT, "TCP connect to 10.0.0.2:830 timed out after 3s")   # lost in the burst
+        if host == "10.0.0.3":
+            return probe.Answer(probe.REFUSED, "connection refused by 10.0.0.3:830")                  # really down
+        return _live(host, port)
+    rc, out, err = _edit_cli(monkeypatch, capsys, attempt, 3, ["--workers", "8"])
+    assert rc == 2 and calls == {"10.0.0.1": 1, "10.0.0.2": 2, "10.0.0.3": 2}
+    assert "R2               (10.0.0.3) refused (connection refused by 10.0.0.3:830)" in out
+    assert "1 device(s) unreachable: R2" in out and "R1" not in out.split("unreachable", 1)[1]
 
 
 # --- H3: the junos session set-up has one deadline ---------------------------------

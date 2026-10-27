@@ -80,12 +80,7 @@ def test_show_mode_default_output_is_still_the_status_line(monkeypatch, capsys, 
     assert "DRY-RUN show" not in out
 
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 def test_reminder_repeats_the_run_targets(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     rc, out, _ = run_cli(monkeypatch, capsys, tmp_path,
                          ["-eC", "set system host-name R1-new", "--commit-confirmed", "5", "-y"],
                          "COMMIT CONFIRMED (5 minutes)\n\n" + DIFF)
@@ -155,7 +150,6 @@ class JobDriver:
 
 
 def run_job(monkeypatch, capsys, tmp_path, job, *extra, driver=None, password="p"):
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     job_file = tmp_path / "job.json"
     job_file.write_text(json.dumps(job))
     driver = driver or JobDriver()
@@ -351,7 +345,6 @@ class PreviewDriver:
 
 def answer(monkeypatch, reply):
     """A terminal that answers the one question with `reply`."""
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(builtins, "input", lambda prompt="": reply() if callable(reply) else reply)
 
@@ -459,7 +452,6 @@ def test_show_diff_abort_paths(monkeypatch, capsys, tmp_path):
 # --- --log: the audit log's file mode and redaction -----------------------------
 
 def test_log_file_is_0600_and_redacted_like_the_audit_log(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     log = tmp_path / "logs" / "run.jsonl"
     reply = ("COMMIT OK\n\nDIFF:\n[edit snmp]\n+   community secret123 {\n"
              "+       authorization read-only;\n+   }")
@@ -490,7 +482,6 @@ def test_log_file_is_0600_and_redacted_like_the_audit_log(monkeypatch, capsys, t
 def test_a_run_the_safety_gate_kept_from_every_device_is_not_all_ok(monkeypatch, capsys, tmp_path):
     """A planted <safety-file>.corrupt blocks every device; the headline and
     $? said 'All devices OK' / 0 for a change that touched nothing."""
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     sf = tmp_path / "gate.json"
     (tmp_path / "gate.json.corrupt").write_text("x")
     calls = []
@@ -540,7 +531,6 @@ def test_an_edit_payload_is_never_resolved_through_the_template_library(monkeypa
     cmds = tmp_path / ".h-ssh" / "commands"
     cmds.mkdir(parents=True)
     (cmds / "junos.json").write_text(json.dumps({"commit": {"command": "run request system reboot"}}))
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     calls = []
     driver = types.SimpleNamespace(AVAILABLE=True,
                                    confirm=lambda *a, **kw: calls.append(("confirm", a)) or "COMMIT CONFIRMED OK",
@@ -550,14 +540,16 @@ def test_an_edit_payload_is_never_resolved_through_the_template_library(monkeypa
 
 
 def test_a_broadcast_file_rewritten_after_the_check_is_not_what_is_sent(monkeypatch, capsys, tmp_path):
-    """-eB was syntax-checked, then re-read after the prompt (#44)."""
+    """-eB was syntax-checked, then re-read after the prompt (#44); here it
+    is rewritten while the probe runs, between the check and the send."""
+    from hssh import probe
     cfg = tmp_path / "all.set"
     cfg.write_text("set system host-name CHECKED\n")
 
-    async def rewrite_then_reachable(target, timeout=2):
+    async def rewrite_then_live(host, port, banner, seconds):
         cfg.write_text("run request system reboot\n")
-        return (target.name, True, "reachable")
-    monkeypatch.setattr(cli, "check_reachability", rewrite_then_reachable)
+        return probe.Answer(probe.LIVE, connect_ms=0.3, banner_ms=7.0, banner="SSH-2.0-OpenSSH_9.6")
+    monkeypatch.setattr(probe, "attempt", rewrite_then_live)
     seen = []
     driver = types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: seen.append(a[3]) or "COMMIT OK")
     audit = tmp_path / "audit.jsonl"
@@ -566,19 +558,14 @@ def test_a_broadcast_file_rewritten_after_the_check_is_not_what_is_sent(monkeypa
     assert json.loads(audit.read_text().splitlines()[-1])["payload"] == "set system host-name CHECKED\n"
 
 
-def test_show_diff_json_keeps_stdout_as_json_and_skips_the_preflight(monkeypatch, capsys, tmp_path):
-    """Previews landed on stdout in front of the JSON array; and the pre-flight
-    TCP connect is redundant once every target has been previewed (#44)."""
-    probes = []
-
-    async def counting(target, timeout=2):
-        probes.append(target.name)
-        return (target.name, True, "reachable")
-    monkeypatch.setattr(cli, "check_reachability", counting)
+def test_show_diff_json_keeps_stdout_as_json_and_is_probed_first(monkeypatch, capsys, tmp_path, probed):
+    """Previews landed on stdout in front of the JSON array (#44). The old
+    pre-flight skipped --show-diff, whose previews proved reachability the
+    slow way; the probe (#127) runs before them, once per box."""
     driver = PreviewDriver()
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path,
                            ["-eC", "set system host-name R1-new", "--show-diff", "-y", "--json"], driver=driver)
-    assert rc == 0 and probes == []
+    assert rc == 0 and probed == [("10.0.0.1", 830)]
     data = json.loads(out)
     assert len(data) == 1 and data[0]["ok"] and "R1-new" in err
 
@@ -599,7 +586,6 @@ def test_ctrl_c_reports_and_audits_the_commit_that_was_in_flight(monkeypatch, ca
     no log line (#45). The unit that had not started must not start."""
     import threading
     import time
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     seen = []
 
     def edit(host, user, passwd, payload, st, ct, commit_confirmed=None, **kw):
@@ -629,7 +615,6 @@ def test_the_run_log_is_written_as_each_device_finishes(monkeypatch, capsys, tmp
     """--log was written once at the very end (#45): R2 finishes only once R1's
     line is already in the file."""
     import time
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     log = tmp_path / "run.jsonl"
 
     def edit(host, user, passwd, payload, st, ct, commit_confirmed=None, **kw):
@@ -749,7 +734,6 @@ def test_a_reply_reaches_a_terminal_without_what_it_would_act_on_and_a_pipe_as_i
         monkeypatch.setattr(sys.stdout, "isatty", lambda: tty)
         if shape == "--show-diff preview":
             answer(monkeypatch, "n")                          # the preview alone, nothing committed
-        monkeypatch.setattr(cli, "check_reachability", _reachable)
         driver = PreviewDriver(paint=EVIL) if shape == "--show-diff preview" else EvilDriver(fail=shape == "failed batch -v")
         monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
         with pytest.raises(SystemExit) as e:

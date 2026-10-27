@@ -160,7 +160,7 @@ def test_a_terminal_is_asked_for_the_password_once_for_the_whole_watch(tmp_path)
         "    AVAILABLE=True, show=lambda host, user, passwd, cmd, *a, **kw: f'passwd={passwd}\\n')\n"
         "cli._watch_sleep = lambda seconds: None\n"
         f"sys.argv = ['h-ssh', '--config', {os.devnull!r}, '--user', 'u', '--store', {str(db)!r}, '--every', '5',\n"
-        "            '--times', '3', 'R1:10.0.0.1:junos', '-sC', 'show version']\n"
+        "            '--times', '3', '--no-probe', 'R1:10.0.0.1:junos', '-sC', 'show version']\n"
         "cli.main_sync()\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith("HSSH_")}
     env["PYTHONPATH"] = os.path.dirname(os.path.dirname(cli.__file__))

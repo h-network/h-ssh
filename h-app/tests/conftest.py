@@ -5,6 +5,12 @@ the environment for a subprocess at import time, and per test through
 HSSH_STORE; a test of the default location clears the variable and changes
 directory itself.
 
+Every run is probed first (hssh.probe, #127): a TCP connect and the SSH
+banner per box. The suite's devices are fakes behind drivers.MODULES at
+addresses nothing listens on, so here every box answers as a healthy sshd
+does and nothing is contacted (`probed` lists the boxes asked); a test of
+the probe itself takes `real_probe`, against listeners on localhost.
+
 The driver registry holds the built-ins and whatever driver packages this
 machine has installed, a broken one included; `installed` runs a test on
 each."""
@@ -17,10 +23,36 @@ import pytest
 _SUITE_STORE_DIR = tempfile.mkdtemp(prefix="hssh-tests-")
 os.environ.setdefault("HSSH_STORE", os.path.join(_SUITE_STORE_DIR, "h-ssh.db"))
 
+from hssh import probe as _probe          # noqa: E402 - after the store's place is set
+
+_REAL_ATTEMPT = _probe.attempt
+
 
 @pytest.fixture(autouse=True)
 def _store_in_tmp(tmp_path, monkeypatch):
     monkeypatch.setenv("HSSH_STORE", str(tmp_path / "test-h-ssh.db"))
+
+
+@pytest.fixture(autouse=True)
+def probed(monkeypatch):
+    """Every box the probe asks answers live at once: a 0.3 ms handshake, the
+    banner 7 ms later (TCP alone where the transport has no banner). The
+    list returned is the (host, port) of every try, in the order asked."""
+    asked = []
+
+    async def answers_live(host, port, banner, seconds):
+        asked.append((host, port))
+        if banner is None:
+            return _probe.Answer(_probe.LIVE, connect_ms=0.3)
+        return _probe.Answer(_probe.LIVE, connect_ms=0.3, banner_ms=7.0, banner="SSH-2.0-OpenSSH_9.6")
+    monkeypatch.setattr(_probe, "attempt", answers_live)
+    return asked
+
+
+@pytest.fixture
+def real_probe(monkeypatch):
+    """The probe as it is: a test that takes this probes for real."""
+    monkeypatch.setattr(_probe, "attempt", _REAL_ATTEMPT)
 
 
 # What `installed` adds next to what this machine has: an entry point, and the drivers it brings.

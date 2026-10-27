@@ -346,42 +346,6 @@ def test_set_file_and_save_paths_stay_inside_their_directory(tmp_path):
         path_inside(str(cfg), "/etc/passwd")
     assert path_inside(str(cfg), "R1.output") == cfg / "R1.output"
 
-# --- #44: the pre-flight wants an SSH banner, not just an open port --------------
-
-def test_preflight_passes_only_on_an_ssh_banner_for_ssh_transports():
-    import asyncio
-    import socket
-    import threading
-    from hssh.cli import check_reachability
-
-    def listener(reply):
-        srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(5)
-
-        def serve():
-            while True:
-                try:
-                    c, _ = srv.accept()
-                except OSError:
-                    return
-                if reply:
-                    c.sendall(reply)
-                c.close()
-        threading.Thread(target=serve, daemon=True).start()
-        return srv, srv.getsockname()[1]
-
-    closes, p_close = listener(b"")
-    speaks, p_ssh = listener(b"SSH-2.0-OpenSSH_9.6\r\n")
-    try:
-        name, ok, msg = asyncio.run(check_reachability(Target("R1", "127.0.0.1", "junos", p_close), timeout=2))
-        assert not ok and "no SSH banner" in msg
-        name, ok, msg = asyncio.run(check_reachability(Target("R1", "127.0.0.1", "junos", p_ssh), timeout=2))
-        assert ok
-        name, ok, msg = asyncio.run(check_reachability(Target("SW", "127.0.0.1", "telnet-ios", p_close), timeout=2))
-        assert ok                                    # telnet has no banner to ask for
-    finally:
-        closes.close(); speaks.close()
-
-
 # --- #79: eAPI is gone; the vendor name gets one clear line --------------------------
 
 def test_the_arista_eapi_vendor_is_retired_with_one_clear_line():
