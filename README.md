@@ -260,8 +260,8 @@ and `openssh`, the target's own when it names one, or what your ssh configuratio
 run goes* below), the server's identification line read and checked to start with `SSH-` (an SSH server
 speaks first; lines it sends before that one are passed over, as paramiko and OpenSSH pass them over, up
 to 100 lines of 255 bytes), and the connection closed. No key exchange, no login, no credential.
-`telnet*` (frozen) has no banner to check: a TCP connect is all it is asked. It is plain TCP, so no root
-is needed.
+`telnet*` (frozen) has no banner to check: a TCP connect is all it is asked, and so is a `junos` target
+on port 23, which PyEZ reaches as a console over telnet. It is plain TCP, so no root is needed.
 
 Each box gets one result:
 
@@ -313,10 +313,11 @@ or a `ProxyCommand` is `not probed` (`reached through ProxyJump bastion (ssh -G)
 cannot see past the jump host; the run goes through it as it always did (an edit too, with no check
 before it, as under `--no-probe`). `junos` (PyEZ and ncclient) reads `~/.ssh/config` for `HostName`,
 `Port` (over the target's own) and `ProxyCommand`, not `ProxyJump`, and the probe reads it the same way
-(`reached through ProxyCommand (~/.ssh/config)`). `ssh` (paramiko) and `telnet*` read no ssh
-configuration: the target's host and port are what the probe asks. A configuration that cannot be read
-(a line `ssh -G` refuses, a `Port` that is no number) leaves the box `not probed`, with the words why,
-and the run says what its transport makes of it.
+(`reached through ProxyCommand (~/.ssh/config)`); a `junos` target on port 23 is a console PyEZ
+telnets to, at the host as given, so only the file's `Port` applies to it. `ssh` (paramiko) and
+`telnet*` read no ssh configuration: the target's host and port are what the probe asks. A
+configuration that cannot be read (a line `ssh -G` refuses, a `Port` that is no number) leaves the
+box `not probed`, with the words why, and the run says what its transport makes of it.
 
 **Before an edit** the probe replaces the old pre-flight, which waited `--session-timeout` per box and
 tried twice. When boxes the edit goes to are dead, an edit does not go on without them unless you say
@@ -926,7 +927,7 @@ apply to every mode once given.
 
 | Guard | Flag | Behaviour |
 |---|---|---|
-| Probe | *(automatic)*; `--no-probe`, `probe = no`, `--skip-unreachable` | Before every run, edits included (`--dry-run` and `--show-diff` too): a TCP connect plus, for `junos`/`ssh`/`openssh`, the SSH banner, so a port that merely accepts and closes is not a device; no login. It asks where the run will connect (`HostName` and `Port` from the ssh configuration on `openssh` and `junos`); a box behind a `ProxyJump` or `ProxyCommand`, or one the safety gate holds, is not probed and runs as without it. `--connect-timeout` for the connect and for the banner, a box that fails asked once more, 100 at a time. An edit (a `--dry-run` too) with a dead box it goes to (a `--job`'s box with only shows is a FAIL, as in a show) asks `Continue with the N reachable? [y/N]` at a terminal (with `-y` too: it confirms the edit, never a partial deployment), is refused without one (exit 2) unless `--skip-unreachable` goes on with the reachable (exit 3). See [The probe](#the-probe) |
+| Probe | *(automatic)*; `--no-probe`, `probe = no`, `--skip-unreachable` | Before every run, edits included (`--dry-run` and `--show-diff` too): a TCP connect plus, for `junos`/`ssh`/`openssh`, the SSH banner (not for a `junos` console on port 23, which is telnet), so a port that merely accepts and closes is not a device; no login. It asks where the run will connect (`HostName` and `Port` from the ssh configuration on `openssh` and `junos`); a box behind a `ProxyJump` or `ProxyCommand`, or one the safety gate holds, is not probed and runs as without it. `--connect-timeout` for the connect and for the banner, a box that fails asked once more, 100 at a time. An edit (a `--dry-run` too) with a dead box it goes to (a `--job`'s box with only shows is a FAIL, as in a show) asks `Continue with the N reachable? [y/N]` at a terminal (with `-y` too: it confirms the edit, never a partial deployment), is refused without one (exit 2) unless `--skip-unreachable` goes on with the reachable (exit 3). See [The probe](#the-probe) |
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
 | Dry run | `--dry-run` | Junos over NETCONF: loads, diffs, runs `commit_check` (when there is a diff), then discards the candidate. `telnet-junos`: `configure exclusive`, loads, `show \| compare`, `rollback 0` — no commit check, so the diff is shown but not validated. Other transports **refuse** `--dry-run` for edits instead of pretending |
 | Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
@@ -1291,7 +1292,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1234 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1236 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

@@ -42,7 +42,7 @@ DIALECTS = {d.name: d for d in _dialects.ALL}
 
 NETCONF = Transport("netconf", "NETCONF over SSH (PyEZ)", module="hssh.transports.netconf",
                     install="junos-eznc", default_port=830, formats=("text", "xml", "json"),
-                    pooled=True, ssh_config="paramiko")
+                    pooled=True, ssh_config="paramiko", console_port=23)
 SSH = Transport("ssh", "SSH exec channel (paramiko)", module="hssh.transports.ssh",
                 install="paramiko", default_port=22)
 OPENSSH = Transport("openssh", "the OpenSSH client", module="hssh.transports.openssh",

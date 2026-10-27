@@ -48,6 +48,11 @@ class Transport:
     # ProxyCommand, as `ssh -G` says), "paramiko" (~/.ssh/config as PyEZ and
     # ncclient read it: HostName, Port, ProxyCommand); None: it reads none.
     ssh_config: Optional[str] = None
+    # A target port its library reaches as a console over telnet, not SSH
+    # (PyEZ makes a Device on port 23 a Console): the probe asks it TCP
+    # alone, as it asks telnet, and of ~/.ssh/config only its Port, as that
+    # Console reads it. None: every port is the transport's own protocol.
+    console_port: Optional[int] = None
 
 
 @dataclass(frozen=True)

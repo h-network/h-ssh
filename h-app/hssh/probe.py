@@ -6,7 +6,9 @@ connection closed. No key exchange, no login, no credential: on the router
 it is one SSH connection closed before login (OpenSSH logs "Did not receive
 identification string from ..." or "Connection closed by ... [preauth]"),
 never a failed login. A box on telnet (frozen; it has no banner) is a TCP
-connect alone. Plain TCP, so no root is needed.
+connect alone, and so is a junos box on port 23, which PyEZ reaches as a
+console over telnet (Transport.console_port). Plain TCP, so no root is
+needed.
 
 The probe asks where the run will go. A transport that reads the ssh
 client's configuration (Transport.ssh_config) connects where it says: the
@@ -411,16 +413,20 @@ def _pyez_config():
     return config
 
 
-def _pyez_route(config, host: str, port: int) -> Route:
+def _pyez_route(config, host: str, port: int, console: bool = False) -> Route:
     """Where the junos transport connects for HOST: ncclient takes the
     file's HostName and ProxyCommand (not ProxyJump), PyEZ its Port over
-    the target's own. (The command is not quoted: paramiko fills its %p
-    with 22 unless told the port, as ncclient tells it.)"""
+    the target's own. A console (PyEZ's Console, over telnet) takes the
+    Port alone: it telnets to HOST as given. (The command is not quoted:
+    paramiko fills its %p with 22 unless told the port, as ncclient tells
+    it.)"""
     found = config.lookup(host)
     try:
-        to = Route(found.get("hostname", host), int(found.get("port", port)))
+        to = Route(host if console else found.get("hostname", host), int(found.get("port", port)))
     except ValueError:
         raise _Unknown(f"~/.ssh/config gives {host} port {found.get('port')!r}")
+    if console:
+        return to
     return to._replace(via="ProxyCommand (~/.ssh/config)") if found.get("proxycommand") else to
 
 
@@ -437,9 +443,11 @@ class _Shared:
         self.ssh_g = asyncio.Semaphore(SSH_G_AT_ONCE)
         self.pyez: Optional[Tuple[object, Optional[str]]] = None     # (the parsed file or None, why it is not)
 
-    async def route(self, t: Target, port: int, reader: Optional[str]) -> Route:
+    async def route(self, t: Target, port: int, reader: Optional[str], console: bool = False) -> Route:
         """Where the box's transport connects; _Unknown when that cannot be
-        told (an ssh configuration that cannot be read: the run says why)."""
+        told (an ssh configuration that cannot be read: the run says why).
+        `console`: the junos transport reaches the box as a console over
+        telnet, which reads only the Port of ~/.ssh/config."""
         if reader == "openssh":
             try:
                 async with self.ssh_g:
@@ -458,7 +466,7 @@ class _Shared:
                 raise _Unknown(f"~/.ssh/config: {why}")
             if config is not None:
                 try:
-                    return _pyez_route(config, t.host, port)
+                    return _pyez_route(config, t.host, port, console)
                 except _Unknown:
                     raise
                 except Exception as e:      # noqa: BLE001 - a Match the lookup cannot run, say
@@ -479,16 +487,19 @@ async def _ask(t: Target, port: int, run: _Shared) -> Tuple[Answer, int]:
     if why:
         return Answer(NOT_PROBED, why), port
     transport = drivers.get(t.vendor).transport
+    # A console over telnet (PyEZ on port 23) sends no SSH banner: TCP alone, as for telnet.
+    console = transport.console_port is not None and port == transport.console_port
+    banner = None if console else transport.banner
     try:
-        to = await run.route(t, port, transport.ssh_config)
+        to = await run.route(t, port, transport.ssh_config, console)
     except _Unknown as e:
         return Answer(NOT_PROBED, str(e)), port
     if to.via:
         return Answer(NOT_PROBED, f"reached through {to.via}"), to.port
-    answer = await run.once(to, transport.banner)
+    answer = await run.once(to, banner)
     if answer.result != LIVE:
         await asyncio.sleep(RETRY_PAUSE)
-        answer = await run.once(to, transport.banner)
+        answer = await run.once(to, banner)
     return answer, to.port
 
 

@@ -1124,6 +1124,54 @@ def test_a_junos_box_is_probed_where_its_ssh_config_sends_it(boxes, monkeypatch,
     assert "s: 1 live, 1 not probed" in out
 
 
+def test_a_junos_box_on_port_23_is_a_console_and_is_asked_tcp_alone(monkeypatch, capsys, tmp_path):
+    """PyEZ makes a junos Device on port 23 a Console and telnets to it, and
+    a console sends no SSH banner: the probe asks it TCP alone, as it asks
+    telnet, where it asked for a banner and called the console's telnet
+    negotiation not SSH, a dead box (its read a FAIL, its edit stopped).
+    Of ~/.ssh/config the Console reads the Port alone: it telnets to the
+    host as given, through no ProxyCommand, and the probe asks it there."""
+    asked = []
+
+    async def a_console_on_23(host, port, banner, seconds):
+        asked.append((host, port, banner))
+        if banner is None:
+            return probe.Answer(probe.LIVE, connect_ms=0.4)
+        if port in (23, 2323):
+            return probe.Answer(probe.NOT_SSH, f"{host}:{port} answered '\\xff\\xfd\\x18', not an SSH banner", 0.4)
+        return probe.Answer(probe.LIVE, None, 0.4, 7.2, "SSH-2.0-OpenSSH_9.6")
+    monkeypatch.setattr(probe, "attempt", a_console_on_23)
+    rc, out, err, _, driver = run(monkeypatch, capsys, ["-sC", "show version", "CON1:10.0.0.9:junos:23", *R12])
+    assert rc == 0, out
+    assert sorted(asked) == [("10.0.0.1", 830, b"SSH-"), ("10.0.0.2", 830, b"SSH-"), ("10.0.0.9", 23, None)]
+    assert sorted(driver.calls) == [("show", "10.0.0.1"), ("show", "10.0.0.2"), ("show", "10.0.0.9")]
+    rc, out, err, _, _ = run(monkeypatch, capsys, ["--probe", "CON1:10.0.0.9:junos:23"])
+    assert rc == 0 and "CON1  live  connect 0.4 ms  TCP only, no banner to check" in out
+    config = tmp_path / "config"
+    config.write_text("Host 10.0.0.9\n  HostName 10.0.0.99\n  Port 2323\n  ProxyCommand ssh -W %h:%p bastion.invalid\n")
+    monkeypatch.setattr(probe, "SSH_CONFIG", str(config))
+    asked.clear()
+    rc, out, err, _, _ = run(monkeypatch, capsys, ["--probe", "CON1:10.0.0.9:junos:23"])
+    assert rc == 0 and asked == [("10.0.0.9", 2323, None)], out
+
+
+def test_a_junos_console_answers_the_probe_with_its_telnet_negotiation(boxes, monkeypatch, capsys, tmp_path):
+    """A console that speaks telnet (IAC DO TERMINAL-TYPE, ...) where an SSH
+    server would send its banner is live to the probe when PyEZ will reach
+    it as a console, on a junos target's port 23 (here moved by the Port
+    in ~/.ssh/config, as PyEZ's Console takes it, since no test listens on
+    23): it used to be not SSH."""
+    console = boxes(b"\xff\xfd\x18\xff\xfd \xff\xfb\x01")
+    config = tmp_path / "config"
+    config.write_text(f"Host 127.0.0.1\n  Port {console.port}\n")
+    monkeypatch.setattr(probe, "SSH_CONFIG", str(config))
+    rc, out, err, _, _ = run(monkeypatch, capsys, ["--probe", "--connect-timeout", "2", "CON1:127.0.0.1:junos:23"])
+    assert rc == 0, out
+    assert re.search(r"CON1  live  connect \S+ ms  TCP only, no banner to check", out)
+    kept, = rows("SELECT output FROM results")
+    assert json.loads(kept["output"])["port"] == console.port
+
+
 def test_an_ssh_config_that_cannot_be_read_leaves_the_box_to_the_run(boxes, monkeypatch, tmp_path):
     """Where the ssh configuration cannot say where a box is (a line ssh
     refuses, a Port that is no number), the box is not probed, with the
