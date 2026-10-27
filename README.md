@@ -884,10 +884,10 @@ store, `--log`, `--json` and the audit log hold the same bytes whether the run w
 terminal or a pipe, the reply's own line endings included (a show over SSH from a device that ends
 its lines with CRLF keeps them there and on `--raw` to a pipe; telnet hands its lines over with LF),
 and `h-ssh-store` hands a pipe or an `export --out` file the rows as they were kept. The file is
-created 0600, opened and its tables made before the first device: a store that cannot be written is
-no run (exit 2, nothing sent), because a run nobody can look up afterwards is not worth having. A
-run refused after the store was opened (`--raw -v`, an edit with no terminal and no `-y`) still
-leaves the file, with no row for it. A
+created 0600, opened and its tables made before the first device, once the run has passed its own
+checks: a store that cannot be written is no run (exit 2, nothing sent), because a run nobody can
+look up afterwards is not worth having, and a run a check refuses (`--raw -v`, an edit with no
+terminal and no `-y`) leaves no file. A
 store that fails during the run (the disk fills, someone deletes or replaces the file) does not stop
 the devices' replies from being shown; the loss is said as it happens, counted at the end with its
 reason, and the run exits 4. The store holds its directory open, so a job directory renamed during
@@ -1415,7 +1415,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1250 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1258 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

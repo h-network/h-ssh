@@ -1052,6 +1052,50 @@ def test_no_store_keeps_nothing_and_contradicts_store(tmp_path, monkeypatch, cap
     assert rc == 2 and "contradict" in err and not (tmp_path / "x.db").exists()
 
 
+@pytest.mark.parametrize("argv, password, says", [
+    (["-sC", "show version", "--raw", "-v"], "p", "--raw and -v are mutually exclusive"),
+    (["-sC", "show version", "--raw", "--json"], "p", "--raw and --json are mutually exclusive"),
+    (["-eC", "set system host-name x"], "p", "Edit operation requires confirmation but stdin is not a TTY"),
+    (["-eC", "set system host-name x", "--show-diff"], "p", "--show-diff needs a terminal to ask, or -y"),
+    (["-sC", "show version"], "", "HSSH_PASSWORD is set but empty"),
+    (["-sC", "show version", "--safety-file", "{tmp}/plain/safety.json"], "p", "--safety-file requested but unusable"),
+    (["-sC", "show version", "--save-output", "{tmp}/plain"], "p", "exists and is not a directory"),
+    (["-sC", "show version", "--save-output", "{tmp}/plain/out"], "p", "--save-output"),
+], ids=["raw-v", "raw-json", "edit-no-terminal", "show-diff-no-terminal", "empty-password", "safety-file",
+        "save-output-file", "save-output-mkdir"])
+def test_a_run_refused_before_it_starts_leaves_no_store_file(tmp_path, monkeypatch, capsys, argv, password, says):
+    """#136: the store was opened before these refusals, so a run that
+    exited 2 with nothing run left an empty h-ssh.db (no run in it) where it
+    was started. Every refusal that needs no store comes before the store is
+    opened; a run that passes them makes the store and fills it."""
+    work = tmp_path / "job"
+    work.mkdir()
+    (tmp_path / "plain").write_text("")             # a file where a directory is wanted
+    monkeypatch.chdir(work)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER", "HSSH_STORE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(cli, "_tty", lambda stream: False)          # a pipeline: no terminal to ask at
+    calls = []
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(
+        AVAILABLE=True, show=lambda *a, **kw: calls.append(a[3]) or "ok", edit=lambda *a, **kw: calls.append(a[3]) or "COMMIT OK\n"))
+
+    def h_ssh(*args, password="p"):
+        monkeypatch.setenv("HSSH_PASSWORD", password)
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "R1:10.0.0.1:junos",
+                                          *(a.replace("{tmp}", str(tmp_path)) for a in args)])
+        rc = asyncio.run(cli.main())
+        return (rc, *capsys.readouterr())
+
+    rc, out, err = h_ssh(*argv, password=password)
+    assert rc == 2 and says in err and calls == []
+    assert os.listdir(work) == []
+    rc, out, err = h_ssh("-sC", "show version")
+    assert rc == 0, err
+    assert calls == ["show version"] and os.listdir(work) == ["h-ssh.db"]
+    assert rows(work / "h-ssh.db", "SELECT device, command, output FROM results") == [
+        {"device": "R1", "command": "show version", "output": "ok"}]
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes anywhere")
 def test_a_directory_you_cannot_write_in_is_no_run(tmp_path, monkeypatch, capsys):
     """The user's rule: not being able to store is a no-go for the run."""

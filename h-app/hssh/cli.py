@@ -1114,6 +1114,34 @@ async def main() -> int:
             print(f"ERROR: {reads_only(args.format, resolved)}", file=sys.stderr)
             return 2
 
+    # The refusals that need nothing written come before anything is: a run
+    # refused here leaves no store file, no audit log and no --save-output
+    # directory behind.
+    if args.no_store and args.store:
+        print("ERROR: --no-store and --store contradict each other.", file=sys.stderr)
+        return 2
+    if args.raw and args.verbose:
+        print("ERROR: --raw and -v are mutually exclusive.", file=sys.stderr)
+        return 2
+    if args.raw and args.json:
+        print("ERROR: --raw and --json are mutually exclusive.", file=sys.stderr)
+        return 2
+    if mode != "probe" and os.environ.get("HSSH_PASSWORD") == "" and not _tty(sys.stdin):
+        # A pipeline whose secret lookup came back empty: refused, since the
+        # run would otherwise go on to key authentication without a word. A
+        # probe logs in nowhere and asks for no password.
+        print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
+        return 2
+    # An edit that changes the network needs its question answered: without
+    # a terminal or -y it is refused here, before the probe touches a box.
+    commits = has_edits and not args.dry_run
+    if commits and not args.yes and not _tty(sys.stdin):
+        if args.show_diff:
+            print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
+        else:
+            print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
+        return 2
+
     # Everything the run will write is proven writable before the first
     # device is touched: an audit log found unwritable after the commits
     # landed records nothing, and a safety gate that cannot keep its file
@@ -1125,32 +1153,6 @@ async def main() -> int:
             except OSError as e:
                 print(f"ERROR: {label} {e}; refusing to start.", file=sys.stderr)
                 return 2
-    store = None
-    if args.no_store and args.store:
-        print("ERROR: --no-store and --store contradict each other.", file=sys.stderr)
-        return 2
-    if not args.no_store:
-        # Every run is kept. The store is opened, and its tables made, before
-        # the first device is touched: one that cannot be written is no run,
-        # found out now and not after the commits landed.
-        store_path = store_where(args.store, file_config)
-        if args.every is not None and _WATCH["tick"]:
-            # A later tick of a watch. Opening a store deleted since would make
-            # a new, empty one and go on there, the ticks so far left behind.
-            found = store_identity(store_path)
-            if found != _WATCH["store"]:
-                print(f"ERROR: store {store_path}: the store file was {'deleted' if found is None else 'replaced'} "
-                      f"after tick {_WATCH['tick']}; a watch keeps all its ticks in one store, so it stops here.",
-                      file=sys.stderr)
-                return 2
-        try:
-            store = Store(store_path)
-        except StoreError as e:
-            print(f"ERROR: store {e}; every run is kept, so a store that cannot be written is no run: "
-                  f"use --store PATH for another file, or --no-store; refusing to start.", file=sys.stderr)
-            return 2
-        if args.every is not None and not _WATCH["tick"]:
-            _WATCH["store"] = store.identity       # the file every later tick must find at the path
     safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
     try:
         safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
@@ -1172,6 +1174,31 @@ async def main() -> int:
             print(f"ERROR: --save-output {save_dir}: {e.strerror or e}", file=sys.stderr)
             return 2
 
+    store = None
+    if not args.no_store:
+        # Every run is kept. The store is opened, and its tables made, before
+        # the first device is touched: one that cannot be written is no run,
+        # found out now and not after the commits landed. It is the last of
+        # these, so a run another of them refuses leaves no store file behind.
+        store_path = store_where(args.store, file_config)
+        if args.every is not None and _WATCH["tick"]:
+            # A later tick of a watch. Opening a store deleted since would make
+            # a new, empty one and go on there, the ticks so far left behind.
+            found = store_identity(store_path)
+            if found != _WATCH["store"]:
+                print(f"ERROR: store {store_path}: the store file was {'deleted' if found is None else 'replaced'} "
+                      f"after tick {_WATCH['tick']}; a watch keeps all its ticks in one store, so it stops here.",
+                      file=sys.stderr)
+                return 2
+        try:
+            store = Store(store_path)
+        except StoreError as e:
+            print(f"ERROR: store {e}; every run is kept, so a store that cannot be written is no run: "
+                  f"use --store PATH for another file, or --no-store; refusing to start.", file=sys.stderr)
+            return 2
+        if args.every is not None and not _WATCH["tick"]:
+            _WATCH["store"] = store.identity       # the file every later tick must find at the path
+
     # Credentials. The user: flag, environment, config file. The password has
     # two sources and no flag: typed at the prompt when someone runs h-ssh by
     # hand, or HSSH_PASSWORD when a pipeline runs it (handed over by whatever
@@ -1181,12 +1208,6 @@ async def main() -> int:
     config = file_config
     user = args.user or os.environ.get("HSSH_USER") or config.get("user")
     passwd = os.environ.get("HSSH_PASSWORD")
-    if args.raw and args.verbose:
-        print("ERROR: --raw and -v are mutually exclusive.", file=sys.stderr)
-        return 2
-    if args.raw and args.json:
-        print("ERROR: --raw and --json are mutually exclusive.", file=sys.stderr)
-        return 2
 
     json_mode = args.json
     raw_mode = args.raw
@@ -1210,11 +1231,6 @@ async def main() -> int:
                 store.close()
             if safety_gate is not None:
                 safety_gate.close()
-    if passwd == "" and not _tty(sys.stdin):
-        # A pipeline whose secret lookup came back empty: refused, since the
-        # run would otherwise go on to key authentication without a word.
-        print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
-        return 2
     if args.every is not None and _WATCH["tick"]:
         # A later tick of a watch: the password typed (or skipped) before
         # tick 1 is the watch's, not asked for again after every sleep.
@@ -1317,16 +1333,6 @@ async def main() -> int:
         max_workers=workers, thread_name_prefix="hssh"))
 
     sem = asyncio.Semaphore(workers)
-
-    # An edit that changes the network needs its question answered: without
-    # a terminal or -y it is refused here, before the probe touches a box.
-    commits = has_edits and not args.dry_run
-    if commits and not args.yes and not _tty(sys.stdin):
-        if args.show_diff:
-            print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
-        else:
-            print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
-        return 2
 
     # The run's row in the store. A read's is opened before its probe, so a
     # read stopped there is kept as an interrupted run; an edit's once the
