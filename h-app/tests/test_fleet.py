@@ -213,12 +213,12 @@ def test_a_hanging_transport_ends_as_a_failed_result_within_the_bound(monkeypatc
         with Fleet(HOSTS, transport="junos", user="u", session_timeout=1, command_timeout=1, retries=0) as fleet:
             got = {r.device: r for r in fleet.show("show version")}
             elapsed = time.monotonic() - started
-            assert elapsed < 4, f"{elapsed:.1f}s: the run waited for the hung device"
+            assert elapsed < 5, f"{elapsed:.1f}s: the run waited for the hung device"
             hung = got["10.0.0.2"]
             assert not hung.ok and hung.output is None
-            assert hung.error == ("no result within 2.2s (1 attempt(s) at session_timeout 1s + command_timeout 1s, "
+            assert hung.error == ("no result within 3.2s (1 attempt(s) at 2 x session_timeout 1s + command_timeout 1s, "
                                   "plus 0.2s): the transport call has not returned")
-            assert hung.duration_ms >= 2200
+            assert hung.duration_ms >= 3200
             assert got["10.0.0.1"].ok and got["10.0.0.3"].ok
             assert fleet._stuck_count() == 1              # the held worker is known
             release.set()                                 # the call returns: the worker is free again
@@ -244,9 +244,9 @@ def test_with_every_worker_held_the_queue_is_failed_at_once_not_waited_for(monke
                    retries=0) as fleet:
             got = list(fleet.show("show version"))
         elapsed = time.monotonic() - started
-        assert elapsed < 4, f"{elapsed:.1f}s"
+        assert elapsed < 5, f"{elapsed:.1f}s"
         assert [r.ok for r in got] == [False, False, False]
-        assert got[0].error.startswith("no result within 2.2s")
+        assert got[0].error.startswith("no result within 3.2s")
         assert all(r.error.startswith("not started: every worker thread (1) was held") for r in got[1:])
         assert seen == ["10.0.0.1"]                                   # the others were never sent
     finally:
@@ -272,7 +272,7 @@ def test_a_wedged_device_does_not_poison_later_runs(monkeypatch):
                 bad = {d: r.error for d, r in got.items() if not r.ok}
                 assert len(got) == 9 and list(bad) == ["10.0.0.9"], (n, bad)
                 if n == 1:
-                    assert bad["10.0.0.9"].startswith("no result within 2.1s") and elapsed >= 2.1
+                    assert bad["10.0.0.9"].startswith("no result within 3.1s") and elapsed >= 3.1
                 else:
                     assert bad["10.0.0.9"] == "the previous call to this device has not returned"
                     assert elapsed < 1.5, f"run {n}: {elapsed:.1f}s"
@@ -302,10 +302,10 @@ def test_the_budget_counts_the_transports_connect_phases():
                   user="u", session_timeout=2, command_timeout=3, retries=1)
     r1, r2, r3, r4 = fleet.targets
     grace = fleet_mod.GRACE_SECONDS
-    assert fleet_mod._budget(fleet, r1, 1, 2) == 2 * (2 + 3) + 1 + grace          # NETCONF: one deadline for the set-up
+    assert fleet_mod._budget(fleet, r1, 1, 2) == 2 * (2 * 2 + 3) + 1 + grace      # NETCONF: the set-up, then the hello
     assert fleet_mod._budget(fleet, r2, 1, 2) == 2 * (3 * 2 + 3) + 1 + grace      # paramiko: connect, banner, auth
     assert fleet_mod._budget(fleet, r3, 1, 2) == fleet_mod._budget(fleet, r4, 1, 2) == fleet_mod._budget(fleet, r2, 1, 2)
-    assert fleet_mod._budget(fleet, r1, 2, 2) == 2 * (2 + 3 * 2) + 1 + grace      # a batch: a timeout per command
+    assert fleet_mod._budget(fleet, r1, 2, 2) == 2 * (2 * 2 + 3 * 2) + 1 + grace  # a batch: a timeout per command
     fleet.close()
 
 
@@ -319,12 +319,12 @@ def test_the_budget_of_a_command_that_is_not_a_read_is_one_attempt():
     def budgets(mode, command):
         return [t.budget for t in fleet_mod._Run(fleet, mode, command, "text").tasks]
     # a read: three attempts and the backoff before the second and the third
-    assert budgets("show", "show version") == [3 * (2 + 3) + (1 + 3) + grace, 3 * (3 * 2 + 3) + (1 + 3) + grace]
-    assert budgets("show", "request system reboot") == [(2 + 3) + grace, (3 * 2 + 3) + grace]
+    assert budgets("show", "show version") == [3 * (2 * 2 + 3) + (1 + 3) + grace, 3 * (3 * 2 + 3) + (1 + 3) + grace]
+    assert budgets("show", "request system reboot") == [(2 * 2 + 3) + grace, (3 * 2 + 3) + grace]
     # a batch with one command that acts is sent once as a whole, as the runner does
-    assert budgets("show-batch", ["show version", "clear bgp neighbor all"]) == [(2 + 3 * 2) + grace,
+    assert budgets("show-batch", ["show version", "clear bgp neighbor all"]) == [(2 * 2 + 3 * 2) + grace,
                                                                                (3 * 2 + 3 * 2) + grace]
-    assert budgets("show-batch", ["show version", "show route"])[0] == 3 * (2 + 3 * 2) + (1 + 3) + grace
+    assert budgets("show-batch", ["show version", "show route"])[0] == 3 * (2 * 2 + 3 * 2) + (1 + 3) + grace
     acting = fleet_mod._Run(fleet, "show", "request system reboot", "text")
     assert [t.attempts for t in acting.tasks] == [1, 1]                        # the runner is told so too
     fleet.close()
@@ -375,8 +375,8 @@ def test_a_script_that_gave_up_on_a_wedged_device_can_exit(tmp_path):
     proc = subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True, timeout=30)
     elapsed = time.monotonic() - started
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.startswith("False no result within 2.1s")
-    assert elapsed < 4.0, f"{elapsed:.1f}s: the interpreter waited for the wedged thread"
+    assert proc.stdout.startswith("False no result within 3.1s")
+    assert elapsed < 5.0, f"{elapsed:.1f}s: the interpreter waited for the wedged thread"
 
 
 # --- batch, async, data -------------------------------------------------------------
@@ -1077,7 +1077,7 @@ def test_a_close_with_a_grace_skips_the_queue_when_every_worker_is_held(monkeypa
     finally:
         release.set()
     assert [(r.device, r.ok) for r in got] == [("10.0.0.1", False)], [(r.device, r.error) for r in got]
-    assert got[0].error.startswith("no result within 2.2s")
+    assert got[0].error.startswith("no result within 3.2s")
     run, = rows(path, "SELECT * FROM runs")
     assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (0, 1, 2, 1)
 

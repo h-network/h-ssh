@@ -349,6 +349,28 @@ def test_an_edit_whose_connect_runs_out_after_ctrl_c_is_not_sent_again(monkeypat
     assert "Interrupted. Completed 0 of 2 device(s); 1 interrupted while connecting." in err
 
 
+def test_a_show_diff_preview_whose_connect_runs_out_after_ctrl_c_is_not_tried_again(monkeypatch, capsys):
+    """The --show-diff preview is a dry run per device before the question.
+    Ctrl-C there did not stop the retries the run itself stops: a preview
+    whose connect ran out was tried twice more, each a new session that
+    locks, loads and discards the candidate, after the operator stopped."""
+    calls, ctrl_c = [], _CtrlC()
+
+    def edit(host, user, passwd, payload, st, ct, *a, **kw):
+        calls.append(host)
+        if len(calls) == 1:
+            ctrl_c.press()               # with this preview's connect under way, which then runs out
+        raise ConnectTimeoutError(f"NETCONF connect failed: TCP connect to {host}:830 timed out after 3s")
+    _cli_env(monkeypatch, types.SimpleNamespace(AVAILABLE=True, edit=edit))
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-y", "--show-diff",
+                                      "--target", "R1:10.0.0.1:junos", "-eC", "set system host-name x"])
+    with pytest.raises(asyncio.CancelledError):      # the h-ssh entry point makes this exit 130
+        ctrl_c.run()
+    out, err = capsys.readouterr()
+    assert calls == ["10.0.0.1"]
+    assert "RETRY" not in out + err
+
+
 def test_an_edit_that_applied_lines_before_a_connect_ran_out_is_failed_not_interrupted(monkeypatch, capsys):
     """openssh sends a none-dialect edit a line an ssh. A later line whose
     connect ran out after Ctrl-C was "interrupted while connecting", which

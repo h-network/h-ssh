@@ -1333,7 +1333,13 @@ async def main() -> int:
         previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units))]
         preview_failed = []
         for coro in asyncio.as_completed(previews):
-            i, res = await coro
+            try:
+                i, res = await coro
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                # As in the run itself (_completed): a preview whose connect
+                # runs out after Ctrl-C is not tried again.
+                stopped.set()
+                raise
             name, ok, out_text = res.name, res.ok, res.text
             # stdout stays the JSON array in --json mode; the previews go to
             # stderr, sanitised when that stream is a terminal. What is kept
