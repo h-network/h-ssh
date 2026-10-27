@@ -400,8 +400,10 @@ async def probe_alone(args, targets, store, user, json_mode: bool, safety_gate=N
     the safety gate), 4 when the store could not keep it. The record (the
     rows, the audit log, --log) is written before the report is printed,
     so a reader that leaves early (`| head`) or a Ctrl-C while it prints
-    costs the report, never the record; the run row is closed whatever
-    ends the run, as interrupted where it was cut short."""
+    costs at most the report, never the record; the run row is closed
+    whatever ends the run, as interrupted where the report was cut short
+    (on 3.11+ a Ctrl-C there takes effect only at the next await, so the
+    report usually finishes and the run is whole)."""
     limit, note = fit_probes_to_open_files(min(MAX_PROBES, len(targets)))
     if note:
         print(f"WARNING: {note}", file=sys.stderr)

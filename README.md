@@ -365,7 +365,7 @@ store could not keep it), and the stderr summary gains `slow` (a box not probed 
 a run of mode `probe`, one row per box with the record as JSON, so `h-ssh-store failed` lists every box
 that is not live with its verdict and `h-ssh-store field connect_ms` the round trips. The rows are
 written before the report is printed: a reader that leaves early (`| head`) or a Ctrl-C while it
-prints costs the report, never the record, and the run is kept as interrupted. `--probe` with a
+prints costs at most the report, never the record; a report cut short closes its run as interrupted. `--probe` with a
 command probes before the run even where the config file says `probe = no` or a run file `no-probe`.
 
 **Two times per live box, one sample each.** The connect time is the TCP handshake's round trip as
