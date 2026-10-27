@@ -27,7 +27,7 @@ from .core import (
     load_jobs, parse_jobs, resolve_target_port, check_unique,
     check_confirm_minutes, control_character, read_failure, is_file,
 
-    path_inside,
+    path_inside, set_file_payload,
 )
 from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
                      DEFAULT_CONNECT_TIMEOUT)
@@ -967,12 +967,19 @@ async def main() -> int:
         # The payloads, read once here and handed to the runner and the audit
         # log as the same string: what the guard checked is what is sent, but
         # for the blank and full-line '#' lines, which the runner keeps from
-        # every driver (core.set_file_payload).
+        # every driver (core.set_file_payload). A file with nothing else in it
+        # is refused here, on every driver, before anything is written or
+        # sent: the plain ssh and openssh drivers logged in, sent nothing and
+        # said OK, where the Junos guard refuses it.
         if args.edit_broadcast:
             try:
                 broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
             except Exception as e:
                 print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
+                return 2
+            if not set_file_payload(broadcast_text):
+                print(f"ERROR: -eB {args.edit_broadcast}: nothing but blank lines and '#' comments in it. "
+                      "Nothing was sent.", file=sys.stderr)
                 return 2
         skipped_missing = 0
         if args.edit_dir:
@@ -984,6 +991,12 @@ async def main() -> int:
                     except Exception as e:
                         print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
                         return 2
+            empty = [f"{name}.set" for name, text in edit_payloads.items() if not set_file_payload(text)]
+            if empty:
+                shown = ", ".join(empty[:20]) + (" …" if len(empty) > 20 else "")
+                print(f"ERROR: -eD {args.edit_dir}: nothing but blank lines and '#' comments in {shown}. "
+                      "Nothing was sent.", file=sys.stderr)
+                return 2
             # A device without a set file is known before the first lock. The
             # run is refused rather than deployed to everyone else, unless the
             # operator said those devices may be left out; then they are
@@ -1141,6 +1154,10 @@ async def main() -> int:
         else:
             print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
         return 2
+    save_dir = args.save_output or None
+    if save_dir and Path(save_dir).exists() and not Path(save_dir).is_dir():
+        print(f"ERROR: --save-output {save_dir} exists and is not a directory.", file=sys.stderr)
+        return 2
 
     # Everything the run will write is proven writable before the first
     # device is touched: an audit log found unwritable after the commits
@@ -1153,33 +1170,13 @@ async def main() -> int:
             except OSError as e:
                 print(f"ERROR: {label} {e}; refusing to start.", file=sys.stderr)
                 return 2
-    safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
-    try:
-        safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
-    except OSError as e:
-        print(f"ERROR: --safety-file requested but unusable: {e}; refusing to start.", file=sys.stderr)
-        return 2
-
-    save_dir = None
-    if args.save_output:
-        save_dir = args.save_output
-        # Raw device output (a config backup is the point), so the directory
-        # and its files are the operator's alone: 0700 / 0600, never redacted.
-        if Path(save_dir).exists() and not Path(save_dir).is_dir():
-            print(f"ERROR: --save-output {save_dir} exists and is not a directory.", file=sys.stderr)
-            return 2
-        try:
-            Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
-        except OSError as e:
-            print(f"ERROR: --save-output {save_dir}: {e.strerror or e}", file=sys.stderr)
-            return 2
-
     store = None
     if not args.no_store:
         # Every run is kept. The store is opened, and its tables made, before
         # the first device is touched: one that cannot be written is no run,
-        # found out now and not after the commits landed. It is the last of
-        # these, so a run another of them refuses leaves no store file behind.
+        # found out now and not after the commits landed. It comes before the
+        # safety file and the --save-output directory, so a store refused
+        # leaves neither; a run refused after it takes it away (_discard_store).
         store_path = store_where(args.store, file_config)
         if args.every is not None and _WATCH["tick"]:
             # A later tick of a watch. Opening a store deleted since would make
@@ -1198,6 +1195,32 @@ async def main() -> int:
             return 2
         if args.every is not None and not _WATCH["tick"]:
             _WATCH["store"] = store.identity       # the file every later tick must find at the path
+
+    def _discard_store() -> None:
+        """A run stopped before it starts, once its store is open: the store
+        goes again when this run made it and nothing is kept in it
+        (Store.discard), so such a run leaves no h-ssh.db behind; one that
+        was there is left as it was."""
+        if store is not None:
+            store.discard()
+
+    safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
+    try:
+        safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
+    except OSError as e:
+        _discard_store()
+        print(f"ERROR: --safety-file requested but unusable: {e}; refusing to start.", file=sys.stderr)
+        return 2
+
+    if save_dir:
+        # Raw device output (a config backup is the point), so the directory
+        # and its files are the operator's alone: 0700 / 0600, never redacted.
+        try:
+            Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as e:
+            _discard_store()
+            print(f"ERROR: --save-output {save_dir}: {e.strerror or e}", file=sys.stderr)
+            return 2
 
     # Credentials. The user: flag, environment, config file. The password has
     # two sources and no flag: typed at the prompt when someone runs h-ssh by
@@ -1241,9 +1264,13 @@ async def main() -> int:
             try:
                 passwd = _ask("Password (press Enter to skip): ", secret=True) or None
             except PromptClosed:
+                _discard_store()
                 print("ERROR: no password given at the prompt (Enter skips it); nothing was sent.",
                       file=sys.stderr)
                 return 2
+            except KeyboardInterrupt:
+                _discard_store()            # Ctrl-C there stops the run before it starts, as Ctrl-D does
+                raise
         else:
             passwd = None
     if args.every is not None:

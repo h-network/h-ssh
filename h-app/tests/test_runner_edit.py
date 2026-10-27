@@ -187,6 +187,23 @@ def test_a_set_file_handed_over_as_text_reaches_no_driver_with_its_comment_lines
         assert [c["payload"] for c in v.edit_calls] == [SET_LINES], mode
 
 
+@pytest.mark.parametrize("vendor", ["ssh", "openssh", "junos", "ios@ssh"])
+def test_a_set_file_with_nothing_but_comments_is_refused_before_any_driver_is_called(monkeypatch, tmp_path, vendor):
+    """#133 review: a -eD or -eB file of blank and '#' lines alone left the
+    driver nothing to send, and the plain ssh and openssh drivers logged in,
+    sent nothing and said OK, where -eD's own read of the file refused it.
+    Refused on every driver and every path now, before the device is
+    contacted: the text the CLI hands over, and the file the runner reads."""
+    (tmp_path / "R1.set").write_text("# change 42, to come\n\n   # nothing yet\n")
+    for mode, where in (("edit-dir", {"config_dir": str(tmp_path)}),
+                        ("edit-broadcast", {"broadcast_file": str(tmp_path / "R1.set")})):
+        for text in ((tmp_path / "R1.set").read_text(), None):
+            v = FakeVendor()
+            _, ok, out, _ = run(monkeypatch, vendor, v, mode=mode, edit_cmd=None, payload_text=text, **where)
+            assert not ok and f"Empty config after filtering: {tmp_path / 'R1.set'}" in out, (mode, text, out)
+            assert v.edit_calls == [], (mode, text)
+
+
 def test_runner_leaves_name_resolution_to_the_transport(monkeypatch):
     """The runner once called gethostbyname before every attempt: result
     unused, errors swallowed, one blocking resolver round-trip per device."""

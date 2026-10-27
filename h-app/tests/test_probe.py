@@ -901,6 +901,16 @@ def test_probe_alone_prints_a_line_per_box_and_a_summary_and_logs_in_nowhere(mon
         "targets": 5, "ok": 3, "fail": 2, "skipped": 0, "slow": 1, "mode": "probe"}
 
 
+def test_probe_alone_in_a_pipeline_with_hssh_password_set_but_empty_still_probes(monkeypatch, capsys):
+    """#136 review: an HSSH_PASSWORD set but empty refuses a pipeline run,
+    which would go on to keys without a word; that refusal now comes before
+    anything is written, and a probe, which logs in nowhere, is no such run:
+    it probes and is kept, no error."""
+    rc, out, err, asked, _ = run(monkeypatch, capsys, ["--probe", *R12], tty=False, password="")
+    assert rc == 0 and asked == [] and "set but empty" not in err, err
+    assert [r["device"] for r in rows("SELECT device FROM results ORDER BY device")] == ["R1", "R2"]
+
+
 def test_probe_alone_is_a_run_in_the_store_with_a_row_per_box(monkeypatch, capsys):
     monkeypatch.setattr(probe, "attempt", answering(dead={"10.0.0.2"}))
     rc, out, err, _, _ = run(monkeypatch, capsys, ["--probe", *R12])

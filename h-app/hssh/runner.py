@@ -525,9 +525,12 @@ def _run_for_target_sync(
                 raise ValueError("No config directory provided for -eD.")
             # The CLI hands over the text it validated; a file re-read here
             # could differ from what the guard saw. Either way no driver gets
-            # its blank and full-line '#' lines.
+            # its blank and full-line '#' lines, and a file with nothing else
+            # is refused before the device is contacted.
             payload = (set_file_payload(payload_text) if payload_text is not None
                        else read_set_file_for_device(config_dir, name))
+            if not payload:
+                raise ValueError(f"Empty config after filtering: {path_inside(config_dir, name + '.set')}")
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
@@ -540,6 +543,8 @@ def _run_for_target_sync(
                 raise ValueError("No broadcast file provided for -eB.")
             payload = set_file_payload(payload_text if payload_text is not None
                                        else _read_broadcast_file(broadcast_file))
+            if not payload:
+                raise ValueError(f"Empty config after filtering: {broadcast_file}")
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
