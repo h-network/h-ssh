@@ -364,22 +364,29 @@ def parse_jobs(data, default_vendor: str = "ssh") -> List[JobEntry]:
     return entries
 
 
-def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
-    """The -eD payload for one device: `<config_dir>/<dev_name>.set` with blank
-    and full-line '#' comment lines dropped, nothing else touched.
+def set_file_payload(text: str) -> str:
+    """What a -eD or -eB file sends, to every driver: its lines with blank and
+    full-line '#' comment lines dropped, nothing else touched; '' when nothing
+    is left. An inline '#' is part of the line (`set snmp community ab#12
+    ...`), the rule junos._strip_comments applies to every set payload. The
+    plain ssh and openssh drivers run each line as a command of its own, so
+    the rule is applied before any driver gets the payload, not by each."""
+    lines = [ln for ln in text.splitlines() if not _is_comment_or_empty(ln)]
+    return "\n".join(lines) + "\n" if lines else ""
 
-    An inline '#' is part of the line (`set snmp community ab#12 ...`), the
-    same rule junos._strip_comments applies to every set payload: -eD sends
-    what the syntax guard validated, and what -eB sends from the same file.
+
+def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
+    """The -eD payload for one device: `<config_dir>/<dev_name>.set` as
+    set_file_payload() makes it, so -eD sends what the syntax guard
+    validated, and what -eB sends from the same file.
     """
     path = path_inside(config_dir, f"{validate_device_name(dev_name)}.set")
     if not path.is_file():
         raise FileNotFoundError(f"Missing config file for {dev_name}: {path}")
-    lines = [ln for ln in path.read_text(encoding="utf-8-sig").splitlines()
-             if not _is_comment_or_empty(ln)]
-    if not lines:
+    payload = set_file_payload(path.read_text(encoding="utf-8-sig"))
+    if not payload:
         raise ValueError(f"Empty config after filtering: {path}")
-    return "\n".join(lines) + "\n"
+    return payload
 
 
 def is_file(path: Path) -> bool:

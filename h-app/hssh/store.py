@@ -102,6 +102,16 @@ def _identity(path: str, dir_fd: Optional[int] = None):
     return (st.st_dev, st.st_ino)
 
 
+def _there(path: str, dir_fd: Optional[int] = None) -> bool:
+    """Whether anything is at `path` (a name in the directory `dir_fd`, when
+    given), a symlink not followed."""
+    try:
+        os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return True
+
+
 # A directory held for still_there(). O_PATH (Linux) needs no read permission
 # on it, only the search permission the path to the file needs anyway.
 _DIRECTORY = getattr(os, "O_PATH", os.O_RDONLY) | getattr(os, "O_DIRECTORY", 0)
@@ -201,6 +211,7 @@ class Store:
     def __init__(self, path: str, readonly: bool = False):
         self.path = path
         self._as_is = None          # (file, what it was) for a store read as it is
+        self.made = False           # this Store created the file: discard() may take it away again
         if readonly:
             if not os.path.exists(path):
                 raise StoreError(f"no store at {path}: no run has been kept here "
@@ -210,7 +221,7 @@ class Store:
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         else:
-            self._create_private(path)
+            self.made = self._create_private(path)
             try:
                 # Not pinned to the opening thread: a library caller may open a
                 # store here and write it from the thread that consumes the results,
@@ -265,18 +276,23 @@ class Store:
         return _settled(resolved) != then
 
     @staticmethod
-    def _create_private(path: str) -> None:
+    def _create_private(path: str) -> bool:
         """The file is made 0600 before SQLite ever opens it, and must be a
         regular file (no following a planted symlink into another file). Its
         directory is made from the path as given, not normalised: abspath()
         takes `link/..` away as text, where the kernel (and SQLite) go up from
-        wherever the link leads."""
+        wherever the link leads. True when this call made the file: one that
+        was there already, or that another run made at the same instant, is
+        not this Store's to take away."""
         directory = os.path.dirname(path)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         try:
             if directory:
                 os.makedirs(directory, mode=0o700, exist_ok=True)
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(path, flags, 0o600)
+            try:
+                fd, made = os.open(path, flags | os.O_EXCL, 0o600), True
+            except FileExistsError:
+                fd, made = os.open(path, flags, 0o600), False
         except OSError as e:
             raise StoreError(f"{path}: {e.strerror or e}") from e
         try:
@@ -284,6 +300,7 @@ class Store:
                 raise StoreError(f"{path}: not a regular file")
         finally:
             os.close(fd)
+        return made
 
     def _open_readonly(self, resolved: str) -> sqlite3.Connection:
         """The reader never writes the store, but a WAL reader wants a -shm
@@ -326,6 +343,43 @@ class Store:
                 pass
         self._where = (self.path, None)         # once closed, the fd's number may be another file's
         self._release_dir()
+
+    def discard(self) -> bool:
+        """Close the store of a run that never started, and take the file
+        away again when this Store made it: a run refused before it starts
+        (Ctrl-D at the password prompt, a --safety-file that cannot be used)
+        leaves no empty h-ssh.db where it was started. The file stays when
+        it was there before, when any run is kept in it (another h-ssh may
+        have kept one meanwhile), and when another connection still has it
+        open: SQLite takes the -wal and -shm away at the last close only, so
+        either of them still there says someone else is in it. The look for
+        rows holds the write lock until the close, so no run is kept in
+        between. True when the file was removed."""
+        name, dir_fd = self._where
+        unkept = False
+        with self._writing:
+            if self.made:
+                try:
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    unkept = not self.conn.execute(
+                        "SELECT EXISTS (SELECT 1 FROM runs) OR EXISTS (SELECT 1 FROM results)").fetchone()[0]
+                except sqlite3.Error:
+                    unkept = False
+            try:
+                self.conn.close()               # the look's transaction is rolled back
+            except sqlite3.Error:
+                pass
+        removed = False
+        if (unkept and not any(_there(name + side, dir_fd) for side in ("-wal", "-shm", "-journal"))
+                and _identity(name, dir_fd) == self.identity):
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+                removed = True
+            except OSError:
+                pass
+        self._where = (self.path, None)
+        self._release_dir()
+        return removed
 
     # --- writing ------------------------------------------------------------
 

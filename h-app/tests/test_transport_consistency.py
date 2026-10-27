@@ -1,6 +1,7 @@
 """#67: the transports agree on what a password means, an edit's verdict
 comes from the reply as well as the exit status, a delete of what is not
-there is not a failure, and the open-file limit is checked before it bites."""
+there is not a failure, and the open-file limit is checked before it bites;
+#133: and none sends a set file's comment line as a command."""
 import asyncio
 import os
 import stat
@@ -134,3 +135,78 @@ def test_the_run_warns_once_and_runs_with_the_lowered_workers(monkeypatch, capsy
     assert rc == 0
     assert err.count("WARNING: the open-file limit of 64 (ulimit -n) carries 5 workers") == 1
     assert "Workers: 5" in out
+
+
+# --- #133: a set file's comment lines are no command on any driver -----------------
+
+SET_FILE = ("# change 42\n"
+            "set snmp community ab#12 authorization read-only\n"
+            "\n"
+            "   # indented, a comment all the same\n"
+            'set interfaces ge-0/0/0 description "uplink #3"\n'
+            "# end\n")
+
+
+@pytest.mark.parametrize("flag", ["-eD", "-eB"])
+@pytest.mark.parametrize("transport", ["ssh", "openssh"])
+def test_a_set_files_comment_lines_are_not_sent_as_commands(monkeypatch, capsys, tmp_path, transport, flag):
+    """-eD and -eB on the plain ssh and openssh drivers ran every line of the
+    file as a command of its own, a full-line '#' comment too, where junos
+    and the dialects' CLI engine dropped it. Blank and comment lines are now
+    dropped before any driver gets the payload; a '#' inside a line is part
+    of it, as written."""
+    from hssh.drivers import results as R
+    from hssh.transports import ssh
+    module = ssh if transport == "ssh" else openssh
+    sent = []
+
+    def run_commands(host, user, passwd, commands, *a, **kw):
+        sent.append(list(commands))
+        return R.EditResult(R.APPLIED, message="".join(f"$ {c}\n" for c in commands))
+    monkeypatch.setattr(module, "_run_commands", run_commands)
+    monkeypatch.setattr(module, "AVAILABLE", True)
+    (tmp_path / "R1.set").write_text(SET_FILE)
+    source = ["-eD", str(tmp_path)] if flag == "-eD" else ["-eB", str(tmp_path / "R1.set")]
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *source, "-y",
+                                      f"R1:10.0.0.1:{transport}"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 0, err
+    assert sent == [["set snmp community ab#12 authorization read-only",
+                     'set interfaces ge-0/0/0 description "uplink #3"']]
+
+
+@pytest.mark.parametrize("flag", ["-eD", "-eB"])
+@pytest.mark.parametrize("transport", ["ssh", "openssh"])
+def test_a_set_file_with_nothing_but_comments_is_refused_before_anything_is_sent(monkeypatch, capsys, tmp_path,
+                                                                                 transport, flag, probed):
+    """#133 review: a -eD or -eB file of blank and '#' lines alone left the
+    plain ssh and openssh drivers nothing to send: they logged in, sent
+    nothing and said OK, exit 0, where the Junos guard refuses such a file.
+    Refused on every driver now: exit 2 naming the file, before anything is
+    probed, written or sent."""
+    from hssh.drivers import results as R
+    from hssh.transports import ssh
+    module = ssh if transport == "ssh" else openssh
+    sent = []
+
+    def run_commands(host, user, passwd, commands, *a, **kw):
+        sent.append(list(commands))
+        return R.EditResult(R.APPLIED, message="".join(f"$ {c}\n" for c in commands))
+    monkeypatch.setattr(module, "_run_commands", run_commands)
+    monkeypatch.setattr(module, "AVAILABLE", True)
+    (tmp_path / "R1.set").write_text("# change 42, to come\n\n   # nothing yet\n")
+    source = ["-eD", str(tmp_path)] if flag == "-eD" else ["-eB", str(tmp_path / "R1.set")]
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *source, "-y",
+                                      f"R1:10.0.0.1:{transport}"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 2 and "nothing but blank lines and '#' comments" in err and "Nothing was sent." in err, err
+    assert ("R1.set" if flag == "-eD" else str(tmp_path / "R1.set")) in err
+    assert sent == [] and probed == [] and not os.path.exists(os.environ["HSSH_STORE"])

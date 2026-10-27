@@ -1052,6 +1052,153 @@ def test_no_store_keeps_nothing_and_contradicts_store(tmp_path, monkeypatch, cap
     assert rc == 2 and "contradict" in err and not (tmp_path / "x.db").exists()
 
 
+@pytest.mark.parametrize("argv, password, says", [
+    (["-sC", "show version", "--raw", "-v"], "p", "--raw and -v are mutually exclusive"),
+    (["-sC", "show version", "--raw", "--json"], "p", "--raw and --json are mutually exclusive"),
+    (["-eC", "set system host-name x"], "p", "Edit operation requires confirmation but stdin is not a TTY"),
+    (["-eC", "set system host-name x", "--show-diff"], "p", "--show-diff needs a terminal to ask, or -y"),
+    (["-sC", "show version"], "", "HSSH_PASSWORD is set but empty"),
+    (["-sC", "show version", "--safety-file", "{tmp}/plain/safety.json"], "p", "--safety-file requested but unusable"),
+    (["-sC", "show version", "--save-output", "{tmp}/plain"], "p", "exists and is not a directory"),
+    (["-sC", "show version", "--save-output", "{tmp}/plain/out"], "p", "--save-output"),
+], ids=["raw-v", "raw-json", "edit-no-terminal", "show-diff-no-terminal", "empty-password", "safety-file",
+        "save-output-file", "save-output-mkdir"])
+def test_a_run_refused_before_it_starts_leaves_no_store_file(tmp_path, monkeypatch, capsys, argv, password, says):
+    """#136: the store was opened before these refusals, so a run that
+    exited 2 with nothing run left an empty h-ssh.db (no run in it) where it
+    was started. Every refusal that needs no store comes before the store is
+    opened, and one after it (a safety file or a --save-output directory
+    that cannot be used) takes away the store the run made; a run that
+    passes them makes the store and fills it."""
+    work = tmp_path / "job"
+    work.mkdir()
+    (tmp_path / "plain").write_text("")             # a file where a directory is wanted
+    monkeypatch.chdir(work)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER", "HSSH_STORE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(cli, "_tty", lambda stream: False)          # a pipeline: no terminal to ask at
+    calls = []
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(
+        AVAILABLE=True, show=lambda *a, **kw: calls.append(a[3]) or "ok", edit=lambda *a, **kw: calls.append(a[3]) or "COMMIT OK\n"))
+
+    def h_ssh(*args, password="p"):
+        monkeypatch.setenv("HSSH_PASSWORD", password)
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "R1:10.0.0.1:junos",
+                                          *(a.replace("{tmp}", str(tmp_path)) for a in args)])
+        rc = asyncio.run(cli.main())
+        return (rc, *capsys.readouterr())
+
+    rc, out, err = h_ssh(*argv, password=password)
+    assert rc == 2 and says in err and calls == []
+    assert os.listdir(work) == []
+    rc, out, err = h_ssh("-sC", "show version")
+    assert rc == 0, err
+    assert calls == ["show version"] and os.listdir(work) == ["h-ssh.db"]
+    assert rows(work / "h-ssh.db", "SELECT device, command, output FROM results") == [
+        {"device": "R1", "command": "show version", "output": "ok"}]
+
+
+@pytest.mark.parametrize("stop", ["ctrl-d", "ctrl-c"])
+def test_a_run_stopped_at_the_password_prompt_leaves_no_store_file(tmp_path, monkeypatch, capsys, stop):
+    """#136 review: the store is opened before the password prompt, so a
+    run stopped there, Ctrl-D (exit 2, nothing was sent) or Ctrl-C, left an
+    empty h-ssh.db with no run in it, its -wal and -shm while it lived. The
+    store that run made is taken away; one that was there stays as it was."""
+    work = tmp_path / "job"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER", "HSSH_STORE", "HSSH_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(cli, "_tty", lambda stream: True)                # by hand, at a terminal
+    calls = []
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(
+        AVAILABLE=True, show=lambda *a, **kw: calls.append(a[2]) or "ok"))
+
+    def h_ssh(typed):
+        def getpass(prompt=""):
+            assert sorted(os.listdir(work)) == ["h-ssh.db", "h-ssh.db-shm", "h-ssh.db-wal"]   # open as it asks
+            if typed is None:
+                raise EOFError if stop == "ctrl-d" else KeyboardInterrupt
+            return typed
+        monkeypatch.setattr(cli.getpass, "getpass", getpass)
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "R1:10.0.0.1:junos",
+                                          "-sC", "show version"])
+        try:
+            rc = asyncio.run(cli.main())
+        except KeyboardInterrupt:
+            rc = 130
+        return (rc, *capsys.readouterr())
+
+    rc, out, err = h_ssh(None)
+    assert rc == (2 if stop == "ctrl-d" else 130) and calls == []
+    assert stop == "ctrl-c" or "no password given at the prompt" in err
+    assert os.listdir(work) == []
+    rc, out, err = h_ssh("s3cret")
+    assert rc == 0 and calls == ["s3cret"], err
+    rc, out, err = h_ssh(None)                       # a store that was there is no run's to take away
+    assert calls == ["s3cret"] and os.listdir(work) == ["h-ssh.db"]
+    assert rows(work / "h-ssh.db", "SELECT device, command, output FROM results") == [
+        {"device": "R1", "command": "show version", "output": "ok"}]
+
+
+def test_discard_takes_away_only_a_store_this_store_made_and_nobody_kept_a_run_in(tmp_path):
+    """Store.discard(), for a run stopped before it starts: the file goes,
+    with its -wal and -shm, when this Store made it and nothing is kept in
+    it. A file that was there, one another connection still has open, one
+    another run kept a row in meanwhile, and one that is not the file this
+    Store opened (another took its name) all stay, with their rows."""
+    path = tmp_path / "s.db"
+    s = Store(str(path))
+    assert s.made and s.discard() is True and os.listdir(tmp_path) == []
+    Store(str(path)).close()
+    found = Store(str(path))                         # there before: never this run's to take away
+    assert not found.made and found.discard() is False and os.listdir(tmp_path) == ["s.db"]
+    path.unlink()
+    s, other = Store(str(path)), Store(str(path))    # another run opened what this one made
+    assert s.made and not other.made
+    assert s.discard() is False and path.exists()
+    run = other.begin_run("show", ["-sC", "show version"], "u", 1, "1.0.0")
+    other.add_entry(run, SHOW, "show version")
+    other.close()
+    assert [r["device"] for r in rows(path, "SELECT device FROM results")] == ["r1"]
+    path.unlink()
+    s, other = Store(str(path)), Store(str(path))
+    other.begin_run("show", ["-sC", "show version"], "u", 1, "1.0.0")
+    other.close()                                    # kept a run and went before this one looked
+    assert s.discard() is False and len(rows(path, "SELECT * FROM runs")) == 1
+    path.unlink()
+    s = Store(str(path))
+    s.identity = (0, 0)                              # the file at the name is not the one it opened
+    assert s.discard() is False and os.listdir(tmp_path) == ["s.db"]
+
+
+@pytest.mark.parametrize("where", ["a file in the store's way", "a directory you cannot write in"])
+def test_a_store_refused_leaves_no_safety_file_and_no_save_output_directory(tmp_path, monkeypatch, capsys, where):
+    """#136 review: with the store opened after them, a store refused left
+    the --safety-file, its .lock and an empty --save-output directory
+    behind, which the run before #136 did not. The store is opened before
+    both again; a run refused after it takes away the store it made."""
+    if where == "a directory you cannot write in" and os.geteuid() == 0:
+        pytest.skip("root writes anywhere")
+    work = tmp_path / "job"
+    work.mkdir()
+    (work / "plainfile").write_text("")
+    monkeypatch.chdir(work)
+    calls = []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: calls.append(1) or "ok")
+    if where == "a file in the store's way":
+        argv, said = ["--store", "plainfile/x.db", "--save-output", "out", "--safety-file", "gate.json"], "plainfile/x.db"
+    else:
+        work.chmod(0o500)
+        argv, said = ["--save-output", str(tmp_path / "out"), "--safety-file", str(tmp_path / "gate.json")], "h-ssh.db"
+    try:
+        rc, out, err = run_cli(monkeypatch, capsys, [*argv, "R1:10.0.0.1:junos", "-sC", "show version"], fake=fake)
+    finally:
+        work.chmod(0o700)
+    assert rc == 2 and f"ERROR: store {said}" in err and calls == []
+    assert os.listdir(work) == ["plainfile"] and os.listdir(tmp_path) == ["job"]
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root writes anywhere")
 def test_a_directory_you_cannot_write_in_is_no_run(tmp_path, monkeypatch, capsys):
     """The user's rule: not being able to store is a no-go for the run."""
