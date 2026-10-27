@@ -44,14 +44,14 @@ def no_sleep(monkeypatch):
 
 def run(monkeypatch, vendor_name, mod, mode="edit-cmd", edit_cmd="set a b",
         dry_run=False, commit_confirmed=None, config_dir=None, broadcast_file=None, attempts=3,
-        expected_diff=None):
+        expected_diff=None, payload_text=None):
     monkeypatch.setitem(drivers.MODULES, drivers.get(vendor_name).name, mod)
     return runner.run_for_target(
         t=Target("R1", "10.0.0.1", vendor_name), transport=vendor_name, mode=mode,
         show_cmd=None, edit_cmd=edit_cmd, config_dir=config_dir, broadcast_file=broadcast_file,
         user="u", passwd="p", session_timeout=5, command_timeout=30,
         dry_run=dry_run, commit_confirmed=commit_confirmed, save_dir=None,
-        quiet=True, max_attempts=attempts, expected_diff=expected_diff)
+        quiet=True, max_attempts=attempts, expected_diff=expected_diff, payload_text=payload_text)
 
 
 def test_junos_dry_run_reaches_the_driver(monkeypatch):
@@ -167,8 +167,24 @@ def test_dash_eD_and_dash_eB_load_the_same_lines(monkeypatch, tmp_path):
     run(monkeypatch, "junos", by_dir, mode="edit-dir", edit_cmd=None, config_dir=str(tmp_path))
     run(monkeypatch, "junos", by_file, mode="edit-broadcast", edit_cmd=None,
         broadcast_file=str(tmp_path / "R1.set"))
-    assert by_file.edit_calls[0]["payload"] == SET_FILE      # -eB hands the driver the file as is
-    assert netconf._strip_comments(by_file.edit_calls[0]["payload"]) + "\n" == by_dir.edit_calls[0]["payload"]
+    # -eB hands the driver the lines -eD does (#133): what junos._strip_comments
+    # made of the file on the router all along
+    assert by_file.edit_calls[0]["payload"] == by_dir.edit_calls[0]["payload"] == SET_LINES
+    assert netconf._strip_comments(SET_FILE) + "\n" == SET_LINES
+
+
+@pytest.mark.parametrize("vendor", ["ssh", "openssh", "junos", "ios@ssh"])
+def test_a_set_file_handed_over_as_text_reaches_no_driver_with_its_comment_lines(monkeypatch, vendor):
+    """#133: the CLI reads a -eD or -eB file once and hands its text over,
+    and the runner gave that to the driver whole: the plain ssh and openssh
+    drivers ran a full-line '#' comment as a command of its own. Every
+    driver now gets the lines without the blank and comment ones, a '#'
+    inside a line as written."""
+    for mode, where in (("edit-dir", {"config_dir": "cfg"}), ("edit-broadcast", {"broadcast_file": "all.set"})):
+        v = FakeVendor()
+        _, ok, out, _ = run(monkeypatch, vendor, v, mode=mode, edit_cmd=None, payload_text=SET_FILE, **where)
+        assert ok, out
+        assert [c["payload"] for c in v.edit_calls] == [SET_LINES], mode
 
 
 def test_runner_leaves_name_resolution_to_the_transport(monkeypatch):

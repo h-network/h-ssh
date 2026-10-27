@@ -12,7 +12,8 @@ from typing import Any, List, NamedTuple, Optional, Tuple
 
 from .errors import ConnectTimeoutError, LocalError, NotAppliedError
 from .audit import secure_write
-from .core import Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines
+from .core import (Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines,
+                   set_file_payload)
 from .safety import SafetyGate
 from . import drivers
 from .drivers import results as R
@@ -523,8 +524,10 @@ def _run_for_target_sync(
             if not config_dir:
                 raise ValueError("No config directory provided for -eD.")
             # The CLI hands over the text it validated; a file re-read here
-            # could differ from what the guard saw.
-            payload = payload_text if payload_text is not None else read_set_file_for_device(config_dir, name)
+            # could differ from what the guard saw. Either way no driver gets
+            # its blank and full-line '#' lines.
+            payload = (set_file_payload(payload_text) if payload_text is not None
+                       else read_set_file_for_device(config_dir, name))
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
@@ -535,7 +538,8 @@ def _run_for_target_sync(
         elif mode == "edit-broadcast":
             if not broadcast_file:
                 raise ValueError("No broadcast file provided for -eB.")
-            payload = payload_text if payload_text is not None else _read_broadcast_file(broadcast_file)
+            payload = set_file_payload(payload_text if payload_text is not None
+                                       else _read_broadcast_file(broadcast_file))
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,

@@ -965,7 +965,9 @@ async def main() -> int:
                                 return 2
 
         # The payloads, read once here and handed to the runner and the audit
-        # log as the same string: what the guard checked is what is sent.
+        # log as the same string: what the guard checked is what is sent, but
+        # for the blank and full-line '#' lines, which the runner keeps from
+        # every driver (core.set_file_payload).
         if args.edit_broadcast:
             try:
                 broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
