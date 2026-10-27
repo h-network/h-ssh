@@ -397,7 +397,11 @@ async def probe_alone(args, targets, store, user, json_mode: bool, safety_gate=N
     that is not live is a failed row with its verdict, so `h-ssh-store
     failed` lists it). 0 when every box is live, 1 when one is dead, 3
     when none is but one was not probed (reached through a proxy, held by
-    the safety gate), 4 when the store could not keep it."""
+    the safety gate), 4 when the store could not keep it. The record (the
+    rows, the audit log, --log) is written before the report is printed,
+    so a reader that leaves early (`| head`) or a Ctrl-C while it prints
+    costs the report, never the record; the run row is closed whatever
+    ends the run, as interrupted where it was cut short."""
     limit, note = fit_probes_to_open_files(min(MAX_PROBES, len(targets)))
     if note:
         print(f"WARNING: {note}", file=sys.stderr)
@@ -413,69 +417,75 @@ async def probe_alone(args, targets, store, user, json_mode: bool, safety_gate=N
         except Exception as e:                    # the file went away since it was opened
             print(f"ERROR: store {store.path}: {e}; refusing to start.", file=sys.stderr)
             return 2
-    started = time.time()
+    recorded = {"live": 0, "dead": 0}     # the boxes whose record is written; every other one is skipped
+    tried = lost = 0                      # rows handed to the store, and those it could not keep
+    reason = None
+    whole = False                         # the run got to the end of its report
     try:
+        started = time.time()
         results = await probes.probe(targets, seconds, args.slow, limit, user=user,
                                      held=held_by(safety_gate, targets))
-    except BaseException:
-        # Ctrl-C, or anything else that ends it here: its row says it did not finish.
+        elapsed_ms = int((time.time() - started) * 1000)
+        stamp = datetime.now().isoformat()
+        for r in results:
+            record = r.to_dict()
+            entry = {"device": r.device, "host": r.host, "vendor": r.vendor, "ok": r.ok,
+                     "duration_ms": r.duration_ms, "error": None if r.ok else r.verdict, "output": record}
+            if run_id is not None:
+                tried += 1
+                try:
+                    store.add_entry(run_id, entry, "probe", fmt="json")
+                except Exception as e:
+                    lost += 1
+                    reason = reason or str(e)
+            if args.audit_log:
+                write_audit_entry(path=args.audit_log, device=r.device, host=r.host, vendor=r.vendor, mode="probe",
+                                  payload="", ok=r.ok, error=entry["error"])
+            if args.log:
+                try:
+                    secure_append(args.log, json.dumps(redact_values({
+                        "timestamp": stamp, "user": user, "mode": "probe", "command": "probe",
+                        "dry_run": args.dry_run, **record, "error": entry["error"]})) + "\n")
+                except Exception as e:
+                    print(f"WARNING: Could not write to log file: {e}", file=sys.stderr)
+                    args.log = None
+            if r.ok or r.dead:
+                recorded["live" if r.ok else "dead"] += 1
         if run_id is not None:
-            with contextlib.suppress(Exception):
-                store.finish_run(run_id, 0, 0, len(targets), interrupted=True)
-        raise
-    elapsed_ms = int((time.time() - started) * 1000)
-    live = sum(1 for r in results if r.ok)
-    dead = sum(1 for r in results if r.dead)
-    passed = len(results) - live - dead              # not probed
-    if json_mode:
-        print(json.dumps([r.to_dict() for r in results], indent=2))
-    else:
-        shown = terminal_safe if _tty(sys.stdout) else (lambda text: text)    # a banner is the device's text
-        for line in probe_lines(results):
-            print(shown(line))
-        print()
-        print(probe_summary(results, elapsed_ms / 1000, args.slow, name_slow=False))
-
-    stamp = datetime.now().isoformat()
-    lost, reason = 0, None
-    for r in results:
-        record = r.to_dict()
-        entry = {"device": r.device, "host": r.host, "vendor": r.vendor, "ok": r.ok, "duration_ms": r.duration_ms,
-                 "error": None if r.ok else r.verdict, "output": record}
-        if run_id is not None:
+            gone = store.still_there()
+            if gone is not None:          # SQLite kept writing into the void; nothing of this run is on disk
+                lost, reason = tried, gone
+        live, dead = recorded["live"], recorded["dead"]
+        passed = len(results) - live - dead              # not probed
+        if json_mode:
+            print(json.dumps([r.to_dict() for r in results], indent=2))
+        else:
+            shown = terminal_safe if _tty(sys.stdout) else (lambda text: text)    # a banner is the device's text
+            for line in probe_lines(results):
+                print(shown(line))
+            print()
+            print(probe_summary(results, elapsed_ms / 1000, args.slow, name_slow=False))
+        whole = True
+    finally:
+        # Whatever ends it (Ctrl-C during the probe or the report, a reader
+        # that left, anything else), the run row is closed with how far it
+        # got, as interrupted where it was cut short; one whose rows the
+        # store kept none of stays open, as a run's does (`?/?`).
+        if run_id is not None and (lost < tried or tried == 0):
             try:
-                store.add_entry(run_id, entry, "probe", fmt="json")
+                store.finish_run(run_id, recorded["live"], recorded["dead"],
+                                 len(targets) - recorded["live"] - recorded["dead"],
+                                 interrupted=not whole)
             except Exception as e:
-                lost += 1
-                reason = reason or str(e)
-        if args.audit_log:
-            write_audit_entry(path=args.audit_log, device=r.device, host=r.host, vendor=r.vendor, mode="probe",
-                              payload="", ok=r.ok, error=entry["error"])
-        if args.log:
-            try:
-                secure_append(args.log, json.dumps(redact_values({
-                    "timestamp": stamp, "user": user, "mode": "probe", "command": "probe", "dry_run": args.dry_run,
-                    **record, "error": entry["error"]})) + "\n")
-            except Exception as e:
-                print(f"WARNING: Could not write to log file: {e}", file=sys.stderr)
-                args.log = None
-    not_kept = 0
-    if run_id is not None:
-        gone = store.still_there()
-        not_kept, reason = (len(results), gone) if gone is not None else (lost, reason)
-        if not_kept < len(results):
-            try:
-                store.finish_run(run_id, live, dead, passed)
-            except Exception as e:
-                print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
-        if not_kept:
-            print(f"WARNING: store {store.path}: {not_kept} of {len(results)} results were not kept: {reason}",
-                  file=sys.stderr)
+                if whole:
+                    print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
+    if lost:
+        print(f"WARNING: store {store.path}: {lost} of {tried} results were not kept: {reason}", file=sys.stderr)
     summary = {"targets": len(results), "ok": live, "fail": dead, "skipped": passed,
-               "slow": sum(1 for r in results if r.slow), **({"not_kept": not_kept} if not_kept else {}),
+               "slow": sum(1 for r in results if r.slow), **({"not_kept": lost} if lost else {}),
                "elapsed_ms": elapsed_ms, "mode": "probe"}
     print(f"[h-ssh] {json.dumps(summary)}", file=sys.stderr)
-    if not_kept:
+    if lost:
         return 4
     return 1 if dead else 3 if passed else 0
 

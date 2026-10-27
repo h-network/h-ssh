@@ -839,6 +839,37 @@ def test_probe_alone_that_ends_on_something_unexpected_still_finishes_its_run_ro
     assert (run_row["ok"], run_row["failed"], run_row["skipped"], run_row["interrupted"]) == (0, 0, 2, 1)
 
 
+@pytest.mark.parametrize("cut", [BrokenPipeError, KeyboardInterrupt])
+def test_probe_alone_keeps_its_record_when_its_report_is_cut_short(monkeypatch, capsys, cut):
+    """The record is written before the report is printed: a reader that
+    leaves early (`| head`, BrokenPipeError) or a Ctrl-C while the report
+    prints (where Python 3.10 raises KeyboardInterrupt) costs the report,
+    never the rows, and the run row is closed as interrupted with what the
+    probe found."""
+    monkeypatch.setattr(probe, "attempt", answering(dead={"10.0.0.2"}))
+
+    class Reader:
+        """stdout whose reader goes away after the header."""
+        lines = 0
+
+        def write(self, text):
+            self.lines += text.count("\n")
+            if self.lines > 2:
+                raise cut()
+            return len(text)
+
+        def flush(self):
+            pass
+    monkeypatch.setattr(sys, "stdout", Reader())
+    with pytest.raises(cut):
+        run(monkeypatch, capsys, ["--probe", *R12])
+    run_row, = rows("SELECT * FROM runs")
+    assert run_row["finished"] is not None
+    assert (run_row["ok"], run_row["failed"], run_row["skipped"], run_row["interrupted"]) == (1, 1, 0, 1)
+    assert [(r["device"], r["ok"], r["error"]) for r in rows("SELECT * FROM results ORDER BY device")] == [
+        ("R1", 1, None), ("R2", 0, "refused (connection refused by 10.0.0.2:830)")]
+
+
 def test_probe_alone_with_json_gives_the_records_and_exit_0_when_every_box_is_live(monkeypatch, capsys):
     rc, out, err, _, _ = run(monkeypatch, capsys, ["--probe", "--json", *R12])
     assert rc == 0, err
