@@ -37,7 +37,7 @@ from .. import drivers
 from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
-from ..errors import ConnectTimeoutError, LocalError
+from ..errors import ConnectTimeoutError, LocalError, NotAppliedError
 from .cli import Cli, edit_policy, refuse_commit_lines
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
                       tcp_timed_out, where)
@@ -458,13 +458,24 @@ def _no_banner(t, exc) -> bool:
     return False
 
 
+# The resolver's own answer that the name does not exist: the same name gets
+# the same answer. Any other failure of the lookup, EAI_AGAIN above all (no
+# answer from the resolver in time), may pass.
+_NO_SUCH_NAME = frozenset({socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)})
+
+
 def _tcp_failure(exc: OSError, host: str, at: str, seconds) -> Exception:
     """The TCP connect's end in words (#126). paramiko lets a timeout and a
     resolver failure through as they are, and wraps a refusal or no route in
     NoValidConnectionsError, whose message ("Unable to connect to port 22 on
-    HOST") says neither; the OS's own answer is in its `errors`."""
+    HOST") says neither; the OS's own answer is in its `errors`. A name
+    that does not exist is "cannot resolve HOST" and fails once; a lookup
+    that failed otherwise is said in the OS's words and, nothing sent, is
+    tried again, an edit too."""
     if isinstance(exc, socket.gaierror):
-        return RuntimeError(f"cannot resolve {host}")
+        if exc.errno in _NO_SUCH_NAME:
+            return RuntimeError(f"cannot resolve {host}")
+        return NotAppliedError(f"name lookup for {host} failed: {exc.strerror or exc}")
     errors = list((getattr(exc, "errors", None) or {}).values())
     if errors:
         exc = errors[-1]                     # the last address tried, as ssh reports it

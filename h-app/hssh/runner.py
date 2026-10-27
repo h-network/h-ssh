@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -92,6 +93,7 @@ _CONNECT_PHASE = (
     "network is unreachable",
     "unable to connect to port",
     "cannot resolve",
+    "name lookup for",                      # ssh: a resolver failure that may pass (EAI_AGAIN)
     "ssh protocol banner",
     "connection timed out",
     "no ssh session",
@@ -118,8 +120,12 @@ def is_permanent_failure(exc) -> bool:
 def is_connect_failure(exc_or_text) -> bool:
     """True when the failure happened while connecting, before any session
     existed: nothing reached the device. paramiko's bare socket timeout is
-    the whole message 'timed out'; a command timeout always says more."""
+    the whole message 'timed out'; a command timeout always says more. An
+    edit whose later line's connect ran out after lines were applied
+    (openssh) is not one: those lines reached the device."""
     text = str(exc_or_text).strip().lower()
+    if _connect.applied(text):
+        return False
     return (text == "timed out" or is_connect_timeout(exc_or_text)
             or any(marker in text for marker in _CONNECT_PHASE))
 
@@ -165,14 +171,25 @@ def _takes(fn, name: str) -> bool:
 
 def _connect_kwargs(fn, connect_timeout) -> dict:
     """{"connect_timeout": n} for a driver function that takes it, as every
-    one of the three SSH transports' does; nothing for one that does not
-    (telnet, which is frozen; a driver from another package; a stand-in)."""
-    if connect_timeout is None or not _takes(fn, "connect_timeout"):
+    one of the three SSH transports' does, None too (the connect phase then
+    has the session timeout); nothing for one that does not (telnet, which
+    is frozen; a driver from another package; a stand-in)."""
+    if not _takes(fn, "connect_timeout"):
         return {}
     return {"connect_timeout": connect_timeout}
 
 
-def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, **kwargs):
+def _stopped(stop: Optional[threading.Event]) -> bool:
+    return stop is not None and stop.is_set()
+
+
+def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, stop=None, **kwargs):
+    """fn(*args, **kwargs) until it succeeds, up to max_attempts, while
+    should_retry(e) says the failure may be tried again. `stop`: a
+    threading.Event the CLI sets on Ctrl-C. Once it is set, the attempt in
+    flight is the last: a connect that runs out after Ctrl-C is a
+    NotAppliedError, and an edit tried again then could commit after the
+    operator stopped the run."""
     attempts = max(1, int(max_attempts))
     last_err = None
     for attempt in range(1, attempts + 1):
@@ -180,19 +197,22 @@ def _retry_loop(fn, name, quiet, max_attempts, should_retry, *args, **kwargs):
             return fn(*args, **kwargs)
         except Exception as e:
             last_err = e
-            if is_permanent_failure(e) or not should_retry(e):
+            if is_permanent_failure(e) or not should_retry(e) or _stopped(stop):
                 raise
             if attempt < attempts:
                 delay = _backoff(attempt, CONNECT_BACKOFF if is_connect_timeout(e) else None)
                 if not quiet:
                     _say(f"{name:16s} RETRY {attempt}/{attempts - 1} in {delay}s ({e})")
                 time.sleep(delay)
+                if _stopped(stop):
+                    raise                    # Ctrl-C came during the pause
     raise last_err
 
 
-def _with_retry(fn, name, quiet, max_attempts, *args, **kwargs):
-    """Call fn until it succeeds, up to max_attempts. Permanent failures stop at one."""
-    return _retry_loop(fn, name, quiet, max_attempts, lambda e: True, *args, **kwargs)
+def _with_retry(fn, name, quiet, max_attempts, *args, stop=None, **kwargs):
+    """Call fn until it succeeds, up to max_attempts. Permanent failures stop
+    at one, and nothing is tried again once `stop` is set."""
+    return _retry_loop(fn, name, quiet, max_attempts, lambda e: True, *args, stop=stop, **kwargs)
 
 
 class RunResult(tuple):
@@ -302,7 +322,7 @@ def _check_edit_policy(b: Bound, commit_confirmed, dry_run):
 
 def _apply_rollback(b: Bound, name, quiet, max_attempts, host, user, passwd,
                     n, session_timeout, command_timeout, commit_confirmed, port, dry_run=False,
-                    comment=None, expected_diff=None, connect_timeout=None):
+                    comment=None, expected_diff=None, connect_timeout=DEFAULT_CONNECT_TIMEOUT, stop=None):
     """Return to rollback n. Same rules as an edit: refused where the transport
     cannot really do it, retried only when nothing reached the device, and
     with `expected_diff` committed only if the device shows that diff again."""
@@ -315,12 +335,13 @@ def _apply_rollback(b: Bound, name, quiet, max_attempts, host, user, passwd,
         host, user, passwd, n, session_timeout, command_timeout,
         port=port, vendor_hint=b.hint, dry_run=dry_run, commit_confirmed=commit_confirmed,
         **_comment_kwargs(b, comment), **_expected_diff_kwargs(b, expected_diff),
-        **_connect_kwargs(b.mod.rollback, connect_timeout))
+        **_connect_kwargs(b.mod.rollback, connect_timeout), stop=stop)
 
 
 def _apply_edit(b: Bound, name, quiet, max_attempts, host, user, passwd,
                 payload, session_timeout, command_timeout, commit_confirmed,
-                port, dry_run=False, comment=None, expected_diff=None, connect_timeout=None):
+                port, dry_run=False, comment=None, expected_diff=None, connect_timeout=DEFAULT_CONNECT_TIMEOUT,
+                stop=None):
     """Push configuration. An edit is not idempotent, so it is only retried when
     the driver says nothing reached the device (NotAppliedError, which a
     connect phase that ran out is too); any other failure, and above all a
@@ -336,7 +357,7 @@ def _apply_edit(b: Bound, name, quiet, max_attempts, host, user, passwd,
         b.mod.edit, name, quiet, max_attempts,
         lambda e: isinstance(e, NotAppliedError),
         host, user, passwd, payload, session_timeout, command_timeout,
-        commit_confirmed, **kwargs)
+        commit_confirmed, stop=stop, **kwargs)
 
 
 def _rpc_call(b: Bound, batch=False):
@@ -393,6 +414,7 @@ def _run_for_target_sync(
     payload_text: Optional[str] = None,
     seq: int = 0,
     connect_timeout: Optional[int] = DEFAULT_CONNECT_TIMEOUT,
+    stop: Optional[threading.Event] = None,
 ) -> RunResult:
     """
     Execute task on a single target device (internal sync implementation).
@@ -447,7 +469,7 @@ def _run_for_target_sync(
                 data = _with_retry(fn, name, quiet, max_attempts,
                                    host, user, passwd, show_cmd, session_timeout, command_timeout,
                                    port=t.port, vendor_hint=b.hint, fmt=fmt,
-                                   **_connect_kwargs(fn, connect_timeout))
+                                   **_connect_kwargs(fn, connect_timeout), stop=stop)
                 typed = data
                 result = data if fmt == "xml" else json.dumps(data, indent=2)
             elif structured and "show_structured" in b.caps:
@@ -458,7 +480,7 @@ def _run_for_target_sync(
                                    session_timeout, command_timeout,
                                    port=t.port, vendor_hint=b.hint,
                                    binding=structured_binding,
-                                   **_connect_kwargs(b.mod.show_structured, connect_timeout))
+                                   **_connect_kwargs(b.mod.show_structured, connect_timeout), stop=stop)
                 typed = data
                 result = json.dumps(data, indent=2, default=str)
             else:
@@ -467,7 +489,7 @@ def _run_for_target_sync(
                 result = _with_retry(b.mod.show, name, quiet, attempts,
                                      host, user, passwd, show_cmd, session_timeout, command_timeout,
                                      port=t.port, vendor_hint=b.hint,
-                                     **_connect_kwargs(b.mod.show, connect_timeout))
+                                     **_connect_kwargs(b.mod.show, connect_timeout), stop=stop)
             if typed is None:
                 typed = result
             output.append(result.rstrip())
@@ -488,12 +510,12 @@ def _run_for_target_sync(
                                      host, user, passwd, session_timeout, command_timeout,
                                      port=t.port, vendor_hint=b.hint,
                                      **_comment_kwargs(b, comment),
-                                     **_connect_kwargs(b.mod.confirm, connect_timeout))
+                                     **_connect_kwargs(b.mod.confirm, connect_timeout), stop=stop)
             else:
                 result = _apply_edit(b, name, quiet, max_attempts,
                                      host, user, passwd, payload, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                     expected_diff, connect_timeout)
+                                     expected_diff, connect_timeout, stop)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -506,7 +528,7 @@ def _run_for_target_sync(
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                 expected_diff, connect_timeout)
+                                 expected_diff, connect_timeout, stop)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -517,7 +539,7 @@ def _run_for_target_sync(
             result = _apply_edit(b, name, quiet, max_attempts,
                                  host, user, passwd, payload, session_timeout,
                                  command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                 expected_diff, connect_timeout)
+                                 expected_diff, connect_timeout, stop)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -533,7 +555,7 @@ def _run_for_target_sync(
                 entries = _with_retry(b.mod.commit_status, name, quiet, max_attempts,
                                       host, user, passwd, session_timeout, command_timeout,
                                       port=t.port, vendor_hint=b.hint,
-                                      **_connect_kwargs(b.mod.commit_status, connect_timeout))
+                                      **_connect_kwargs(b.mod.commit_status, connect_timeout), stop=stop)
                 typed = R.as_commits(entries)
                 output.append(json.dumps(typed.to_list()))
 
@@ -543,7 +565,7 @@ def _run_for_target_sync(
             result = _apply_rollback(b, name, quiet, max_attempts,
                                      host, user, passwd, rollback, session_timeout,
                                      command_timeout, commit_confirmed, t.port, dry_run, comment,
-                                     expected_diff, connect_timeout)
+                                     expected_diff, connect_timeout, stop)
             typed = R.as_edit(result)
             output.append(typed.rstrip())
 
@@ -565,12 +587,12 @@ def _run_for_target_sync(
                 cmd_results = _with_retry(fn, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
                                           port=t.port, vendor_hint=b.hint, fmt=fmt,
-                                          **_connect_kwargs(fn, connect_timeout))
+                                          **_connect_kwargs(fn, connect_timeout), stop=stop)
             else:
                 cmd_results = _with_retry(b.mod.show_batch, name, quiet, max_attempts,
                                           host, user, passwd, batch_cmds, session_timeout, command_timeout,
                                           port=t.port, vendor_hint=b.hint,
-                                          **_connect_kwargs(b.mod.show_batch, connect_timeout))
+                                          **_connect_kwargs(b.mod.show_batch, connect_timeout), stop=stop)
             batch = R.as_batch(cmd_results)
             result_json = json.dumps(batch.to_list())
             duration_ms = int((time.time() - start_time) * 1000)
@@ -638,6 +660,7 @@ def run_for_target(
     payload_text: Optional[str] = None,
     seq: int = 0,
     connect_timeout: Optional[int] = DEFAULT_CONNECT_TIMEOUT,
+    stop: Optional[threading.Event] = None,
 ) -> RunResult:
     """
     Synchronous public API for library users. `expected_diff` is the diff a
@@ -646,8 +669,10 @@ def run_for_target(
     same device (0 for the first): with `save_dir` the first is saved as
     `<name>.output` and a later one as `<name>.<seq+1>.output`, `.json` for
     a batch. `connect_timeout` bounds the TCP connect and the SSH banner on
-    the three SSH transports (never more than `session_timeout`); a connect
-    phase that runs out is tried again after a short pause.
+    the three SSH transports (never more than `session_timeout`; None leaves
+    them the session timeout, as before #126); a connect phase that runs
+    out is tried again after a short pause. `stop`, a threading.Event: once
+    it is set, the attempt in flight is the last (the CLI sets it on Ctrl-C).
     Returns: (device_name, success, output_text, duration_ms)
     """
     return _run_for_target_sync(
@@ -668,6 +693,7 @@ def run_for_target(
         payload_text=payload_text,
         seq=seq,
         connect_timeout=connect_timeout,
+        stop=stop,
     )
 
 
@@ -699,6 +725,7 @@ async def run_for_target_async(
     payload_text: Optional[str] = None,
     seq: int = 0,
     connect_timeout: Optional[int] = DEFAULT_CONNECT_TIMEOUT,
+    stop: Optional[threading.Event] = None,
 ) -> RunResult:
     """
     Async public API. Offloads the sync vendor calls to a thread.
@@ -723,6 +750,7 @@ async def run_for_target_async(
         payload_text=payload_text,
         seq=seq,
         connect_timeout=connect_timeout,
+        stop=stop,
     )
 
 

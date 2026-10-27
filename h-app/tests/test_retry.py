@@ -1,6 +1,7 @@
 """Retry classification and the attempt budget."""
 import os
 import sys
+import threading
 import time
 import pytest
 
@@ -307,3 +308,42 @@ def test_an_edit_whose_connect_phase_ran_out_is_tried_again(monkeypatch):
     with pytest.raises(ConnectTimeoutError):
         _retry_loop(dead, "r1", True, 3, lambda e: isinstance(e, NotAppliedError))
     assert len(calls) == 3
+
+
+def test_once_the_run_is_stopped_the_attempt_in_flight_is_the_last(monkeypatch, capsys):
+    """Ctrl-C (the CLI sets `stop`): a connect that runs out after it is a
+    NotAppliedError, and an edit tried again then could commit after the
+    operator stopped the run. Nothing is tried again, a read neither, and
+    nothing waits."""
+    pauses = []
+    monkeypatch.setattr(time, "sleep", pauses.append)
+    for should_retry in (lambda e: isinstance(e, NotAppliedError), lambda e: True):
+        stop, calls = threading.Event(), []
+
+        def dead():
+            calls.append(1)
+            stop.set()                       # Ctrl-C while this attempt is under way
+            raise ConnectTimeoutError("TCP connect to 10.0.0.1:22 timed out after 3s")
+
+        with pytest.raises(ConnectTimeoutError):
+            _retry_loop(dead, "r1", False, 3, should_retry, stop=stop)
+        assert calls == [1]
+    assert pauses == [] and "RETRY" not in capsys.readouterr().out
+
+
+def test_a_stop_during_the_pause_starts_no_new_attempt(monkeypatch):
+    stop, calls = threading.Event(), []
+    monkeypatch.setattr(time, "sleep", lambda _s: stop.set())       # Ctrl-C during the pause
+
+    def dead():
+        calls.append(1)
+        raise ConnectTimeoutError("no SSH banner from 10.0.0.1:22 within 3s")
+
+    with pytest.raises(ConnectTimeoutError):
+        _with_retry(dead, "r1", True, 3, stop=stop)
+    assert calls == [1]
+    stop.clear()
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    with pytest.raises(ConnectTimeoutError):
+        _with_retry(dead, "r1", True, 3, stop=stop)             # not set: every attempt, as before
+    assert len(calls) == 4

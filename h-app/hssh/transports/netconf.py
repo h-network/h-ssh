@@ -235,11 +235,12 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         "user": user,
         "port": port or DEFAULT_PORT,
         "gather_facts": False,
-        # PyEZ hands this to ncclient for the TCP connect; _ConnectSocket
-        # holds every address of the name to it together. On port 23 PyEZ
-        # opens a console over telnet instead, where it is the whole login's
-        # timeout, and that stays the session timeout.
-        "conn_open_timeout": session_timeout if str(port) == "23" else connect_s,
+        # PyEZ hands this to ncclient for the TCP connect and for the wait
+        # for the router's NETCONF hello (on port 23, a console over telnet,
+        # for the whole login): the session timeout. _ConnectSocket holds
+        # the TCP connect, every address of the name together, to what is
+        # left of the connect phase.
+        "conn_open_timeout": session_timeout,
         # A reply with a text node over 10 MB (a big configuration, a log
         # file) is rejected by lxml unless the parser is told to expect it.
         "huge_tree": True,

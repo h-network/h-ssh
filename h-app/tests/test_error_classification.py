@@ -187,9 +187,12 @@ def test_open_raises_a_connect_phase_that_ran_out_as_a_connect_timeout(monkeypat
         netconf._open("10.0.0.1", "u", "p", 2, 30, None, connect_timeout=5)    # never more than the session timeout
     assert made[0]["conn_open_timeout"] == 2
     assert netconf._DEADLINE.at is None and netconf._DEADLINE.connect_at is None
-    with pytest.raises(NotAppliedError):
-        netconf._open("10.0.0.1", "u", "p", 30, 30, 23, connect_timeout=5)
-    assert made[1]["conn_open_timeout"] == 30      # port 23 is PyEZ's console over telnet: its whole login
+    with pytest.raises(ConnectTimeoutError):
+        netconf._open("10.0.0.1", "u", "p", 30, 30, None, connect_timeout=5)
+    # ncclient waits as long for the router's hello (PyEZ's console on port
+    # 23 for its whole login): the session timeout; the socket holds the TCP
+    # connect to the connect phase.
+    assert made[1]["conn_open_timeout"] == 30
 
 
 def test_an_ipv6_literal_is_named_as_the_reason():
@@ -272,8 +275,24 @@ def _main_cancelled_after(delay):
     return asyncio.run(go())
 
 
-def _cli_env(monkeypatch, driver):
-    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
+class _CtrlC:
+    """cli.main() with a Ctrl-C a fake driver presses from inside its call:
+    the call is in flight when it comes, however slowly the run got there,
+    and runs out on its own half a second after."""
+
+    def run(self):
+        async def go():
+            self.loop, self.main = asyncio.get_running_loop(), asyncio.current_task()
+            return await cli.main()
+        return asyncio.run(go())
+
+    def press(self):
+        self.loop.call_soon_threadsafe(self.main.cancel)
+        time.sleep(0.5)
+
+
+def _cli_env(monkeypatch, driver, name="junos@netconf"):
+    monkeypatch.setitem(drivers.MODULES, name, driver)
     monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
@@ -289,14 +308,14 @@ def test_ctrl_c_during_a_connect_is_interrupted_not_failed(monkeypatch, capsys, 
         raise NotAppliedError("NETCONF connect failed: TCP connect to %s:830 timed out after 10s" % host)
     _cli_env(monkeypatch, types.SimpleNamespace(AVAILABLE=True, show=show))
     log = tmp_path / "run.jsonl"
-    # One attempt: a connect that ran out is tried again (#126), which here
-    # would only lengthen the wait for the verdict this test is about.
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u",
                                       "--target", "R1:10.0.0.1:junos", "--target", "R2:10.0.0.2:junos",
-                                      "--workers", "1", "--retries", "0", "-sC", "show version", "--log", str(log)])
+                                      "--workers", "1", "-sC", "show version", "--log", str(log)])
     rc = _main_cancelled_after(0.3)
     out, err = capsys.readouterr()
-    assert rc == 130 and seen == ["10.0.0.1"]
+    # A connect that ran out is tried again (#126), but not once the
+    # operator has stopped the run: its attempt in flight was its last.
+    assert rc == 130 and seen == ["10.0.0.1"] and "RETRY" not in out
     assert "R1" in out and "INTERRUPTED" in out and "FAIL" not in out
     assert "Interrupted. Completed 0 of 2 device(s); 1 interrupted while connecting." in err
     summary = json.loads(err.split("[h-ssh] ", 1)[1].splitlines()[0])
@@ -304,6 +323,51 @@ def test_ctrl_c_during_a_connect_is_interrupted_not_failed(monkeypatch, capsys, 
     line = json.loads(log.read_text().splitlines()[0])
     assert line["device"] == "R1" and line["ok"] is False and line["interrupted"] is True
     assert line["error"].startswith("interrupted while connecting: NETCONF connect failed")
+
+
+def test_an_edit_whose_connect_runs_out_after_ctrl_c_is_not_sent_again(monkeypatch, capsys):
+    """#126 made a connect that ran out a NotAppliedError, the one failure an
+    edit is tried again on: one that ran out after Ctrl-C was tried again
+    and committed after the operator had stopped the run ("R1 RETRY 1/2",
+    then "R1 OK COMMIT OK"). The attempt in flight runs out; no other starts."""
+    calls, ctrl_c = [], _CtrlC()
+
+    def edit(host, user, passwd, payload, st, ct, *a, **kw):
+        calls.append(host)
+        if len(calls) > 1:
+            return "COMMIT OK\n"
+        ctrl_c.press()                   # with this connect under way, which then runs out
+        raise ConnectTimeoutError(f"NETCONF connect failed: TCP connect to {host}:830 timed out after 3s")
+    _cli_env(monkeypatch, types.SimpleNamespace(AVAILABLE=True, edit=edit))
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-y",
+                                      "--target", "R1:10.0.0.1:junos", "--target", "R2:10.0.0.2:junos",
+                                      "--workers", "1", "-eC", "set system host-name x"])
+    rc = ctrl_c.run()
+    out, err = capsys.readouterr()
+    assert rc == 130 and calls == ["10.0.0.1"]
+    assert "INTERRUPTED" in out and "RETRY" not in out and "COMMIT OK" not in out
+    assert "Interrupted. Completed 0 of 2 device(s); 1 interrupted while connecting." in err
+
+
+def test_an_edit_that_applied_lines_before_a_connect_ran_out_is_failed_not_interrupted(monkeypatch, capsys):
+    """openssh sends a none-dialect edit a line an ssh. A later line whose
+    connect ran out after Ctrl-C was "interrupted while connecting", which
+    says nothing reached the device, and was counted with the interrupted:
+    the lines before it had been applied."""
+    ctrl_c = _CtrlC()
+
+    def edit(host, user, passwd, payload, st, ct, *a, **kw):
+        ctrl_c.press()                   # with line 2's connect under way
+        raise RuntimeError(f"TCP connect to {host}:22 timed out after 3s; the 1 line(s) before it were applied")
+    _cli_env(monkeypatch, types.SimpleNamespace(AVAILABLE=True, edit=edit), "none@openssh")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-y",
+                                      "--target", "R1:10.0.0.1:openssh", "-eC", "set a 1"])
+    rc = ctrl_c.run()
+    out, err = capsys.readouterr()
+    assert rc == 130 and "INTERRUPTED" not in out and "interrupted while connecting" not in out + err
+    assert "ERROR: TCP connect to 10.0.0.1:22 timed out after 3s; the 1 line(s) before it were applied" in out
+    summary = json.loads(err.split("[h-ssh] ", 1)[1].splitlines()[0])
+    assert summary["fail"] == 1 and summary["interrupted"] == 0
 
 
 def test_ctrl_c_after_the_session_was_up_keeps_a_real_failure(monkeypatch, capsys):

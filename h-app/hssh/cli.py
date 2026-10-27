@@ -14,6 +14,7 @@ import re
 import shlex
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1298,10 +1299,12 @@ async def main() -> int:
                 fmt=args.format,
                 expected_diff=expected_diff,
                 seq=seq,
+                stop=stopped,
             )
 
     started = set()      # unit indices whose device may already be in play
     inflight = set()     # of those, the ones still running when Ctrl-C came
+    stopped = threading.Event()      # set on Ctrl-C: an attempt in flight is that device's last
 
     async def _run_unit(i, dry_run=None, expected_diff=None):
         """units[i] on its device, in its own mode and command for a job
@@ -1400,6 +1403,10 @@ async def main() -> int:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 interrupted = True
+                # A device whose attempt fails from here on is not tried
+                # again: a connect that ran out is a NotAppliedError, and an
+                # edit retried after the operator stopped the run could commit.
+                stopped.set()
                 for i, task in enumerate(tasks):
                     if i not in started and task in pending:
                         task.cancel()

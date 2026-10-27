@@ -26,11 +26,17 @@ _TIMED_OUT = re.compile(r"tcp connect to \S+ timed out after [\d.]+s"
                         r"|connect to host \S+ port \d+: connection timed out"
                         r"|connection timed out during banner exchange")
 
+# What an edit sent a line at a time (openssh's none dialect, one ssh a
+# line) adds when a later line's connect runs out: the lines before it
+# reached the device, so the failure is no longer one where nothing was sent.
+_APPLIED = "line(s) before it were applied"
+
 
 def budget(connect_timeout, session_timeout):
     """The connect phase's seconds: --connect-timeout, never more than
-    --session-timeout."""
-    return min(connect_timeout, session_timeout)
+    --session-timeout; with no connect timeout (None), the session
+    timeout, as before #126."""
+    return session_timeout if connect_timeout is None else min(connect_timeout, session_timeout)
 
 
 def where(host, port) -> str:
@@ -66,7 +72,20 @@ def answered(err: OSError, at: str) -> str:
     return f"TCP connect to {at} failed: {getattr(err, 'strerror', None) or err}"
 
 
+def after_applied(err, lines: int) -> str:
+    """`err`, a connect phase that ran out, after `lines` lines of an edit
+    were applied."""
+    return f"{err}; the {lines} {_APPLIED}"
+
+
+def applied(text) -> bool:
+    """True when `text` says lines of an edit reached the device before
+    its connect ran out."""
+    return _APPLIED in str(text).lower()
+
+
 def timed_out(text) -> bool:
-    """True when `text` says the connect phase ran out: no TCP answer, or
-    no SSH banner, in time."""
-    return _TIMED_OUT.search(str(text).lower()) is not None
+    """True when `text` says the connect phase ran out, no TCP answer or no
+    SSH banner in time, with nothing sent: not after lines were applied."""
+    text = str(text).lower()
+    return not applied(text) and _TIMED_OUT.search(text) is not None

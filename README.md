@@ -54,7 +54,7 @@ lands in a JSONL audit trail.
                     └──────────── every edit ──────────────────┴──▶ --audit-log (JSONL)
 ```
 
-On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted, the file read as the `ssh` transport reads it: its `@cert-authority` lines are passed over, and a key it marks `@revoked` is refused (`host key verification failed for HOST:PORT: its key is marked @revoked in FILE`). With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT` or `no route to host HOST:PORT` (what the OS answered the TCP connect, where ncclient says only "Could not open socket"), `TCP connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns`, `no SSH session to HOST:PORT within Ns: the banner came, but key exchange did not finish`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication, the NETCONF hello — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts; within it `--connect-timeout` (3 s) bounds the TCP connect and the banner together, so a router that does not answer, or accepts TCP and then says nothing, costs 3 s an attempt and is tried again (see [Failure handling](#failure-handling)). An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted, the file read as the `ssh` transport reads it: its `@cert-authority` lines are passed over, and a key it marks `@revoked` is refused (`host key verification failed for HOST:PORT: its key is marked @revoked in FILE`). With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT` or `no route to host HOST:PORT` (what the OS answered the TCP connect, where ncclient says only "Could not open socket"), `TCP connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns`, `no SSH session to HOST:PORT within Ns: the banner came, but key exchange did not finish`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts, and the router's NETCONF hello after it has `--session-timeout` of its own. Within that deadline `--connect-timeout` (3 s) bounds the TCP connect and the banner together, so a router that does not answer, or accepts TCP and then says nothing, costs 3 s an attempt and is tried again (see [Failure handling](#failure-handling)); a slow key exchange, login or hello still has the session timeout. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
 
 ## Install
 
@@ -320,12 +320,14 @@ connection is refused before anything is sent, naming the file, the line number 
 does not have; an `@revoked` line that cannot be read is refused the same way, so a revocation is
 never dropped. The TCP connect and the SSH banner get `--connect-timeout` between them; running out
 there is `TCP connect to HOST:PORT timed out after Ns` or `no SSH banner from HOST:PORT within Ns`, and
-is tried again. A refusal, no route or a name that does not resolve is said as the OS said it
+is tried again. A refusal, no route or a name the resolver says does not exist is said as the OS said it
 (`connection refused by HOST:PORT`, `no route to host HOST:PORT`, `cannot resolve HOST`, where paramiko
-said `[Errno None] Unable to connect to port 22 on HOST`) and is not. The key exchange gets
-`--session-timeout`, not paramiko's fixed 15 s; one that has not finished by then is `no SSH session to
-HOST within Ns: the banner came, but key exchange did not finish`, as on `openssh`, and is not retried;
-a server that drops the session there is named the same way and retried.
+said `[Errno None] Unable to connect to port 22 on HOST`) and is not; a lookup that failed otherwise, a
+resolver that did not answer in time above all, is said in its words too (`name lookup for HOST failed:
+Temporary failure in name resolution`) and is tried again, an edit too: nothing was sent. The key
+exchange gets `--session-timeout`, not paramiko's fixed 15 s; one that has not finished by then is `no
+SSH session to HOST within Ns: the banner came, but key exchange did not finish`, as on `openssh`, and
+is not retried; a server that drops the session there is named the same way and retried.
 
 ### `openssh` — for hosts where you cannot install anything
 
@@ -334,7 +336,7 @@ auth, and `SSH_ASKPASS` for password auth, because OpenSSH refuses to read a pas
 The password reaches OpenSSH through a helper it execs itself, on a channel the session never
 touches — never through the terminal, where device output and auth prompts would share one stream.
 Batch work reuses one TCP connection and one authentication through OpenSSH connection multiplexing
-(`ControlMaster`), so each command still comes back cleanly separated. OpenSSH's `ConnectTimeout` bounds the TCP connect and the banner, and it is `--connect-timeout`; nothing in OpenSSH bounds a key exchange that hangs after the banner, so the driver keeps its own clock: ssh's `-v` log (written to a private file with `-E`, never mixed into the device's output) says how far the connection got and when the session is up. No TCP connection, or no banner, within `--connect-timeout` is `TCP connect to HOST:PORT timed out after Ns` or `no SSH banner from HOST:PORT within Ns` (the same words when ssh's own `ConnectTimeout` fires first), and is tried again; a session that is not up within `--session-timeout` is abandoned then (`no SSH session to HOST within Ns: the banner came, but key exchange or authentication did not finish`), and `--command-timeout` starts the moment the session is up, not at process start. Through a `ProxyJump` or a `ProxyCommand` the connect timeout covers reaching the device's banner through the jump, as OpenSSH's own does: raise it for a slow jump host. A batch is one `ssh` per command, so a batch whose connect runs out ends there, as one failure, instead of spending a connect timeout on every command. ssh's own diagnostics come from that log; the `STDERR:` block of an output is the device's.
+(`ControlMaster`), so each command still comes back cleanly separated. OpenSSH's `ConnectTimeout` bounds the TCP connect and the banner, and it is `--connect-timeout`; nothing in OpenSSH bounds a key exchange that hangs after the banner, so the driver keeps its own clock: ssh's `-v` log (written to a private file with `-E`, never mixed into the device's output) says how far the connection got and when the session is up. No TCP connection, or no banner, within `--connect-timeout` is `TCP connect to HOST:PORT timed out after Ns` or `no SSH banner from HOST:PORT within Ns` (the same words when ssh's own `ConnectTimeout` fires first), and is tried again; a session that is not up within `--session-timeout` is abandoned then (`no SSH session to HOST within Ns: the banner came, but key exchange or authentication did not finish`), and `--command-timeout` starts the moment the session is up, not at process start. Through a `ProxyJump` or a `ProxyCommand` the connect timeout covers reaching the device's banner through the jump, as OpenSSH's own does: raise it for a slow jump host. A batch is one `ssh` per command, so a batch whose connect runs out before any command ran ends there, as one failure, instead of spending a connect timeout on every command; once a command has its result, the results stand, and a later command whose connect runs out is that command's failure. ssh's own diagnostics come from that log; the `STDERR:` block of an output is the device's.
 
 Password auth needs OpenSSH 8.4+ for `SSH_ASKPASS_REQUIRE=force`; older clients are refused rather
 than silently falling back to a terminal prompt. Key auth has no such floor.
@@ -495,8 +497,8 @@ on `junos`, `ssh` and `openssh`, 3 s by default and never more than `session_tim
 is tried again after half a second and then a second, so three attempts take about 10 s, where it cost
 30 s on `junos` and `openssh` and about 94 s on `ssh`. A healthy sshd sends its banner within about
 100 ms of the TCP connect (the lab's cRPDs did, 254 at once), so 3 s leaves room; raise it for a slow
-link or a jump host. `session_timeout` (30 s) is what the key exchange and the login get once the
-device has answered, and all of a telnet login.
+link or a jump host. `session_timeout` (30 s) is what the key exchange, the login and the NETCONF
+hello get once the device has answered, and all of a telnet login.
 
 **Passwords are never read from this file.** A config file on a shared jump host is the wrong place
 for a secret; a `password`, `passwd`, `secret`, `token` or `pass` line is refused with exit 2 naming
@@ -697,7 +699,7 @@ classified before anything is retried:
 | Failure | Behaviour |
 |---|---|
 | No answer in the connect phase — no TCP answer, or no SSH banner, within `--connect-timeout` (`TCP connect to HOST:PORT timed out after Ns`, `no SSH banner from HOST:PORT within Ns`) | retried on `junos`, `ssh` and `openssh`, `--retries` times, after 0.5 s and then 1 s; nothing was sent, so an edit is retried too (a show that acts on the device keeps its one attempt). `telnet*` (frozen) keeps `--session-timeout` for its connect and retries the socket's bare `timed out` with the usual pauses |
-| A clear answer in the connect phase — refused, no route, network unreachable, a name that does not resolve (`connection refused by HOST:PORT`, `no route to host HOST:PORT`, `cannot resolve HOST`) | fail immediately (on `telnet*` an unresolvable name is still retried: the socket's bare `Name or service not known` matches no marker) |
+| A clear answer in the connect phase — refused, no route, network unreachable, a name that does not resolve (`connection refused by HOST:PORT`, `no route to host HOST:PORT`, `cannot resolve HOST`) | fail immediately (on `telnet*` an unresolvable name is still retried: the socket's bare `Name or service not known` matches no marker). On `ssh` only a name the resolver says does not exist is `cannot resolve HOST`; a lookup that failed otherwise, a resolver that did not answer in time above all (`name lookup for HOST failed: Temporary failure in name resolution`), is retried after 1 s and then 3 s, an edit too |
 | A key exchange that `--session-timeout` ran out on after the banner (`no SSH session to HOST within Ns: the banner came, but key exchange did not finish`) | fail immediately |
 | Authentication, host key, rejected command | fail immediately |
 | The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a pin file another h-ssh run keeps locked (`ssh`: `~/.h-ssh/known_hosts is locked by another h-ssh run`), a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
@@ -716,7 +718,7 @@ reports that nothing reached the device: a connect phase that got no answer, and
 candidate-lock failure, over NETCONF or a refused `configure exclusive`. Any other failure — above all
 a timeout around a commit — is reported once and left for you to check. (A none-dialect edit over
 `openssh` sends each line as its own `ssh`: a connect that runs out after a line was applied is
-reported, not retried.)
+reported, not retried, and after Ctrl-C it is a failure, not interrupted: lines reached the device.)
 
 Retrying an authentication failure cannot succeed either, and on a fleet it spends three real login
 attempts per device against accounts that may lock out. Those stop at one.
@@ -727,13 +729,14 @@ a thread; h-ssh sizes the executor to `--workers` rather than leaving it at asyn
 device that does not answer holds one of those six through every attempt.
 
 Ctrl-C stops starting new devices and lets the calls already in flight run out: a commit that was on
-its way to a router is reported, logged and audited like any other, never dropped. The run then
-reports how many devices completed (`Interrupted. Completed 1 of 3 device(s).`, on stderr) and exits
-`130`. Output already written to stdout stays valid, so a truncated `--raw` run cannot look like a
-complete one. A device that was still being connected to when Ctrl-C came, and whose connect then
-ran out on its own (its attempts too: about 10 s at most at the defaults), is reported as
-`INTERRUPTED` rather than `FAIL`: nothing reached it and the operator stopped the run. Its entry
-carries `interrupted: true`, its error starts with `interrupted while connecting:`, the notice says
+its way to a router is reported, logged and audited like any other, never dropped. Nothing is tried
+again after it: the attempt in flight is that device's last, so an edit whose connect runs out after
+Ctrl-C is not sent again once you have stopped the run. The run then reports how many devices
+completed (`Interrupted. Completed 1 of 3 device(s).`, on stderr) and exits `130`. Output already
+written to stdout stays valid, so a truncated `--raw` run cannot look like a complete one. A device
+that was still being connected to when Ctrl-C came, and whose connect then ran out on its own, is
+reported as `INTERRUPTED` rather than `FAIL`: nothing reached it and the operator stopped the run.
+Its entry carries `interrupted: true`, its error starts with `interrupted while connecting:`, the notice says
 `; N interrupted while connecting`, and the summary gains an `interrupted` count. With `--json` there is no notice: the array holds only the devices that completed, the
 summary's `targets` is that count, and the exit code is still `130`.
 
@@ -949,8 +952,10 @@ commit-status types are also still the text or list the drivers always returned 
 
 Connection and command timeouts are separate knobs — a slow login and a slow `show route extensive` are different problems.
 `run_for_target()` and every function of the three SSH transports take `connect_timeout=` as well (3 by default):
-the TCP connect and the SSH banner, never more than the session timeout. A transport function that runs out
-there raises `hssh.errors.ConnectTimeoutError`, a `NotAppliedError`: nothing was sent.
+the TCP connect and the SSH banner, never more than the session timeout (`None` leaves them the session timeout).
+A transport function that runs out there raises `hssh.errors.ConnectTimeoutError`, a `NotAppliedError`: nothing
+was sent. `run_for_target(stop=)` takes a `threading.Event`: once it is set, the attempt in flight is the
+device's last, as after the CLI's Ctrl-C.
 
 ### Transactions, comments, commit status
 
@@ -1087,7 +1092,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1150 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1162 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

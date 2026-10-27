@@ -52,7 +52,8 @@ from ..dialects.base import Dialect
 from ..drivers import results as R
 from ..errors import ConnectTimeoutError, NotAppliedError
 from .cli import Cli, edit_policy, refuse_commit_lines
-from .connect import DEFAULT as DEFAULT_CONNECT_TIMEOUT, budget, no_banner, tcp_timed_out, where
+from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, after_applied, budget, no_banner, tcp_timed_out,
+                      where)
 
 AVAILABLE = shutil.which("ssh") is not None
 
@@ -605,8 +606,10 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
                 except ConnectTimeoutError as exc:
                     if edit and i:
                         # The lines before it were applied: no longer
-                        # nothing-was-sent, so the edit is not tried again.
-                        raise RuntimeError(f"{exc}; the {i} line(s) before it were applied") from exc
+                        # nothing-was-sent, so the edit is not tried again,
+                        # and after Ctrl-C it is not "interrupted while
+                        # connecting" either.
+                        raise RuntimeError(after_applied(exc, i)) from exc
                     raise
                 except OSError as exc:
                     raise RuntimeError("SSH transport failed: %s" % exc)
@@ -708,9 +711,12 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                port: int = None, vendor_hint: str = None,
                connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
     """Execute multiple commands over one multiplexed SSH connection. A
-    connect phase that runs out ends the batch as one failure, as on the
-    other transports, where a batch has one connection: each command after
-    it would cost another connect timeout for the same silence (#126)."""
+    connect phase that runs out before any command ran ends the batch as
+    one failure, as on the other transports, where a batch has one
+    connection: each command after it would cost another connect timeout
+    for the same silence (#126). Once a command has its result, the results
+    stand: a connect that runs out after that is that command's failure,
+    and the batch goes on."""
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
@@ -734,9 +740,9 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                     else:
                         results.append({"command": cmd, "ok": True,
                                         "output": _format(cmd, proc)})
-                except ConnectTimeoutError:
-                    raise
                 except Exception as exc:
+                    if isinstance(exc, ConnectTimeoutError) and not results:
+                        raise           # nothing ran: one failure, which may be tried again
                     results.append({"command": cmd, "ok": False, "error": str(exc)})
             return R.BatchResult(results)
     finally:

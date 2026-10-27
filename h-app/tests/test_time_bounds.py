@@ -7,6 +7,7 @@ import asyncio
 import errno
 import inspect
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -454,6 +455,174 @@ def test_the_connect_phase_never_gets_more_than_the_session_timeout(listening, m
     assert time.monotonic() - started < 2.5
 
 
+# A NETCONF server's hello, base:1.0 only, so both sides frame with ]]>]]>.
+_NETCONF_HELLO = (b'<hello xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><capabilities>'
+                  b'<capability>urn:ietf:params:netconf:base:1.0</capability></capabilities>'
+                  b'<session-id>1</session-id></hello>]]>]]>')
+
+
+@pytest.fixture
+def late_sshd():
+    """late_sshd(kex=, login=, hello=) -> the port of an SSH server on
+    127.0.0.1 whose banner comes at once and whose key exchange, login or
+    NETCONF hello comes that many seconds late: a proxy in front holds what
+    the server says after its banner, the password is answered late, the
+    hello is said late. paramiko lets anyone in with a password; an exec
+    answers "fake COMMAND", the netconf subsystem a <command> with
+    "fake version" and a <close-session> with <ok/>."""
+    paramiko = pytest.importorskip("paramiko")
+    key = paramiko.ECDSAKey.generate()
+    opened, transports = [], []
+
+    class Sshd(paramiko.ServerInterface):
+        def __init__(self, login, hello):
+            self.login, self.hello = login, hello
+
+        def get_allowed_auths(self, username):
+            return "password"
+
+        def check_auth_password(self, username, password):
+            time.sleep(self.login)
+            return paramiko.AUTH_SUCCESSFUL
+
+        def check_channel_request(self, kind, chanid):
+            return paramiko.OPEN_SUCCEEDED
+
+        def check_channel_exec_request(self, channel, command):
+            def run():
+                channel.sendall(b"fake " + command + b"\n")
+                channel.send_exit_status(0)
+                channel.shutdown_write()
+            threading.Thread(target=run, daemon=True).start()
+            return True
+
+        def check_channel_subsystem_request(self, channel, name):
+            if name != "netconf":
+                return False
+
+            def run():
+                time.sleep(self.hello)
+                channel.sendall(_NETCONF_HELLO)
+                pending = b""
+                while True:
+                    data = channel.recv(65536)
+                    if not data:
+                        return
+                    pending += data
+                    while b"]]>]]>" in pending:
+                        message, pending = pending.split(b"]]>]]>", 1)
+                        mid = re.search(rb'message-id="([^"]+)"', message)
+                        if mid is None:
+                            continue                         # the client's hello
+                        reply = (b'<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="'
+                                 + mid.group(1) + b'">')
+                        if b"close-session" in message:
+                            channel.sendall(reply + b"<ok/></rpc-reply>]]>]]>")
+                            channel.close()
+                            return
+                        channel.sendall(reply + b"<output>fake version</output></rpc-reply>]]>]]>")
+            threading.Thread(target=run, daemon=True).start()
+            return True
+
+    def listen():
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        opened.append(srv)
+        return srv
+
+    def pump(src, dst, hold):
+        """src to dst; with `hold`, the first line (the banner) at once and
+        the rest `hold` seconds later."""
+        try:
+            if hold:
+                line = b""
+                while not line.endswith(b"\n"):
+                    byte = src.recv(1)
+                    if not byte:
+                        return
+                    line += byte
+                dst.sendall(line)
+                time.sleep(hold)
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    return
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (src, dst):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def make(kex=0.0, login=0.0, hello=0.0):
+        sshd, front = listen(), listen()
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = sshd.accept()
+                except OSError:
+                    return
+                t = paramiko.Transport(conn)
+                t.add_server_key(key)
+                transports.append(t)
+                try:
+                    t.start_server(server=Sshd(login, hello))
+                except (paramiko.SSHException, EOFError, OSError):
+                    pass
+
+        def proxy():
+            while True:
+                try:
+                    client, _ = front.accept()
+                except OSError:
+                    return
+                server = socket.create_connection(sshd.getsockname())
+                opened.extend((client, server))
+                threading.Thread(target=pump, args=(server, client, kex), daemon=True).start()
+                threading.Thread(target=pump, args=(client, server, 0), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        threading.Thread(target=proxy, daemon=True).start()
+        return front.getsockname()[1]
+    yield make
+    for t in transports:
+        t.close()
+    for s in opened:
+        s.close()
+
+
+@pytest.mark.parametrize("late", ["kex", "login"])
+def test_ssh_gives_what_comes_after_the_banner_the_session_timeout(late_sshd, late, monkeypatch, tmp_path):
+    """Only the TCP connect and the banner have --connect-timeout: a key
+    exchange or a login slower than that (a busy RE) has the session
+    timeout, as it had before #126."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    port = late_sshd(**{late: 1.5})
+    started = time.monotonic()
+    out = ssh.show("127.0.0.1", "u", "p", "show version", 30, 10, port=port, connect_timeout=1)
+    assert out == "$ show version\nfake show version\n"
+    assert time.monotonic() - started >= 1.5
+
+
+@pytest.mark.parametrize("late", ["kex", "login", "hello"])
+def test_junos_gives_what_comes_after_the_banner_the_session_timeout(late_sshd, late):
+    """The same on NETCONF, the hello too: ncclient waits for the router's
+    hello as long as PyEZ's conn_open_timeout, which had the connect
+    timeout, so a hello 1.5 s late at --connect-timeout 1 was "Capability
+    exchange timed out", and failed for good."""
+    pytest.importorskip("jnpr.junos")
+    port = late_sshd(**{late: 1.5})
+    started = time.monotonic()
+    out = netconf.show("127.0.0.1", "u", "p", "show version", 30, 10, port=port, connect_timeout=1)
+    assert out == "fake version"
+    assert time.monotonic() - started >= 1.5
+    netconf.wait_for_closes(5)
+
+
 @pytest.mark.parametrize("vendor, said", [("junos", "NETCONF connect failed: connection refused by 127.0.0.1:{port}"),
                                           ("ssh", "connection refused by 127.0.0.1:{port}")])
 def test_a_refused_port_fails_once_at_once_in_the_oss_words(listening, monkeypatch, tmp_path, capsys, vendor, said):
@@ -532,17 +701,45 @@ def test_the_runner_hands_the_connect_timeout_to_every_function_that_takes_it(mo
         assert "connect_timeout" not in inspect.signature(getattr(telnet, name)).parameters
     seen = []
 
-    def takes(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, connect_timeout=None):
+    def takes(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, connect_timeout="its own"):
         seen.append(connect_timeout)
         return "ok"
 
     def plain(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None):
         seen.append("plain")
         return "ok"
-    for show, kw in ((takes, {"connect_timeout": 7}), (takes, {}), (plain, {"connect_timeout": 7})):
+    for show, kw in ((takes, {"connect_timeout": 7}), (takes, {}), (takes, {"connect_timeout": None}),
+                     (plain, {"connect_timeout": 7})):
         monkeypatch.setitem(drivers.MODULES, "none@ssh", types.SimpleNamespace(AVAILABLE=True, show=show))
         assert _run("ssh", None, **kw).ok
-    assert seen == [7, 1, "plain"]
+    assert seen == [7, 1, None, "plain"]          # None as given: the session timeout, below
+
+
+def test_a_connect_timeout_of_none_gives_the_connect_phase_the_session_timeout(listening, fake_ssh,
+                                                                              monkeypatch, tmp_path):
+    """A library caller's connect_timeout=None was a TypeError on all three
+    transports ('<' not supported between instances of 'int' and
+    'NoneType'): it is the connect phase with no clock of its own, the
+    session timeout's, as before #126."""
+    pytest.importorskip("paramiko")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    port = listening("refused")
+    with pytest.raises(RuntimeError, match=rf"^connection refused by 127\.0\.0\.1:{port}$"):
+        ssh.show("127.0.0.1", "u", "p", "show version", 30, 10, port=port, connect_timeout=None)
+    if netconf.AVAILABLE:
+        with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: connection refused by "
+                                                  rf"127\.0\.0\.1:{port}$"):
+            netconf.show("127.0.0.1", "u", "p", "show version", 30, 10, port=port, connect_timeout=None)
+    seen = []
+    real = subprocess.Popen
+
+    def spy(argv, **kwargs):
+        seen.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    assert "device output" in openssh.show("h", "u", None, "show version", 7, 10, connect_timeout=None)
+    assert "ConnectTimeout=7" in seen[0]
+    assert "ConnectTimeout=7" in openssh.ssh_command_line("h", "u", "show version", 7, connect_timeout=None)
 
 
 def test_opensshs_connect_timeout_is_the_connect_timeout(fake_ssh, monkeypatch):
@@ -602,11 +799,10 @@ def test_an_openssh_batch_whose_connect_runs_out_fails_as_one(fake_ssh, monkeypa
     assert time.monotonic() - started < 2.5            # one connect timeout, not one a command
 
 
-def test_an_openssh_edit_whose_second_line_gets_no_answer_is_not_tried_again(tmp_path, monkeypatch):
-    """The none dialect sends each line as its own ssh. A connect that runs
-    out before the first line sent nothing, and is tried again, an edit too;
-    one that runs out after a line was applied did send something: it is
-    reported, never repeated."""
+def _ssh_that_answers_once(tmp_path, monkeypatch, said):
+    """A stub ssh whose first run is a session that prints `said` and exits
+    0, and whose every later run gets no TCP answer. Returns the file that
+    counts the runs."""
     count = tmp_path / "count"
     bindir = tmp_path / "bin"
     bindir.mkdir()
@@ -616,13 +812,36 @@ def test_an_openssh_edit_whose_second_line_gets_no_answer_is_not_tried_again(tmp
         'while [ $# -gt 0 ]; do case "$1" in -E) shift; LOG="$1";; esac; shift; done\n'
         f'n=$(cat {shlex.quote(str(count))} 2>/dev/null || echo 0); n=$((n + 1)); echo $n > {shlex.quote(str(count))}\n'
         'if [ "$n" -eq 1 ]; then echo "Authenticated to h ([10.0.0.1]:22) using publickey." >> "$LOG"; '
-        'echo applied; exit 0; fi\n'
+        f'echo {shlex.quote(said)}; exit 0; fi\n'
         'echo "debug1: Connecting to h port 22." >> "$LOG"\n'
         'sleep 5\n'
         'exit 255\n')
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
     monkeypatch.setattr(openssh, "AVAILABLE", True)
+    return count
+
+
+def test_an_openssh_batch_keeps_what_ran_before_a_connect_ran_out(tmp_path, monkeypatch):
+    """Once a command has run, a connect that runs out after it is that
+    command's failure: the whole batch was thrown away as one connect
+    timeout, a reboot's record and output with it, and a batch that acts
+    on the device gets no second attempt to bring them back."""
+    count = _ssh_that_answers_once(tmp_path, monkeypatch, "rebooting")
+    results = openssh.show_batch("h", "u", None, ["request system reboot", "show chassis alarms"], 30, 10,
+                                 connect_timeout=1)
+    assert list(results) == [
+        {"command": "request system reboot", "ok": True, "output": "$ request system reboot\nrebooting"},
+        {"command": "show chassis alarms", "ok": False, "error": "TCP connect to h:22 timed out after 1s"}]
+    assert count.read_text().strip() == "2"
+
+
+def test_an_openssh_edit_whose_second_line_gets_no_answer_is_not_tried_again(tmp_path, monkeypatch):
+    """The none dialect sends each line as its own ssh. A connect that runs
+    out before the first line sent nothing, and is tried again, an edit too;
+    one that runs out after a line was applied did send something: it is
+    reported, never repeated."""
+    count = _ssh_that_answers_once(tmp_path, monkeypatch, "applied")
     monkeypatch.setattr(runner.time, "sleep", lambda s: None)
     result = runner.run_for_target(
         t=Target("R1", "h", "openssh"), transport="openssh", mode="edit-cmd", show_cmd=None,
@@ -632,6 +851,9 @@ def test_an_openssh_edit_whose_second_line_gets_no_answer_is_not_tried_again(tmp
     assert not result.ok
     assert result.error == "TCP connect to h:22 timed out after 1s; the 1 line(s) before it were applied"
     assert count.read_text().strip() == "2"            # the first line, the second, and no attempt after
+    # Something reached the device: not a connect failure (after Ctrl-C the
+    # CLI called it "interrupted while connecting"), nor one to try again.
+    assert not is_connect_failure(result.error) and not is_connect_timeout(result.error)
 
 
 def test_ssh_says_what_the_os_answered_the_tcp_connect(monkeypatch, tmp_path):
@@ -657,6 +879,32 @@ def test_ssh_says_what_the_os_answered_the_tcp_connect(monkeypatch, tmp_path):
         ssh.show("r1.lab", "u", "p", "show version", 30, 10)
     assert is_permanent_failure(failed.value) and is_connect_failure(failed.value)
     assert not is_connect_timeout(failed.value)
+
+
+def test_a_resolver_that_did_not_answer_in_time_is_tried_again_on_ssh(monkeypatch, tmp_path, capsys):
+    """Only a name the resolver says does not exist is "cannot resolve HOST",
+    which fails once. EAI_AGAIN (no answer from the resolver in time) was
+    that too, so a DNS hiccup failed the device after one attempt where it
+    had been tried again. Said in the OS's words, nothing sent: tried again,
+    an edit too."""
+    paramiko = pytest.importorskip("paramiko")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lookups = []
+
+    def lookup(self, **kw):
+        lookups.append(kw["hostname"])
+        raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    monkeypatch.setattr(paramiko.SSHClient, "connect", lookup)
+    said = "name lookup for r1.lab failed: Temporary failure in name resolution"
+    with pytest.raises(NotAppliedError, match=f"^{said}$") as failed:
+        ssh.show("r1.lab", "u", "p", "show version", 30, 10)
+    assert not is_permanent_failure(failed.value) and is_connect_failure(failed.value)
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    lookups.clear()
+    result = _run("ssh", None, t=Target("R1", "r1.lab", "ssh"), mode="edit-cmd", show_cmd=None,
+                  edit_cmd="set a 1", quiet=False)
+    assert not result.ok and result.error == said and lookups == ["r1.lab"] * 3
+    assert f"RETRY 2/2 in 3s ({said})" in capsys.readouterr().out
 
 
 def test_the_socket_ncclient_opens_keeps_the_oss_answer_and_the_connect_phases_clock(listening):
