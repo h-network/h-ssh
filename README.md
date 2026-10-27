@@ -190,8 +190,8 @@ A password means the same on every transport: it is the credential, and no `~/.s
 |---|---|---|
 | `-sC` | Show | Run a show/display command (or a template name): one line of text, so a line break or another control character in it is refused (exit 2). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` (exit 2, nothing sent) |
 | `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL) is refused (exit 2) |
-| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written; an edit typed at an IOS-shaped CLI (`telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) also skips a full-line `!` comment; on the plain `ssh` and `openssh` drivers every non-blank line is sent as a command, a `#` line too. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
-| `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`) |
+| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped on every driver, nothing else is touched, so `community ab#12` goes as written; an edit typed at an IOS-shaped CLI (`telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) also skips a full-line `!` comment. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3). A `<NAME>.set` with nothing in it but blank lines and `#` comments ends the run the same way on every driver, `--allow-missing` or not |
+| `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`; a file with nothing else in it ends the run before anything is sent, exit 2) |
 | `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
 | `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt` (or `NAME`; a name with a `/` is a path), or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused) |
@@ -795,13 +795,12 @@ Two rules the file cannot bend:
   runs. The password comes from `HSSH_PASSWORD` or the prompt when stdin is a terminal, exactly as
   without a file, so a run file can live in git or on a shared jump host.
 - **Changes need a timer.** A run started with `--run` that commits (an `edit`, `edit-dir`,
-  `edit-broadcast`, `rollback` or job edit in the file, or `-eC`, `-eD`, `-eB` or `--rollback` on the
-  command line) must set `commit-confirmed` in the file or on the command line, or be a `dry-run`;
-  otherwise exit 2. A confirm (`edit: commit`) needs no timer. Nobody watches a pipeline, and an
-  unattended commit without a rollback timer is the one thing it must not be able to do by accident.
-  A `--job` file typed on the command line beside `--run` is not checked: give it the timer yourself.
-  The `y/N` question and `-y` work as they do for flags, and the banner names the file, the device
-  count and the timer.
+  `edit-broadcast`, `rollback` or job edit in the file, or `-eC`, `-eD`, `-eB`, `--rollback` or a
+  `--job` file's edit on the command line) must set `commit-confirmed` in the file or on the command
+  line, or be a `dry-run`; otherwise exit 2. A confirm (`edit: commit`) needs no timer. Nobody watches
+  a pipeline, and an unattended commit without a rollback timer is the one thing it must not be able
+  to do by accident. The `y/N` question and `-y` work as they do for flags, and the banner names the
+  file, the device count and the timer.
 
 The file is declarative: no variables, loops or templating. A pipeline that needs them generates the
 file. YAML needs PyYAML, which comes along with junos-eznc, so every install has it; a JSON run file needs nothing.
@@ -813,7 +812,7 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | *(none)* | one status line per device, plus the verdict and diff under it for edits |
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
-| `--json` | one object per device (per entry for a `--job`): `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show (`output` only for a job's show entry), a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, a `commits` list for `--commit-status`, `error` for a failure; with `--diff` on a show or a batch the objects come in target order and, when two or more are `ok`, each of those has a `diff` against the first of them, the baseline: the unified diff or `(identical)`, for a batch a list of `{command, diff}` (`(baseline)` on the baseline itself). `--probe` alone prints the probe's records instead (see [The probe](#the-probe)) |
+| `--json` | one object per device (per entry for a `--job`): `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show (a job's show entry too), a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, a `commits` list for `--commit-status`, `error` for a failure; with `--diff` on a show or a batch the objects come in target order and, when two or more are `ok`, each of those has a `diff` against the first of them, the baseline: the unified diff or `(identical)`, for a batch a list of `{command, diff}` (`(baseline)` on the baseline itself). `--probe` alone prints the probe's records instead (see [The probe](#the-probe)) |
 | `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (the NETCONF `junos` driver only; `junos@ssh`, `junos@openssh` and every other driver refuse it, nothing sent, a FAIL of that device): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2), under `--dry-run` too |
 
 A reader that stops early (`h-ssh ... | head`) is not an error and gets no traceback: whatever had
@@ -847,8 +846,7 @@ Junos: 24.2R1-S2.5
 `--raw` is exclusive with `-v` and with `--json`; asking for either pair is an error rather than a
 silent preference (`--json -v` is accepted: the JSON is printed as without `-v`, which only lets paramiko's and ncclient's log records, their tracebacks among them, through to stderr). The command echo (`$ show version`) belongs to the framed view — `--raw` and `--json`
 both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
-`output` (a `--job`'s show entries are the exception: no `command` field, and on `ssh` and `openssh`
-the echo stays in `output`, in `--raw` and in the store).
+`output`.
 
 `--save-output DIR` makes DIR (0700) and writes one file into it per device that ran or that the probe
 found dead (0600, never redacted; none for a device the safety gate held back or `--allow-missing` left
@@ -886,10 +884,13 @@ store, `--log`, `--json` and the audit log hold the same bytes whether the run w
 terminal or a pipe, the reply's own line endings included (a show over SSH from a device that ends
 its lines with CRLF keeps them there and on `--raw` to a pipe; telnet hands its lines over with LF),
 and `h-ssh-store` hands a pipe or an `export --out` file the rows as they were kept. The file is
-created 0600, opened and its tables made before the first device: a store that cannot be written is
-no run (exit 2, nothing sent), because a run nobody can look up afterwards is not worth having. A
-run refused after the store was opened (`--raw -v`, an edit with no terminal and no `-y`) still
-leaves the file, with no row for it. A
+created 0600, opened and its tables made before the first device, after the checks that need no
+file: a store that cannot be written is no run (exit 2, nothing sent), because a run nobody can look
+up afterwards is not worth having. A run refused before it starts leaves no store file: one those
+checks refuse never opens it (`--raw -v`, an edit with no terminal and no `-y`), and a store the run
+made is taken away again when the run stops after it with nothing kept in it (a `--safety-file` or
+`--save-output` that cannot be used, Ctrl-D or Ctrl-C at the password prompt); one that was there
+stays as it was. A
 store that fails during the run (the disk fills, someone deletes or replaces the file) does not stop
 the devices' replies from being shown; the loss is said as it happens, counted at the end with its
 reason, and the run exits 4. The store holds its directory open, so a job directory renamed during
@@ -1417,7 +1418,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1240 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1272 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

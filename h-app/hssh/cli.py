@@ -27,7 +27,7 @@ from .core import (
     load_jobs, parse_jobs, resolve_target_port, check_unique,
     check_confirm_minutes, control_character, read_failure, is_file,
 
-    path_inside,
+    path_inside, set_file_payload,
 )
 from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
                      DEFAULT_CONNECT_TIMEOUT)
@@ -965,12 +965,21 @@ async def main() -> int:
                                 return 2
 
         # The payloads, read once here and handed to the runner and the audit
-        # log as the same string: what the guard checked is what is sent.
+        # log as the same string: what the guard checked is what is sent, but
+        # for the blank and full-line '#' lines, which the runner keeps from
+        # every driver (core.set_file_payload). A file with nothing else in it
+        # is refused here, on every driver, before anything is written or
+        # sent: the plain ssh and openssh drivers logged in, sent nothing and
+        # said OK, where the Junos guard refuses it.
         if args.edit_broadcast:
             try:
                 broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
             except Exception as e:
                 print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
+                return 2
+            if not set_file_payload(broadcast_text):
+                print(f"ERROR: -eB {args.edit_broadcast}: nothing but blank lines and '#' comments in it. "
+                      "Nothing was sent.", file=sys.stderr)
                 return 2
         skipped_missing = 0
         if args.edit_dir:
@@ -982,6 +991,12 @@ async def main() -> int:
                     except Exception as e:
                         print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
                         return 2
+            empty = [f"{name}.set" for name, text in edit_payloads.items() if not set_file_payload(text)]
+            if empty:
+                shown = ", ".join(empty[:20]) + (" …" if len(empty) > 20 else "")
+                print(f"ERROR: -eD {args.edit_dir}: nothing but blank lines and '#' comments in {shown}. "
+                      "Nothing was sent.", file=sys.stderr)
+                return 2
             # A device without a set file is known before the first lock. The
             # run is refused rather than deployed to everyone else, unless the
             # operator said those devices may be left out; then they are
@@ -1024,16 +1039,18 @@ async def main() -> int:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
         return 2
     # Nobody watches a pipeline: a run file that commits must arm a timer, or
-    # say it is a dry run. A flag on the command line may supply either.
-    if args.run and has_edits and edit_needs_timer(args, is_confirm):
+    # say it is a dry run. A flag on the command line may supply either, and
+    # an edit given there (-eC, -eD, -eB, --rollback, a --job file) is held to
+    # it as the file's own are.
+    job_edits = [je.command for je in (job_entries or []) if je.mode.startswith("edit")]
+    if args.run and has_edits and edit_needs_timer(args, is_confirm, job_edits):
         print(f"ERROR: run file '{args.run}' makes changes without a rollback timer: set commit_confirmed "
               "(minutes) in the file or pass --commit-confirmed, or set dry_run.", file=sys.stderr)
         return 2
     # A confirm is a plain commit: it cannot arm a new timer, so a run that
     # asks for one would end with a banner promising a rollback that no
     # device is counting down.
-    confirms = ([args.edit_command] if args.edit_command else
-                [je.command for je in (job_entries or []) if je.mode.startswith("edit")])
+    confirms = [args.edit_command] if args.edit_command else job_edits
     if args.commit_confirmed and confirms and all(is_confirm(c) for c in confirms):
         print('ERROR: --commit-confirmed does not go with -eC "commit": a confirm cannot arm a new timer.',
               file=sys.stderr)
@@ -1110,6 +1127,38 @@ async def main() -> int:
             print(f"ERROR: {reads_only(args.format, resolved)}", file=sys.stderr)
             return 2
 
+    # The refusals that need nothing written come before anything is: a run
+    # refused here leaves no store file, no audit log and no --save-output
+    # directory behind.
+    if args.no_store and args.store:
+        print("ERROR: --no-store and --store contradict each other.", file=sys.stderr)
+        return 2
+    if args.raw and args.verbose:
+        print("ERROR: --raw and -v are mutually exclusive.", file=sys.stderr)
+        return 2
+    if args.raw and args.json:
+        print("ERROR: --raw and --json are mutually exclusive.", file=sys.stderr)
+        return 2
+    if mode != "probe" and os.environ.get("HSSH_PASSWORD") == "" and not _tty(sys.stdin):
+        # A pipeline whose secret lookup came back empty: refused, since the
+        # run would otherwise go on to key authentication without a word. A
+        # probe logs in nowhere and asks for no password.
+        print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
+        return 2
+    # An edit that changes the network needs its question answered: without
+    # a terminal or -y it is refused here, before the probe touches a box.
+    commits = has_edits and not args.dry_run
+    if commits and not args.yes and not _tty(sys.stdin):
+        if args.show_diff:
+            print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
+        else:
+            print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
+        return 2
+    save_dir = args.save_output or None
+    if save_dir and Path(save_dir).exists() and not Path(save_dir).is_dir():
+        print(f"ERROR: --save-output {save_dir} exists and is not a directory.", file=sys.stderr)
+        return 2
+
     # Everything the run will write is proven writable before the first
     # device is touched: an audit log found unwritable after the commits
     # landed records nothing, and a safety gate that cannot keep its file
@@ -1122,13 +1171,12 @@ async def main() -> int:
                 print(f"ERROR: {label} {e}; refusing to start.", file=sys.stderr)
                 return 2
     store = None
-    if args.no_store and args.store:
-        print("ERROR: --no-store and --store contradict each other.", file=sys.stderr)
-        return 2
     if not args.no_store:
         # Every run is kept. The store is opened, and its tables made, before
         # the first device is touched: one that cannot be written is no run,
-        # found out now and not after the commits landed.
+        # found out now and not after the commits landed. It comes before the
+        # safety file and the --save-output directory, so a store refused
+        # leaves neither; a run refused after it takes it away (_discard_store).
         store_path = store_where(args.store, file_config)
         if args.every is not None and _WATCH["tick"]:
             # A later tick of a watch. Opening a store deleted since would make
@@ -1147,24 +1195,30 @@ async def main() -> int:
             return 2
         if args.every is not None and not _WATCH["tick"]:
             _WATCH["store"] = store.identity       # the file every later tick must find at the path
+
+    def _discard_store() -> None:
+        """A run stopped before it starts, once its store is open: the store
+        goes again when this run made it and nothing is kept in it
+        (Store.discard), so such a run leaves no h-ssh.db behind; one that
+        was there is left as it was."""
+        if store is not None:
+            store.discard()
+
     safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
     try:
         safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
     except OSError as e:
+        _discard_store()
         print(f"ERROR: --safety-file requested but unusable: {e}; refusing to start.", file=sys.stderr)
         return 2
 
-    save_dir = None
-    if args.save_output:
-        save_dir = args.save_output
+    if save_dir:
         # Raw device output (a config backup is the point), so the directory
         # and its files are the operator's alone: 0700 / 0600, never redacted.
-        if Path(save_dir).exists() and not Path(save_dir).is_dir():
-            print(f"ERROR: --save-output {save_dir} exists and is not a directory.", file=sys.stderr)
-            return 2
         try:
             Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
         except OSError as e:
+            _discard_store()
             print(f"ERROR: --save-output {save_dir}: {e.strerror or e}", file=sys.stderr)
             return 2
 
@@ -1177,12 +1231,6 @@ async def main() -> int:
     config = file_config
     user = args.user or os.environ.get("HSSH_USER") or config.get("user")
     passwd = os.environ.get("HSSH_PASSWORD")
-    if args.raw and args.verbose:
-        print("ERROR: --raw and -v are mutually exclusive.", file=sys.stderr)
-        return 2
-    if args.raw and args.json:
-        print("ERROR: --raw and --json are mutually exclusive.", file=sys.stderr)
-        return 2
 
     json_mode = args.json
     raw_mode = args.raw
@@ -1206,11 +1254,6 @@ async def main() -> int:
                 store.close()
             if safety_gate is not None:
                 safety_gate.close()
-    if passwd == "" and not _tty(sys.stdin):
-        # A pipeline whose secret lookup came back empty: refused, since the
-        # run would otherwise go on to key authentication without a word.
-        print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
-        return 2
     if args.every is not None and _WATCH["tick"]:
         # A later tick of a watch: the password typed (or skipped) before
         # tick 1 is the watch's, not asked for again after every sleep.
@@ -1221,9 +1264,13 @@ async def main() -> int:
             try:
                 passwd = _ask("Password (press Enter to skip): ", secret=True) or None
             except PromptClosed:
+                _discard_store()
                 print("ERROR: no password given at the prompt (Enter skips it); nothing was sent.",
                       file=sys.stderr)
                 return 2
+            except KeyboardInterrupt:
+                _discard_store()            # Ctrl-C there stops the run before it starts, as Ctrl-D does
+                raise
         else:
             passwd = None
     if args.every is not None:
@@ -1313,16 +1360,6 @@ async def main() -> int:
         max_workers=workers, thread_name_prefix="hssh"))
 
     sem = asyncio.Semaphore(workers)
-
-    # An edit that changes the network needs its question answered: without
-    # a terminal or -y it is refused here, before the probe touches a box.
-    commits = has_edits and not args.dry_run
-    if commits and not args.yes and not _tty(sys.stdin):
-        if args.show_diff:
-            print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
-        else:
-            print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
-        return 2
 
     # The run's row in the store. A read's is opened before its probe, so a
     # read stopped there is kept as an interrupted run; an edit's once the
@@ -1683,6 +1720,11 @@ async def main() -> int:
         t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
         dev_mode = je.mode if je else mode
+        # The show this device ran, resolved for its vendor (a shortcut can
+        # differ device to device), a job's show entry its own: the command
+        # field, and the '$ cmd' echo a text transport opens its reply with.
+        dev_show = je.command if je and je.mode == "show" else show_cmd
+        resolved_cmd = resolve_command(dev_show, t.vendor) if dev_show else None
         entry = {
             "device": name,
             "host": t.host,
@@ -1721,8 +1763,6 @@ async def main() -> int:
                 entry["commands"] = []
                 entry["error"] = res.error if res.error is not None else (out_text.strip() or "unknown error")
         elif ok:
-            # Resolved per target, so a shortcut can differ device to device.
-            resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
             if resolved_cmd:
                 entry["command"] = resolved_cmd
             entry["output"] = strip_result_header(out_text, resolved_cmd)
@@ -1841,7 +1881,6 @@ async def main() -> int:
                 else:
                     print(f"{name}: ERROR: {res.error}" if res.error is not None else f"{name}: failed", file=sys.stderr)
             elif ok:
-                resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
                 print(f"{name}:")
                 print(strip_result_header(shown, resolved_cmd))
                 print()
