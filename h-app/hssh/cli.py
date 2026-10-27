@@ -1687,6 +1687,11 @@ async def main() -> int:
         t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
         dev_mode = je.mode if je else mode
+        # The show this device ran, resolved for its vendor (a shortcut can
+        # differ device to device), a job's show entry its own: the command
+        # field, and the '$ cmd' echo a text transport opens its reply with.
+        dev_show = je.command if je and je.mode == "show" else show_cmd
+        resolved_cmd = resolve_command(dev_show, t.vendor) if dev_show else None
         entry = {
             "device": name,
             "host": t.host,
@@ -1725,8 +1730,6 @@ async def main() -> int:
                 entry["commands"] = []
                 entry["error"] = res.error if res.error is not None else (out_text.strip() or "unknown error")
         elif ok:
-            # Resolved per target, so a shortcut can differ device to device.
-            resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
             if resolved_cmd:
                 entry["command"] = resolved_cmd
             entry["output"] = strip_result_header(out_text, resolved_cmd)
@@ -1845,7 +1848,6 @@ async def main() -> int:
                 else:
                     print(f"{name}: ERROR: {res.error}" if res.error is not None else f"{name}: failed", file=sys.stderr)
             elif ok:
-                resolved_cmd = resolve_command(show_cmd, t.vendor) if show_cmd else None
                 print(f"{name}:")
                 print(strip_result_header(shown, resolved_cmd))
                 print()
