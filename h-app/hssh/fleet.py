@@ -331,14 +331,15 @@ def _check_ms(name: str, value) -> float:
 
 def _connect_factor(target: Target) -> int:
     """How many session_timeouts the session set-up may take, worst case.
-    The NETCONF transport runs the whole of it against one deadline (#66).
+    The NETCONF transport runs the set-up against one deadline (#66) and
+    then waits for the router's NETCONF hello a session timeout more (#126).
     The paramiko transport gives the TCP connect and the SSH banner the
     connect timeout, never more than the session timeout (#126), and the
     negotiation and the authentication the full timeout each
     (hssh/transports/ssh.py, _connect); the OpenSSH client has its session
     clock, the connect timeout inside it, and the telnet login a handful of
     reads each bounded by it: three covers them."""
-    return 1 if drivers.get(target.vendor).transport.name == "netconf" else 3
+    return 2 if drivers.get(target.vendor).transport.name == "netconf" else 3
 
 
 def _attempts(fleet: "Fleet", target: Target, command) -> int:

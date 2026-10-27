@@ -1058,7 +1058,7 @@ The library reads no environment variable and no config file; that is the CLI's 
   after a short pause; a command that is not a read is sent once). A transport call that has not returned
   within those bounds (the SSH and telnet transports may spend up to three session timeouts on the set-up:
   on `ssh` the connect phase, the key exchange and the authentication get one at most each; NETCONF has one
-  deadline for all of it) plus 10 s is reported as that
+  deadline for the set-up and one more for the router's NETCONF hello) plus 10 s is reported as that
   device's failure and its thread left to finish on its own, so one wedged device cannot hold the run. It
   does hold one worker until it returns: when every worker is held, the devices still queued are failed at
   once rather than waited for, and a later run on the same Fleet fails that device at once (`the previous
@@ -1280,7 +1280,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1219 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1220 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
