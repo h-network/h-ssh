@@ -1322,6 +1322,31 @@ async def main() -> int:
             print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
         return 2
 
+    # The run's row in the store. A read's is opened before its probe, so a
+    # read stopped there is kept as an interrupted run; an edit's once the
+    # edit is past its questions (the probe's, the confirmation, --show-diff's),
+    # so an edit stopped before them committed nothing and leaves no row.
+    store_run = None
+
+    def _begin_run() -> bool:
+        """Open the run's row; False (said why) when the store went away
+        since it was opened."""
+        nonlocal store_run
+        if store is None:
+            return True
+        try:
+            about = ("\n".join(batch_cmds) if batch_cmds else
+                     show_cmd or edit_cmd or args.edit_broadcast or (args.edit_dir and f"dir:{args.edit_dir}") or mode)
+            store_run = store.begin_run(mode, sys.argv[1:], user, len(units), __version__,
+                                        origin=socket.gethostname(), command=about)
+        except Exception as e:
+            print(f"ERROR: store {store.path}: {e}; refusing to start.", file=sys.stderr)
+            return False
+        return True
+
+    if not has_edits and not _begin_run():
+        return 2
+
     # The probe (#127), before every run unless --no-probe or `probe = no`
     # says otherwise: a TCP connect and the SSH banner per box, no login, at
     # most MAX_PROBES at once, to where the box's transport will connect.
@@ -1337,6 +1362,8 @@ async def main() -> int:
     dead = {}               # unit index -> the probe's result, for a unit whose box did not answer
     leave_out = set()       # of those, the units an edit goes on without: skipped, not failed
     probe_ms = None         # how long the probe took, for the summary
+    interrupted = False     # Ctrl-C, during a read's probe or during the run
+    not_started = 0         # the units a Ctrl-C during a read's probe kept from starting: all, skipped
     if probe_first:
         boxes = {}
         for t, _ in units:
@@ -1345,16 +1372,23 @@ async def main() -> int:
         if probe_note:
             print(f"WARNING: {probe_note}", file=sys.stderr)
         probe_started = time.monotonic()
-        found = dict(zip(boxes, await probes.probe(list(boxes.values()),
-                                                   connect_budget(args.connect_timeout, args.session_timeout),
-                                                   args.slow, limit, user=user,
-                                                   held=held_by(safety_gate, boxes.values()))))
+        try:
+            answers = await probes.probe(list(boxes.values()),
+                                         connect_budget(args.connect_timeout, args.session_timeout),
+                                         args.slow, limit, user=user, held=held_by(safety_gate, boxes.values()))
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if has_edits:
+                raise           # an edit stopped before its questions is no run (see above)
+            # A read stopped during its probe: no device was started. The run
+            # ends here as an interrupted one, its row kept, every device skipped.
+            interrupted, not_started, answers = True, len(units), []
         probe_ms = int((time.monotonic() - probe_started) * 1000)
+        found = dict(zip(boxes, answers))
         for i, (t, _) in enumerate(units):
-            r = found[(t.host, resolve_target_port(t))]
-            if r.dead:
+            r = found.get((t.host, resolve_target_port(t)))
+            if r is not None and r.dead:
                 dead[i] = r
-        if show_progress or (has_edits and not json_mode):
+        if not interrupted and (show_progress or (has_edits and not json_mode)):
             print(f"\n{probe_summary(list(found.values()), probe_ms / 1000, args.slow)}")
         if has_edits and dead:
             down = [r for r in found.values() if r.dead]
@@ -1423,19 +1457,11 @@ async def main() -> int:
     json_results = []
     given_at = []        # each result's place in target order, for --diff
     run_start = time.time()
-    store_run = None
     store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
     store_reason = None
     unkept = []                       # --every: those results' rows, compared as the tick got them
-    if store is not None:
-        try:
-            about = ("\n".join(batch_cmds) if batch_cmds else
-                     show_cmd or edit_cmd or args.edit_broadcast or (args.edit_dir and f"dir:{args.edit_dir}") or mode)
-            store_run = store.begin_run(mode, sys.argv[1:], user, len(units), __version__,
-                                        origin=socket.gethostname(), command=about)
-        except Exception as e:                    # the file went away between the probe and the run
-            print(f"ERROR: store {store.path}: {e}; refusing to start.", file=sys.stderr)
-            return 2
+    if has_edits and not (args.show_diff and commits) and not _begin_run():
+        return 2
 
 
     # A job may list one device in several entries. Those run one at a time
@@ -1594,6 +1620,8 @@ async def main() -> int:
                 _audit_aborted("aborted by user confirmation")
                 print("Aborted by user.")
                 return 0
+        if not _begin_run():
+            return 2
 
     if job_entries:
         # A job lists one device in several entries. With the pool on they
@@ -1602,7 +1630,8 @@ async def main() -> int:
         # and an edit entry's session is clean again before the next one.
         pool.enable()
 
-    tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
+    tasks = [] if interrupted else [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i)))
+                                    for i in range(len(units))]
     screen = _tty(sys.stdout)     # control sequences are stripped for a terminal, kept for a pipe
 
     def _screen(text: str) -> str:
@@ -1611,7 +1640,6 @@ async def main() -> int:
         store, --log, --json) is the reply as it came either way."""
         return terminal_safe(text) if screen else text
 
-    interrupted = False
     log_cmd = (batch_cmds or show_cmd or edit_cmd or args.edit_broadcast
                or (args.edit_dir and f"dir:{args.edit_dir}") or "job")
     log_ts = datetime.now().isoformat()
@@ -2030,7 +2058,7 @@ async def main() -> int:
         "targets": len(json_results) + not_run,
         "ok": ok_count,
         "fail": failures,
-        "skipped": skipped + not_run + unreachable,
+        "skipped": skipped + not_run + unreachable + not_started,
         **({"interrupted": interrupted_connects} if interrupted else {}),
         **({"not_kept": not_kept} if not_kept else {}),
         **({"probe_ms": probe_ms} if probe_ms is not None else {}),
@@ -2045,7 +2073,8 @@ async def main() -> int:
         # that could not keep its results.
         if not_kept < store_tried or store_tried == 0:
             try:
-                store.finish_run(store_run, ok_count, failures, skipped + not_run + unreachable, interrupted)
+                store.finish_run(store_run, ok_count, failures, skipped + not_run + unreachable + not_started,
+                                 interrupted)
             except Exception as e:
                 print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
         lost = f"{not_kept} of {store_tried} results were not kept: {store_reason}" if not_kept else None

@@ -790,7 +790,12 @@ is one row, a `--batch` one row per command in order, an edit one row with the p
 and the verdict (the diff, the commit line) as the output, `--commit-status` the history as JSON, a
 `--job` one row per entry (a device the job names twice has `seq` 0 and 1, in file order). A
 second table, `runs`, has one row per invocation: when it started and finished, the mode, what it was
-about, the whole command line, who ran it and from where, and the counts. Everything is kept as it
+about, the whole command line, who ran it and from where, and the counts. A read's row is opened before
+its probe, so a read stopped there by Ctrl-C is kept as an interrupted run, every device skipped. An
+edit's is opened once the edit is past its questions (the probe's, `Proceed with changes?`,
+`--show-diff`'s `Commit these changes on all devices?`): an edit stopped before that (an answer other
+than y, an edit the probe stopped, a `--show-diff` preview that failed, a Ctrl-C) committed nothing
+and is no run, so it leaves no row. Everything is kept as it
 came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
 a `show configuration` keeps its hashes; escape sequences and control characters are taken out of a
 reply as a terminal is shown it, by `h-ssh` and by `h-ssh-store` alike, never out of the record: the
@@ -907,7 +912,10 @@ that was still being connected to when Ctrl-C came, and whose connect then ran o
 reported as `INTERRUPTED` rather than `FAIL`: nothing reached it and the operator stopped the run.
 Its entry carries `interrupted: true`, its error starts with `interrupted while connecting:`, the notice says
 `; N interrupted while connecting`, and the summary gains an `interrupted` count. With `--json` there is no notice: the array holds only the devices that completed, the
-summary's `targets` is that count, and the exit code is still `130`.
+summary's `targets` is that count, and the exit code is still `130`. A Ctrl-C during the probe stops a
+read before any device is started (`Interrupted. Completed 0 of 3 device(s).`, exit `130`): it is kept
+in the store as an interrupted run with every device skipped, and the summary's `skipped` counts them.
+An edit stopped there committed nothing and leaves no run (see [The result store](#the-result-store)).
 
 ## Safety
 
@@ -941,7 +949,7 @@ Exit codes: `0` success (also when the operator answers N to the confirmation; f
 ```
 
 `targets` is the number of devices that completed, `skipped` the safety-gate blocks and the boxes an edit
-went on without, `probe_ms` the probe's time before the run when it ran (`elapsed_ms` is the run's own,
+went on without (and every device of a read stopped during its probe), `probe_ms` the probe's time before the run when it ran (`elapsed_ms` is the run's own,
 from the confirmation on), `mode` one of `show`, `edit`, `rollback`, `commit`, `batch`, `job`, `probe`
 (which adds `slow`, the boxes tagged slow, and counts a box not probed in `skipped`).
 
@@ -1282,7 +1290,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1222 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1232 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

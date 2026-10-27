@@ -5,6 +5,7 @@ import asyncio
 import builtins
 import json
 import os
+import sqlite3
 import stat
 import sys
 import time
@@ -447,6 +448,35 @@ def test_show_diff_abort_paths(monkeypatch, capsys, tmp_path):
     driver = PreviewDriver()
     rc, _, err = run_cli(monkeypatch, capsys, tmp_path, argv, driver=driver)
     assert rc == 2 and "needs a terminal" in err and driver.calls == []
+
+
+def test_a_show_diff_edit_that_commits_nothing_leaves_no_run_in_the_store(monkeypatch, capsys, tmp_path):
+    """An edit's run row is opened once the edit is past its questions, and
+    --show-diff asks after its previews: an N there, or a preview that
+    failed, committed nothing and is no run, as an edit stopped at `Proceed
+    with changes?` is. The row used to be opened before the previews and
+    left open (`?/?`, as a run that could not keep its results reads); a y
+    opens it and keeps the commit."""
+    def runs():
+        con = sqlite3.connect(os.environ["HSSH_STORE"])
+        con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute("SELECT * FROM runs")]
+        finally:
+            con.close()
+    argv = ["-eC", "set system host-name R1-new", "--show-diff"]
+    answer(monkeypatch, "n")
+    rc, out, _ = run_cli(monkeypatch, capsys, tmp_path, argv, driver=PreviewDriver())
+    assert rc == 0 and "Aborted by user." in out and runs() == []
+    failing = types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("commit check failed")))
+    rc, _, err = run_cli(monkeypatch, capsys, tmp_path, [*argv, "-y"], driver=failing)
+    assert rc == 1 and "dry-run failed on R1; nothing committed" in err and runs() == []
+    answer(monkeypatch, "y")
+    rc, out, _ = run_cli(monkeypatch, capsys, tmp_path, argv, driver=PreviewDriver())
+    assert rc == 0 and "COMMIT OK" in out
+    run_row, = runs()
+    assert run_row["finished"] is not None and (run_row["mode"], run_row["ok"], run_row["failed"]) == ("edit-cmd", 1, 0)
 
 
 # --- --log: the audit log's file mode and redaction -----------------------------

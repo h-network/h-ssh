@@ -492,6 +492,75 @@ def test_every_tick_of_a_watch_is_probed(monkeypatch, capsys, tmp_path):
     assert "--- R2: show version: OK -> FAIL (probe: refused (connection refused by 10.0.0.2:830))" in out
 
 
+def stopped_during_the_probe(monkeypatch, capsys, argv, how="cancel"):
+    """main() with a Ctrl-C while the probe waits on boxes that do not
+    answer: the main task cancelled, as asyncio.run does on SIGINT from
+    Python 3.11 (`how` = "cancel"), or a KeyboardInterrupt raised in the
+    probe, as 3.10 raises it in the code that runs ("raise"). Returns (rc,
+    stdout, stderr, the driver); a KeyboardInterrupt that asyncio.run
+    raises again once main() has returned is rc 130."""
+    async def does_not_answer(host, port, banner, seconds):
+        if how == "raise":
+            raise KeyboardInterrupt
+        await asyncio.sleep(30)
+    monkeypatch.setattr(probe, "attempt", does_not_answer)
+    driver = Junos()
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(cli, "_tty", lambda stream: False)
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *argv])
+
+    async def go():
+        if how == "cancel":
+            asyncio.get_running_loop().call_later(0.2, asyncio.current_task().cancel)
+        return await cli.main()
+    try:
+        rc = asyncio.run(go())
+    except KeyboardInterrupt:
+        rc = 130
+    out, err = capsys.readouterr()
+    return rc, out, err, driver
+
+
+# The reads, and the mode the store keeps each under.
+READS = {"-sC": "show", "--batch": "show-batch", "--profile": "show-batch", "--job": "job",
+         "--commit-status": "commit-status"}
+
+
+@pytest.mark.parametrize("mode,how", [*((mode, "cancel") for mode in READS), ("-sC", "raise")])
+def test_a_read_stopped_during_its_probe_is_kept_as_an_interrupted_run(monkeypatch, capsys, tmp_path, mode, how):
+    """Ctrl-C while the probe waits on boxes that do not answer: no device
+    was started, and the run is kept all the same, as one stopped during
+    the run is: its row in the store, closed as interrupted with every
+    device skipped, `Interrupted. Completed 0 of N device(s).`, the summary,
+    exit 130. The row was opened after the probe, so the run left none."""
+    _files(tmp_path)
+    argv = [a.replace("{tmp}", str(tmp_path)) for a in MODES[mode]] + ([] if mode == "--job" else R12)
+    units = 3 if mode == "--job" else 2
+    rc, out, err, driver = stopped_during_the_probe(monkeypatch, capsys, argv, how)
+    assert rc == 130 and driver.calls == []
+    assert f"Interrupted. Completed 0 of {units} device(s)." in err
+    summary = json.loads(err.split("[h-ssh] ", 1)[1].splitlines()[0])
+    assert (summary["targets"], summary["ok"], summary["fail"], summary["skipped"], summary["interrupted"]) == (
+        0, 0, 0, units, 0)
+    run_row, = rows("SELECT * FROM runs")
+    assert run_row["finished"] is not None and (run_row["mode"], run_row["targets"]) == (READS[mode], units)
+    assert (run_row["ok"], run_row["failed"], run_row["skipped"], run_row["interrupted"]) == (0, 0, units, 1)
+    assert rows("SELECT * FROM results") == []
+
+
+@pytest.mark.parametrize("mode", ["-eC", "--dry-run", "--rollback"])
+def test_an_edit_stopped_during_its_probe_leaves_no_run(monkeypatch, capsys, tmp_path, mode):
+    """An edit's row is opened once the edit is past its questions: one
+    stopped during its probe committed nothing and is no run, as one
+    stopped at its question is. Ctrl-C ends it as before (exit 130)."""
+    with pytest.raises(asyncio.CancelledError):
+        stopped_during_the_probe(monkeypatch, capsys, MODES[mode] + R12)
+    assert rows("SELECT * FROM runs") == []
+
+
 def test_a_dead_box_is_a_fail_of_the_run_in_the_probes_words_and_is_not_touched(monkeypatch, capsys):
     """A read goes to the live boxes; the dead one fails within seconds with
     the probe's reason (exit 1, a device failed), in --json and in the
