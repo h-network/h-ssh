@@ -190,7 +190,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 |---|---|---|
 | `-sC` | Show | Run a show/display command (or a template name): one line of text, so a line break or another control character in it is refused (exit 2). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` (exit 2, nothing sent) |
 | `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL) is refused (exit 2) |
-| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written; on the plain `ssh` and `openssh` drivers every non-blank line is sent as a command, a `#` line too. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
+| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written; an edit typed at an IOS-shaped CLI (`telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) also skips a full-line `!` comment; on the plain `ssh` and `openssh` drivers every non-blank line is sent as a command, a `#` line too. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
 | `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`) |
 | `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
 | `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt` (or `NAME`; a name with a `/` is a path), or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
@@ -592,8 +592,9 @@ DRIVERS = [Driver(DIALECT, drivers.SSH, frozenset({"show", "show_batch", "edit"}
 **A `Driver` on a transport.** `Driver(dialect, transport, supports, aliases=())`. The transport is one
 of `drivers.SSH`, `drivers.OPENSSH`, `drivers.NETCONF` and `drivers.TELNET` (frozen: it takes a
 dialect, nothing else), or a `Transport` of the package's own, `Transport(name, description, module,
-install, default_port, formats=("text",), banner=b"SSH-", ssh_config=None, console_port=None)`, whose
-`module` meets the contract below. The probe asks every box for `banner` before each run, so a
+install, default_port, formats=("text",), banner=b"SSH-", pooled=False, frozen=False, ssh_config=None,
+console_port=None)` (give the ones after `default_port` as keywords), whose `module` meets the contract
+below. The probe asks every box for `banner` before each run, so a
 transport that is not SSH sets `banner=None` (a TCP connect only), or every box is dead to the probe;
 `ssh_config` (`"openssh"` or `"paramiko"`) says which ssh configuration the transport follows, so the
 probe asks where it connects. `supports` is the set of words the runner may ask for: `show`,
@@ -686,12 +687,14 @@ probe     = yes         # no: skip the probe before every run, as --no-probe doe
 ```
 
 Precedence is flag → config file → built-in default. A value given on the command line always wins;
-only the user and the store have an environment step: `--user` falls back to `HSSH_USER`, then the
-file's `user`, then the name you are logged in as, like ssh; `--store` falls back to `HSSH_STORE`, then
-the file's `store`, then `./h-ssh.db` (see [The result store](#the-result-store)). The password has no
-flag and no file entry: `HSSH_PASSWORD` when set, else the prompt. A key the file does not set keeps
-its built-in default: `workers` 8, `retries` 2, `session_timeout` 30, `connect_timeout` 3,
-`command_timeout` 20, `transport` ssh, `slow` 10, `probe` yes. Keys may be written with `-` or `_`.
+of the file's keys only `user` and `store` have an environment step: `--user` falls back to `HSSH_USER`,
+then the file's `user`, then the name you are logged in as, like ssh; `--store` falls back to
+`HSSH_STORE`, then the file's `store`, then `./h-ssh.db` (see [The result store](#the-result-store)).
+`--audit-log` and `--safety-file` have no key in the file and fall back to `HSSH_AUDIT_LOG` and
+`HSSH_SAFETY_FILE`. The password has no flag and no file entry: `HSSH_PASSWORD` when set, else the
+prompt. A key the file does not set keeps its built-in default: `workers` 8, `retries` 2,
+`session_timeout` 30, `connect_timeout` 3, `command_timeout` 20, `transport` ssh, `slow` 10,
+`probe` yes. Keys may be written with `-` or `_`.
 
 `transport` is the vendor for targets that don't declare one — `name,ip` inventory rows, a target
 without one (`10.0.1.1`, `R1:10.0.1.1`), or a job entry without a vendor. The example above runs those through the
@@ -828,8 +831,9 @@ does the closing `Done.` line when something failed or was skipped (`Done. All d
 printed), so for a show `--raw > out.txt` keeps the file clean even on a partial run. A show adds
 nothing else to stdout but the `Resolved 'version' -> 'show version | no-more' (junos)` line a
 shortcut produces (and `--diff`'s block, when asked for). An edit also prints to stdout its probe line
-(and the boxes found dead), `Ready to execute on N device(s).`, the confirmation, `--show-diff`'s
-previews and the commit-confirmed reminder.
+(and the boxes found dead), `Ready to execute on N device(s).`, the confirmation (and
+`Aborted by user.` when it is not answered y), `--show-diff`'s previews, the commit-confirmed reminder
+and, when the probe stops it, `ERROR: N device(s) unreachable: …` with its `Aborting …` line.
 
 ```console
 $ h-ssh -sC "show version | match Junos:" --raw
@@ -841,16 +845,17 @@ Junos: 24.2R1-S2.5
 ```
 
 `--raw` is exclusive with `-v` and with `--json`; asking for either pair is an error rather than a
-silent preference (`--json -v` is accepted: the JSON is printed as without `-v`, which only lets paramiko's tracebacks through to stderr). The command echo (`$ show version`) belongs to the framed view — `--raw` and `--json`
+silent preference (`--json -v` is accepted: the JSON is printed as without `-v`, which only lets paramiko's and ncclient's log records, their tracebacks among them, through to stderr). The command echo (`$ show version`) belongs to the framed view — `--raw` and `--json`
 both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
 `output` (a `--job`'s show entries are the exception: no `command` field, and on `ssh` and `openssh`
 the echo stays in `output`, in `--raw` and in the store).
 
-`--save-output DIR` makes DIR (0700) and writes one file per device into it (0600, never redacted):
-`NAME.output` holds the DEVICE/HOST/MODE/VENDOR header, then the reply or the `ERROR:` line; a batch
-that ran is `NAME.json`, its commands as JSON (one that failed before it ran, or that the probe found
-dead, gets `NAME.output`); a job's later entries for one device go to `NAME.2.output`,
-`NAME.3.output`, … in file order (see [Modes](#modes)).
+`--save-output DIR` makes DIR (0700) and writes one file into it per device that ran or that the probe
+found dead (0600, never redacted; none for a device the safety gate held back or `--allow-missing` left
+out, nor for `--probe` alone): `NAME.output` holds the DEVICE/HOST/MODE/VENDOR header, then the reply
+or the `ERROR:` line; a batch that ran is `NAME.json`, its commands as JSON (one that failed before it
+ran, or that the probe found dead, gets `NAME.output`); a job's later entries for one device go to
+`NAME.2.output`, `NAME.3.output`, … in file order (see [Modes](#modes)).
 
 ### The result store
 
@@ -958,7 +963,7 @@ once a run is under way, with the probe skipped or after it, is classified befor
 | A key exchange that `--session-timeout` ran out on after the banner (`no SSH session to HOST within Ns: the banner came, but key exchange did not finish`) | fail immediately |
 | A device that drops the session before login (`HOST dropped the session before login after Ns (…)`, an sshd at its connection limit) | on `ssh` a read is retried after 1 s and then 3 s, an edit is not; on `junos` it fails at once |
 | Authentication, host key, rejected command | fail immediately |
-| The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a pin file another h-ssh run keeps locked (`ssh`: `~/.h-ssh/known_hosts is locked by another h-ssh run`), a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
+| The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a pin file another h-ssh run keeps locked (`ssh`: `/home/you/.h-ssh/known_hosts is locked by another h-ssh run …`), a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
 | Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2), after 1 s and then 3 s |
 
 The split is whether the device answered. A box that does not answer at all — a dead or blackholed
@@ -1009,11 +1014,11 @@ mode; the opt-in ones (`--safety-file`, `--audit-log`, `--log`) apply to every m
 | Guard | Flag | Behaviour |
 |---|---|---|
 | Probe | *(automatic)*; `--no-probe`, `probe = no`, `--skip-unreachable` | Before every run, edits included (`--dry-run` and `--show-diff` too): a TCP connect plus, for `junos`/`ssh`/`openssh`, the SSH banner (not for a `junos` console on port 23, which is telnet), so a port that merely accepts and closes is not a device; no login. It asks where the run will connect (`HostName` and `Port` from the ssh configuration on `openssh` and `junos`); a box behind a `ProxyJump` or `ProxyCommand`, or one the safety gate holds, is not probed and runs as without it. `--connect-timeout` for the connect and for the banner, a box that fails asked once more, 100 at a time. An edit (a `--dry-run` too) with a dead box it goes to (a `--job`'s box with only shows is a FAIL, as in a show) asks `Continue with the N reachable? [y/N]` at a terminal (with `-y` too: it confirms the edit, never a partial deployment), is refused without one (exit 2) unless `--skip-unreachable` goes on with the reachable (exit 3). See [The probe](#the-probe) |
-| Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation. Without a terminal and without `-y` an edit is refused (exit 2) before the probe touches a box, so nothing is sent |
+| Confirmation | *(automatic)* | An edit that commits prompts `y/N` (with `--show-diff`, once, after the previews); a `--dry-run` gets no such prompt, only the probe's question when a box is dead. `-y` skips the prompt in automation. Without a terminal and without `-y` an edit that commits is refused (exit 2) before the probe touches a box, so nothing is sent |
 | Dry run | `--dry-run` | Junos over NETCONF: loads, diffs, runs `commit_check` (when there is a diff), then discards the candidate. `junos@ssh`, `junos@openssh` and `telnet-junos`: `configure exclusive`, loads, `show \| compare`, `rollback 0` — no commit check, so the diff is shown but not validated. Every other driver **refuses** `--dry-run` for edits instead of pretending (a FAIL of that device) |
 | Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
 | Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box. NETCONF `junos` only: `telnet-junos` and every other transport refuse it rather than drop it, and it needs an edit (`-eC`, `-eD`, `-eB`, `--rollback`, or a job with edits) |
-| Commit confirmed | `--commit-confirmed [N]` | Junos rolls back after N minutes (1 to 65535; 10 when N is omitted) unless confirmed (confirm with `-eC "commit"`; a run without `--json` ends by printing that command for its own targets, a `--job`'s edit entries included); `junos@ssh`, `junos@openssh` and `telnet-junos` send `commit confirmed N`. Drivers that cannot do this (`ssh`, `openssh`, `ios@…`, `nxos@…`, `eos@…`, telnet IOS/NX-OS/Arista) refuse it rather than commit with no timer (a FAIL of that device) |
+| Commit confirmed | `--commit-confirmed [N]` | Junos rolls back after N minutes (1 to 65535; 10 when N is omitted) unless confirmed (confirm with `-eC "commit"`; a run without `--json` ends by printing that command for its own targets, a `--job`'s edit entries included); `junos@ssh`, `junos@openssh` and `telnet-junos` send `commit confirmed N`. Every other driver (`ssh`, `openssh`, `telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) refuses it rather than commit with no timer (a FAIL of that device) |
 | Reply verdict (`ssh`, `openssh`) | *(automatic)* | A show whose reply opens with `error: ...` (Junos) or `% ...` (IOS, EOS) is FAILED as refused, not reported as output; an `error:` or `%` line further down a show's reply is output (a log, say). An edit line the device answers with `error: ...` (Junos) or `% ...` (IOS, Arista) is FAILED with that line even when the command exits 0: a plain `ssh` or `openssh` edit stops there; a dialect's edit typed at the CLI sends the rest, then a Junos candidate is discarded, and an IOS-shaped edit fails with the other lines applied |
 | Junos syntax guard | *(automatic)* | Enforces set-style syntax — each line must start with `set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect` or `unprotect`, lowercase — with `#`-only comments, for every Junos driver, `junos`, `junos@ssh`, `junos@openssh` and `telnet-junos` (checked when any target is one). `commit` (or `commit;`) is only valid as the single, exact command in `-eC` or a `--job` edit, never inside `-eD`/`-eB` configuration files |
 | Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite. The file and its `.lock` are created and locked once before the first device; a path that cannot be created, opened or locked (a directory that cannot be made, a symlink, a FIFO; a missing directory is made) refuses the run with exit 2 |
@@ -1208,7 +1213,8 @@ the pool's `HSSH_POOL_IDLE_TIMEOUT`, read when `hssh` is imported. What it does 
 
 `show` and `batch` only, no edits. A command is not checked to be a read: one that acts on the device
 (`request system reboot`) is sent, once and never retried, as `-sC` sends it; only `fmt="json"` or `"xml"`
-refuses it. The command is sent as typed (shortcuts are the CLI's), one line of text: the line
+refuses it. The command is sent as typed (shortcuts are the CLI's: `hssh.resolve_command("bgp", "junos")`
+gives the command `-sC bgp` sends a `junos` target), one line of text: the line
 break that ends a line read from a file is dropped (`fleet.batch(open(path))`), and any other line break or control
 character is a `ValueError` before anything runs. A file is taken as it is: a blank line is a `ValueError`
 and a `#` comment is sent as a command; `fleet.batch(hssh.core.read_command_file_lines(pathlib.Path(path)))`
@@ -1357,7 +1363,7 @@ an edit reports `NotAppliedError` if the session died before the lock, and the u
 h-ssh/
 ├── h-app/
 │   ├── hssh/
-│   │   ├── __init__.py      # public API: Fleet, Target, run_for_target(_async), SafetyGate, load_devices_csv and the target/job parsers, pool, drivers, transports; __version__
+│   │   ├── __init__.py      # public API: Fleet, Target, run_for_target(_async), SafetyGate, load_devices_csv and the target/job parsers, resolve_command and get_available_commands (the shortcut library), write_audit_entry, pool, drivers, transports; __version__
 │   │   ├── core.py          # Target, CSV loader, template resolver, job parser
 │   │   ├── cli.py           # argument parsing + orchestration
 │   │   ├── runner.py        # one device's run: the driver call, retries and their classification, the safety gate, the typed RunResult
