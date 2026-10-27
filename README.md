@@ -1307,12 +1307,14 @@ refused before anything is sent, because the session's lock belongs to the threa
 command you know into its RPC (what `| display xml rpc` does), and answers in its own JSON:
 
 ```python
+from hssh.transports import netconf
+
 hw = netconf.rpc("10.0.1.1", "admin", None, "show chassis hardware", 30, 20)
 # -> {'chassis-inventory': [{'chassis': [{'serial-number': [{'data': 'VM6AD25B940C'}], ...}]}]}
 
-netconf.rpc(host, user, None, "get-interface-information", 30, 20,
+netconf.rpc("10.0.1.1", "admin", None, "get-interface-information", 30, 20,
             args={"interface-name": "ge-0/0/0", "terse": True})   # RPC name + arguments
-netconf.rpc(host, user, None, "show route summary", 30, 20, fmt="xml")   # the reply XML, as text
+netconf.rpc("10.0.1.1", "admin", None, "show route summary", 30, 20, fmt="xml")   # the reply XML, as text
 ```
 
 `rpc()` runs on the pooled session like everything else, and `rpc_batch()` answers a list of
