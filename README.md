@@ -15,26 +15,26 @@
 
 `h-ssh` runs commands across a fleet of network devices: one device or three hundred, Juniper, any SSH host, or a console
 still speaking telnet. Devices are worked in parallel, results are collected per device, and one dead box does not sink a run:
-every run probes the boxes first, without logging in, so a dead one is a FAIL within seconds, and an edit run does not start a
-partial deployment unless you say so.
+every run probes the boxes first (unless you say `--no-probe`), without logging in, so a dead one is a FAIL within seconds,
+and an edit does not go on without a box the probe found dead unless you say so.
 
 The per-device session is a solved problem; what is left is everything around it: the thread pool, per-device result collection, a rate
 limiter (`--safety-file`) so a router that already failed is not hammered, and a record of what changed (`--audit-log`). That is
 the part h-ssh provides.
 
 On Junos, everything goes through PyEZ over NETCONF, reads and writes alike, which gives one session, real RPC errors, and the lock, diff
-and rollback that config changes need. Every edit is probed for reachability and prompts before it commits; with `--audit-log` it
-lands in a JSONL audit trail.
+and rollback that config changes need. Every edit is probed for reachability (unless `--no-probe`) and prompts before it commits;
+with `--audit-log` it lands in a JSONL audit trail.
 `--commit-confirmed` puts the device back the way it was if you never confirm.
 
 ## Features
 
-- **Four transports, one interface.** Juniper (PyEZ over NETCONF), any SSH host through paramiko or the system `ssh` binary, and raw-socket telnet with IOS-, Junos-, Arista- and NX-OS-flavoured prompt handling. Same flags whichever you point it at; the ones only a Junos transport can honour (`--dry-run` on an edit, `--show-diff`, `--commit-confirmed`, and over NETCONF `--comment`, `--format`, `--rollback`, `--commit-status`) are refused on the others before anything is sent, never faked.
-- **Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box. 3 routers, 3 show commands, ~350 ms end to end.
+- **Four transports, one interface.** Juniper (PyEZ over NETCONF), any SSH host through paramiko or the system `ssh` binary, and raw-socket telnet with IOS-, Junos-, Arista- and NX-OS-flavoured prompt handling. Same flags whichever you point it at; the ones only a Junos transport can honour (`--dry-run` on an edit, `--show-diff`, `--commit-confirmed`, and over NETCONF `--comment`, `--format`, `--rollback`, `--commit-status`) are refused on the others device by device: such a device is a FAIL with the reason, nothing is sent to it, and the run exits 1; never faked.
+- **Parallel by default.** Devices are worked concurrently behind an `asyncio` semaphore, `--workers 8` out of the box.
 - **One command or many, one device or many.** `--batch` runs several commands per device on a single connection; `--job` takes a JSON file with different commands — and different modes — per device, readable from a file or stdin.
-- **A dead box costs seconds, not a worker.** Every run starts with a probe — a TCP connect and the SSH banner, no login, 100 boxes at a time — and goes to the boxes that answered; `--probe` alone is a health check of the fleet, with each box's TCP handshake round trip as the kernel measured it and the time its sshd took to answer. See [The probe](#the-probe).
+- **A dead box costs seconds, not a worker.** Every run starts with a probe (`--no-probe` skips it) — a TCP connect and the SSH banner, no login, 100 boxes at a time — and goes to the boxes that answered; `--probe` alone is a health check of the fleet, with each box's TCP handshake round trip as the kernel measured it and the time its sshd took to answer. See [The probe](#the-probe).
 - **Writes are gated.** The probe's question before a partial deployment, `y/N` confirmation, `--dry-run` that shows the diff without committing and `--commit-confirmed N` for changes that undo themselves unless you confirm within N minutes (both Junos), and an opt-in per-device rate limit and cooldown (`--safety-file`).
-- **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an EOS switch each their own command. Drop your own in `~/.h-ssh/commands/{dialect}.json` (`junos`, `eos`, `none`) to override.
+- **Templates instead of memorised syntax.** `-sC bgp` resolves through a per-vendor JSON template library — *per target*, so the same shortcut sends a Junos router and an EOS switch each their own command. Drop your own in `~/.h-ssh/commands/{dialect}.json` (`junos`, `ios`, `nxos`, `eos`, `none`) to add or override; `junos`, `eos` and `none` ship one.
 - **Built to be scripted.** `--json` on stdout, a structured summary line on stderr, meaningful exit codes, and credentials from `HSSH_USER` / `HSSH_PASSWORD` — or import `hssh` and skip the CLI entirely. A whole fleet run fits in one YAML file (`--run fleet.yaml`) that a pipeline step or a jump-host session runs as it is.
 - **Built for a maintenance, not just a run.** A session pool keeps one NETCONF session per router open for a whole script; `rpc()` and `--format json|xml` return the router's own data instead of CLI text; `begin()` holds a diffed candidate open until a gate decides; `--rollback N`, commit comments, `--commit-status` and `guarded_commit()` cover the commit-confirmed lifecycle without a `| match` in sight.
 - **Two runtime dependencies — or none.** `paramiko` and `junos-eznc` come with the package. Telnet is a raw socket (no stdlib `telnetlib`, so it still works on Python 3.13+), and the `openssh` transport drives the system `ssh` binary, so a checkout on a locked-down jump host with nothing installable still runs shows and edits over `ssh`.
@@ -64,7 +64,7 @@ lands in a JSONL audit trail.
                     └──────────── every edit ──────────────────┴──▶ --audit-log (JSONL)
 ```
 
-On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted, the file read as the `ssh` transport reads it: its `@cert-authority` lines are passed over, and a key it marks `@revoked` is refused (`host key verification failed for HOST:PORT: its key is marked @revoked in FILE`). With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT` or `no route to host HOST:PORT` (what the OS answered the TCP connect, where ncclient says only "Could not open socket"), `TCP connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns`, `no SSH session to HOST:PORT within Ns: the banner came, but key exchange did not finish`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts, and the router's NETCONF hello after it has `--session-timeout` of its own. Within that deadline `--connect-timeout` (3 s) bounds the TCP connect and the banner together, so a router that does not answer, or accepts TCP and then says nothing, costs 3 s an attempt and is tried again (see [Failure handling](#failure-handling)); a slow key exchange, login or hello still has the session timeout. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it), and the NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted, the file read as the `ssh` transport reads it: its `@cert-authority` lines are passed over, and a key it marks `@revoked` is refused (`host key verification failed for HOST:PORT: its key is marked @revoked in FILE`). With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT` or `no route to host HOST:PORT` (what the OS answered the TCP connect, where ncclient says only "Could not open socket"), `TCP connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login after Ns (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns`, `no SSH session to HOST:PORT within Ns: the banner came, but key exchange did not finish`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts, and the router's NETCONF hello after it has `--session-timeout` of its own. Within that deadline `--connect-timeout` (3 s) bounds the TCP connect and the banner together, so a router that does not answer, or accepts TCP and then says nothing, costs 3 s an attempt and is tried again (see [Failure handling](#failure-handling)); a slow key exchange, login or hello still has the session timeout. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
 
 ## Install
 
@@ -79,11 +79,13 @@ h-ssh --list-vendors
 The installer puts h-ssh in a Python environment of its own, `~/.h-ssh/venv`, with every transport
 (paramiko and PyEZ come with it), and links `h-ssh` and `h-ssh-store` into `~/.local/bin`, creating
 that directory when it is missing; if it is not on your `PATH` yet the script says so and how to add
-it. Your config, inventory and stores live next to the environment under `~/.h-ssh`, and pip's download
-cache lands in `~/.cache/pip`. Running the same line again upgrades, whatever the version number says.
-It installs the `develop` branch; a knob on the `sh` side of the pipe picks another branch or tag:
-`curl -fsSL … | H_SSH_REF=main sh` (`H_SSH_HOME`, `H_SSH_BIN` and `H_SSH_PYTHON` are the others, see
-the script's header). Removing it:
+it. Your config, inventory, shortcuts and profiles live next to the environment under `~/.h-ssh` (the
+result store is `./h-ssh.db` in the directory you run from, unless you name another), and pip's
+download cache lands in its usual place (`~/.cache/pip` on Linux). Running the same line again
+upgrades, whatever the version number says. It installs the `develop` branch; a knob on the `sh` side
+of the pipe picks another branch or tag: `curl -fsSL … | H_SSH_REF=<branch or tag> sh` (`main` lags
+behind `develop`). `H_SSH_REPO`, `H_SSH_HOME`, `H_SSH_BIN` and `H_SSH_PYTHON` are the others, see the
+script's header. Removing it:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/h-network/h-ssh/develop/install.sh | sh -s -- --uninstall
@@ -95,19 +97,22 @@ neither does an install. Read the script first if you like: a page of POSIX sh t
 paragraph says.
 
 If you already use [pipx](https://pipx.pypa.io) or [uv](https://docs.astral.sh/uv/), the same thing in
-their words: `pipx install git+https://github.com/h-network/h-ssh.git` or
-`uv tool install git+https://github.com/h-network/h-ssh.git`.
+their words: `pipx install git+https://github.com/h-network/h-ssh.git@develop` or
+`uv tool install git+https://github.com/h-network/h-ssh.git@develop` (without `@develop` they install
+`main`, the repository's default branch, which lags behind).
 
 For working on h-ssh itself:
 
 ```bash
-git clone https://github.com/h-network/h-ssh.git && cd h-ssh
+git clone -b develop https://github.com/h-network/h-ssh.git && cd h-ssh
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'           # the package, editable, plus pytest
+pip install -e '.[dev]'           # the package, editable, plus pytest, pytest-cov and ruff
 ```
 
 The checkout's `./h-app/h-ssh.py` is the same CLI without installing, on an interpreter that has
-`paramiko` and `junos-eznc`; the `openssh` and `telnet` transports need neither.
+`paramiko` and `junos-eznc`; the `openssh` and `telnet` transports need neither. The store reader has
+no script there: `PYTHONPATH=h-app python3 -c 'from hssh.store import main_sync; main_sync()' runs` is
+`h-ssh-store runs`.
 
 ## Quick start
 
@@ -119,14 +124,16 @@ h-ssh --transport junos 10.0.1.1 10.0.1.2 -sC bgp
 # the same, named, the vendor on the target, as another user
 h-ssh --user admin -sC bgp R1:10.0.1.1:junos R2:10.0.1.2:junos
 
-# ... or from a CSV inventory, as JSON (the sample inventory has junos, openssh and ssh rows)
+# ... or from a CSV inventory, as JSON (the sample inventory in a checkout has junos, openssh and ssh rows)
 h-ssh --user admin --json -sC "show version" --devices h-app/devices.csv
 
 # compare one command's output across the fleet: each device against the first that answered, in
 # target order (bare hosts, then --target; or the inventory's rows)
 h-ssh -sC bgp --diff R1:10.0.1.1:junos R2:10.0.1.2:junos
 
-# config change — look before you leap (no host typed: the inventory is ~/.h-ssh/devices.csv, or ./devices.csv)
+# config change — look before you leap (no host typed: the inventory is ~/.h-ssh/devices.csv, or
+# ./devices.csv; these are Junos lines: an ssh or openssh row fails --dry-run and --commit-confirmed,
+# and gets the set line as a command)
 h-ssh --user admin -eC "set system ntp server 10.0.0.1" --dry-run
 h-ssh --user admin -eC "set system ntp server 10.0.0.1" -y
 
@@ -137,7 +144,7 @@ h-ssh --user admin -eB configs/all.set --commit-confirmed 10 -y
 h-ssh --batch commands.txt R1:10.0.1.1:junos
 h-ssh --profile junos-health R1:10.0.1.1:junos     # a named command set, yours or shipped (--list-profiles)
 
-# watch: the same read every 30 s, every tick kept in the store, only what changed is printed
+# watch: the same read again 30 s after each tick, every tick kept in the store, only what changed is printed
 h-ssh -sC "show bgp summary" --every 30 R1:10.0.1.1:junos R2:10.0.1.2:junos
 
 # a console server still speaking telnet
@@ -146,14 +153,14 @@ h-ssh -sC "show version" SW1:10.0.0.1:5000:telnet-ios
 # is every box there? one line each, no login (the same probe runs before every run)
 h-ssh --probe
 
-# every run is kept in ./h-ssh.db, as the devices answered; read it back
+# every run is kept in ./h-ssh.db (a --probe too), as the devices answered; read it back
 h-ssh-store runs
-h-ssh-store output R1
+h-ssh-store output R1 20261027-0930    # R1's reply in that run: an id from the list, or a unique prefix
 ```
 
-Targets are typed bare on the command line, before or between the flags. A host alone (`10.0.1.1`, `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on `--transport`; `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` name it (`NAME:HOST:VENDOR:PORT` works too, and is what the confirm hint prints), an IPv6 host in brackets, `R1:[2001:db8::1]:junos`. `--target SPEC` is the same thing as a flag (repeatable; it wants the name). With any target typed the inventory file is not read; without one it is `--devices`, else `~/.h-ssh/devices.csv`, else `./devices.csv`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none, and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device. Each device is listed once, a device being its host and the port its transport uses, written or not (`R1:10.0.0.1:junos` and `R2:10.0.0.1:830:junos` are one router): the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (its entries run in file order, on one session), but not use one name for two hosts.
+Targets are typed bare on the command line, before or between the flags (not right after a `--commit-confirmed` that has no N: the target would be read as the minutes). A host alone (`10.0.1.1`, `cr1.example.net`, `[2001:db8::1]`) is a device named after itself on `--transport`; `NAME:HOST`, `NAME:HOST:VENDOR`, `NAME:HOST:PORT` or `NAME:HOST:PORT:VENDOR` name it (`NAME:HOST:VENDOR:PORT` works too; the confirm hint writes a job's targets that way), an IPv6 host in brackets, `R1:[2001:db8::1]:junos`. A port needs a name: `10.0.1.1:830` is read as `NAME:HOST`, a device named `10.0.1.1` on host `830`; write `R1:10.0.1.1:830`. `--target SPEC` is the same thing as a flag (repeatable; it wants the name). With any target typed the inventory file is not read; without one it is `--devices`, else `~/.h-ssh/devices.csv`, else `./devices.csv`. A CSV inventory accepts `name,ip`, `name,ip,vendor` or `name,ip,vendor,port`, or one bare hostname per line; headers or none (a header is a first row whose first column is `name`; any other first row is a device), and `#` comments, full-line or trailing. A UTF-8 BOM from Excel or Notepad is skipped. A fifth column, a port outside 1..65535 or a port that is not a number is refused naming the row, so a typo never turns into the wrong device. Each device is listed once, a device being its host and the port its transport uses, written or not (`R1:10.0.0.1:junos` and `R2:10.0.0.1:830:junos` are one router): the same row twice, one name on two hosts, or one host under two names is refused before anything runs (exit 2, naming the duplicate). A job file may repeat a device (its entries run in file order; on `junos` they share one NETCONF session, on the other transports each entry logs in again), but not use one name for two hosts or one host under two names.
 
-**A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` on the target to get NETCONF, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
+**A target that doesn't declare a vendor gets `--transport`**, which defaults to plain `ssh` — the transport that assumes least, since its show and edit paths are both `exec_command`. Declare `junos` on the target to get NETCONF, or set it once with `--transport junos` (or `transport = junos` in `~/.h-ssh/config`; either takes only `junos`, `ssh`, `openssh` or `telnet`, so another driver, `telnet-ios` or `junos@ssh`, goes on the target or the CSV row) for an inventory of `name,ip` rows; a vendor on the target itself always wins. Command shortcuts resolve per target against that vendor, so one `-sC bgp` across a mixed inventory sends each device its own command.
 
 ### Authentication
 
@@ -169,10 +176,11 @@ password. A variable that is set but empty refuses a pipeline run (exit 2) rathe
 keys without a word. A flag would show the password to every user on the host (`ps`,
 `/proc/<pid>/cmdline`), leave it in the shell history, and put it in the command line `--store` keeps.
 Your own user password belongs in neither a file nor a shell profile; the environment variable is for
-an account made for automation. The same `ps` exposure holds for the
-`openssh` transport's commands: each line runs as the `ssh` process's argument, so a config line is
-readable from `ps` for the life of that process; push secrets over NETCONF or paramiko, not over
-`openssh`.
+an account made for automation. The same `ps` exposure holds for what the `openssh` driver sends: a
+show, and each line of an `openssh` edit, runs as the `ssh` process's argument, so a config line is
+readable from `ps` for the life of that process (a dialect's edit over the OpenSSH binary,
+`junos@openssh` and the like, is typed into `ssh -tt` instead); push secrets over NETCONF or paramiko,
+not over `openssh`.
 
 A password means the same on every transport: it is the credential, and no `~/.ssh/id_*` key and no agent key is offered first (`openssh` passes `PubkeyAuthentication=no` and `IdentitiesOnly=yes`), so a wrong password is a failed login on `junos`, `ssh` and `openssh` alike, never an OK by way of a key. Without a password the keys and the agent are what you log in with.
 
@@ -182,15 +190,18 @@ A password means the same on every transport: it is the credential, and no `~/.s
 |---|---|---|
 | `-sC` | Show | Run a show/display command (or a template name): one line of text, so a line break or another control character in it is refused (exit 2). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` (exit 2, nothing sent) |
 | `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL) is refused (exit 2) |
-| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
-| `-eB` | Edit broadcast | One config file applied to all targets |
+| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped, nothing else is touched, so `community ab#12` goes as written; on the plain `ssh` and `openssh` drivers every non-blank line is sent as a command, a `#` line too. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3) |
+| `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`) |
 | `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
-| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt`, or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
-| `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
-| `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
-| `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
-| `--probe` | Probe | Alone, with no command: every box checked without logging in, one line each with its result and times, a summary, kept in the store; exit 0 when every box is live, 1 when one is dead, 3 when none is but one was not probed. See [The probe](#the-probe) |
-| `--run FILE` | Run file | Any of the above described in one YAML or JSON file: devices, commands, options, outputs. See [Run files](#run-files) |
+| `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt` (or `NAME`; a name with a `/` is a path), or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
+| `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused) |
+| `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (NETCONF `junos` only) |
+| `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (NETCONF `junos` only) |
+| `--probe` | Probe | Alone, with no command: every box checked without logging in, one line each with its result and times, a summary, kept in the store; exit 0 when every box is live, 1 when one is dead, 3 when none is but one was not probed, 4 when the store could not keep it. See [The probe](#the-probe) |
+| `--run FILE` | Run file | Any of the above but `--profile` and `--probe` alone, described in one YAML or JSON file: devices, commands, options, outputs (a profile's file can go in as `batch:`; `--profile` or `--probe` typed next to `--run` still work). See [Run files](#run-files) |
+
+`-sC`, `-eC`, `-eD` and `-eB` are also `--show-command`, `--edit-command`, `--edit-dir` and
+`--edit-broadcast`; `-y` and `-v` are `--yes` and `--verbose`.
 
 ```json
 [
@@ -202,7 +213,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 
 ```bash
 ./h-app/h-ssh.py --user admin --job jobs.json --json -y
-cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json -y   # the job is on stdin, so an edit cannot be confirmed there
+cat jobs.json | ./h-app/h-ssh.py --user admin --job - --json -y   # the job is on stdin: an edit cannot be confirmed there, and no password is asked (HSSH_PASSWORD, or keys)
 ```
 
 An entry may also carry `"port": 830` to override the target's port. A `show` is one line of text and an `edit` has no control character but its line breaks, as for `-sC` and `-eC`. A job with an edit entry asks the usual
@@ -234,6 +245,7 @@ tick 2 14:02:43: 250 OK, 0 failed, 1 changed
   --- 2026-10-25T14:02:10
   +++ 2026-10-25T14:02:43
   @@ -3,2 +3,2 @@
+   10.9.9.9  65000  Establ
   -10.9.9.8  65000  Establ
   +10.9.9.8  65000  Active
 ```
