@@ -766,6 +766,56 @@ def test_a_job_with_an_edit_goes_on_without_a_dead_box_only_when_told(monkeypatc
     assert [r["seq"] for r in rows("SELECT seq FROM results WHERE device = 'R2' ORDER BY seq")] == [0, 1]
 
 
+def last_run():
+    run_row, = rows("SELECT * FROM runs ORDER BY rowid DESC LIMIT 1")
+    return run_row
+
+
+def test_a_dead_box_a_job_only_reads_is_a_fail_and_does_not_stop_its_edit(monkeypatch, capsys, tmp_path):
+    """The probe's question, its abort and --skip-unreachable are about the
+    boxes the edit goes to. A job whose dead box only has shows goes on with
+    nothing asked: those shows are a FAIL of the run (exit 1), as in a show
+    run, where the edit used to be stopped (exit 2) or, with
+    --skip-unreachable, the shows SKIPPED (exit 3)."""
+    monkeypatch.setattr(probe, "attempt", answering(dead={"10.0.0.3"}))
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": "show version"},
+                               {"target": "R2:10.0.0.2:junos", "edit": "set system host-name x"},
+                               {"target": "R3:10.0.0.3:junos", "show": "show version"}]))
+    for extra, tty in (([], False), (["--skip-unreachable"], False), ([], True), (["--dry-run"], False)):
+        rc, out, err, asked, driver = run(monkeypatch, capsys, ["--job", str(job), "-y", *extra], tty=tty)
+        assert rc == 1 and asked == [], (extra, tty, out, err)
+        sent = [("dry-run", "10.0.0.2")] if "--dry-run" in extra else [("edit", "10.0.0.2"), ("show", "10.0.0.1")]
+        assert sorted(driver.calls) == sent                                 # a dry run's show is not sent
+        assert "R3               FAIL\n  ERROR: probe: refused (connection refused by 10.0.0.3:830)\n" in out
+        assert "Aborting" not in out and "SKIPPED" not in out and "Skipping" not in err
+        assert '"ok": 2, "fail": 1, "skipped": 0' in err
+        assert (last_run()["ok"], last_run()["failed"], last_run()["skipped"]) == (2, 1, 0)
+
+
+def test_a_job_asks_about_the_dead_boxes_it_edits_and_fails_the_ones_it_only_reads(monkeypatch, capsys, tmp_path):
+    """With a dead box the edit goes to and another the job only reads, the
+    question and the abort name the first alone; going on without it skips
+    its entries, and the other's show is a FAIL (exit 1: a device failed)."""
+    monkeypatch.setattr(probe, "attempt", answering(dead={"10.0.0.2", "10.0.0.3"}))
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": "show version"},
+                               {"target": "R2:10.0.0.2:junos", "edit": "set system host-name x"},
+                               {"target": "R2:10.0.0.2:junos", "show": "show version"},
+                               {"target": "R3:10.0.0.3:junos", "show": "show version"}]))
+    rc, out, err, asked, driver = run(monkeypatch, capsys, ["--job", str(job), "-y"])
+    assert rc == 2 and driver.calls == []
+    assert "ERROR: 1 device(s) unreachable: R2\n" in out and "R3               (10.0.0.3)" not in out
+    rc, out, err, asked, driver = run(monkeypatch, capsys, ["--job", str(job), "-y"], tty=True, answer="y")
+    assert rc == 1 and asked == ["Continue with the 1 reachable? [y/N]: "] and driver.calls == [("show", "10.0.0.1")]
+    rc, out, err, asked, driver = run(monkeypatch, capsys, ["--job", str(job), "-y", "--skip-unreachable"])
+    assert rc == 1 and driver.calls == [("show", "10.0.0.1")]
+    assert "Skipping 1 unreachable device(s) (--skip-unreachable): R2" in err
+    assert out.count("R2               SKIPPED") == 2 and "R3               FAIL" in out
+    assert "Done. Failures: 1, skipped as unreachable: 2" in out
+    assert (last_run()["ok"], last_run()["failed"], last_run()["skipped"]) == (1, 1, 2)
+
+
 def test_an_edit_with_every_box_dead_is_refused_and_asks_nothing(monkeypatch, capsys):
     monkeypatch.setattr(probe, "attempt", answering(dead={"10.0.0.1", "10.0.0.2"}))
     for argv, tty in ((["-y"], True), (["-y", "--skip-unreachable"], False)):

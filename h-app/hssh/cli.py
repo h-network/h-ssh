@@ -1357,8 +1357,9 @@ async def main() -> int:
     # tried twice: an edit goes on without a dead box only when the operator
     # says so, asked at a terminal (-y confirms the edit, never a partial
     # deployment) or by --skip-unreachable without one, and those left out
-    # are skipped (exit 3). A dry run is asked and stopped the same way: it
-    # rehearses the edit.
+    # are skipped (exit 3). That is for a box the edit goes to: a dead box a
+    # job only reads is a FAIL of the run, as in a show. A dry run is asked
+    # and stopped the same way: it rehearses the edit.
     dead = {}               # unit index -> the probe's result, for a unit whose box did not answer
     leave_out = set()       # of those, the units an edit goes on without: skipped, not failed
     probe_ms = None         # how long the probe took, for the summary
@@ -1390,9 +1391,12 @@ async def main() -> int:
                 dead[i] = r
         if not interrupted and (show_progress or (has_edits and not json_mode)):
             print(f"\n{probe_summary(list(found.values()), probe_ms / 1000, args.slow)}")
-        if has_edits and dead:
-            down = [r for r in found.values() if r.dead]
-            reachable = len(found) - len(down)
+        # The boxes an edit goes to: every box of -eC, -eD, -eB and --rollback,
+        # the boxes of a job's edit entries. Only their being dead stops the edit.
+        edited = {(t.host, resolve_target_port(t)) for t, je in units if je is None or je.mode.startswith("edit")}
+        down = [r for box, r in found.items() if r.dead and box in edited] if has_edits else []
+        if down:
+            reachable = sum(1 for r in found.values() if not r.dead)
             listing = "\n".join(f"  {r.device:16s} ({r.host}) {r.verdict}" for r in down)
             if not json_mode:
                 print(listing)
@@ -1427,7 +1431,7 @@ async def main() -> int:
                           (f"; --skip-unreachable goes on with the {reachable} reachable." if reachable
                            else ": no device answered the probe."))
                 return 2
-            leave_out = set(dead)
+            leave_out = {i for i in dead if (units[i][0].host, resolve_target_port(units[i][0])) in edited}
 
     if commits and not args.show_diff:
         if not json_mode:
