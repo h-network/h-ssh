@@ -81,7 +81,10 @@ def rows(path, sql, *params):
         c.close()
 
 
-def wait_for(condition, seconds=2.0):
+def wait_for(condition, seconds=10.0):
+    """True as soon as `condition` holds. The deadline only matters when it
+    never does: a loaded CI runner can keep a thread from running for a
+    second or two, which a 2 s deadline once took for a failure."""
     deadline = time.monotonic() + seconds
     while not condition():
         if time.monotonic() >= deadline:
@@ -838,7 +841,7 @@ def test_iterating_after_close_ends_instead_of_hanging(monkeypatch, tmp_path):
             for r in res:
                 assert r.device == "10.0.0.1" and r.ok
                 break                                    # one answer was enough
-            assert started.wait(2)                       # 10.0.0.2 is in flight, 10.0.0.3 still queued
+            assert started.wait(10)                       # 10.0.0.2 is in flight, 10.0.0.3 still queued
             held = next(t for t in fleet._run.tasks if t.target.host == "10.0.0.2")
         release.set()                                    # the in-flight call returns after the close
         assert wait_for(lambda: held.future.done())      # a late answer: dropped, as its row says
@@ -866,7 +869,7 @@ def test_iterating_after_close_ends_instead_of_hanging_async(monkeypatch):
             async for r in res:
                 assert r.device == "10.0.0.1"
                 break
-            assert started.wait(2)
+            assert started.wait(10)
         release.set()
         t0 = time.monotonic()
         got = [r async for r in res]
@@ -889,7 +892,7 @@ def test_a_close_from_another_thread_wakes_the_consumer_at_once(monkeypatch):
     try:
         fleet = Fleet(HOSTS, transport="junos", user="u", workers=2, session_timeout=5, command_timeout=5, retries=0)
         res = fleet.show("show version")
-        assert started.wait(2)
+        assert started.wait(10)
         t0 = time.monotonic()
         timers.append(threading.Timer(0.3, fleet.close))
         timers[0].start()
@@ -912,7 +915,7 @@ def test_a_close_from_another_thread_wakes_an_async_consumer_at_once(monkeypatch
     async def main():
         fleet = Fleet(HOSTS, transport="junos", user="u", workers=2, session_timeout=5, command_timeout=5, retries=0)
         res = fleet.show("show version")
-        assert started.wait(2)
+        assert started.wait(10)
         t0 = time.monotonic()
         timers.append(threading.Timer(0.3, fleet.close))
         timers[0].start()
@@ -977,7 +980,7 @@ def test_close_with_a_grace_yields_the_device_that_finished_inside_it(monkeypatc
     res = fleet.show("show version")
     for r in res:
         break
-    assert started.wait(2)                                   # 10.0.0.2 in flight, 10.0.0.3 queued
+    assert started.wait(10)                                   # 10.0.0.2 in flight, 10.0.0.3 queued
     threading.Timer(0.3, release.set).start()
     t0 = time.monotonic()
     fleet.close(wait=3)                                      # a Ctrl-C handler giving the devices a moment
@@ -1021,14 +1024,15 @@ def test_a_close_with_a_grace_skips_the_queued_devices_instead_of_failing_them(m
     consumer.start()
     queued = next(t for t in res._run.tasks if t.target.host == "10.0.0.3")
     try:
-        assert started.wait(2)
+        assert started.wait(10)
         # The consumer waits on the queued device before the close cancels
         # it (cf.wait's waiter on the future; asyncio's callback once it is
         # wrapped): one that first looked after the cancel never sees it.
         assert wait_for(lambda: queued.future._waiters if how == "for" else len(queued.future._done_callbacks) > 1)
         closer = threading.Thread(target=fleet.close, kwargs={"wait": 5})
         closer.start()
-        assert wait_for(lambda: queued.future.cancelled())   # close(wait=) under way: the queue is cancelled
+        assert wait_for(lambda: queued.future.cancelled()), (   # close(wait=) under way: the queue is cancelled
+            f"closer alive={closer.is_alive()} started={queued.started} future={queued.future}")
         release.set()                                        # 10.0.0.2 answers: its worker drains the queue
         assert wait_for(lambda: any(r.device == "10.0.0.2" for r in got))
         time.sleep(0.2)                                      # time enough to mistake the notified queue for results
@@ -1063,7 +1067,7 @@ def test_a_close_with_a_grace_skips_the_queue_when_every_worker_is_held(monkeypa
     consumer = threading.Thread(target=lambda: got.extend(res))
     consumer.start()
     try:
-        assert started.wait(2)
+        assert started.wait(10)
         closer = threading.Thread(target=fleet.close, kwargs={"wait": 10})
         closer.start()
         queued = [t for t in res._run.tasks if t.target.host != "10.0.0.1"]
@@ -1102,7 +1106,7 @@ def test_a_close_interrupted_in_its_grace_still_ends_the_run(monkeypatch, tmp_pa
     consumer = threading.Thread(target=lambda: got.extend(res), daemon=True)
     consumer.start()
     try:
-        assert started.wait(2)
+        assert started.wait(10)
         with pytest.raises(KeyboardInterrupt):
             fleet.close(wait=10)
         consumer.join(5)
@@ -1430,7 +1434,7 @@ def test_a_run_the_caller_never_finished_is_recorded_as_interrupted(monkeypatch,
         with Fleet(HOSTS, transport="junos", user="lab", workers=1, store=str(path)) as fleet:
             for r in fleet.show("show version"):
                 break                                      # one answer was enough
-            assert started.wait(2)
+            assert started.wait(10)
         run, = rows(path, "SELECT * FROM runs")
         assert (run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (1, 0, 2, 1)
         assert run["finished"] is not None
