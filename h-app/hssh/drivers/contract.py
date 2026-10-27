@@ -3,7 +3,9 @@
 The runner calls every driver function the same way: ``host, user, passwd``,
 then the command, commands, payload or rollback number if the call has one,
 then ``session_timeout, command_timeout`` (and ``commit_confirmed`` for an
-edit), with ``port=`` and ``vendor_hint=`` as keywords. A capability that is
+edit), with ``port=`` and ``vendor_hint=`` as keywords, and ``connect_timeout=``
+when the function takes it (every function of the three SSH transports does;
+one that does not is called as before). A capability that is
 declared but not backed this way would fail on the first device, with a
 ``TypeError`` where a refusal should have been; ``violations()`` finds that
 before any device does, and the contract test runs it over every registered

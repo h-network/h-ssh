@@ -458,7 +458,7 @@ def history(monkeypatch, *reads):
     returns the list that grows by one per read made."""
     reads, made = list(reads), []
 
-    def commit_status(host, user, passwd, st, ct, port=None, vendor_hint=None):
+    def commit_status(host, user, passwd, st, ct, port=None, vendor_hint=None, connect_timeout=None):
         made.append(host)
         return reads.pop(0) if len(reads) > 1 else reads[0]
 

@@ -3,4 +3,6 @@
 transport's work for every dialect on it, told the dialect by the
 vendor_hint it is called with. The CLI engine (`cli`) types at any byte
 channel according to a dialect's CliSyntax; the paramiko shell, the
-`ssh -tt` process and the telnet socket are such channels."""
+`ssh -tt` process and the telnet socket are such channels. `connect` is the
+connect phase the three SSH transports share: the TCP connect and the SSH
+banner within --connect-timeout, and the words for how it ended."""

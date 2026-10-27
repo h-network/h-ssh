@@ -379,3 +379,24 @@ def test_the_show_of_a_run_file_is_stripped_and_its_errors_name_the_file(monkeyp
         rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
         assert rc == 2 and drv.shows == drv.edits == [], err
         assert f"ERROR: run file '{f}': {text}" in err and "-sC" not in err and "-eC" not in err
+
+
+def test_connect_timeout_is_a_run_file_key(monkeypatch, capsys, tmp_path):
+    """#126: `connect-timeout` reaches the run, a flag on the command line
+    wins, and it is held to the flag's range."""
+    class Timed(Driver):
+        def __init__(self):
+            super().__init__()
+            self.connects = []
+
+        def show(self, host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, connect_timeout=None):
+            self.connects.append(connect_timeout)
+            return super().show(host, user, passwd, cmd, st, ct, port=port, vendor_hint=vendor_hint)
+    f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nshow: show version\nconnect-timeout: 4\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f], driver=Timed())
+    assert rc == 0 and drv.connects == [4], err
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--connect-timeout", "2"], driver=Timed())
+    assert rc == 0 and drv.connects == [2], err
+    f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nshow: show version\nconnect_timeout: 0\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f], driver=Timed())
+    assert rc == 2 and "'connect_timeout' must be at least 1, not 0" in err and drv.connects == []

@@ -37,8 +37,10 @@ from .. import drivers
 from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
-from ..errors import LocalError
+from ..errors import ConnectTimeoutError, LocalError, NotAppliedError
 from .cli import Cli, edit_policy, refuse_commit_lines
+from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
+                      tcp_timed_out, where)
 
 try:
     import paramiko
@@ -381,15 +383,39 @@ class _RevokedKey(Exception):
 if AVAILABLE:
     class _Transport(paramiko.Transport):
         """paramiko's Transport with what SSHClient.connect() cannot be
-        told: the key exchange gets the session timeout, not a fixed 15 s
-        after the banner, and a key ~/.ssh/known_hosts marks @revoked is
-        refused the moment it arrives, before any pin is looked at or any
-        credential sent, whatever the policy."""
+        told: the banner is due by the end of the connect phase
+        (`banner_by`, --connect-timeout from the TCP connect on, #126), the
+        negotiation after it gets the session timeout rather than the TCP
+        connect's timeout that connect() hands on, the key exchange the
+        session timeout rather than a fixed 15 s after the banner, and a
+        key ~/.ssh/known_hosts marks @revoked is refused the moment it
+        arrives, before any pin is looked at or any credential sent,
+        whatever the policy."""
 
-        def __init__(self, sock, handshake_timeout=15.0, revoked=frozenset(), **kw):
+        def __init__(self, sock, handshake_timeout=15.0, revoked=frozenset(), banner_by=None,
+                     negotiation_timeout=None, **kw):
             super().__init__(sock, **kw)
             self.handshake_timeout = handshake_timeout
             self._hssh_revoked = revoked
+            self._hssh_banner_by = banner_by
+            self._hssh_negotiation = negotiation_timeout
+
+        @property
+        def banner_timeout(self):
+            # Read by paramiko's own thread when it starts waiting for the banner.
+            by = self.__dict__.get("_hssh_banner_by")
+            if by is None:
+                return self.__dict__.get("_hssh_banner_timeout", 15)
+            return max(0.1, by - time.monotonic())
+
+        @banner_timeout.setter
+        def banner_timeout(self, value):
+            self.__dict__["_hssh_banner_timeout"] = value
+
+        def start_client(self, event=None, timeout=None):
+            if self._hssh_negotiation is not None:
+                timeout = self._hssh_negotiation
+            return super().start_client(event=event, timeout=timeout)
 
         def get_remote_server_key(self):
             key = super().get_remote_server_key()
@@ -413,13 +439,63 @@ def _kex_unfinished(t, exc) -> bool:
     return isinstance(exc, EOFError) or str(exc) == "No existing session"
 
 
+def _no_banner(t, exc) -> bool:
+    """True when connect() stopped before the server's banner came, for
+    want of time: paramiko's banner wait ran out (a timeout under "Error
+    reading SSH protocol banner"), or start_client() gave up first and
+    connect() asked for the server's key anyway ("No existing session"). A
+    server that closed first is an EOF under the same words, and not this."""
+    if t is None or getattr(t, "remote_version", ""):
+        return False
+    if str(exc) == "No existing session":
+        return True
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, TimeoutError):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+# The resolver's own answer that the name does not exist: the same name gets
+# the same answer. Any other failure of the lookup, EAI_AGAIN above all (no
+# answer from the resolver in time), may pass.
+_NO_SUCH_NAME = frozenset({socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)})
+
+
+def _tcp_failure(exc: OSError, host: str, at: str, seconds) -> Exception:
+    """The TCP connect's end in words (#126). paramiko lets a timeout and a
+    resolver failure through as they are, and wraps a refusal or no route in
+    NoValidConnectionsError, whose message ("Unable to connect to port 22 on
+    HOST") says neither; the OS's own answer is in its `errors`. A name
+    that does not exist is "cannot resolve HOST" and fails once; a lookup
+    that failed otherwise is said in the OS's words and, nothing sent, is
+    tried again, an edit too."""
+    if isinstance(exc, socket.gaierror):
+        if exc.errno in _NO_SUCH_NAME:
+            return RuntimeError(f"cannot resolve {host}")
+        return NotAppliedError(f"name lookup for {host} failed: {exc.strerror or exc}")
+    errors = list((getattr(exc, "errors", None) or {}).values())
+    if errors:
+        exc = errors[-1]                     # the last address tried, as ssh reports it
+    if is_timeout(exc):
+        return ConnectTimeoutError(tcp_timed_out(at, seconds))
+    return RuntimeError(answered(exc, at))
+
+
 def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
-             port: Optional[int]):
-    """A connected SSHClient, host key checked, ready for exec_command."""
+             port: Optional[int], connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
+    """A connected SSHClient, host key checked, ready for exec_command. The
+    TCP connect and the banner have --connect-timeout between them (#126);
+    the key exchange, the authentication and a channel open have the session
+    timeout each."""
     if not AVAILABLE:
         raise RuntimeError("paramiko not available in this environment.")
 
     session_timeout_float = float(session_timeout)
+    connect_s = budget(connect_timeout, session_timeout)
+    at = where(host, port or 22)
     known_hosts = _known_hosts()
     client = paramiko.SSHClient()
     revoked = _load_pins(client, known_hosts, session_timeout_float)
@@ -429,17 +505,14 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
         "hostname": host,
         "username": user,
         "port": port or 22,
-        "timeout": session_timeout_float,
-        "banner_timeout": session_timeout_float,
+        # The TCP connect, each address of the name; connect() hands it on
+        # to the negotiation too, which _Transport takes back.
+        "timeout": float(connect_s),
         "auth_timeout": session_timeout_float,
         # The shell for an edit opens a channel with no clock of its own;
         # paramiko would wait an hour for a device that authenticates and
         # then says nothing. (A show's exec channel has the command timeout.)
         "channel_timeout": session_timeout_float,
-        # connect() takes no handshake_timeout: the key exchange had a fixed
-        # 15 s after the banner, whatever --session-timeout said.
-        "transport_factory": functools.partial(_Transport, handshake_timeout=session_timeout_float,
-                                               revoked=revoked),
     }
 
     if passwd is not None:
@@ -451,6 +524,12 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
         conn_params["allow_agent"] = True
 
     started = time.monotonic()
+    # connect() takes no handshake_timeout: the key exchange had a fixed 15 s
+    # after the banner, whatever --session-timeout said; and its banner_timeout
+    # is a wait of its own, which here is what is left of the connect phase.
+    conn_params["transport_factory"] = functools.partial(
+        _Transport, handshake_timeout=session_timeout_float, revoked=revoked,
+        banner_by=started + connect_s, negotiation_timeout=session_timeout_float)
     try:
         client.connect(**conn_params)
     except _RevokedKey:
@@ -464,19 +543,30 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
             "If the device was re-keyed, remove its line from %s (or ~/.ssh/known_hosts)."
             % (host, known_hosts)) from exc
     except (paramiko.SSHException, EOFError) as exc:
-        kex = _kex_unfinished(client.get_transport(), exc)
+        t = client.get_transport()
+        kex, banner = _kex_unfinished(t, exc), _no_banner(t, exc)
         client.close()
         if "no authentication methods available" in str(exc).lower():
             # paramiko found nothing to offer: no password, no ~/.ssh/id_*, no agent key.
             raise RuntimeError(
                 "No authentication methods available for %s@%s: no password was given and "
                 "no key was found in ~/.ssh or from an agent." % (user, host)) from exc
+        if banner:
+            raise ConnectTimeoutError(no_banner(at, connect_s)) from exc
         if kex:
             elapsed = time.monotonic() - started
             if elapsed < session_timeout_float / 2:
                 raise RuntimeError(f"{host} dropped the session before login after {elapsed:.1f}s "
                                    f"({_KEX_UNFINISHED})") from exc
             raise RuntimeError(f"no SSH session to {host} within {session_timeout}s: {_KEX_UNFINISHED}") from exc
+        raise
+    except OSError as exc:
+        # Before the Transport exists, the TCP connect; after it, something
+        # paramiko let through as it was, which stays as it is.
+        before = client.get_transport() is None
+        client.close()
+        if before:
+            raise _tcp_failure(exc, host, at, connect_s) from exc
         raise
     except BaseException:
         # A refused login or a dropped handshake leaves a Transport thread
@@ -575,13 +665,13 @@ class ShellChannel:
 
 
 def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout: int,
-                   port: Optional[int], dialect: Dialect):
+                   port: Optional[int], dialect: Dialect, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """(client, session): a CLI session at the device's own prompt on a shell
     channel of a fresh connection; the caller closes both. The terminal is
     wide so the device never wraps the echo of a long line, which the engine
     must recognise as the echo. There is no login dialogue over SSH: login()
     reads the banner up to the prompt and learns this device's own."""
-    client = _connect(host, user, passwd, session_timeout, port)
+    client = _connect(host, user, passwd, session_timeout, port, connect_timeout)
     try:
         chan = client.invoke_shell(term="vt100", width=511, height=1000)
         session = Cli(ShellChannel(chan), dialect, session_timeout)
@@ -593,17 +683,20 @@ def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout:
 
 
 def show(host: str, user: str, passwd: str, cmd: str, session_timeout: int,
-         command_timeout: int, port: int = None, vendor_hint: str = None) -> str:
+         command_timeout: int, port: int = None, vendor_hint: str = None,
+         connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """One show command on an exec channel; a reply the dialect's CLI opens
-    with a refusal is a failure, not output."""
+    with a refusal is a failure, not output. `connect_timeout` bounds the
+    TCP connect and the SSH banner, never more than `session_timeout` (every
+    function here that connects takes it)."""
     return _run_commands(host, user, passwd, [cmd], session_timeout, command_timeout, port=port,
-                         dialect=_dialect(vendor_hint))
+                         dialect=_dialect(vendor_hint), connect_timeout=connect_timeout)
 
 
 def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
          command_timeout: int, commit_confirmed: int = None, port: int = None,
          vendor_hint: str = None, dry_run: bool = False,
-         expected_diff: Optional[str] = None) -> R.EditResult:
+         expected_diff: Optional[str] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> R.EditResult:
     """Push configuration.
 
     The none dialect (the plain `ssh` driver) runs each line as its own exec
@@ -624,14 +717,14 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
         edit_policy(d, vendor_hint or "ssh", dry_run, None, expected_diff)
         commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
         return _run_commands(host, user, passwd, commands, session_timeout, command_timeout, port=port,
-                             edit=True, dialect=d)
+                             edit=True, dialect=d, connect_timeout=connect_timeout)
     if d.cli is None:
         raise ValueError(f"{vendor_hint}: the {d.title} dialect has no CLI to type at; "
                          "nothing was sent to the device")
     edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
     if d.cli.has_candidate:
         refuse_commit_lines(payload)
-    client, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    client, session = _shell_session(host, user, passwd, session_timeout, port, d, connect_timeout)
     try:
         if d.cli.has_candidate:
             return session.edit_candidate(payload, dry_run=dry_run, confirmed_minutes=commit_confirmed or 0,
@@ -644,7 +737,7 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
 
 def confirm(host: str, user: str, passwd: str, session_timeout: int, command_timeout: int,
             port: int = None, vendor_hint: str = "junos@ssh",
-            comment: Optional[str] = None) -> R.EditResult:
+            comment: Optional[str] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> R.EditResult:
     """Confirm a pending commit-confirmed on a Junos device over SSH: `show
     system commit` must show one waiting, then configure exclusive, a bare
     `commit` (`commit comment "…"` with a comment), exit. Only a dialect with
@@ -652,7 +745,7 @@ def confirm(host: str, user: str, passwd: str, session_timeout: int, command_tim
     d = _dialect(vendor_hint)
     if d.cli is None or not d.cli.has_candidate or d.commit_pending is None:
         raise ValueError(f"confirm is only for a Junos dialect, not {vendor_hint}; nothing was sent")
-    client, session = _shell_session(host, user, passwd, session_timeout, port, d)
+    client, session = _shell_session(host, user, passwd, session_timeout, port, d, connect_timeout)
     try:
         return session.confirm(command_timeout, comment)
     finally:
@@ -663,7 +756,7 @@ def confirm(host: str, user: str, passwd: str, session_timeout: int, command_tim
 def show_structured(host: str, user: str, passwd: str, cmd: str,
                     session_timeout: int, command_timeout: int,
                     port: int = None, vendor_hint: str = None,
-                    binding: Optional[dict] = None):
+                    binding: Optional[dict] = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
     """A command's own JSON, for a dialect whose CLI renders one: EOS answers
     `<cmd> | json` with the data its text would show, so the exec channel runs
     that and the reply is parsed. `binding` is the field map the NETCONF
@@ -674,7 +767,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
         raise ValueError(f"--structured is not supported by {vendor_hint or 'ssh'}; "
                          "nothing was sent to the device")
     full = f"{cmd} | json"
-    client = _connect(host, user, passwd, session_timeout, port)
+    client = _connect(host, user, passwd, session_timeout, port, connect_timeout)
     try:
         rc, out, err = _exec(client, full, command_timeout)
     finally:
@@ -693,13 +786,14 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
 
 def _run_commands(host: str, user: str, passwd: str, commands: List[str],
                   session_timeout: int, command_timeout: int, port: int = None,
-                  edit: bool = False, dialect: Optional[Dialect] = None) -> str:
+                  edit: bool = False, dialect: Optional[Dialect] = None,
+                  connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """Execute commands via SSH on any device. The reply is read as well as
     the exit status: a CLI that answers "error: ..." or "% ..." (or whatever
     the dialect's `refused` says) and exits 0 has refused the line, and the
     edit stops there; a show whose reply opens that way got no answer, and is
     failed rather than reported as output."""
-    client = _connect(host, user, passwd, session_timeout, port)
+    client = _connect(host, user, passwd, session_timeout, port, connect_timeout)
 
     try:
         outputs = []
@@ -722,10 +816,11 @@ def _run_commands(host: str, user: str, passwd: str, commands: List[str],
 
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
-               port: int = None, vendor_hint: str = None) -> List[dict]:
+               port: int = None, vendor_hint: str = None,
+               connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
     """Execute multiple commands on a single SSH connection."""
     d = _dialect(vendor_hint)
-    client = _connect(host, user, passwd, session_timeout, port)
+    client = _connect(host, user, passwd, session_timeout, port, connect_timeout)
     try:
         results = []
         for cmd in cmds:

@@ -39,6 +39,7 @@ def run_main(monkeypatch, capsys, argv, config=os.devnull):
     (["--session-timeout", "-1"], "from 1 to 86400, not -1"),
     (["--session-timeout", "99999999"], "from 1 to 86400, not 99999999"),
     (["--command-timeout", "0"], "--command-timeout takes a number from 1 to 86400"),
+    (["--connect-timeout", "0"], "--connect-timeout takes a number from 1 to 86400, not 0"),
     (["--workers", "0"], "--workers takes a number from 1 to 256, not 0"),
     (["--workers", "-5"], "not -5"),
     (["--workers", "100000"], "not 100000"),

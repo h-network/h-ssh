@@ -8,9 +8,10 @@ back the results as values, in the order the devices finish.
             print(r.device, r.ok, r.output if r.ok else r.error)
 
 Threads talk to the devices; the caller never sees one. Each device gets
-the runner's run (`run_for_target`): the session and command timeouts, the
-retry budget with its classification (a failure the same call cannot fix is
-tried once, a command that is not a read is sent once), the typed result.
+the runner's run (`run_for_target`): the connect, session and command
+timeouts, the retry budget with its classification (a failure the same call
+cannot fix is tried once, a command that is not a read is sent once), the
+typed result.
 A device that fails is a result with `ok` False and the failure in `error`,
 never an exception out of the loop. At most `workers` devices are in flight
 at once, `workers` lowered to what the open-file limit carries. A transport
@@ -59,13 +60,15 @@ from typing import Any, AsyncIterator, Iterable, Iterator, List, Optional, Union
 from . import drivers, limits, pool
 from .core import Target, check_unique, control_character, load_devices_csv, parse_bare_target
 from .drivers import results as R
-from .runner import RunResult, _backoff, run_for_target
+from .runner import DEFAULT_CONNECT_TIMEOUT, RunResult, _backoff, run_for_target
 from .store import Store
 
-__all__ = ["Fleet", "Results", "DeviceResult", "MAX_WORKERS", "GRACE_SECONDS", "FORMATS", "DEFAULT_RETRIES"]
+__all__ = ["Fleet", "Results", "DeviceResult", "MAX_WORKERS", "GRACE_SECONDS", "FORMATS", "DEFAULT_RETRIES",
+           "DEFAULT_CONNECT_TIMEOUT"]
 
 MAX_WORKERS = limits.MAX_WORKERS
-# The CLI's --retries default: one engine, one behaviour.
+# The CLI's --retries default: one engine, one behaviour. The connect
+# timeout's default is the runner's, the CLI's too.
 DEFAULT_RETRIES = 2
 # Past the transports' own timeouts (session set-up, the commands, the
 # retries' backoff) before a call that has not returned is given up on.
@@ -308,13 +311,15 @@ def _check_int(name: str, value, low: int, high: Optional[int] = None) -> int:
 
 def _connect_factor(target: Target) -> int:
     """How many session_timeouts the session set-up may take, worst case.
-    The NETCONF transport runs the whole of it against one deadline (#66).
-    The paramiko transport gives the TCP connect, the SSH banner and the
-    authentication each the full timeout (hssh/transports/ssh.py, _connect),
-    the OpenSSH client its ConnectTimeout and then the session clock, and
-    the telnet login a handful of reads each bounded by it: three covers
-    them."""
-    return 1 if drivers.get(target.vendor).transport.name == "netconf" else 3
+    The NETCONF transport runs the set-up against one deadline (#66) and
+    then waits for the router's NETCONF hello a session timeout more (#126).
+    The paramiko transport gives the TCP connect and the SSH banner the
+    connect timeout, never more than the session timeout (#126), and the
+    negotiation and the authentication the full timeout each
+    (hssh/transports/ssh.py, _connect); the OpenSSH client has its session
+    clock, the connect timeout inside it, and the telnet login a handful of
+    reads each bounded by it: three covers them."""
+    return 2 if drivers.get(target.vendor).transport.name == "netconf" else 3
 
 
 def _attempts(fleet: "Fleet", target: Target, command) -> int:
@@ -518,7 +523,7 @@ class _Run:
                 session_timeout=fleet.session_timeout, command_timeout=fleet.command_timeout,
                 dry_run=False, commit_confirmed=None, save_dir=None, quiet=True,
                 batch_cmds=list(self.command) if self.mode == "show-batch" else None,
-                max_attempts=task.attempts, fmt=self.fmt)
+                max_attempts=task.attempts, fmt=self.fmt, connect_timeout=fleet.connect_timeout)
         except Exception as e:
             # The runner reports every failure as a result; this is the way
             # out for one it did not expect, so the device still gets a verdict.
@@ -860,7 +865,10 @@ class Fleet:
     classification allows; 2 by default, as the CLI's --retries. `store`: a
     path, or an open Store, to keep every result in; a path the Fleet opens
     it closes on exit; an open Store may be shared with other Fleets, on
-    other threads.
+    other threads. `connect_timeout`: whole seconds for the TCP connect and
+    the SSH banner on the SSH transports, never more than session_timeout,
+    3 by default, as the CLI's --connect-timeout; a device that does not
+    answer in that time is tried again after a short pause.
 
     One run at a time: a second show() or batch() while devices of the
     previous run are still in flight raises RuntimeError; a previous run
@@ -893,7 +901,8 @@ class Fleet:
     def __init__(self, targets, transport: str = "ssh", user: Optional[str] = None,
                  passwd: Optional[str] = None, workers: int = 32, session_timeout: int = 30,
                  command_timeout: int = 60, retries: int = DEFAULT_RETRIES,
-                 store: Union[None, str, os.PathLike, Store] = None):
+                 store: Union[None, str, os.PathLike, Store] = None,
+                 connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
         self.transport = transport
         found = _as_targets(targets, transport)
         if not found:
@@ -915,6 +924,7 @@ class Fleet:
         self._passwd = passwd
         self.workers = _check_int("workers", workers, 1, limits.MAX_WORKERS)
         self.session_timeout = _check_int("session_timeout", session_timeout, 1)
+        self.connect_timeout = _check_int("connect_timeout", connect_timeout, 1)
         self.command_timeout = _check_int("command_timeout", command_timeout, 1)
         self.retries = _check_int("retries", retries, 0)
         if isinstance(store, Store) or store is None:

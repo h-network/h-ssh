@@ -6,6 +6,12 @@ class NotAppliedError(RuntimeError):
     was sent (connect/auth/lock). Safe to retry even for an edit."""
 
 
+class ConnectTimeoutError(NotAppliedError):
+    """The device did not answer the connect phase within --connect-timeout:
+    no TCP answer, or no SSH banner. Nothing was sent, so it is safe to try
+    again, even for an edit; the runner does, after a short pause."""
+
+
 class LocalError(RuntimeError):
     """Refused on this machine before anything reached the device: a pin
     file another h-ssh run holds locked. The device did nothing to earn a

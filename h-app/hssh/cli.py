@@ -14,6 +14,7 @@ import re
 import shlex
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,8 @@ from .core import (
 
     path_inside,
 )
-from .runner import run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name
+from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
+                     DEFAULT_CONNECT_TIMEOUT)
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
@@ -193,6 +195,7 @@ class _Parser(argparse.ArgumentParser):
 CONFIG_DEFAULTS = {
     "workers": 8,
     "session_timeout": 30,
+    "connect_timeout": DEFAULT_CONNECT_TIMEOUT,
     "command_timeout": 20,
     "retries": 2,
     "transport": "ssh",
@@ -201,8 +204,9 @@ CONFIG_DEFAULTS = {
 
 TRANSPORT_CHOICES = ["junos", "ssh", "openssh", "telnet"]
 # The floor a config-file value must reach; a flag has argparse for this.
-CONFIG_FLOORS = {"workers": 1, "retries": 0, "session_timeout": 1, "command_timeout": 1}
-CONFIG_CEILINGS = {"workers": MAX_WORKERS, "session_timeout": MAX_SECONDS, "command_timeout": MAX_SECONDS}
+CONFIG_FLOORS = {"workers": 1, "retries": 0, "session_timeout": 1, "connect_timeout": 1, "command_timeout": 1}
+CONFIG_CEILINGS = {"workers": MAX_WORKERS, "session_timeout": MAX_SECONDS, "connect_timeout": MAX_SECONDS,
+                   "command_timeout": MAX_SECONDS}
 
 
 def apply_config_defaults(args, config: dict) -> None:
@@ -428,7 +432,13 @@ async def main() -> int:
     parser.add_argument("--workers", type=_ranged_int(1, MAX_WORKERS, "--workers"), default=None,
                         help="Parallel workers (default: 8)")
     parser.add_argument("--session-timeout", type=_ranged_int(1, MAX_SECONDS, "--session-timeout"), default=None,
-                        help="Timeout for establishing connection/session (default: 30)")
+                        help="Timeout for setting up the session: key exchange, authentication, the NETCONF "
+                             "hello; the whole login on telnet (default: 30)")
+    parser.add_argument("--connect-timeout", type=_ranged_int(1, MAX_SECONDS, "--connect-timeout"), default=None,
+                        metavar="SECONDS",
+                        help="junos, ssh, openssh: how long the TCP connect and the SSH banner may take, per "
+                             "attempt and never more than --session-timeout; a device that has not answered by "
+                             "then is tried again after a short pause, --retries times (default: 3)")
     parser.add_argument("--command-timeout", type=_ranged_int(1, MAX_SECONDS, "--command-timeout"), default=None,
                         help="Timeout for individual commands/operations (default: 20)")
     parser.add_argument("--dry-run", action="store_true",
@@ -1110,8 +1120,8 @@ async def main() -> int:
     # asyncio.to_thread runs on the loop's default executor, which sizes itself
     # min(32, cpu+4) — 6 threads on a 2-vCPU jump host. Without this, --workers
     # silently caps at that number and the semaphore below is the smaller lie:
-    # devices queue behind threads, and blocked ones (a 30s connect timeout)
-    # hold a thread the whole time, stalling everything behind them.
+    # devices queue behind threads, and blocked ones (a device that does not
+    # answer) hold a thread the whole time, stalling everything behind them.
     workers = resolve_workers(args.workers)
     loop = asyncio.get_running_loop()
     loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(
@@ -1271,6 +1281,7 @@ async def main() -> int:
                 user=user,
                 passwd=passwd,
                 session_timeout=args.session_timeout,
+                connect_timeout=args.connect_timeout,
                 command_timeout=args.command_timeout,
                 dry_run=dry_run,
                 payload_text=(broadcast_text if actual_mode == "edit-broadcast"
@@ -1288,10 +1299,12 @@ async def main() -> int:
                 fmt=args.format,
                 expected_diff=expected_diff,
                 seq=seq,
+                stop=stopped,
             )
 
     started = set()      # unit indices whose device may already be in play
     inflight = set()     # of those, the ones still running when Ctrl-C came
+    stopped = threading.Event()      # set on Ctrl-C: an attempt in flight is that device's last
 
     async def _run_unit(i, dry_run=None, expected_diff=None):
         """units[i] on its device, in its own mode and command for a job
@@ -1320,7 +1333,13 @@ async def main() -> int:
         previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units))]
         preview_failed = []
         for coro in asyncio.as_completed(previews):
-            i, res = await coro
+            try:
+                i, res = await coro
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                # As in the run itself (_completed): a preview whose connect
+                # runs out after Ctrl-C is not tried again.
+                stopped.set()
+                raise
             name, ok, out_text = res.name, res.ok, res.text
             # stdout stays the JSON array in --json mode; the previews go to
             # stderr, sanitised when that stream is a terminal. What is kept
@@ -1390,6 +1409,10 @@ async def main() -> int:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 interrupted = True
+                # A device whose attempt fails from here on is not tried
+                # again: a connect that ran out is a NotAppliedError, and an
+                # edit retried after the operator stopped the run could commit.
+                stopped.set()
                 for i, task in enumerate(tasks):
                     if i not in started and task in pending:
                         task.cancel()

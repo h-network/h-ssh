@@ -249,3 +249,49 @@ def test_a_declared_vendor_beats_the_transport_default(monkeypatch, tmp_path):
     rc, seen = run_main(monkeypatch, "--transport", "junos", "-sC", "show version",
                         "--target", "R1:192.0.2.1:telnet", "--target", "R2:192.0.2.2", config=cfg)
     assert rc == 0 and seen == [("R1", "telnet", "telnet"), ("R2", "junos", "junos")]
+
+
+# --- #126: --connect-timeout, `connect-timeout` in the config file, 3 by default ---------
+
+def connect_timeouts(monkeypatch, *argv, config=os.devnull):
+    """(rc, [(session_timeout, connect_timeout)]) as the driver got them for
+    one show through main(); nothing is contacted."""
+    from hssh import cli, drivers
+    got = []
+
+    def show(host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, connect_timeout=None):
+        got.append((st, connect_timeout))
+        return "ok"
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", types.SimpleNamespace(AVAILABLE=True, show=show))
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, "--user", "u", "-sC", "show version",
+                                      "R1:192.0.2.1:ssh", *argv])
+    rc = asyncio.run(cli.main())
+    return rc, got
+
+
+def test_the_connect_timeout_is_a_flag_and_a_config_key_and_3_by_default(monkeypatch, tmp_path):
+    assert connect_timeouts(monkeypatch) == (0, [(30, 3)])
+    cfg = write(tmp_path, "connect-timeout = 5\nsession_timeout = 20\n")
+    assert connect_timeouts(monkeypatch, config=cfg) == (0, [(20, 5)])
+    assert connect_timeouts(monkeypatch, "--connect-timeout", "2", config=cfg) == (0, [(20, 2)])    # the flag wins
+    from hssh.cli import apply_config_defaults
+    for value, text in (("0", "connect_timeout = 0 is below 1"), ("86401", "connect_timeout = 86401 is above 86400"),
+                        ("soon", "connect_timeout = 'soon' is not a number")):
+        args = types.SimpleNamespace(workers=None, session_timeout=None, connect_timeout=None,
+                                     command_timeout=None, retries=None, transport=None)
+        with pytest.raises(ValueError, match=re.escape(text)):
+            apply_config_defaults(args, {"connect_timeout": value})
+
+
+def test_the_help_shows_the_connect_timeout(monkeypatch, capsys):
+    from hssh import cli
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--help"])
+    with pytest.raises(SystemExit) as e:
+        asyncio.run(cli.main())
+    out = " ".join(capsys.readouterr().out.split())
+    assert e.value.code == 0 and "--connect-timeout SECONDS" in out
+    assert ("how long the TCP connect and the SSH banner may take, per attempt and never more than "
+            "--session-timeout" in out and "(default: 3)" in out)
