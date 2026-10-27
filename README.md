@@ -281,13 +281,13 @@ Each box gets one result:
 |---|---|
 | `live` | the box answered with an SSH banner, `SSH-2.0-…`, which is kept as its sshd's version string |
 | `refused` | the TCP connect was refused (`connection refused by HOST:PORT`) |
-| `no route` | the network said there is no way to the box (`no route to host HOST:PORT`, `network is unreachable for HOST:PORT`) |
-| `name not found` | the name did not resolve (`cannot resolve HOST`, or the resolver's own words); a name no resolver takes, `10.0.0..1` or a label over 63 characters, says why (`cannot resolve 10.0.0..1: label empty or too long`) |
+| `no route` | the network said there is no way to the box (`no route to host HOST:PORT`, `network is unreachable for HOST:PORT`), or the OS refused the connect otherwise (`TCP connect to HOST:PORT failed: …`) |
+| `name not found` | the name did not resolve (`cannot resolve HOST`, `name lookup for HOST failed: …` in the resolver's words, or `name lookup for HOST did not answer within Ns`); a name no resolver takes, `10.0.0..1` or a label over 63 characters, says why (`cannot resolve 10.0.0..1: label empty or too long`) |
 | `timed out` | no TCP answer within `--connect-timeout` (`TCP connect to HOST:PORT timed out after Ns`) |
 | `silent` | TCP accepted, and no banner within `--connect-timeout` (nothing at all, or the start of one and no more), or the connection closed without a word (a NAT or load balancer answering for a dead box, an sshd that hangs or is at its `MaxStartups`) |
-| `not SSH` | something else answered (`HOST:PORT answered 'HTTP/1.1 400 Bad Request', not an SSH banner`): a line and no `SSH-` line after it, or bytes that cannot begin one; a server that greets and then waits for the client is known when `--connect-timeout` runs out |
+| `not SSH` | something else answered (`HOST:PORT answered '220 mail.example ESMTP', not an SSH banner`): a line and no `SSH-` line after it, or bytes that cannot begin one; a server that greets and then waits for the client is known when `--connect-timeout` runs out. A server that waits for the client to speak first, a web server say, sends nothing and is `silent` |
 | `error` | the probe itself failed on something it did not expect (`the probe of HOST:PORT failed: …`); that box counts as dead, and every other box is probed as usual |
-| `not probed` | the probe did not ask: the box is reached through a `ProxyJump` or a `ProxyCommand`, its ssh configuration cannot be read, or the safety gate holds it in cooldown. It is not dead: the run goes to it as with `--no-probe` |
+| `not probed` | the probe did not ask: the box is reached through a `ProxyJump` or a `ProxyCommand`, its ssh configuration cannot be read, or the safety gate holds it (a cooldown, or a corrupt safety file, which holds every box). It is not dead: the run goes to it as with `--no-probe` |
 
 Every result but `live` and `not probed` is a dead box.
 
@@ -312,10 +312,14 @@ $ h-ssh -sC "show version" cr1:10.0.1.1:junos cr2:10.0.1.2:junos cr3:10.0.1.3:ju
 ...
 Probe: 3 box(es) in 0.5s: 2 live, 1 dead (refused 1), 1 slow (above 10 ms: cr2 10.7 ms)
 
+[03:02:44] cr1              STARTED
+[03:02:44] cr2              STARTED
 [03:02:44] cr3              FAIL
   ERROR: probe: refused (connection refused by 10.0.1.3:830)
 [03:02:44] cr2              OK
 [03:02:44] cr1              OK
+
+Done. Failures: 1
 ```
 
 **Where the run goes.** The probe asks the host and port the run will connect to. `openssh` reads your
@@ -341,8 +345,9 @@ so (a dead box a `--job` only reads is a FAIL of the run, as in a show, and asks
   nothing failed but not everything ran. Anything else: nothing is sent, exit 2;
 - without a terminal the edit is refused, exit 2 (`ERROR: N device(s) unreachable: …`, or with `--json`
   the object `{"error": …, "unreachable": [names], "reasons": {name: why}}`), unless
-  `--skip-unreachable` is given, which goes on with the reachable boxes without asking; the skipped
-  ones make the exit code 3;
+  `--skip-unreachable` is given, which goes on with the reachable boxes without asking, at a terminal
+  too; the skipped ones make the exit code 3. Without a terminal an edit that commits needs `-y` first
+  (it is refused before the probe otherwise), so a pipeline gives `-y --skip-unreachable`;
 - `-y` confirms the edit; it never accepts a partial deployment by itself, so the question is asked
   with `-y` too, and without a terminal `-y` alone is refused;
 - with every box dead the edit is refused (exit 2) and nothing is asked;
@@ -401,17 +406,21 @@ Where that matters, or when you know every box is up and accept the risk, `--no-
 run, `probe = no` in `~/.h-ssh/config` for every run, `no-probe: true` in a run file, and
 `Fleet(..., probe=False)` in the library. Without it a dead box costs `--connect-timeout` per attempt
 during the run (see [Failure handling](#failure-handling)), and an edit has no reachability check
-before it starts. A box the `--safety-file` gate holds in cooldown is never probed (`not probed`,
-`safety gate: cooldown active (Ns remaining)`), on a run, a tick or `--probe` alone, so the rate-limit
+before it starts. A box the `--safety-file` gate holds is never probed (`not probed`, `safety gate:
+cooldown active (Ns remaining)`, or for every box `safety gate: safety file corrupted (fail-closed): …`
+when the file is corrupt), on a run, a tick or `--probe` alone, so the rate-limit
 the gate spares stays spared; the run's gate turns it away as before (exit 3).
 
 ## Transports
 
 A target names a *driver*: one dialect (what the device speaks) on one transport (how it is reached).
-The canonical name is `dialect@transport` — `junos@netconf`, `ios@telnet` — and the names in the
-table below are its aliases; both work in a target, a CSV and a job file. The driver declares what it
-can be asked (`hssh.drivers`): the runner refuses `--rollback`, `--format`, `--comment`, `--dry-run`
-on an edit or `--commit-confirmed` where the driver does not list them, before any device is touched.
+The canonical name is `dialect@transport` — `junos@netconf`, `ios@telnet` — and the short names in
+the table below (`junos`, `ssh`, `openssh`, `telnet`, `telnet-ios`, …) are aliases of canonical ones;
+the `@ssh` and `@openssh` rows are canonical names themselves. Both kinds work in a target, a CSV and a
+job file. The driver declares what it can be asked (`hssh.drivers`): where it does not list
+`--rollback`, `--format`, `--comment`, `--commit-status`, `--dry-run` on an edit or
+`--commit-confirmed`, each device fails with the reason before a session is opened (exit 1); only the
+probe has connected to it, and an edit has still asked its questions.
 
 | Vendor | Transport | Library | Show | Edit |
 |---|---|---|---|---|
@@ -441,7 +450,9 @@ a shell.
 `h-ssh --list-vendors` prints the registry: every driver a target may name, its aliases, transport,
 dialect, the formats `--format` can ask it for, what it supports, and where it came from (`built-in`,
 or the package that registered it: see [Adding a vendor](#adding-a-vendor)). `h-ssh --list-commands
---transport junos` lists a dialect's shortcut library the same way.
+--transport junos` lists the `junos` shortcut library the same way. `--transport` takes only `junos`,
+`ssh`, `openssh` and `telnet`, and the last three list the `none` library, so the `eos` library and a
+package dialect's are read in their JSON files.
 
 Telnet is a prompt match on a raw socket, so it is strict about what it has not seen. A read that reaches
 its timeout or loses the connection is an error, never a partial reply passed off as the device's answer,
@@ -479,14 +490,16 @@ and the host is looked up again under that lock: a host another run pinned meanw
 against that pin, never pinned over. Another run's lock is waited for as long as that run keeps
 pinning, since every pin changes the file; one held for `--session-timeout` with the file unchanged (a
 run stopped with Ctrl-Z in the middle of a pin) fails the device, not retried, with
-`~/.h-ssh/known_hosts is locked by another h-ssh run`, and the devices queued behind it fail with it
+`/home/you/.h-ssh/known_hosts is locked by another h-ssh run (one stopped with Ctrl-Z while it
+pinned?); resume or end it`, and the devices queued behind it fail with it
 rather than wait again. A line of `~/.h-ssh/known_hosts` that holds no pin — too few fields, a key
 that is not base64 or not a key of its type, a key type paramiko does not know, a hashed name that is
 not `|1|salt|hash`, a marker — is not dropped, which would pin that host again on trust: the
 connection is refused before anything is sent, naming the file, the line number and the line. In
 `~/.ssh/known_hosts` such a line is passed over, as OpenSSH passes it over, and so is a marker OpenSSH
 does not have; an `@revoked` line that cannot be read is refused the same way, so a revocation is
-never dropped. The TCP connect and the SSH banner get `--connect-timeout` between them; running out
+never dropped, but one with a key type paramiko does not know is passed over, since paramiko can never
+be shown that key. The TCP connect and the SSH banner get `--connect-timeout` between them; running out
 there is `TCP connect to HOST:PORT timed out after Ns` or `no SSH banner from HOST:PORT within Ns`, and
 is tried again. A refusal, no route or a name the resolver says does not exist is said as the OS said it
 (`connection refused by HOST:PORT`, `no route to host HOST:PORT`, `cannot resolve HOST`, where paramiko
@@ -495,7 +508,9 @@ resolver that did not answer in time above all, is said in its words too (`name 
 Temporary failure in name resolution`) and is tried again, an edit too: nothing was sent. The key
 exchange gets `--session-timeout`, not paramiko's fixed 15 s; one that has not finished by then is `no
 SSH session to HOST within Ns: the banner came, but key exchange did not finish`, as on `openssh`, and
-is not retried; a server that drops the session there is named the same way and retried.
+is not retried. A server that drops the session there sooner (within half the session timeout) is
+`HOST dropped the session before login after Ns (the banner came, but key exchange did not finish)`: a
+read is retried, an edit is not.
 
 ### `openssh` — for hosts where you cannot install anything
 
@@ -516,19 +531,24 @@ paramiko` is not on the table but `ssh` is already there:
 ./h-app/h-ssh.py --target R1:10.0.1.1:openssh -sC "show version" --user admin
 ```
 
-It inherits your `~/.ssh/config`, keys, agent and `known_hosts`, so jump-host `ProxyJump` stanzas and
-per-host identities work with no extra flags. The probe reads it too, through `ssh -G`: a `HostName` or
-`Port` there is where it asks the box, and a box behind a `ProxyJump` or `ProxyCommand` is not probed
-but run (see [The probe](#the-probe)). Host key policy defaults to `accept-new`; override with
-`HSSH_HOST_KEY_POLICY=yes` (strict) or `no` (skip).
+It inherits your `~/.ssh/config`, so jump-host `ProxyJump` stanzas and per-host identities work with
+no extra flags; without a password it also uses your keys and agent (with one, the password is the
+credential: see [Authentication](#authentication)). The probe reads the config too, through `ssh -G`:
+a `HostName` or `Port` there is where it asks the box, and a box behind a `ProxyJump` or `ProxyCommand`
+is not probed but run (see [The probe](#the-probe)). Host keys are checked against `~/.ssh/known_hosts`
+under `HSSH_HOST_KEY_POLICY`, whatever `StrictHostKeyChecking` or `UserKnownHostsFile` your config sets:
+the policy defaults to `accept-new`; override with `HSSH_HOST_KEY_POLICY=yes` (strict) or `no` (skip).
 
-Two limits, both deliberate: `--structured` has no bindings here, and `--commit-confirmed` is
-rejected rather than silently ignored — as it is on every transport but `junos` and `telnet-junos`,
-the two that can arm a rollback timer; dropping the timer without saying so would be worse than refusing.
+Two limits of the plain `openssh` driver, both deliberate: `--structured` falls back to text
+(`eos@openssh` has it, through `| json`), and `--commit-confirmed` is rejected rather than silently
+ignored, as it is on every driver but the four Junos ones (`junos`, `junos@ssh`, `junos@openssh`,
+`telnet-junos`), which can arm a rollback timer; dropping the timer without saying so would be worse
+than refusing.
 
-Edits run in an EOS configure session: the lines load into the session, its diff comes back, and
-`commit` makes them live together. A rejected line aborts the session and leaves running-config as
-it was; `NO CHANGES` means the session diff was empty and nothing was committed.
+On `eos@openssh` (and `eos@ssh`, `telnet-arista`) an edit is typed in config mode, as for IOS:
+`configure terminal`, the lines, `end`. Each line is live once it is typed; there is no session diff
+and nothing to roll back. A refused line fails the edit after `end`, and the lines around it stay
+applied. A clean edit prints `(config applied)`.
 
 ## Adding a vendor
 
@@ -538,16 +558,17 @@ own through the `hssh.drivers` entry-point group, so an internal package can shi
 driver pairing one with an existing transport, without a fork of h-ssh. Four pieces and one test run.
 
 **A dialect file.** A `Dialect` (`hssh/dialects/base.py`) is everything h-ssh knows about the device
-and nothing about connections; `hssh/dialects/ios.py` and `none.py` are the smallest built-in ones.
+and nothing about connections; `hssh/dialects/ios.py` is the smallest that defines its own CLI, and
+`nxos.py` and `eos.py` reuse it in a few lines.
 
 | Field | What it is |
 |---|---|
 | `name` | the half of a driver name before the `@` (`ios` in `ios@ssh`), and the stem of the operator's shortcut file |
 | `title`, `description` | the name as printed to the operator, and one line on the dialect |
-| `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. Every text transport reads replies with it: a show whose reply opens with such a line is a failure, not output, and an edit stops at the line that got one. A dialect on `ssh`, `openssh` or `telnet` must have one |
+| `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. On an exec channel (`ssh`, `openssh`) every reply is read with it: a show whose reply opens with such a line is a failure, not output, and the plain drivers' line-by-line edit stops at the line that got one. Typed at a CLI (a shell on `ssh` or `openssh`, `telnet`), a candidate edit checks each line's reply with it and discards the candidate after the last line; a lines edit looks for `error`, `invalid` or `%` instead and fails after `end`, the other lines applied; a telnet show is not checked. A dialect on `ssh`, `openssh` or `telnet` must have one |
 | `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*`; a command with a line break in it is never a read, whatever the dialect says |
 | `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
-| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt). `None`: the dialect shows over those transports but cannot edit |
+| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
 | `commit_pending` | a regex whose group 1 is the minutes left on a pending commit-confirmed, as `show system commit` prints them; `-eC commit` confirms only when it finds one |
 | `shortcuts` | the stem of a shipped library, `hssh/dialects/<stem>.json` — built-in dialects only, see below |
 
@@ -570,13 +591,19 @@ DRIVERS = [Driver(DIALECT, drivers.SSH, frozenset({"show", "show_batch", "edit"}
 
 **A `Driver` on a transport.** `Driver(dialect, transport, supports, aliases=())`. The transport is one
 of `drivers.SSH`, `drivers.OPENSSH`, `drivers.NETCONF` and `drivers.TELNET` (frozen: it takes a
-dialect, nothing else), or a `Transport` of the package's own whose `module` meets the contract below.
-`supports` is the set of words the runner may ask for: `show`, `show_batch`, `show_structured`, `rpc`,
-`edit`, `rollback`, `confirm`, `commit_status`, and the policies `dry_run`, `commit_confirmed` and
-`comment`. A word the driver does not list is refused by name before any device is touched, so list
-what the transport's module really does for this dialect. The `ssh` and `openssh` modules show on an
-exec channel for any dialect with a `refused`, edit through the CLI engine for one with a `cli`, and
-need a candidate (`compare`, `discard`, `commit`) for `dry_run`, `commit_confirmed` and `confirm`;
+dialect, nothing else), or a `Transport` of the package's own, `Transport(name, description, module,
+install, default_port, formats=("text",), banner=b"SSH-", ssh_config=None, console_port=None)`, whose
+`module` meets the contract below. The probe asks every box for `banner` before each run, so a
+transport that is not SSH sets `banner=None` (a TCP connect only), or every box is dead to the probe;
+`ssh_config` (`"openssh"` or `"paramiko"`) says which ssh configuration the transport follows, so the
+probe asks where it connects. `supports` is the set of words the runner may ask for: `show`,
+`show_batch`, `show_structured`, `rpc`, `edit`, `rollback`, `confirm`, `commit_status`, and the
+policies `dry_run`, `commit_confirmed` and `comment`. A word the driver does not list is refused by
+name on each device before a session is opened (the device fails; only the probe has reached it), so
+list what the transport's module really does for this dialect. The `ssh` and `openssh` modules show on
+an exec channel for any dialect with a `refused`, edit through the CLI engine for one with a `cli`,
+need a candidate (`compare`, `discard`, `commit`) for `dry_run` and `commit_confirmed`, and a candidate
+and `commit_pending` for `confirm`, which reads `show system commit` first, as Junos prints it;
 `show_structured` there is EOS's `| json`, and `rpc`, `rollback`, `commit_status` and `comment` are
 NETCONF's. `Driver` itself refuses nonsense (`rpc` on a text-only transport, a policy without `edit`).
 An alias is another name a target may carry (`telnet-ios` for `ios@telnet`) and must be free.
@@ -621,6 +648,8 @@ acme@ssh       -        ssh        acme     text           edit show show_batch 
 An entry point is taken whole or not at all. One whose import raises, that hands over something that is
 not a `Driver`, or that claims a name or alias already registered is listed by name at the end of that
 output — `broken entry point 'acme': ImportError: …` — never as a traceback, and the rest still load.
+A target that names one of its drivers is then `ERROR: Unknown vendor 'acme@ssh'.` (exit 2);
+`--list-vendors` says why.
 The registry is `hssh.drivers`: `DRIVERS`, `SOURCES` and `BROKEN` are what `--list-vendors` prints,
 and `load()` rebuilds them.
 
@@ -630,12 +659,14 @@ a function for each capability declared — `show`, `show_batch`, `edit`, … �
 passes: `host, user, passwd`, then the command, commands, payload or rollback number, then
 `session_timeout, command_timeout` (and `commit_confirmed` for an edit), with `port=` and
 `vendor_hint=` as keywords, and `connect_timeout=` to a function that takes it (the built-in SSH
-transports' all do; one without it is called as before); `dry_run=` and `expected_diff=` on `edit` for a driver that declares
-`dry_run`, `comment=` on `edit`, `confirm` and `rollback` for `comment`, and `rpc_batch()` next to
-`rpc()`. A capability declared and not backed would otherwise fail on the first device with a
-`TypeError` where a refusal should have been. Run it with the package installed; for one that is not,
-build the entry point in a test and hand it to `drivers.load([...])`, as `tests/test_entry_points.py`
-does with the packages under `tests/fixtures/`.
+transports' all do; one without it is called as before); `binding=` on `show_structured`, `fmt=` on
+`rpc` and on the `rpc_batch()` that must sit next to it, `dry_run=` and `commit_confirmed=` on
+`rollback`; `dry_run=` and `expected_diff=` on `edit` for a driver that declares `dry_run`, and
+`comment=` on `edit`, `confirm` and `rollback` for `comment`. A capability declared and not backed
+would otherwise fail on the first device with a `TypeError` where a refusal should have been. Run it
+with the package installed; for one that is not, build the entry point in a test and hand it to
+`drivers.load([...])`, as `h-app/tests/test_entry_points.py` does with the packages under
+`h-app/tests/fixtures/`.
 
 ## Defaults
 
