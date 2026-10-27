@@ -1026,16 +1026,18 @@ async def main() -> int:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
         return 2
     # Nobody watches a pipeline: a run file that commits must arm a timer, or
-    # say it is a dry run. A flag on the command line may supply either.
-    if args.run and has_edits and edit_needs_timer(args, is_confirm):
+    # say it is a dry run. A flag on the command line may supply either, and
+    # an edit given there (-eC, -eD, -eB, --rollback, a --job file) is held to
+    # it as the file's own are.
+    job_edits = [je.command for je in (job_entries or []) if je.mode.startswith("edit")]
+    if args.run and has_edits and edit_needs_timer(args, is_confirm, job_edits):
         print(f"ERROR: run file '{args.run}' makes changes without a rollback timer: set commit_confirmed "
               "(minutes) in the file or pass --commit-confirmed, or set dry_run.", file=sys.stderr)
         return 2
     # A confirm is a plain commit: it cannot arm a new timer, so a run that
     # asks for one would end with a banner promising a rollback that no
     # device is counting down.
-    confirms = ([args.edit_command] if args.edit_command else
-                [je.command for je in (job_entries or []) if je.mode.startswith("edit")])
+    confirms = [args.edit_command] if args.edit_command else job_edits
     if args.commit_confirmed and confirms and all(is_confirm(c) for c in confirms):
         print('ERROR: --commit-confirmed does not go with -eC "commit": a confirm cannot arm a new timer.',
               file=sys.stderr)

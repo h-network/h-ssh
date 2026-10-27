@@ -252,16 +252,15 @@ def apply_run(args, run: Dict[str, Any], parser) -> List[str]:
     return applied
 
 
-def edit_needs_timer(args, is_confirm) -> bool:
-    """True when the run file leads to a commit on devices without a
-    commit-confirmed timer: refused, since nobody is watching a pipeline."""
+def edit_needs_timer(args, is_confirm, job_edits=()) -> bool:
+    """True when a run started with --run leads to a commit on devices
+    without a commit-confirmed timer: refused, since nobody is watching a
+    pipeline. `job_edits` are the payloads of the run's job edit entries,
+    from the file's `jobs` or from a --job file typed beside --run alike."""
     if args.dry_run or args.commit_confirmed is not None:
         return False
-    edits = [c for c in (args.edit_command,) if c]
-    jobs = getattr(args, "jobs_data", None) or []
-    edits += [j["edit"] for j in jobs if isinstance(j, dict) and isinstance(j.get("edit"), str)]
-    has_edit = bool(args.edit_command or args.edit_dir or args.edit_broadcast
-                    or args.rollback is not None or edits)
+    edits = [c for c in (args.edit_command,) if c] + list(job_edits)
+    has_edit = bool(edits or args.edit_dir or args.edit_broadcast or args.rollback is not None)
     if not has_edit:
         return False
     # A confirm is not a new commit; it cannot carry a timer anyway.

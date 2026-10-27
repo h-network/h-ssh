@@ -257,6 +257,35 @@ def test_a_job_edit_from_a_file_needs_a_timer(monkeypatch, capsys, tmp_path):
     assert drv.edits == []
 
 
+def test_a_job_file_typed_beside_the_run_file_needs_a_timer_too(monkeypatch, capsys, tmp_path):
+    """#134: the rule looked at the file's own `jobs` and at -eC, -eD, -eB
+    and --rollback typed beside --run, not at a --job file typed there:
+    its edit entries committed with no timer, exit 0. They are held to it
+    as the file's jobs are; a timer or a dry run lets them run, and a job
+    that only reads, or only confirms, needs neither."""
+    f = write(tmp_path, "run.yaml", "user: u\nworkers: 2\n")
+    edit_job = write(tmp_path, "edit.json", json.dumps([
+        {"target": "R1:10.0.0.1:junos", "show": "show version"},
+        {"target": "R2:10.0.0.2:junos", "edit": "set system host-name R2"}]))
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", edit_job, "-y"])
+    assert rc == 2 and "without a rollback timer" in err and "commit_confirmed" in err
+    assert drv.edits == [] and drv.shows == []
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", edit_job, "-y", "--commit-confirmed", "5"])
+    assert rc == 0, err
+    assert drv.edits == [("10.0.0.2", "set system host-name R2", 5, False)]
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", edit_job, "-y", "--dry-run"])
+    assert rc == 0, err
+    assert drv.edits == [("10.0.0.2", "set system host-name R2", None, True)]
+    reads = write(tmp_path, "reads.json", json.dumps([{"target": "R1:10.0.0.1:junos", "show": "show version"}]))
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", reads])
+    assert rc == 0, err
+    assert drv.shows == [("10.0.0.1", "show version", None)]
+    confirm = write(tmp_path, "confirm.json", json.dumps([{"target": "R1:10.0.0.1:junos", "edit": "commit"}]))
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", confirm, "-y"])
+    assert rc == 0, err
+    assert drv.edits == [("10.0.0.1", "commit", None, False)]
+
+
 def test_jobs_and_job_flag_are_two_lists(monkeypatch, capsys, tmp_path):
     job = write(tmp_path, "job.json", json.dumps([{"target": "R1:10.0.0.1:junos", "show": "show version"}]))
     f = write(tmp_path, "run.yaml", 'user: u\njobs:\n  - {target: "R1:10.0.0.1:junos", show: show version}\n')

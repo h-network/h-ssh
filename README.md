@@ -795,13 +795,12 @@ Two rules the file cannot bend:
   runs. The password comes from `HSSH_PASSWORD` or the prompt when stdin is a terminal, exactly as
   without a file, so a run file can live in git or on a shared jump host.
 - **Changes need a timer.** A run started with `--run` that commits (an `edit`, `edit-dir`,
-  `edit-broadcast`, `rollback` or job edit in the file, or `-eC`, `-eD`, `-eB` or `--rollback` on the
-  command line) must set `commit-confirmed` in the file or on the command line, or be a `dry-run`;
-  otherwise exit 2. A confirm (`edit: commit`) needs no timer. Nobody watches a pipeline, and an
-  unattended commit without a rollback timer is the one thing it must not be able to do by accident.
-  A `--job` file typed on the command line beside `--run` is not checked: give it the timer yourself.
-  The `y/N` question and `-y` work as they do for flags, and the banner names the file, the device
-  count and the timer.
+  `edit-broadcast`, `rollback` or job edit in the file, or `-eC`, `-eD`, `-eB`, `--rollback` or a
+  `--job` file's edit on the command line) must set `commit-confirmed` in the file or on the command
+  line, or be a `dry-run`; otherwise exit 2. A confirm (`edit: commit`) needs no timer. Nobody watches
+  a pipeline, and an unattended commit without a rollback timer is the one thing it must not be able
+  to do by accident. The `y/N` question and `-y` work as they do for flags, and the banner names the
+  file, the device count and the timer.
 
 The file is declarative: no variables, loops or templating. A pipeline that needs them generates the
 file. YAML needs PyYAML, which comes along with junos-eznc, so every install has it; a JSON run file needs nothing.
@@ -1417,7 +1416,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1248 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1249 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
