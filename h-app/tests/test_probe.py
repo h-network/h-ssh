@@ -747,6 +747,26 @@ def test_without_a_terminal_a_dead_box_stops_the_edit_unless_skip_unreachable(mo
     assert rc == 3 and driver.calls == [("edit", "10.0.0.1")]
 
 
+@pytest.mark.parametrize("edit", ["-eC", "--show-diff", "--rollback", "--job"])
+def test_an_edit_without_y_or_a_terminal_is_refused_before_the_probe_touches_a_box(monkeypatch, capsys, tmp_path,
+                                                                                   probed, edit):
+    """An edit nobody can confirm (no -y, no terminal) is refused before the
+    probe: a pipeline that left out -y costs the routers no pre-auth
+    connection, which their ssh rate-limit would count, and sends nothing."""
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": "show version"},
+                               {"target": "R2:10.0.0.2:junos", "edit": "set system host-name x"}]))
+    argv = {"-eC": ["-eC", "set system host-name x", *R12],
+            "--show-diff": ["-eC", "set system host-name x", "--show-diff", *R12],
+            "--rollback": ["--rollback", "1", *R12],
+            "--job": ["--job", str(job)]}[edit]
+    rc, out, err, asked, driver = run(monkeypatch, capsys, argv)
+    assert rc == 2 and asked == [] and driver.calls == []
+    assert probed == [] and "Probe:" not in out
+    assert ("--show-diff needs a terminal to ask, or -y." if edit == "--show-diff" else
+            "Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.") in err
+
+
 def test_a_job_with_an_edit_goes_on_without_a_dead_box_only_when_told(monkeypatch, capsys, tmp_path):
     """A job with an edit entry is an edit: its dead box stops it without a
     terminal, and with --skip-unreachable every entry of that box is
