@@ -15,10 +15,6 @@ from hssh.core import check_unique, Target
 from hssh.safety import SafetyGate
 
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 class Driver:
     AVAILABLE = True
 
@@ -36,7 +32,6 @@ class Driver:
 def run(monkeypatch, capsys, argv):
     drv = Driver()
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", drv)
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")

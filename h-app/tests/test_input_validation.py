@@ -197,10 +197,6 @@ def test_a_command_with_a_control_character_is_refused(monkeypatch, capsys, cmd,
 
 def test_an_edit_payload_keeps_its_line_breaks_but_no_other_control_character(monkeypatch, capsys):
     """#110: an ESC typed into a device's CLI is a key, not configuration."""
-    async def reachable(target, timeout=2):
-        return target.name, True, "reachable"
-
-    monkeypatch.setattr(cli, "check_reachability", reachable)
     rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-eC", "set system host-name x\x1b", "-y"])
     assert rc == 2 and "ERROR: -eC has an ESC ('set system host-name x\\x1b'); a payload is plain text." in err
     rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-eC",

@@ -34,9 +34,18 @@ Fleet dropped without close() lets its worker threads go, and gives the
 session pool back, once it is collected. The library reads no environment
 variable and no config file: what it is given is what it uses.
 
+Before every show() and batch() the boxes are probed (hssh.probe, #127): a
+TCP connect and the SSH banner per box, no login, at most MAX_PROBES at
+once, where the box's transport connects. The run goes to the boxes that
+answered; a dead one is a failed result at once, with the probe's reason,
+instead of a worker spent on its connect timeouts; one reached through a
+proxy is not probed and runs as without the probe. Fleet(probe=False)
+skips it. `probe(slow_ms=)` is the check alone: one ProbeResult per box,
+kept in the store as a run of mode `probe` when there is one.
+
 Reads only, `show` and `batch`. An edit has gates the CLI applies before
-the runner is called (the set-syntax guard, the pre-flight check, the
-question); those stay with the CLI and the transports' own edit()/begin().
+the runner is called (the set-syntax guard, the probe's question, the
+confirmation); those stay with the CLI and the transports' own edit()/begin().
 """
 
 import asyncio
@@ -58,13 +67,16 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterable, Iterator, List, Optional, Union
 
 from . import drivers, limits, pool
+from . import probe as probes
 from .core import Target, check_unique, control_character, load_devices_csv, parse_bare_target
 from .drivers import results as R
+from .probe import ProbeResult
 from .runner import DEFAULT_CONNECT_TIMEOUT, RunResult, _backoff, run_for_target
 from .store import Store
+from .transports.connect import budget as connect_budget
 
-__all__ = ["Fleet", "Results", "DeviceResult", "MAX_WORKERS", "GRACE_SECONDS", "FORMATS", "DEFAULT_RETRIES",
-           "DEFAULT_CONNECT_TIMEOUT"]
+__all__ = ["Fleet", "Results", "DeviceResult", "ProbeResult", "MAX_WORKERS", "GRACE_SECONDS", "FORMATS",
+           "DEFAULT_RETRIES", "DEFAULT_CONNECT_TIMEOUT"]
 
 MAX_WORKERS = limits.MAX_WORKERS
 # The CLI's --retries default: one engine, one behaviour. The connect
@@ -309,6 +321,14 @@ def _check_int(name: str, value, low: int, high: Optional[int] = None) -> int:
     return value
 
 
+def _check_ms(name: str, value) -> float:
+    """Milliseconds above 0, whole or not, up to a day's worth: the probe's
+    slow threshold, held to what --slow takes."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 86_400_000:
+        raise ValueError(f"{name} must be milliseconds above 0, up to 86400000, not {value!r}")
+    return float(value)
+
+
 def _connect_factor(target: Target) -> int:
     """How many session_timeouts the session set-up may take, worst case.
     The NETCONF transport runs the set-up against one deadline (#66) and
@@ -482,18 +502,37 @@ class _Run:
                     self.store_run = fleet._store.begin_run(self.mode, argv, fleet.user, len(self.tasks),
                                                             _version(), origin=socket.gethostname(), command=about)
                 workers = fleet._engine()
-            self._submit_all(workers)
+            dead = self._probe() if fleet.probe_first else {}
+            self._submit_all(workers, dead)
         except BaseException:
             self.end(interrupted=True)           # the devices not handed out are skipped, the row says so
             raise
 
-    def _submit_all(self, workers: "_DaemonPool") -> None:
+    def _probe(self) -> dict:
+        """The probe before the run (#127), off the run's lock: {device name:
+        its ProbeResult} for every box that did not answer. A close() that
+        lands meanwhile ends the run and wakes this at once; the start then
+        fails as on a closed Fleet."""
+        found = self.fleet._probe_boxes(probes.SLOW_MS, stop=self.stop, stacklevel=5)
+        with self._lock:
+            if self.ended or found is None:
+                raise RuntimeError("this Fleet is closed")
+        return {r.device: r for r in found if r.dead}
+
+    def _submit_all(self, workers: "_DaemonPool", dead: Optional[dict] = None) -> None:
         fleet = self.fleet
+        dead = dead or {}
         for task in self.tasks:
             with self._lock:
                 if self.ended:                   # closed while starting: the rest never runs
                     break
-                if fleet._stuck_task(task.target.name) is not None:
+                if task.target.name in dead:
+                    # The probe found the box dead: a failed result at once, in
+                    # its words, and no worker spent on the device's connect.
+                    r = dead[task.target.name]
+                    future = cf.Future()
+                    future.set_result(_failed(task.target, self.mode, f"probe: {r.verdict}", r.duration_ms))
+                elif fleet._stuck_task(task.target.name) is not None:
                     # An earlier run's call to this device has not returned. It
                     # holds a worker and, in real life, the pool's lock for that
                     # router: another call would queue behind it and be given up
@@ -868,7 +907,10 @@ class Fleet:
     other threads. `connect_timeout`: whole seconds for the TCP connect and
     the SSH banner on the SSH transports, never more than session_timeout,
     3 by default, as the CLI's --connect-timeout; a device that does not
-    answer in that time is tried again after a short pause.
+    answer in that time is tried again after a short pause. `probe`: True
+    (the default) probes the boxes before every show() and batch(), so a
+    dead one is a failed result with the probe's reason at once; False
+    skips it, for a fleet known to be up (see probe()).
 
     One run at a time: a second show() or batch() while devices of the
     previous run are still in flight raises RuntimeError; a previous run
@@ -881,7 +923,8 @@ class Fleet:
     returns later is dropped: its row says skipped). A close() that lands
     while show() is still opening the run's store row waits for the row,
     records the run as interrupted, and that show() raises
-    RuntimeError("this Fleet is closed"). The sessions close (one still in
+    RuntimeError("this Fleet is closed"); one that lands while the boxes
+    are being probed does the same at once. The sessions close (one still in
     use closes when its call returns), and the routers get up to a second
     in all (pool.CLOSE_WAIT) to acknowledge that, so the sessions'
     descriptors are freed with them; a store this Fleet opened is closed.
@@ -902,7 +945,7 @@ class Fleet:
                  passwd: Optional[str] = None, workers: int = 32, session_timeout: int = 30,
                  command_timeout: int = 60, retries: int = DEFAULT_RETRIES,
                  store: Union[None, str, os.PathLike, Store] = None,
-                 connect_timeout: int = DEFAULT_CONNECT_TIMEOUT):
+                 connect_timeout: int = DEFAULT_CONNECT_TIMEOUT, probe: bool = True):
         self.transport = transport
         found = _as_targets(targets, transport)
         if not found:
@@ -927,6 +970,10 @@ class Fleet:
         self.connect_timeout = _check_int("connect_timeout", connect_timeout, 1)
         self.command_timeout = _check_int("command_timeout", command_timeout, 1)
         self.retries = _check_int("retries", retries, 0)
+        if not isinstance(probe, bool):
+            raise ValueError(f"probe must be True or False, not {probe!r}")
+        self.probe_first = probe
+        self._probe_limit: Optional[int] = None    # probes at once, fitted to the open-file limit at the first
         if isinstance(store, Store) or store is None:
             self._store, self._owns_store = store, False
         else:
@@ -975,6 +1022,93 @@ class Fleet:
         """batch() for asyncio code, as show_async()."""
         async for r in self._run_async(self._prepare("show-batch", commands, fmt)):
             yield r
+
+    def probe(self, slow_ms: float = probes.SLOW_MS) -> List[ProbeResult]:
+        """Every box asked whether it is there, without logging in: a TCP
+        connect, the server's identification checked to be an SSH banner
+        (TCP alone on telnet), the connection closed (hssh.probe), where
+        the box's transport connects (the ssh configuration's HostName and
+        Port on the openssh and junos transports). One ProbeResult per box,
+        in the targets' order: `result` live, refused, no route, name not
+        found, timed out, silent, not SSH or error (`dead`), or not probed
+        (a box reached through a ProxyJump or ProxyCommand, or whose ssh
+        configuration cannot be read: the run goes to it); `connect_ms`,
+        the TCP handshake's round trip as the kernel measured it, and
+        `banner_ms`, the wall time to the banner, one sample each; `banner`
+        or `reason`; `slow`, the tag of a live box whose round trip is
+        above `slow_ms` (10 by default, as the CLI's --slow), else None.
+        The connect timeout bounds the TCP connect and the banner each, a
+        box that fails is tried once more after a short pause, and at most
+        MAX_PROBES run at once. With a store, kept as a run of mode `probe`
+        with a row per box, the record as JSON; what it could not keep is a
+        RuntimeWarning, never raised. Blocks until every box has answered
+        or run out; a run in progress is no obstacle."""
+        slow_ms = _check_ms("slow_ms", slow_ms)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("this Fleet is closed")
+        store, run_id = self._store, None
+        if store is not None:
+            run_id = store.begin_run("probe", ["Fleet.probe"], self.user, len(self.targets), _version(),
+                                     origin=socket.gethostname(), command="probe")
+        try:
+            found = self._probe_boxes(slow_ms, stacklevel=4)
+        except BaseException:
+            if run_id is not None:
+                try:
+                    store.finish_run(run_id, 0, 0, len(self.targets), interrupted=True)
+                except Exception:
+                    pass
+            raise
+        if run_id is not None:
+            self._keep_probe(store, run_id, found)
+        return found
+
+    def _probe_boxes(self, slow_ms: float, stop: Optional[cf.Future] = None,
+                     stacklevel: int = 3) -> Optional[List[ProbeResult]]:
+        """Every box probed on a thread of the probe's own, the connect
+        timeout (never more than the session timeout) for the connect and
+        for the banner; None when `stop` completed first (a close()), the
+        probe then left to end by itself."""
+        with self._lock:
+            if self._probe_limit is None:
+                fitted, note = limits.fit_probes_to_open_files(min(limits.MAX_PROBES, len(self.targets)))
+                if note:
+                    warnings.warn(note, RuntimeWarning, stacklevel=stacklevel + 1)
+                self._probe_limit = fitted
+            limit = self._probe_limit
+        future = probes.in_thread(self.targets, connect_budget(self.connect_timeout, self.session_timeout),
+                                  slow_ms, limit, user=self.user)
+        cf.wait([future] if stop is None else [future, stop], return_when=cf.FIRST_COMPLETED)
+        if not future.done():
+            return None
+        return future.result()
+
+    def _keep_probe(self, store: Store, run_id: str, found: List[ProbeResult]) -> None:
+        """A probe's rows, as the CLI keeps them: one per box, the record as
+        JSON, a box that is not live a failed row with its verdict as the
+        error; the run counts a box not probed as skipped."""
+        lost, error = 0, None
+        for r in found:
+            entry = {"device": r.device, "host": r.host, "vendor": r.vendor, "ok": r.ok,
+                     "duration_ms": r.duration_ms, "error": None if r.ok else r.verdict, "output": r.to_dict()}
+            try:
+                store.add_entry(run_id, entry, "probe", fmt="json")
+            except Exception as e:
+                lost += 1
+                error = error or str(e)
+        gone = store.still_there()
+        if gone is not None:
+            lost, error = len(found), gone
+        live = sum(1 for r in found if r.ok)
+        dead = sum(1 for r in found if r.dead)
+        if lost < len(found):
+            try:
+                store.finish_run(run_id, live, dead, len(found) - live - dead)
+            except Exception as e:
+                _warn(f"store {store.path}, run {run_id}: {e}")
+        if lost:
+            _warn(f"store {store.path}, run {run_id}: {lost} of {len(found)} results were not kept: {error}")
 
     async def _run_async(self, run: _Run) -> AsyncIterator[DeviceResult]:
         loop = asyncio.get_running_loop()

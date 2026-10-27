@@ -40,9 +40,19 @@ class Transport:
     install: str                 # what is missing when that module says AVAILABLE = False
     default_port: int
     formats: Tuple[str, ...] = ("text",)   # device-side formats it can ask for (--format)
-    banner: Optional[bytes] = b"SSH-"   # what the port must say to be a device (pre-flight); None: open is enough
+    banner: Optional[bytes] = b"SSH-"   # what the port must say first to be a device (the probe); None: open is enough
     pooled: bool = False         # sessions can outlive one command (hssh.pool)
     frozen: bool = False         # kept working, gets nothing new
+    # How it reads the ssh client's configuration, so the probe asks where
+    # the run goes: "openssh" (the client itself: HostName, Port, ProxyJump,
+    # ProxyCommand, as `ssh -G` says), "paramiko" (~/.ssh/config as PyEZ and
+    # ncclient read it: HostName, Port, ProxyCommand); None: it reads none.
+    ssh_config: Optional[str] = None
+    # A target port its library reaches as a console over telnet, not SSH
+    # (PyEZ makes a Device on port 23 a Console): the probe asks it TCP
+    # alone, as it asks telnet, and of ~/.ssh/config only its Port, as that
+    # Console reads it. None: every port is the transport's own protocol.
+    console_port: Optional[int] = None
 
 
 @dataclass(frozen=True)

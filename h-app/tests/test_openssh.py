@@ -168,7 +168,7 @@ def test_registered_as_a_vendor():
     assert driver.name == "none@openssh" and driver.aliases == ("openssh",)
     assert drivers.module_of(driver) is openssh
     assert driver.transport.install == "the OpenSSH client ('ssh' on PATH)"
-    assert cli.drivers is drivers      # one registry; the CLI's pre-flight reads the same one
+    assert cli.drivers is drivers      # one registry; the CLI and its probe read the same one
 
 
 @pytest.fixture

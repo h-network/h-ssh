@@ -162,8 +162,9 @@ def test_workers_actually_run_in_parallel(tmp_path):
     hssh = os.path.join(os.path.dirname(__file__), "..", "h-ssh.py")
 
     start = time.time()
+    # --no-probe: the stub is every device, and nothing listens at 10.0.0.x to answer a probe.
     proc = subprocess.run([sys.executable, hssh, "--devices", str(devices), "--user", "x",
-                           "-sC", "show version", "--raw", "--workers", "24"],
+                           "-sC", "show version", "--raw", "--workers", "24", "--no-probe"],
                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, env=env)
     elapsed = time.time() - start
 

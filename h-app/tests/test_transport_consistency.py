@@ -120,15 +120,10 @@ def test_workers_are_lowered_to_what_the_limit_carries(monkeypatch):
     assert cli.fit_workers_to_open_files(256) == (256, None)
 
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 def test_the_run_warns_once_and_runs_with_the_lowered_workers(monkeypatch, capsys):
     _rlimits(monkeypatch, 64, 64, settable=False)
     driver = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "ok")
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")

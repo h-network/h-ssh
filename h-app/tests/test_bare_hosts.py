@@ -127,10 +127,6 @@ def test_the_help_shows_the_hosts(monkeypatch, capsys):
     assert e.value.code == 0 and "[HOST ...]" in out and "name:host[:vendor][:port]" in out
 
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 def test_a_bare_host_edits_and_the_confirm_hint_keeps_it_bare(monkeypatch, capsys):
     edits = []
 
@@ -139,7 +135,6 @@ def test_a_bare_host_edits_and_the_confirm_hint_keeps_it_bare(monkeypatch, capsy
         return "COMMIT CONFIRMED (2 minutes)\n\nDIFF:\n+ x\n"
 
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True, edit=edit))
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")

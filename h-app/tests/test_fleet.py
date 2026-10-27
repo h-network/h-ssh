@@ -367,7 +367,7 @@ def test_a_script_that_gave_up_on_a_wedged_device_can_exit(tmp_path):
         "    return 'late'\n"
         "drivers.MODULES['junos@netconf'] = types.SimpleNamespace(AVAILABLE=True, show=show)\n"
         "with Fleet(['10.0.0.1'], transport='junos', user='u', session_timeout=1, command_timeout=1,\n"
-        "           retries=0) as fleet:\n"
+        "           retries=0, probe=False) as fleet:\n"
         "    r, = fleet.show('show version')\n"
         "    print(r.ok, r.error, flush=True)\n")
     env = {**os.environ, "PYTHONPATH": os.path.dirname(os.path.dirname(hssh.__file__))}

@@ -31,12 +31,14 @@ from .core import (
 )
 from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
                      DEFAULT_CONNECT_TIMEOUT)
+from . import probe as probes
+from .transports.connect import budget as connect_budget
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
 from .safety import SafetyGate
 from . import pool
-from .audit import write_audit_entry, redact_values, secure_append, probe_append
+from .audit import write_audit_entry, redact_values, secure_append, secure_write, probe_append
 from .store import Store, StoreError, ENV_VAR as STORE_ENV, DEFAULT as STORE_DEFAULT, where as store_where
 from .store import _identity as store_identity
 from .screen import terminal_safe, is_terminal as _tty
@@ -45,6 +47,7 @@ from . import drivers
 # The worker ceiling and the open-file fitting are hssh.limits', shared with
 # the library engine (hssh.fleet); the CLI's names for them stay.
 from .limits import MAX_WORKERS, FDS_PER_WORKER, FDS_BASE, fit_workers_to_open_files  # noqa: F401
+from .limits import MAX_PROBES, fit_probes_to_open_files
 
 
 
@@ -135,6 +138,18 @@ def _seconds_arg(text: str) -> float:
     return value
 
 
+def _ms_arg(text: str) -> float:
+    """--slow MS: milliseconds above 0, fractions allowed, up to a day's
+    worth (the config file's `slow` is held to the same)."""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"--slow takes milliseconds, not {text!r}")
+    if not 0 < value <= MAX_SECONDS * 1000:          # NaN is neither
+        raise argparse.ArgumentTypeError(f"--slow takes milliseconds above 0, up to {MAX_SECONDS * 1000}, not {text}")
+    return value
+
+
 def _ranged_int(low: int, high: Optional[int], what: str):
     """An argparse type: an integer within [low, high], or one line naming the
     range. The value a flag accepts is the value a config file accepts, so
@@ -199,6 +214,7 @@ CONFIG_DEFAULTS = {
     "command_timeout": 20,
     "retries": 2,
     "transport": "ssh",
+    "slow": float(probes.SLOW_MS),
 }
 
 
@@ -206,7 +222,9 @@ TRANSPORT_CHOICES = ["junos", "ssh", "openssh", "telnet"]
 # The floor a config-file value must reach; a flag has argparse for this.
 CONFIG_FLOORS = {"workers": 1, "retries": 0, "session_timeout": 1, "connect_timeout": 1, "command_timeout": 1}
 CONFIG_CEILINGS = {"workers": MAX_WORKERS, "session_timeout": MAX_SECONDS, "connect_timeout": MAX_SECONDS,
-                   "command_timeout": MAX_SECONDS}
+                   "command_timeout": MAX_SECONDS, "slow": MAX_SECONDS * 1000}
+# `probe = no` skips the probe before every run, as --no-probe does for one (#127).
+PROBE_WORDS = {"yes": True, "true": True, "on": True, "1": True, "no": False, "false": False, "off": False, "0": False}
 
 
 def apply_config_defaults(args, config: dict) -> None:
@@ -225,7 +243,16 @@ def apply_config_defaults(args, config: dict) -> None:
             setattr(args, key, fallback)
             continue
         value = config[key]
-        if isinstance(fallback, int):
+        if isinstance(fallback, float):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key} = {value!r} is not a number")
+            if not value > 0:                    # NaN is not either
+                raise ValueError(f"{key} = {value:g} is not above 0")
+            if value > CONFIG_CEILINGS[key]:
+                raise ValueError(f"{key} = {value:g} is above {CONFIG_CEILINGS[key]}")
+        elif isinstance(fallback, int):
             try:
                 value = int(value)
             except (TypeError, ValueError):
@@ -239,6 +266,10 @@ def apply_config_defaults(args, config: dict) -> None:
             if value not in TRANSPORT_CHOICES:
                 raise ValueError(f"transport = {value!r} is not one of {', '.join(TRANSPORT_CHOICES)}")
         setattr(args, key, value)
+    word = str(config.get("probe", "yes")).strip().lower()
+    if word not in PROBE_WORDS:
+        raise ValueError(f"probe = {word!r} is not yes or no")
+    args.probe_by_config = PROBE_WORDS[word]
 
 
 def format_edit_result(out_text: str) -> str:
@@ -312,42 +343,153 @@ def edit_guard(vendor: str):
     return dialect if dialect.check_edit else None
 
 
-async def check_reachability(target, timeout: int = 2) -> tuple:
-    """Quick reachability check for a target."""
-    port = resolve_target_port(target)
-    banner = drivers.get(target.vendor).transport.banner
+def probe_lines(results) -> list:
+    """--probe's report, one line per box: the name, the result, the TCP
+    handshake's round trip and the banner time, the banner or the reason,
+    and the slow tag."""
+    name_width = max(len(r.device) for r in results)
+    result_width = max(len(r.result) for r in results)
+    lines = []
+    for r in results:
+        parts = [r.device.ljust(name_width), r.result.ljust(result_width)]
+        if r.connect_ms is not None:
+            parts.append(f"connect {probes.ms_text(r.connect_ms)} ms")
+        if r.banner_ms is not None:
+            parts.append(f"banner {probes.ms_text(r.banner_ms)} ms")
+        if r.ok:
+            parts.append(r.banner if r.banner is not None else "TCP only, no banner to check")
+        elif r.reason:
+            parts.append(r.reason)
+        if r.slow:
+            parts.append(r.slow)
+        lines.append("  ".join(parts).rstrip())
+    return lines
 
-    loop = asyncio.get_running_loop()
-    try:
-        await loop.getaddrinfo(target.host, None)
+
+def probe_summary(results, seconds: float, slow_ms: float, name_slow: bool = True) -> str:
+    """`Probe: N box(es) in Ts: L live, D dead (refused 1, ...), S slow`,
+    the slow ones named with their round trip when their lines are not
+    printed."""
+    text = f"Probe: {len(results)} box(es) in {seconds:.1f}s: {probes.tally(results)}"
+    slow = [r for r in results if r.slow]
+    if slow:
+        named = ""
+        if name_slow:
+            named = ": " + ", ".join(f"{r.device} {probes.ms_text(r.connect_ms)} ms" for r in slow[:10]) + \
+                    (" …" if len(slow) > 10 else "")
+        text += f" (above {slow_ms:g} ms{named})"
+    return text
+
+
+def held_by(gate, targets) -> dict:
+    """{host: why} for the boxes the safety gate holds now (a cooldown, a
+    corrupt safety file): the probe does not contact them either, and the
+    run's gate turns them away as before."""
+    if gate is None:
+        return {}
+    return {host: f"safety gate: {why}" for host, why in gate.holds({t.host for t in targets}).items()}
+
+
+async def probe_alone(args, targets, store, user, json_mode: bool, safety_gate=None) -> int:
+    """--probe with no command: every box probed (hssh.probe), no login
+    and no credential; one line per box and a summary, or the records with
+    --json; kept in the store as a run of mode `probe`, a row per box (one
+    that is not live is a failed row with its verdict, so `h-ssh-store
+    failed` lists it). 0 when every box is live, 1 when one is dead, 3
+    when none is but one was not probed (reached through a proxy, held by
+    the safety gate), 4 when the store could not keep it. The record (the
+    rows, the audit log, --log) is written before the report is printed,
+    so a reader that leaves early (`| head`) or a Ctrl-C while it prints
+    costs at most the report, never the record; the run row is closed
+    whatever ends the run, as interrupted where the report was cut short
+    (on 3.11+ a Ctrl-C there takes effect only at the next await, so the
+    report usually finishes and the run is whole)."""
+    limit, note = fit_probes_to_open_files(min(MAX_PROBES, len(targets)))
+    if note:
+        print(f"WARNING: {note}", file=sys.stderr)
+    seconds = connect_budget(args.connect_timeout, args.session_timeout)
+    if not json_mode:
+        print(f"\nProbe: {len(targets)} box(es), {limit} at a time, {seconds:g}s for the TCP connect and "
+              f"{seconds:g}s for the banner")
+    run_id = None
+    if store is not None:
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(target.host, port),
-                timeout=timeout,
-            )
+            run_id = store.begin_run("probe", sys.argv[1:], user, len(targets), __version__,
+                                     origin=socket.gethostname(), command="probe")
+        except Exception as e:                    # the file went away since it was opened
+            print(f"ERROR: store {store.path}: {e}; refusing to start.", file=sys.stderr)
+            return 2
+    recorded = {"live": 0, "dead": 0}     # the boxes whose record is written; every other one is skipped
+    tried = lost = 0                      # rows handed to the store, and those it could not keep
+    reason = None
+    whole = False                         # the run got to the end of its report
+    try:
+        started = time.time()
+        results = await probes.probe(targets, seconds, args.slow, limit, user=user,
+                                     held=held_by(safety_gate, targets))
+        elapsed_ms = int((time.time() - started) * 1000)
+        stamp = datetime.now().isoformat()
+        for r in results:
+            record = r.to_dict()
+            entry = {"device": r.device, "host": r.host, "vendor": r.vendor, "ok": r.ok,
+                     "duration_ms": r.duration_ms, "error": None if r.ok else r.verdict, "output": record}
+            if run_id is not None:
+                tried += 1
+                try:
+                    store.add_entry(run_id, entry, "probe", fmt="json")
+                except Exception as e:
+                    lost += 1
+                    reason = reason or str(e)
+            if args.audit_log:
+                write_audit_entry(path=args.audit_log, device=r.device, host=r.host, vendor=r.vendor, mode="probe",
+                                  payload="", ok=r.ok, error=entry["error"])
+            if args.log:
+                try:
+                    secure_append(args.log, json.dumps(redact_values({
+                        "timestamp": stamp, "user": user, "mode": "probe", "command": "probe",
+                        "dry_run": args.dry_run, **record, "error": entry["error"]})) + "\n")
+                except Exception as e:
+                    print(f"WARNING: Could not write to log file: {e}", file=sys.stderr)
+                    args.log = None
+            if r.ok or r.dead:
+                recorded["live" if r.ok else "dead"] += 1
+        if run_id is not None:
+            gone = store.still_there()
+            if gone is not None:          # SQLite kept writing into the void; nothing of this run is on disk
+                lost, reason = tried, gone
+        live, dead = recorded["live"], recorded["dead"]
+        passed = len(results) - live - dead              # not probed
+        if json_mode:
+            print(json.dumps([r.to_dict() for r in results], indent=2))
+        else:
+            shown = terminal_safe if _tty(sys.stdout) else (lambda text: text)    # a banner is the device's text
+            for line in probe_lines(results):
+                print(shown(line))
+            print()
+            print(probe_summary(results, elapsed_ms / 1000, args.slow, name_slow=False))
+        whole = True
+    finally:
+        # Whatever ends it (Ctrl-C during the probe or the report, a reader
+        # that left, anything else), the run row is closed with how far it
+        # got, as interrupted where it was cut short; one whose rows the
+        # store kept none of stays open, as a run's does (`?/?`).
+        if run_id is not None and (lost < tried or tried == 0):
             try:
-                if banner:
-                    # A port that accepts and closes (a NAT in front of a dead
-                    # container, sshd at its connection limit) is not a device:
-                    # the transport's banner is.
-                    first = await asyncio.wait_for(reader.readline(), timeout=timeout)
-                    if not first.startswith(banner):
-                        return (target.name, False,
-                                f"port {port} open but no {banner.decode('ascii', 'replace').rstrip('-')} banner")
-            finally:
-                writer.close()
-                await writer.wait_closed()
-            return (target.name, True, "reachable")
-        except asyncio.TimeoutError:
-            return (target.name, False, "connection timeout")
-        except ConnectionRefusedError:
-            return (target.name, False, f"port {port} not responding")
-        except OSError:
-            return (target.name, False, f"port {port} not responding")
-    except socket.gaierror:
-        return (target.name, False, "hostname not found")
-    except Exception as e:
-        return (target.name, False, f"error: {e}")
+                store.finish_run(run_id, recorded["live"], recorded["dead"],
+                                 len(targets) - recorded["live"] - recorded["dead"],
+                                 interrupted=not whole)
+            except Exception as e:
+                if whole:
+                    print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
+    if lost:
+        print(f"WARNING: store {store.path}: {lost} of {tried} results were not kept: {reason}", file=sys.stderr)
+    summary = {"targets": len(results), "ok": live, "fail": dead, "skipped": passed,
+               "slow": sum(1 for r in results if r.slow), **({"not_kept": lost} if lost else {}),
+               "elapsed_ms": elapsed_ms, "mode": "probe"}
+    print(f"[h-ssh] {json.dumps(summary)}", file=sys.stderr)
+    if lost:
+        return 4
+    return 1 if dead else 3 if passed else 0
 
 
 def is_confirm(payload: str) -> bool:
@@ -424,6 +566,13 @@ async def main() -> int:
     parser.add_argument("--show-diff", action="store_true",
                         help="Edits: run a dry-run on every target, print the diffs, then ask once before "
                              "committing; a diff that changed by then is not committed")
+    parser.add_argument("--probe", action="store_true",
+                        help="Alone, with no command: check every box without logging in (a TCP connect and the "
+                             "SSH banner): one line per box with its result, the handshake's round trip and the "
+                             "banner time, then a summary; kept in the store; exit 0 when every box is live, 1 "
+                             "when one is dead, 3 when none is but one was not probed (behind a ProxyJump or "
+                             "ProxyCommand, held by the safety gate). With a command: probe first even where the "
+                             "config file or a run file says not to")
 
     # Behavior
     parser.add_argument("--retries", type=_ranged_int(0, None, "--retries"), default=None,
@@ -441,12 +590,25 @@ async def main() -> int:
                              "then is tried again after a short pause, --retries times (default: 3)")
     parser.add_argument("--command-timeout", type=_ranged_int(1, MAX_SECONDS, "--command-timeout"), default=None,
                         help="Timeout for individual commands/operations (default: 20)")
+    parser.add_argument("--no-probe", action="store_true",
+                        help="Skip the probe that runs before every run (a TCP connect and the SSH banner per box, "
+                             "100 at a time: the run goes to the live boxes, a dead one is FAIL within seconds, "
+                             "and an edit asks before it goes on without one); you say every box is up and "
+                             "accept the risk")
+    parser.add_argument("--slow", type=_ms_arg, metavar="MS", default=None,
+                        help="The probe tags a live box whose TCP handshake took longer than MS milliseconds as "
+                             "slow; information only, never a failure (default: 10)")
+    parser.add_argument("--skip-unreachable", action="store_true",
+                        help="Edits: go on with the boxes that answered the probe, without asking; the others are "
+                             "skipped (exit 3). Without it a dead box stops an edit that has no terminal to ask at "
+                             "(exit 2); -y does not stand in for it")
     parser.add_argument("--dry-run", action="store_true",
                         help="Do not push, only show what would happen")
     parser.add_argument("--commit-confirmed", type=confirm_minutes_arg, nargs="?", const=10, default=None,
                         help="Use commit confirmed with auto-rollback timer in minutes, 1-65535 (default: 10, Junos only)")
     parser.add_argument("-y", "--yes", action="store_true",
-                        help="Skip confirmation prompt for edit operations")
+                        help="Skip confirmation prompt for edit operations (not the probe's question about "
+                             "unreachable boxes; see --skip-unreachable)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed output for all operations")
     parser.add_argument("--every", type=_seconds_arg, metavar="SECONDS", default=None,
@@ -539,11 +701,12 @@ async def main() -> int:
     # typed on the command line wins, the file wins over the environment and
     # ~/.h-ssh/config. It is read before anything else so the banner and the
     # checks below see what the run will use.
+    from_run_file = []           # the options the run file set
     if args.run:
         try:
             run_data = validate_run(load_run_file(args.run), args.run, TRANSPORT_CHOICES, CONFIG_FLOORS,
                                     CONFIG_CEILINGS)
-            apply_run(args, run_data, parser)
+            from_run_file = apply_run(args, run_data, parser)
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
@@ -560,6 +723,15 @@ async def main() -> int:
     except ValueError as e:
         print(f"ERROR: {get_config_path() if args.config is None else args.config}: {e}", file=sys.stderr)
         return 2
+    if args.probe and args.no_probe:
+        if "no_probe" not in from_run_file:
+            print("ERROR: --probe and --no-probe contradict each other.", file=sys.stderr)
+            return 2
+        args.no_probe = False       # typed on the command line, --probe wins over a run file's no_probe
+    # The probe before the run (#127): on unless --no-probe (or a run file's
+    # no_probe) or `probe = no` in the config file says otherwise; --probe
+    # with a command turns it on over both files.
+    probe_first = not args.no_probe and (args.probe or args.probe_by_config)
 
     # A command made of whitespace is a typo, not a request; one with a
     # control character in it is not a command: a line break in -sC would
@@ -682,8 +854,10 @@ async def main() -> int:
         if args.batch and args.batch_commands:
             print("ERROR: --batch and a run file's 'commands' are two command lists; use one.", file=sys.stderr)
             return 2
-        if sum(modes) != 1:
-            print("ERROR: choose exactly one of -sC, -eC, -eD, -eB, --batch, --rollback, --commit-status, or --job.", file=sys.stderr)
+        alone = args.probe and not any(modes)     # --probe with no command: the health check, no run
+        if sum(modes) != 1 and not alone:
+            print("ERROR: choose exactly one of -sC, -eC, -eD, -eB, --batch, --rollback, --commit-status, or --job "
+                  "(or --probe alone, to check the boxes).", file=sys.stderr)
             return 2
         if args.rollback is not None and not 0 <= args.rollback <= 49:
             print(f"ERROR: --rollback takes a number from 0 to 49, not {args.rollback}.", file=sys.stderr)
@@ -827,7 +1001,9 @@ async def main() -> int:
                     return 2
 
         # Mode label
-        if args.show_command:
+        if alone:
+            mode = "probe"
+        elif args.show_command:
             mode = "show"
         elif args.edit_command:
             mode = "edit-cmd"
@@ -880,11 +1056,11 @@ async def main() -> int:
             return 2
         try:
             driver = drivers.get(v)
-            mod = drivers.module_of(driver)
+            mod = drivers.module_of(driver) if mode != "probe" else None     # a probe logs in nowhere
         except (ValueError, ImportError):
             print(f"ERROR: Unknown vendor '{v}'.", file=sys.stderr)
             return 2
-        if not getattr(mod, "AVAILABLE", True):
+        if mod is not None and not getattr(mod, "AVAILABLE", True):
             print(f"ERROR: {driver.transport.install} not installed (required for vendor '{v}').",
                   file=sys.stderr)
             return 2
@@ -896,8 +1072,8 @@ async def main() -> int:
         return 2
     if args.every is not None:
         if mode not in ("show", "show-batch"):
-            print("ERROR: --every watches reads (-sC, --batch, --profile), not edits, rollbacks, commit status or jobs.",
-                  file=sys.stderr)
+            print("ERROR: --every watches reads (-sC, --batch, --profile), not edits, rollbacks, commit status, jobs "
+                  "or --probe.", file=sys.stderr)
             return 2
         if args.no_store:
             print("ERROR: --every compares every tick with the one before through the store; drop --no-store "
@@ -1010,7 +1186,7 @@ async def main() -> int:
 
     json_mode = args.json
     raw_mode = args.raw
-    # Progress chatter only. Edit pre-flight and confirmation stay visible.
+    # Progress chatter only. An edit's probe line and confirmation stay visible.
     show_progress = not (json_mode or raw_mode)
 
     if args.every is not None:
@@ -1021,6 +1197,15 @@ async def main() -> int:
         # means the name you are logged in as, with no question asked.
         user = getpass.getuser()
 
+    if mode == "probe":
+        # A probe logs in nowhere: no password is read or asked for.
+        try:
+            return await probe_alone(args, targets, store, user, json_mode, safety_gate)
+        finally:
+            if store is not None:
+                store.close()
+            if safety_gate is not None:
+                safety_gate.close()
     if passwd == "" and not _tty(sys.stdin):
         # A pipeline whose secret lookup came back empty: refused, since the
         # run would otherwise go on to key authentication without a word.
@@ -1129,68 +1314,131 @@ async def main() -> int:
 
     sem = asyncio.Semaphore(workers)
 
-    # Pre-flight check and confirmation for edit operations
-    # --show-diff previews every target before asking, which proves
-    # reachability the real way and spares the router a connection it counts
-    # against its ssh rate limit.
-    if has_edits and not args.dry_run and not args.show_diff:
-        # Probed --workers at a time with --session-timeout, like the run
-        # itself: 250 probes at once trip sshd's MaxStartups and a router's
-        # ssh rate-limit, and called devices unreachable that the real
-        # 32-worker edit then reached (H1). A probe that fails is tried once
-        # more before the device is called unreachable, for the same reason.
-        async def _probe(t):
-            async with sem:
-                result = await check_reachability(t, timeout=args.session_timeout)
-                if not result[1]:
-                    result = await check_reachability(t, timeout=args.session_timeout)
-                return result
-
-        if not json_mode:
-            print(f"\nPre-flight check: Validating device reachability "
-                  f"({min(workers, len(targets))} at a time, {args.session_timeout}s each)...")
-
-        reachability_results = await asyncio.gather(*[_probe(t) for t in targets])
-
-        unreachable = []
-        for t, (name, reachable, msg) in zip(targets, reachability_results):
-            if not json_mode:
-                status = "[PASS]" if reachable else "[FAIL]"
-                print(f"  {status} {name:16s} ({t.host}) - {msg}")
-            if not reachable:
-                unreachable.append(t)
-
-        if unreachable:
-            if args.audit_log:
-                for ut in unreachable:
-                    write_audit_entry(
-                        path=args.audit_log,
-                        device=ut.name,
-                        host=ut.host,
-                        vendor=ut.vendor,
-                        mode=mode if 'mode' in locals() else "preflight",
-                        payload="",
-                        ok=False,
-                        error="preflight reachability check failed (aborted)",
-                    )
-            names = [ut.name for ut in unreachable]
-            if json_mode:
-                err = {"error": f"{len(unreachable)} device(s) unreachable", "unreachable": names}
-                print(json.dumps(err))
-            else:
-                print(f"\nERROR: {len(unreachable)} device(s) unreachable: {', '.join(names)}")
-                print("Aborting to prevent partial deployment.")
-            return 2
-
-        if not json_mode:
-            print(f"\nReady to execute on {len(targets)} device(s).")
-
+    # An edit that changes the network needs its question answered: without
+    # a terminal or -y it is refused here, before the probe touches a box.
+    commits = has_edits and not args.dry_run
+    if commits and not args.yes and not _tty(sys.stdin):
         if args.show_diff:
-            pass  # the diffs are shown first, the question comes after them
-        elif not args.yes:
-            if not _tty(sys.stdin):
-                print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
+            print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
+        else:
+            print("ERROR: Edit operation requires confirmation but stdin is not a TTY. Use -y to skip.", file=sys.stderr)
+        return 2
+
+    # The run's row in the store. A read's is opened before its probe, so a
+    # read stopped there is kept as an interrupted run; an edit's once the
+    # edit is past its questions (the probe's, the confirmation, --show-diff's),
+    # so an edit stopped before them committed nothing and leaves no row.
+    store_run = None
+
+    def _begin_run() -> bool:
+        """Open the run's row; False (said why) when the store went away
+        since it was opened."""
+        nonlocal store_run
+        if store is None:
+            return True
+        try:
+            about = ("\n".join(batch_cmds) if batch_cmds else
+                     show_cmd or edit_cmd or args.edit_broadcast or (args.edit_dir and f"dir:{args.edit_dir}") or mode)
+            store_run = store.begin_run(mode, sys.argv[1:], user, len(units), __version__,
+                                        origin=socket.gethostname(), command=about)
+        except Exception as e:
+            print(f"ERROR: store {store.path}: {e}; refusing to start.", file=sys.stderr)
+            return False
+        return True
+
+    if not has_edits and not _begin_run():
+        return 2
+
+    # The probe (#127), before every run unless --no-probe or `probe = no`
+    # says otherwise: a TCP connect and the SSH banner per box, no login, at
+    # most MAX_PROBES at once, to where the box's transport will connect.
+    # The run goes to the boxes that answered; a dead one is that run's
+    # FAIL, with the probe's reason; one it did not probe (reached through a
+    # proxy, or held by the safety gate) is run as without the probe. It
+    # replaces the edit's pre-flight, which waited --session-timeout and
+    # tried twice: an edit goes on without a dead box only when the operator
+    # says so, asked at a terminal (-y confirms the edit, never a partial
+    # deployment) or by --skip-unreachable without one, and those left out
+    # are skipped (exit 3). That is for a box the edit goes to: a dead box a
+    # job only reads is a FAIL of the run, as in a show. A dry run is asked
+    # and stopped the same way: it rehearses the edit.
+    dead = {}               # unit index -> the probe's result, for a unit whose box did not answer
+    leave_out = set()       # of those, the units an edit goes on without: skipped, not failed
+    probe_ms = None         # how long the probe took, for the summary
+    interrupted = False     # Ctrl-C, during a read's probe or during the run
+    not_started = 0         # the units a Ctrl-C during a read's probe kept from starting: all, skipped
+    if probe_first:
+        boxes = {}
+        for t, _ in units:
+            boxes.setdefault((t.host, resolve_target_port(t)), t)     # a job may name a device in several entries
+        limit, probe_note = fit_probes_to_open_files(min(MAX_PROBES, len(boxes)))
+        if probe_note:
+            print(f"WARNING: {probe_note}", file=sys.stderr)
+        probe_started = time.monotonic()
+        try:
+            answers = await probes.probe(list(boxes.values()),
+                                         connect_budget(args.connect_timeout, args.session_timeout),
+                                         args.slow, limit, user=user, held=held_by(safety_gate, boxes.values()))
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if has_edits:
+                raise           # an edit stopped before its questions is no run (see above)
+            # A read stopped during its probe: no device was started. The run
+            # ends here as an interrupted one, its row kept, every device skipped.
+            interrupted, not_started, answers = True, len(units), []
+        probe_ms = int((time.monotonic() - probe_started) * 1000)
+        found = dict(zip(boxes, answers))
+        for i, (t, _) in enumerate(units):
+            r = found.get((t.host, resolve_target_port(t)))
+            if r is not None and r.dead:
+                dead[i] = r
+        if not interrupted and (show_progress or (has_edits and not json_mode)):
+            print(f"\n{probe_summary(list(found.values()), probe_ms / 1000, args.slow)}")
+        # The boxes an edit goes to: every box of -eC, -eD, -eB and --rollback,
+        # the boxes of a job's edit entries. Only their being dead stops the edit.
+        edited = {(t.host, resolve_target_port(t)) for t, je in units if je is None or je.mode.startswith("edit")}
+        down = [r for box, r in found.items() if r.dead and box in edited] if has_edits else []
+        if down:
+            reachable = sum(1 for r in found.values() if not r.dead)
+            listing = "\n".join(f"  {r.device:16s} ({r.host}) {r.verdict}" for r in down)
+            if not json_mode:
+                print(listing)
+            go_on = False
+            if reachable and args.skip_unreachable:
+                go_on = True
+                print(f"Skipping {len(down)} unreachable device(s) (--skip-unreachable): "
+                      f"{', '.join(r.device for r in down)}", file=sys.stderr)
+            elif reachable and _tty(sys.stdin):
+                if json_mode:       # stdout stays the JSON: the boxes and the question go to the terminal
+                    print(listing, file=sys.stderr)
+                try:
+                    go_on = _ask(f"Continue with the {reachable} reachable? [y/N]: ").strip().lower() in ("y", "yes")
+                except PromptClosed:
+                    pass
+                except KeyboardInterrupt:
+                    print(file=sys.stderr)
+            if not go_on:
+                if args.audit_log:
+                    for i, r in dead.items():
+                        t, je = units[i]
+                        write_audit_entry(path=args.audit_log, device=t.name, host=t.host, vendor=t.vendor,
+                                          mode=je.mode if je else mode, payload="", ok=False,
+                                          error=f"preflight probe failed: {r.verdict} (aborted)")
+                names = [r.device for r in down]
+                if json_mode:
+                    print(json.dumps({"error": f"{len(down)} device(s) unreachable", "unreachable": names,
+                                      "reasons": {r.device: r.verdict for r in down}}))
+                else:
+                    print(f"\nERROR: {len(down)} device(s) unreachable: {', '.join(names)}")
+                    print("Aborting to prevent partial deployment" +
+                          (f"; --skip-unreachable goes on with the {reachable} reachable." if reachable
+                           else ": no device answered the probe."))
                 return 2
+            leave_out = {i for i in dead if (units[i][0].host, resolve_target_port(units[i][0])) in edited}
+
+    if commits and not args.show_diff:
+        if not json_mode:
+            print(f"\nReady to execute on {len(units) - len(dead)} device(s).")     # a dead box is not run
+        if not args.yes:
             try:
                 confirm = input("\nProceed with changes? [y/N]: ").strip().lower()
                 if confirm not in ['y', 'yes']:
@@ -1210,23 +1458,16 @@ async def main() -> int:
     failures = 0
     interrupted_connects = 0
     skipped = 0                                              # held back by the safety gate (in the results)
+    unreachable = 0                                          # left out by an edit after the probe (in the results)
     not_run = skipped_missing if not job_entries else 0      # no set file (--allow-missing): not in the results
     json_results = []
     given_at = []        # each result's place in target order, for --diff
     run_start = time.time()
-    store_run = None
     store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
     store_reason = None
     unkept = []                       # --every: those results' rows, compared as the tick got them
-    if store is not None:
-        try:
-            about = ("\n".join(batch_cmds) if batch_cmds else
-                     show_cmd or edit_cmd or args.edit_broadcast or (args.edit_dir and f"dir:{args.edit_dir}") or mode)
-            store_run = store.begin_run(mode, sys.argv[1:], user, len(units), __version__,
-                                        origin=socket.gethostname(), command=about)
-        except Exception as e:                    # the file went away between the probe and the run
-            print(f"ERROR: store {store.path}: {e}; refusing to start.", file=sys.stderr)
-            return 2
+    if has_edits and not (args.show_diff and commits) and not _begin_run():
+        return 2
 
 
     # A job may list one device in several entries. Those run one at a time
@@ -1306,10 +1547,23 @@ async def main() -> int:
     inflight = set()     # of those, the ones still running when Ctrl-C came
     stopped = threading.Event()      # set on Ctrl-C: an attempt in flight is that device's last
 
+    def _dead_result(i):
+        """The result of a unit whose box the probe found dead: the probe's
+        words, as the runner words a failure; the device is not touched."""
+        t, je = units[i]
+        error = f"probe: {dead[i].verdict}" + ("; skipped" if i in leave_out else "")
+        text = (f"DEVICE: {t.name}\nHOST:   {t.host}\nMODE:   {je.mode if je else mode}\nVENDOR: {t.vendor}\n\n"
+                f"ERROR: {error}\n")
+        if save_dir:
+            secure_write(str(path_inside(save_dir, save_name(t.name, seq_of[i] if je else 0))), text)
+        return RunResult(t.name, False, text, dead[i].duration_ms, error=error)
+
     async def _run_unit(i, dry_run=None, expected_diff=None):
         """units[i] on its device, in its own mode and command for a job
         entry; the index comes back with the result."""
         t, je = units[i]
+        if i in dead:
+            return i, _dead_result(i)
         mark = lambda: started.add(i)
         if je is not None:
             result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
@@ -1326,11 +1580,8 @@ async def main() -> int:
     # --show-diff: every target's diff first, one question, then the real
     # run, which commits each diff only if the device produces it again.
     expected = {}
-    if args.show_diff and has_edits and not args.dry_run:
-        if not args.yes and not _tty(sys.stdin):
-            print("ERROR: --show-diff needs a terminal to ask, or -y.", file=sys.stderr)
-            return 2
-        previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units))]
+    if args.show_diff and commits:
+        previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units)) if i not in dead]
         preview_failed = []
         for coro in asyncio.as_completed(previews):
             try:
@@ -1375,6 +1626,8 @@ async def main() -> int:
                 _audit_aborted("aborted by user confirmation")
                 print("Aborted by user.")
                 return 0
+        if not _begin_run():
+            return 2
 
     if job_entries:
         # A job lists one device in several entries. With the pool on they
@@ -1383,7 +1636,8 @@ async def main() -> int:
         # and an edit entry's session is clean again before the next one.
         pool.enable()
 
-    tasks = [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i))) for i in range(len(units))]
+    tasks = [] if interrupted else [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i)))
+                                    for i in range(len(units))]
     screen = _tty(sys.stdout)     # control sequences are stripped for a terminal, kept for a pipe
 
     def _screen(text: str) -> str:
@@ -1392,7 +1646,6 @@ async def main() -> int:
         store, --log, --json) is the reply as it came either way."""
         return terminal_safe(text) if screen else text
 
-    interrupted = False
     log_cmd = (batch_cmds or show_cmd or edit_cmd or args.edit_broadcast
                or (args.edit_dir and f"dir:{args.edit_dir}") or "job")
     log_ts = datetime.now().isoformat()
@@ -1633,7 +1886,8 @@ async def main() -> int:
                     elif not ok and res.error is not None:
                         print(f"  ERROR: {res.error}")
             else:
-                status = "OK" if ok else ("INTERRUPTED" if entry.get("interrupted") else "FAIL")
+                status = ("OK" if ok else "SKIPPED" if i in leave_out
+                          else "INTERRUPTED" if entry.get("interrupted") else "FAIL")
                 print(f"[{timestamp}] {name:16s} {status}")
 
                 if args.verbose:
@@ -1646,7 +1900,9 @@ async def main() -> int:
                     print(f"  ERROR: {res.error}")
 
         if not ok:
-            if entry.get("error", "").startswith("safety gate blocked"):
+            if i in leave_out:
+                unreachable += 1
+            elif entry.get("error", "").startswith("safety gate blocked"):
                 skipped += 1
             elif entry.get("interrupted"):
                 interrupted_connects += 1
@@ -1753,11 +2009,12 @@ async def main() -> int:
         # The verdict counts what did not run as well as what failed: a run the
         # safety gate kept away from every device must not read as a success.
         notes = ([f"skipped by the safety gate: {skipped}"] if skipped else []) + \
-                ([f"skipped for want of a set file: {not_run}"] if not_run else [])
+                ([f"skipped for want of a set file: {not_run}"] if not_run else []) + \
+                ([f"skipped as unreachable: {unreachable}"] if unreachable else [])
         if failures:
             verdict = f"Done. Failures: {failures}" + (", " + ", ".join(notes) if notes else "")
         elif notes:
-            applied = len(json_results) - skipped
+            applied = len(json_results) - skipped - unreachable
             verdict = f"Done. OK: {applied}, " + ", ".join(notes)
             if has_edits and not applied:
                 verdict += ", nothing applied"
@@ -1765,9 +2022,9 @@ async def main() -> int:
             verdict = "Done. All devices OK."
         if not raw_mode and args.every is None:
             print("")
-            if failures or skipped or not_run or not interrupted:
+            if failures or skipped or not_run or unreachable or not interrupted:
                 print(verdict)
-        elif failures or skipped or not_run:
+        elif failures or skipped or not_run or unreachable:
             # stdout is device output only; the verdict belongs on stderr.
             print(verdict, file=sys.stderr)
 
@@ -1794,7 +2051,7 @@ async def main() -> int:
 
     # Structured stderr summary
     elapsed_ms = int((time.time() - run_start) * 1000)
-    ok_count = len(json_results) - failures - skipped - interrupted_connects
+    ok_count = len(json_results) - failures - skipped - unreachable - interrupted_connects
     stderr_mode = "batch" if mode == "show-batch" else ("job" if mode == "job" else mode.split("-")[0])
     not_kept = 0
     if store_run is not None:
@@ -1807,9 +2064,10 @@ async def main() -> int:
         "targets": len(json_results) + not_run,
         "ok": ok_count,
         "fail": failures,
-        "skipped": skipped + not_run,
+        "skipped": skipped + not_run + unreachable + not_started,
         **({"interrupted": interrupted_connects} if interrupted else {}),
         **({"not_kept": not_kept} if not_kept else {}),
+        **({"probe_ms": probe_ms} if probe_ms is not None else {}),
         "elapsed_ms": elapsed_ms,
         "mode": stderr_mode,
     })
@@ -1821,7 +2079,8 @@ async def main() -> int:
         # that could not keep its results.
         if not_kept < store_tried or store_tried == 0:
             try:
-                store.finish_run(store_run, ok_count, failures, skipped + not_run, interrupted)
+                store.finish_run(store_run, ok_count, failures, skipped + not_run + unreachable + not_started,
+                                 interrupted)
             except Exception as e:
                 print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
         lost = f"{not_kept} of {store_tried} results were not kept: {store_reason}" if not_kept else None
@@ -1847,7 +2106,7 @@ async def main() -> int:
         return 4    # the run's record is incomplete: results were not kept (before 1 and 3; `fail` is in the summary)
     if failures:
         return 1
-    return 3 if skipped or not_run else 0   # 3: nothing failed, but not everything ran
+    return 3 if skipped or not_run or unreachable else 0   # 3: nothing failed, but not everything ran
 
 
 # --every: the watch's state between ticks. main() runs one tick and leaves

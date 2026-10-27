@@ -326,10 +326,6 @@ def test_cli_job_show_entries_are_data_and_edit_entries_text(monkeypatch, capsys
         {"target": "R2:10.0.0.2:junos", "edit": "set system host-name r2"},
     ]))
 
-    async def reachable(target, timeout=2):
-        return target.name, True, "reachable"
-
-    monkeypatch.setattr(cli, "check_reachability", reachable)
     v = FakeVendor({"show version": {"a": 1}})
     rc, out, _ = run_cli(monkeypatch, capsys, v, "--job", str(job), "--format", "json", "--json", "-y")
     assert rc == 0

@@ -167,7 +167,7 @@ def test_the_cli_knows_what_to_install_for_every_name(monkeypatch, capsys, tmp_p
     assert drivers.get("junos").transport.install == drivers.get("junos@netconf").transport.install == "junos-eznc"
     assert drivers.get("telnet-ios").transport.install == "(built-in)"
     assert set(cli.TRANSPORT_CHOICES) <= set(drivers.names())
-    # the pre-flight names it when the module says it is missing, before any device is touched
+    # the CLI names it when the module says it is missing, before any device is touched
     rc, out, err, _ = run_cli(monkeypatch, capsys, tmp_path,
                               ["--user", "u", "--target", "R1:10.0.0.1:junos@netconf", "-sC", "show version"],
                               driver=types.SimpleNamespace(AVAILABLE=False))

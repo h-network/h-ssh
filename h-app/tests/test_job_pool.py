@@ -10,10 +10,6 @@ from hssh.transports import netconf
 from tests.test_junos import FakeConfig, FakeDevice
 
 
-async def _reachable(target, timeout=2):
-    return (target.name, True, "reachable")
-
-
 @pytest.fixture(autouse=True)
 def fake_pyez(monkeypatch):
     FakeDevice.instances = []
@@ -26,7 +22,6 @@ def fake_pyez(monkeypatch):
     monkeypatch.setattr(netconf, "JunosDevice", FakeDevice)
     monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
     monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: None)
-    monkeypatch.setattr(cli, "check_reachability", _reachable)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     pool.close_all()

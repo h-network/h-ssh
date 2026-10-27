@@ -152,37 +152,37 @@ def test_edit_guard_is_none_for_guardless_or_unknown_vendor_names():
     assert cli.edit_guard("nope") is None and cli.edit_guard("arista") is None
 
 
-def test_the_preflight_wants_a_banner_only_where_the_transport_has_one(monkeypatch):
-    class Reader:
-        def __init__(self, line):
-            self.line = line
+def test_the_probe_wants_a_banner_only_where_the_transport_has_one(monkeypatch):
+    """The SSH transports' banner is what the probe checks the first line
+    against; telnet has none, and a TCP connect is all it asks. Neither
+    has a junos box on port 23, which PyEZ reaches as a console over
+    telnet (the transport's console_port); on 22 it is NETCONF over SSH."""
+    from hssh import drivers, probe
+    asked = {}
 
-        async def readline(self):
-            return self.line
+    async def attempt(host, port, banner, seconds):
+        asked[host] = (port, banner)
+        return probe.Answer(probe.LIVE, connect_ms=0.3)
+    monkeypatch.setattr(probe, "attempt", attempt)
+    asyncio.run(probe.probe([Target("R1", "10.0.0.1", "none@ssh"), Target("SW", "10.0.0.2", "ios@telnet"),
+                             Target("R3", "10.0.0.3", "junos"), Target("CON", "10.0.0.4", "junos", 23),
+                             Target("R5", "10.0.0.5", "junos", 22)], 3))
+    assert asked == {"10.0.0.1": (22, b"SSH-"), "10.0.0.2": (23, None), "10.0.0.3": (830, b"SSH-"),
+                     "10.0.0.4": (23, None), "10.0.0.5": (22, b"SSH-")}
+    assert {name: t.console_port for name, t in drivers.TRANSPORTS.items()} == {
+        "netconf": 23, "ssh": None, "openssh": None, "telnet": None}
 
-    class Writer:
-        def close(self):
-            pass
 
-        async def wait_closed(self):
-            pass
-
-    async def open_connection(host, port):
-        return Reader(b"220 telnet banner\r\n"), Writer()
-
-    async def getaddrinfo(host, port):
-        return []
-    monkeypatch.setattr(cli.asyncio, "open_connection", open_connection)
-
-    async def go():
-        loop = asyncio.get_running_loop()
-        monkeypatch.setattr(loop, "getaddrinfo", getaddrinfo)
-        ssh = await cli.check_reachability(Target("R1", "10.0.0.1", "none@ssh"))
-        tn = await cli.check_reachability(Target("R1", "10.0.0.1", "ios@telnet"))
-        return ssh, tn
-    ssh, tn = asyncio.run(go())
-    assert ssh == ("R1", False, "port 22 open but no SSH banner")
-    assert tn == ("R1", True, "reachable")
+def test_the_probe_reads_the_ssh_config_where_the_transport_reads_it():
+    """The OpenSSH client and PyEZ (the junos transport) read the ssh
+    client's configuration and connect where it says, so the probe reads it
+    for them, each the way it does; paramiko as the ssh transport and
+    telnet read none. Every dialect on a transport gets the same."""
+    from hssh import drivers
+    readers = {name: d.transport.ssh_config for name, d in drivers.DRIVERS.items()}
+    assert {readers[n] for n in ("junos@netconf",)} == {"paramiko"}
+    assert {readers[n] for n in ("none@openssh", "junos@openssh", "ios@openssh", "eos@openssh")} == {"openssh"}
+    assert {readers[n] for n in ("none@ssh", "junos@ssh", "ios@telnet", "junos@telnet")} == {None}
 
 
 def test_telnet_maps_its_hints_to_dialects():
