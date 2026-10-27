@@ -1,13 +1,14 @@
 # Test Results
 
-Two kinds of evidence: the unit suite, which needs no devices and runs on every push and pull
-request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX routers, listed with the
-code state they were run on.
+Two kinds of evidence: the unit suite, which needs no devices and runs on every push to `main` or
+`develop` and on every pull request (GitHub Actions, Python 3.10–3.13), and live runs against Junos vMX
+routers, listed with the code state they were run on.
 
 ## Unit Tests — 1240/1240 passed
 
-`pip install -e '.[dev]' && pytest` from the checkout root (`feat/fleet`, 2026-10-25, with the dialect /
-transport / driver split of #80–#84 complete, the store hardening and the `Fleet` library API). The standalone review of `develop` (18
+`pip install -e '.[dev]' && pytest` from the checkout root (`develop` a39d9c9, 2026-10-27: the dialect /
+transport / driver split of #80–#84, the store hardening, the `Fleet` library API, `--every`, profiles,
+`h-ssh-store export`, `--connect-timeout` (#126) and the probe (#127)). The standalone review of `develop` (18
 items, issues #23–#29, PRs #30–#36) added 110 regression tests; every one was run against the code
 before its fix and failed there.
 
