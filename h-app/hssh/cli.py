@@ -381,12 +381,23 @@ def probe_summary(results, seconds: float, slow_ms: float, name_slow: bool = Tru
     return text
 
 
-async def probe_alone(args, targets, store, user, json_mode: bool) -> int:
+def held_by(gate, targets) -> dict:
+    """{host: why} for the boxes the safety gate holds now (a cooldown, a
+    corrupt safety file): the probe does not contact them either, and the
+    run's gate turns them away as before."""
+    if gate is None:
+        return {}
+    return {host: f"safety gate: {why}" for host, why in gate.holds({t.host for t in targets}).items()}
+
+
+async def probe_alone(args, targets, store, user, json_mode: bool, safety_gate=None) -> int:
     """--probe with no command: every box probed (hssh.probe), no login
     and no credential; one line per box and a summary, or the records with
-    --json; kept in the store as a run of mode `probe`, a row per box (a
-    dead one is a failed row, so `h-ssh-store failed` lists it). 0 when
-    every box is live, 1 otherwise, 4 when the store could not keep it."""
+    --json; kept in the store as a run of mode `probe`, a row per box (one
+    that is not live is a failed row with its verdict, so `h-ssh-store
+    failed` lists it). 0 when every box is live, 1 when one is dead, 3
+    when none is but one was not probed (reached through a proxy, held by
+    the safety gate), 4 when the store could not keep it."""
     limit, note = fit_probes_to_open_files(min(MAX_PROBES, len(targets)))
     if note:
         print(f"WARNING: {note}", file=sys.stderr)
@@ -404,14 +415,18 @@ async def probe_alone(args, targets, store, user, json_mode: bool) -> int:
             return 2
     started = time.time()
     try:
-        results = await probes.probe(targets, seconds, args.slow, limit)
-    except (asyncio.CancelledError, KeyboardInterrupt):
+        results = await probes.probe(targets, seconds, args.slow, limit, user=user,
+                                     held=held_by(safety_gate, targets))
+    except BaseException:
+        # Ctrl-C, or anything else that ends it here: its row says it did not finish.
         if run_id is not None:
             with contextlib.suppress(Exception):
                 store.finish_run(run_id, 0, 0, len(targets), interrupted=True)
         raise
     elapsed_ms = int((time.time() - started) * 1000)
     live = sum(1 for r in results if r.ok)
+    dead = sum(1 for r in results if r.dead)
+    passed = len(results) - live - dead              # not probed
     if json_mode:
         print(json.dumps([r.to_dict() for r in results], indent=2))
     else:
@@ -450,19 +465,19 @@ async def probe_alone(args, targets, store, user, json_mode: bool) -> int:
         not_kept, reason = (len(results), gone) if gone is not None else (lost, reason)
         if not_kept < len(results):
             try:
-                store.finish_run(run_id, live, len(results) - live, 0)
+                store.finish_run(run_id, live, dead, passed)
             except Exception as e:
                 print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
         if not_kept:
             print(f"WARNING: store {store.path}: {not_kept} of {len(results)} results were not kept: {reason}",
                   file=sys.stderr)
-    summary = {"targets": len(results), "ok": live, "fail": len(results) - live, "skipped": 0,
+    summary = {"targets": len(results), "ok": live, "fail": dead, "skipped": passed,
                "slow": sum(1 for r in results if r.slow), **({"not_kept": not_kept} if not_kept else {}),
                "elapsed_ms": elapsed_ms, "mode": "probe"}
     print(f"[h-ssh] {json.dumps(summary)}", file=sys.stderr)
     if not_kept:
         return 4
-    return 0 if live == len(results) else 1
+    return 1 if dead else 3 if passed else 0
 
 
 def is_confirm(payload: str) -> bool:
@@ -543,7 +558,9 @@ async def main() -> int:
                         help="Alone, with no command: check every box without logging in (a TCP connect and the "
                              "SSH banner): one line per box with its result, the handshake's round trip and the "
                              "banner time, then a summary; kept in the store; exit 0 when every box is live, 1 "
-                             "otherwise. With a command: probe first even where the config file says probe = no")
+                             "when one is dead, 3 when none is but one was not probed (behind a ProxyJump or "
+                             "ProxyCommand, held by the safety gate). With a command: probe first even where the "
+                             "config file or a run file says not to")
 
     # Behavior
     parser.add_argument("--retries", type=_ranged_int(0, None, "--retries"), default=None,
@@ -578,7 +595,8 @@ async def main() -> int:
     parser.add_argument("--commit-confirmed", type=confirm_minutes_arg, nargs="?", const=10, default=None,
                         help="Use commit confirmed with auto-rollback timer in minutes, 1-65535 (default: 10, Junos only)")
     parser.add_argument("-y", "--yes", action="store_true",
-                        help="Skip confirmation prompt for edit operations")
+                        help="Skip confirmation prompt for edit operations (not the probe's question about "
+                             "unreachable boxes; see --skip-unreachable)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show detailed output for all operations")
     parser.add_argument("--every", type=_seconds_arg, metavar="SECONDS", default=None,
@@ -671,11 +689,12 @@ async def main() -> int:
     # typed on the command line wins, the file wins over the environment and
     # ~/.h-ssh/config. It is read before anything else so the banner and the
     # checks below see what the run will use.
+    from_run_file = []           # the options the run file set
     if args.run:
         try:
             run_data = validate_run(load_run_file(args.run), args.run, TRANSPORT_CHOICES, CONFIG_FLOORS,
                                     CONFIG_CEILINGS)
-            apply_run(args, run_data, parser)
+            from_run_file = apply_run(args, run_data, parser)
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
@@ -693,11 +712,13 @@ async def main() -> int:
         print(f"ERROR: {get_config_path() if args.config is None else args.config}: {e}", file=sys.stderr)
         return 2
     if args.probe and args.no_probe:
-        print("ERROR: --probe and --no-probe contradict each other.", file=sys.stderr)
-        return 2
+        if "no_probe" not in from_run_file:
+            print("ERROR: --probe and --no-probe contradict each other.", file=sys.stderr)
+            return 2
+        args.no_probe = False       # typed on the command line, --probe wins over a run file's no_probe
     # The probe before the run (#127): on unless --no-probe (or a run file's
     # no_probe) or `probe = no` in the config file says otherwise; --probe
-    # with a command turns it on over the config file.
+    # with a command turns it on over both files.
     probe_first = not args.no_probe and (args.probe or args.probe_by_config)
 
     # A command made of whitespace is a typo, not a request; one with a
@@ -1167,7 +1188,7 @@ async def main() -> int:
     if mode == "probe":
         # A probe logs in nowhere: no password is read or asked for.
         try:
-            return await probe_alone(args, targets, store, user, json_mode)
+            return await probe_alone(args, targets, store, user, json_mode, safety_gate)
         finally:
             if store is not None:
                 store.close()
@@ -1293,16 +1314,19 @@ async def main() -> int:
 
     # The probe (#127), before every run unless --no-probe or `probe = no`
     # says otherwise: a TCP connect and the SSH banner per box, no login, at
-    # most MAX_PROBES at once. The run goes to the boxes that answered; a
-    # dead one is that run's FAIL, with the probe's reason. It replaces the
-    # edit's pre-flight, which waited --session-timeout and tried twice: an
-    # edit that changes the network goes on without a dead box only when
-    # the operator says so, asked at a terminal (-y confirms the edit, never
-    # a partial deployment) or by --skip-unreachable without one, and those
-    # left out are skipped (exit 3). A dry run deploys nothing: its dead box
-    # is a FAIL, as a read's.
+    # most MAX_PROBES at once, to where the box's transport will connect.
+    # The run goes to the boxes that answered; a dead one is that run's
+    # FAIL, with the probe's reason; one it did not probe (reached through a
+    # proxy, or held by the safety gate) is run as without the probe. It
+    # replaces the edit's pre-flight, which waited --session-timeout and
+    # tried twice: an edit goes on without a dead box only when the operator
+    # says so, asked at a terminal (-y confirms the edit, never a partial
+    # deployment) or by --skip-unreachable without one, and those left out
+    # are skipped (exit 3). A dry run is asked and stopped the same way: it
+    # rehearses the edit.
     dead = {}               # unit index -> the probe's result, for a unit whose box did not answer
     leave_out = set()       # of those, the units an edit goes on without: skipped, not failed
+    probe_ms = None         # how long the probe took, for the summary
     if probe_first:
         boxes = {}
         for t, _ in units:
@@ -1313,15 +1337,17 @@ async def main() -> int:
         probe_started = time.monotonic()
         found = dict(zip(boxes, await probes.probe(list(boxes.values()),
                                                    connect_budget(args.connect_timeout, args.session_timeout),
-                                                   args.slow, limit)))
+                                                   args.slow, limit, user=user,
+                                                   held=held_by(safety_gate, boxes.values()))))
+        probe_ms = int((time.monotonic() - probe_started) * 1000)
         for i, (t, _) in enumerate(units):
             r = found[(t.host, resolve_target_port(t))]
-            if not r.ok:
+            if r.dead:
                 dead[i] = r
-        if show_progress or (commits and not json_mode):
-            print(f"\n{probe_summary(list(found.values()), time.monotonic() - probe_started, args.slow)}")
-        if commits and dead:
-            down = [r for r in found.values() if not r.ok]
+        if show_progress or (has_edits and not json_mode):
+            print(f"\n{probe_summary(list(found.values()), probe_ms / 1000, args.slow)}")
+        if has_edits and dead:
+            down = [r for r in found.values() if r.dead]
             reachable = len(found) - len(down)
             listing = "\n".join(f"  {r.device:16s} ({r.host}) {r.verdict}" for r in down)
             if not json_mode:
@@ -1991,6 +2017,7 @@ async def main() -> int:
         "skipped": skipped + not_run + unreachable,
         **({"interrupted": interrupted_connects} if interrupted else {}),
         **({"not_kept": not_kept} if not_kept else {}),
+        **({"probe_ms": probe_ms} if probe_ms is not None else {}),
         "elapsed_ms": elapsed_ms,
         "mode": stderr_mode,
     })

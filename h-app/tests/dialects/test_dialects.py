@@ -167,6 +167,18 @@ def test_the_probe_wants_a_banner_only_where_the_transport_has_one(monkeypatch):
     assert asked == {"10.0.0.1": (22, b"SSH-"), "10.0.0.2": (23, None), "10.0.0.3": (830, b"SSH-")}
 
 
+def test_the_probe_reads_the_ssh_config_where_the_transport_reads_it():
+    """The OpenSSH client and PyEZ (the junos transport) read the ssh
+    client's configuration and connect where it says, so the probe reads it
+    for them, each the way it does; paramiko as the ssh transport and
+    telnet read none. Every dialect on a transport gets the same."""
+    from hssh import drivers
+    readers = {name: d.transport.ssh_config for name, d in drivers.DRIVERS.items()}
+    assert {readers[n] for n in ("junos@netconf",)} == {"paramiko"}
+    assert {readers[n] for n in ("none@openssh", "junos@openssh", "ios@openssh", "eos@openssh")} == {"openssh"}
+    assert {readers[n] for n in ("none@ssh", "junos@ssh", "ios@telnet", "junos@telnet")} == {None}
+
+
 def test_telnet_maps_its_hints_to_dialects():
     assert telnet._dialect("telnet-junos") is dialects.junos.DIALECT
     assert telnet._dialect("junos@telnet") is dialects.junos.DIALECT

@@ -9,7 +9,10 @@ Every run is probed first (hssh.probe, #127): a TCP connect and the SSH
 banner per box. The suite's devices are fakes behind drivers.MODULES at
 addresses nothing listens on, so here every box answers as a healthy sshd
 does and nothing is contacted (`probed` lists the boxes asked); a test of
-the probe itself takes `real_probe`, against listeners on localhost.
+the probe itself takes `real_probe`, against listeners on localhost. The
+ssh client configuration the probe reads for the openssh and junos
+transports is none here (`ssh -F /dev/null -G`, an empty ~/.ssh/config),
+so the machine's own cannot move a test's box.
 
 The driver registry holds the built-ins and whatever driver packages this
 machine has installed, a broken one included; `installed` runs a test on
@@ -46,6 +49,8 @@ def probed(monkeypatch):
             return _probe.Answer(_probe.LIVE, connect_ms=0.3)
         return _probe.Answer(_probe.LIVE, connect_ms=0.3, banner_ms=7.0, banner="SSH-2.0-OpenSSH_9.6")
     monkeypatch.setattr(_probe, "attempt", answers_live)
+    monkeypatch.setattr(_probe, "SSH_G", ("ssh", "-F", os.devnull, "-G"))
+    monkeypatch.setattr(_probe, "SSH_CONFIG", os.devnull)
     return asked
 
 

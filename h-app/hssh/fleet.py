@@ -36,11 +36,12 @@ variable and no config file: what it is given is what it uses.
 
 Before every show() and batch() the boxes are probed (hssh.probe, #127): a
 TCP connect and the SSH banner per box, no login, at most MAX_PROBES at
-once. The run goes to the boxes that answered; a dead one is a failed
-result at once, with the probe's reason, instead of a worker spent on its
-connect timeouts. Fleet(probe=False) skips it. `probe(slow_ms=)` is the
-check alone: one ProbeResult per box, kept in the store as a run of mode
-`probe` when there is one.
+once, where the box's transport connects. The run goes to the boxes that
+answered; a dead one is a failed result at once, with the probe's reason,
+instead of a worker spent on its connect timeouts; one reached through a
+proxy is not probed and runs as without the probe. Fleet(probe=False)
+skips it. `probe(slow_ms=)` is the check alone: one ProbeResult per box,
+kept in the store as a run of mode `probe` when there is one.
 
 Reads only, `show` and `batch`. An edit has gates the CLI applies before
 the runner is called (the set-syntax guard, the probe's question, the
@@ -515,7 +516,7 @@ class _Run:
         with self._lock:
             if self.ended or found is None:
                 raise RuntimeError("this Fleet is closed")
-        return {r.device: r for r in found if not r.ok}
+        return {r.device: r for r in found if r.dead}
 
     def _submit_all(self, workers: "_DaemonPool", dead: Optional[dict] = None) -> None:
         fleet = self.fleet
@@ -1023,20 +1024,24 @@ class Fleet:
 
     def probe(self, slow_ms: float = probes.SLOW_MS) -> List[ProbeResult]:
         """Every box asked whether it is there, without logging in: a TCP
-        connect, the server's first line checked to be an SSH banner (TCP
-        alone on telnet), the connection closed (hssh.probe). One
-        ProbeResult per box, in the targets' order: `result` live,
-        refused, no route, name not found, timed out, silent or not SSH;
-        `connect_ms`, the TCP handshake's round trip as the kernel measured
-        it, and `banner_ms`, the wall time to the banner, one sample each;
-        `banner` or `reason`; `slow`, the tag of a live box whose round
-        trip is above `slow_ms` (10 by default, as the CLI's --slow), else
-        None. The connect timeout bounds the TCP connect and the banner
-        each, a box that fails is tried once more after a short pause, and
-        at most MAX_PROBES run at once. With a store, kept as a run of mode
-        `probe` with a row per box, the record as JSON; what it could not
-        keep is a RuntimeWarning, never raised. Blocks until every box has
-        answered or run out; a run in progress is no obstacle."""
+        connect, the server's identification checked to be an SSH banner
+        (TCP alone on telnet), the connection closed (hssh.probe), where
+        the box's transport connects (the ssh configuration's HostName and
+        Port on the openssh and junos transports). One ProbeResult per box,
+        in the targets' order: `result` live, refused, no route, name not
+        found, timed out, silent, not SSH or error (`dead`), or not probed
+        (a box reached through a ProxyJump or ProxyCommand, or whose ssh
+        configuration cannot be read: the run goes to it); `connect_ms`,
+        the TCP handshake's round trip as the kernel measured it, and
+        `banner_ms`, the wall time to the banner, one sample each; `banner`
+        or `reason`; `slow`, the tag of a live box whose round trip is
+        above `slow_ms` (10 by default, as the CLI's --slow), else None.
+        The connect timeout bounds the TCP connect and the banner each, a
+        box that fails is tried once more after a short pause, and at most
+        MAX_PROBES run at once. With a store, kept as a run of mode `probe`
+        with a row per box, the record as JSON; what it could not keep is a
+        RuntimeWarning, never raised. Blocks until every box has answered
+        or run out; a run in progress is no obstacle."""
         slow_ms = _check_ms("slow_ms", slow_ms)
         with self._lock:
             if self._closed:
@@ -1072,7 +1077,7 @@ class Fleet:
                 self._probe_limit = fitted
             limit = self._probe_limit
         future = probes.in_thread(self.targets, connect_budget(self.connect_timeout, self.session_timeout),
-                                  slow_ms, limit)
+                                  slow_ms, limit, user=self.user)
         cf.wait([future] if stop is None else [future, stop], return_when=cf.FIRST_COMPLETED)
         if not future.done():
             return None
@@ -1080,7 +1085,8 @@ class Fleet:
 
     def _keep_probe(self, store: Store, run_id: str, found: List[ProbeResult]) -> None:
         """A probe's rows, as the CLI keeps them: one per box, the record as
-        JSON, a dead box a failed row with its verdict as the error."""
+        JSON, a box that is not live a failed row with its verdict as the
+        error; the run counts a box not probed as skipped."""
         lost, error = 0, None
         for r in found:
             entry = {"device": r.device, "host": r.host, "vendor": r.vendor, "ok": r.ok,
@@ -1094,9 +1100,10 @@ class Fleet:
         if gone is not None:
             lost, error = len(found), gone
         live = sum(1 for r in found if r.ok)
+        dead = sum(1 for r in found if r.dead)
         if lost < len(found):
             try:
-                store.finish_run(run_id, live, len(found) - live, 0)
+                store.finish_run(run_id, live, dead, len(found) - live - dead)
             except Exception as e:
                 _warn(f"store {store.path}, run {run_id}: {e}")
         if lost:

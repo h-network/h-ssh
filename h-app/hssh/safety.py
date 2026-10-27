@@ -106,6 +106,22 @@ class SafetyGate:
             self._attempt_timestamps[host].append(now)
             return True, "ok"
 
+    def holds(self, hosts) -> dict:
+        """{host: why} for each of `hosts` that check_device() would turn
+        away now for a reason that outlasts this run: a cooldown, a corrupt
+        safety file. Nothing is recorded; the probe asks before it
+        connects, so a box in cooldown gets no connection from it either."""
+        with self._lock:
+            if self._safety_file:
+                self._load_cooldowns()
+                if self._corrupt:
+                    why = (f"safety file corrupted (fail-closed): check and remove "
+                           f"{self._safety_file}.corrupt to clear it")
+                    return {host: why for host in hosts}
+            now = time.time()
+            return {host: f"cooldown active ({int(self._cooldowns[host] - now)}s remaining)"
+                    for host in hosts if now < self._cooldowns.get(host, now)}
+
     def release_device(self, host: str) -> None:
         """Release a device from the active set after a successful operation."""
         with self._lock:

@@ -43,6 +43,11 @@ class Transport:
     banner: Optional[bytes] = b"SSH-"   # what the port must say first to be a device (the probe); None: open is enough
     pooled: bool = False         # sessions can outlive one command (hssh.pool)
     frozen: bool = False         # kept working, gets nothing new
+    # How it reads the ssh client's configuration, so the probe asks where
+    # the run goes: "openssh" (the client itself: HostName, Port, ProxyJump,
+    # ProxyCommand, as `ssh -G` says), "paramiko" (~/.ssh/config as PyEZ and
+    # ncclient read it: HostName, Port, ProxyCommand); None: it reads none.
+    ssh_config: Optional[str] = None
 
 
 @dataclass(frozen=True)

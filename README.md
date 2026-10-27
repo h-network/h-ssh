@@ -189,7 +189,7 @@ A password means the same on every transport: it is the credential, and no `~/.s
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (Junos) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (Junos) |
-| `--probe` | Probe | Alone, with no command: every box checked without logging in, one line each with its result and times, a summary, kept in the store; exit 0 when every box is live, 1 otherwise. See [The probe](#the-probe) |
+| `--probe` | Probe | Alone, with no command: every box checked without logging in, one line each with its result and times, a summary, kept in the store; exit 0 when every box is live, 1 when one is dead, 3 when none is but one was not probed. See [The probe](#the-probe) |
 | `--run FILE` | Run file | Any of the above described in one YAML or JSON file: devices, commands, options, outputs. See [Run files](#run-files) |
 
 ```json
@@ -255,10 +255,13 @@ in one store.
 ## The probe
 
 Every run starts by asking each box whether it is there, at the protocol level and without logging in:
-a TCP connect to the port its transport uses (830 for `junos`, 22 for `ssh` and `openssh`, the target's
-own when it names one), the server's first line read and checked to start with `SSH-` (an SSH server
-speaks first), and the connection closed. No key exchange, no login, no credential. `telnet*` (frozen)
-has no banner to check: a TCP connect is all it is asked. It is plain TCP, so no root is needed.
+a TCP connect to where the run will connect (the port its transport uses, 830 for `junos`, 22 for `ssh`
+and `openssh`, the target's own when it names one, or what your ssh configuration says: see *Where the
+run goes* below), the server's identification line read and checked to start with `SSH-` (an SSH server
+speaks first; lines it sends before that one are passed over, as paramiko and OpenSSH pass them over, up
+to 100 lines of 255 bytes), and the connection closed. No key exchange, no login, no credential.
+`telnet*` (frozen) has no banner to check: a TCP connect is all it is asked. It is plain TCP, so no root
+is needed.
 
 Each box gets one result:
 
@@ -267,10 +270,14 @@ Each box gets one result:
 | `live` | the box answered with an SSH banner, `SSH-2.0-…`, which is kept as its sshd's version string |
 | `refused` | the TCP connect was refused (`connection refused by HOST:PORT`) |
 | `no route` | the network said there is no way to the box (`no route to host HOST:PORT`, `network is unreachable for HOST:PORT`) |
-| `name not found` | the name did not resolve (`cannot resolve HOST`, or the resolver's own words) |
+| `name not found` | the name did not resolve (`cannot resolve HOST`, or the resolver's own words); a name no resolver takes, `10.0.0..1` or a label over 63 characters, says why (`cannot resolve 10.0.0..1: label empty or too long`) |
 | `timed out` | no TCP answer within `--connect-timeout` (`TCP connect to HOST:PORT timed out after Ns`) |
-| `silent` | TCP accepted, and no banner within `--connect-timeout`, or the connection closed without one (a NAT or load balancer answering for a dead box, an sshd that hangs or is at its `MaxStartups`) |
-| `not SSH` | something else answered (`HOST:PORT answered 'HTTP/1.1 400 Bad Request', not an SSH banner`) |
+| `silent` | TCP accepted, and no banner within `--connect-timeout` (nothing at all, or the start of one and no more), or the connection closed without a word (a NAT or load balancer answering for a dead box, an sshd that hangs or is at its `MaxStartups`) |
+| `not SSH` | something else answered (`HOST:PORT answered 'HTTP/1.1 400 Bad Request', not an SSH banner`): a line and no `SSH-` line after it, or bytes that cannot begin one; a server that greets and then waits for the client is known when `--connect-timeout` runs out |
+| `error` | the probe itself failed on something it did not expect (`the probe of HOST:PORT failed: …`); that box counts as dead, and every other box is probed as usual |
+| `not probed` | the probe did not ask: the box is reached through a `ProxyJump` or a `ProxyCommand`, its ssh configuration cannot be read, or the safety gate holds it in cooldown. It is not dead: the run goes to it as with `--no-probe` |
+
+Every result but `live` and `not probed` is a dead box.
 
 The TCP connect and the banner get `--connect-timeout` each (3 s, never more than `--session-timeout`;
 a name's lookup too), a box that fails is tried once more half a second later, and at most 100 boxes are probed at once
@@ -285,7 +292,8 @@ it, about 10 s of a worker at the defaults.
 boxes that answered; a dead one is a FAIL of that run with the probe's reason, in `--json`, `--log`, the
 audit log and the store like any failed device, and exit 1 (a device failed); it is not touched again
 in that run, so it starts no `--safety-file` cooldown either (the gate counts the run's own attempts).
-The progress output gets one line for the probe:
+A box not probed is run as without the probe. The progress output gets one line for the probe, and the
+stderr summary `probe_ms`, the time it took:
 
 ```console
 $ h-ssh -sC "show version" cr1:10.0.1.1:junos cr2:10.0.1.2:junos cr3:10.0.1.3:junos
@@ -297,6 +305,18 @@ Probe: 3 box(es) in 0.5s: 2 live, 1 dead (refused 1), 1 slow (above 10 ms: cr2 1
 [03:02:44] cr2              OK
 [03:02:44] cr1              OK
 ```
+
+**Where the run goes.** The probe asks the host and port the run will connect to. `openssh` reads your
+ssh configuration (`~/.ssh/config`, `/etc/ssh/ssh_config`), so for an `openssh` box the probe asks
+`ssh -G`: its `HostName` and `Port` are where the box is asked, and a box reached through a `ProxyJump`
+or a `ProxyCommand` is `not probed` (`reached through ProxyJump bastion (ssh -G)`), since the probe
+cannot see past the jump host; the run goes through it as it always did (an edit too, with no check
+before it, as under `--no-probe`). `junos` (PyEZ and ncclient) reads `~/.ssh/config` for `HostName`,
+`Port` (over the target's own) and `ProxyCommand`, not `ProxyJump`, and the probe reads it the same way
+(`reached through ProxyCommand (~/.ssh/config)`). `ssh` (paramiko) and `telnet*` read no ssh
+configuration: the target's host and port are what the probe asks. A configuration that cannot be read
+(a line `ssh -G` refuses, a `Port` that is no number) leaves the box `not probed`, with the words why,
+and the run says what its transport makes of it.
 
 **Before an edit** the probe replaces the old pre-flight, which waited `--session-timeout` per box and
 tried twice. When boxes are dead, an edit does not go on without them unless you say so:
@@ -312,8 +332,9 @@ tried twice. When boxes are dead, an edit does not go on without them unless you
 - `-y` confirms the edit; it never accepts a partial deployment by itself, so the question is asked
   with `-y` too, and without a terminal `-y` alone is refused;
 - with every box dead the edit is refused (exit 2) and nothing is asked;
-- a `--dry-run` deploys nothing, so its dead box is a FAIL, as a read's; `--show-diff` is probed before
-  its previews and previews only the boxes that will get the change.
+- a `--dry-run` rehearses the edit, the question included: it is asked and stopped the same way (it
+  still needs neither `-y` nor a terminal to start); `--show-diff` is probed before its previews and
+  previews only the boxes that will get the change.
 
 An edit the probe stopped leaves an audit entry per dead box (`preflight probe failed: refused (…)
 (aborted)`).
@@ -335,13 +356,13 @@ sw1  live       connect 0.3 ms  TCP only, no banner to check
 Probe: 5 box(es) in 6.5s: 3 live, 2 dead (refused 1, timed out 1), 1 slow (above 10 ms)
 ```
 
-It exits 0 when every box is live and 1 otherwise (4 when the store could not keep it), and the stderr
-summary gains `slow`. `--json` prints the records instead, one per box: `device`, `host`, `port`,
-`vendor`, `ok`, `result`, `connect_ms`, `banner_ms`, `banner`, `reason`, `slow`, `duration_ms`. The
-check is kept in the store as a run of mode `probe`, one row per box with the record as JSON, so
-`h-ssh-store failed` lists the dead boxes with their reasons and `h-ssh-store field connect_ms` the
-round trips. `--probe` with a command probes before the run even where the config file says
-`probe = no`.
+It exits 0 when every box is live, 1 when one is dead, 3 when none is but one was not probed (4 when the
+store could not keep it), and the stderr summary gains `slow` (a box not probed is in `skipped`).
+`--json` prints the records instead, one per box: `device`, `host`, `port`, `vendor`, `ok`, `result`,
+`connect_ms`, `banner_ms`, `banner`, `reason`, `slow`, `duration_ms`. The check is kept in the store as
+a run of mode `probe`, one row per box with the record as JSON, so `h-ssh-store failed` lists every box
+that is not live with its verdict and `h-ssh-store field connect_ms` the round trips. `--probe` with a
+command probes before the run even where the config file says `probe = no` or a run file `no-probe`.
 
 **Two times per live box, one sample each.** The connect time is the TCP handshake's round trip as
 the kernel measured it (`TCP_INFO`'s `tcpi_rtt` on Linux, exact however many probes run at once; where
@@ -364,7 +385,9 @@ Where that matters, or when you know every box is up and accept the risk, `--no-
 run, `probe = no` in `~/.h-ssh/config` for every run, `no-probe: true` in a run file, and
 `Fleet(..., probe=False)` in the library. Without it a dead box costs `--connect-timeout` per attempt
 during the run (see [Failure handling](#failure-handling)), and an edit has no reachability check
-before it starts.
+before it starts. A box the `--safety-file` gate holds in cooldown is never probed (`not probed`,
+`safety gate: cooldown active (Ns remaining)`), on a run, a tick or `--probe` alone, so the rate-limit
+the gate spares stays spared; the run's gate turns it away as before (exit 3).
 
 ## Transports
 
@@ -478,7 +501,9 @@ paramiko` is not on the table but `ssh` is already there:
 ```
 
 It inherits your `~/.ssh/config`, keys, agent and `known_hosts`, so jump-host `ProxyJump` stanzas and
-per-host identities work with no extra flags. Host key policy defaults to `accept-new`; override with
+per-host identities work with no extra flags. The probe reads it too, through `ssh -G`: a `HostName` or
+`Port` there is where it asks the box, and a box behind a `ProxyJump` or `ProxyCommand` is not probed
+but run (see [The probe](#the-probe)). Host key policy defaults to `accept-new`; override with
 `HSSH_HOST_KEY_POLICY=yes` (strict) or `no` (skip).
 
 Two limits, both deliberate: `--structured` has no bindings here, and `--commit-confirmed` is
@@ -698,7 +723,8 @@ The rest are the flags: `show`, `edit`, `edit-dir`, `edit-broadcast`, `batch`, `
 YAML reads a bare `yes:` as a boolean, both spellings work), `structured`, `format`, `json`, `raw`,
 `diff`, `verbose`, `save-output`, `log`, `audit-log`, `safety-file`, `retries`, `workers`,
 `session-timeout`, `connect-timeout`, `command-timeout`, `transport`, `user`, `allow-missing`, and the
-probe's `no-probe`, `slow` and `skip-unreachable` (`--probe` alone has no key: a run file runs commands).
+probe's `no-probe`, `slow` and `skip-unreachable` (`--probe` alone has no key: a run file runs commands;
+`--probe` typed on the command line probes a run whose file says `no-probe`, as any flag wins).
 
 Two rules the file cannot bend:
 
@@ -838,7 +864,7 @@ once a run is under way, with the probe skipped or after it, is classified befor
 
 | Failure | Behaviour |
 |---|---|
-| A box the probe found dead before the run — refused, no route, a name that does not resolve, no TCP answer or no SSH banner within `--connect-timeout`, something other than SSH on the port | a FAIL of the run at once, in the probe's words (`probe: refused (connection refused by HOST:PORT)`), not tried by the run: the probe asked twice, half a second apart. An edit asks first, or stops (see [The probe](#the-probe)) |
+| A box the probe found dead before the run — refused, no route, a name that does not resolve, no TCP answer or no SSH banner within `--connect-timeout`, something other than SSH on the port, the probe failing on something it did not expect | a FAIL of the run at once, in the probe's words (`probe: refused (connection refused by HOST:PORT)`), not tried by the run: the probe asked twice, half a second apart. An edit asks first, or stops (see [The probe](#the-probe)) |
 | No answer in the connect phase — no TCP answer, or no SSH banner, within `--connect-timeout` (`TCP connect to HOST:PORT timed out after Ns`, `no SSH banner from HOST:PORT within Ns`) | retried on `junos`, `ssh` and `openssh`, `--retries` times, after 0.5 s and then 1 s; nothing was sent, so an edit is retried too (a show that acts on the device keeps its one attempt). `telnet*` (frozen) keeps `--session-timeout` for its connect and retries the socket's bare `timed out` with the usual pauses |
 | A clear answer in the connect phase — refused, no route, network unreachable, a name that does not resolve (`connection refused by HOST:PORT`, `no route to host HOST:PORT`, `cannot resolve HOST`) | fail immediately (on `telnet*` an unresolvable name is still retried: the socket's bare `Name or service not known` matches no marker). On `ssh` only a name the resolver says does not exist is `cannot resolve HOST`; a lookup that failed otherwise, a resolver that did not answer in time above all (`name lookup for HOST failed: Temporary failure in name resolution`), is retried after 1 s and then 3 s, an edit too |
 | A key exchange that `--session-timeout` ran out on after the banner (`no SSH session to HOST within Ns: the banner came, but key exchange did not finish`) | fail immediately |
@@ -889,7 +915,7 @@ apply to every mode once given.
 
 | Guard | Flag | Behaviour |
 |---|---|---|
-| Probe | *(automatic)*; `--no-probe`, `probe = no`, `--skip-unreachable` | Before every run, edits included (`--dry-run` and `--show-diff` too): a TCP connect plus, for `junos`/`ssh`/`openssh`, the SSH banner, so a port that merely accepts and closes is not a device; no login. `--connect-timeout` for the connect and for the banner, a box that fails asked once more, 100 at a time. An edit with a dead box asks `Continue with the N reachable? [y/N]` at a terminal (with `-y` too: it confirms the edit, never a partial deployment), is refused without one (exit 2) unless `--skip-unreachable` goes on with the reachable (exit 3). See [The probe](#the-probe) |
+| Probe | *(automatic)*; `--no-probe`, `probe = no`, `--skip-unreachable` | Before every run, edits included (`--dry-run` and `--show-diff` too): a TCP connect plus, for `junos`/`ssh`/`openssh`, the SSH banner, so a port that merely accepts and closes is not a device; no login. It asks where the run will connect (`HostName` and `Port` from the ssh configuration on `openssh` and `junos`); a box behind a `ProxyJump` or `ProxyCommand`, or one the safety gate holds, is not probed and runs as without it. `--connect-timeout` for the connect and for the banner, a box that fails asked once more, 100 at a time. An edit (a `--dry-run` too) with a dead box asks `Continue with the N reachable? [y/N]` at a terminal (with `-y` too: it confirms the edit, never a partial deployment), is refused without one (exit 2) unless `--skip-unreachable` goes on with the reachable (exit 3). See [The probe](#the-probe) |
 | Confirmation | *(automatic)* | Edits prompt `y/N`; `-y` to skip in automation |
 | Dry run | `--dry-run` | Junos over NETCONF: loads, diffs, runs `commit_check` (when there is a diff), then discards the candidate. `telnet-junos`: `configure exclusive`, loads, `show \| compare`, `rollback 0` — no commit check, so the diff is shown but not validated. Other transports **refuse** `--dry-run` for edits instead of pretending |
 | Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
@@ -906,15 +932,16 @@ A request h-ssh refuses before touching the device (bad arguments, a missing con
 
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a second attempt on the same host while one is in flight is refused rather than doubled up, and a failure cools it before anything else can try. The mark lives in memory; only cooldowns reach the file, so a crashed process blocks nothing in the next run.
 
-Exit codes: `0` success (also when the operator answers N to the confirmation; for `--probe` alone, every box live) · `1` a device failed (also a box the probe found dead, a failed `--show-diff` preview, or an audit write failure in an edit mode; for `--probe` alone, a box that is not live) · `2` usage error, a transport that cannot honour the request, or an edit the probe stopped (a dead box and no terminal to ask at, no `--skip-unreachable`; an answer other than y at its question; every box dead) · `3` nothing failed but not everything ran: the safety gate skipped a device, or an edit went on without the boxes the probe found dead (the verdict line says how many) · `4` the store could not keep some or all of the results (a disk that filled, a file deleted or replaced under the run): the replies were shown, a `WARNING` says how many of how many were not kept and why, the summary carries `not_kept`, and the run's record is incomplete; `4` wins over `1` and `3`, the summary's `fail` still says what failed · `130` interrupted. A run that reaches its devices also prints a structured summary to stderr (a usage error, an edit the probe stopped or an N at the prompt exit before it):
+Exit codes: `0` success (also when the operator answers N to the confirmation; for `--probe` alone, every box live) · `1` a device failed (also a box the probe found dead, a failed `--show-diff` preview, or an audit write failure in an edit mode; for `--probe` alone, a box found dead) · `2` usage error, a transport that cannot honour the request, or an edit the probe stopped (a dead box and no terminal to ask at, no `--skip-unreachable`; an answer other than y at its question; every box dead) · `3` nothing failed but not everything ran: the safety gate skipped a device, or an edit went on without the boxes the probe found dead (the verdict line says how many); for `--probe` alone, a box not probed · `4` the store could not keep some or all of the results (a disk that filled, a file deleted or replaced under the run): the replies were shown, a `WARNING` says how many of how many were not kept and why, the summary carries `not_kept`, and the run's record is incomplete; `4` wins over `1` and `3`, the summary's `fail` still says what failed · `130` interrupted. A run that reaches its devices also prints a structured summary to stderr (a usage error, an edit the probe stopped or an N at the prompt exit before it):
 
 ```
-[h-ssh] {"targets": 3, "ok": 2, "fail": 1, "skipped": 0, "elapsed_ms": 812, "mode": "show"}
+[h-ssh] {"targets": 3, "ok": 2, "fail": 1, "skipped": 0, "probe_ms": 512, "elapsed_ms": 812, "mode": "show"}
 ```
 
 `targets` is the number of devices that completed, `skipped` the safety-gate blocks and the boxes an edit
-went on without, `mode` one of `show`, `edit`, `rollback`, `commit`, `batch`, `job`, `probe` (which adds
-`slow`, the boxes tagged slow).
+went on without, `probe_ms` the probe's time before the run when it ran (`elapsed_ms` is the run's own,
+from the confirmation on), `mode` one of `show`, `edit`, `rollback`, `commit`, `batch`, `job`, `probe`
+(which adds `slow`, the boxes tagged slow, and counts a box not probed in `skipped`).
 
 ## Structured output
 
@@ -1006,11 +1033,14 @@ The library reads no environment variable and no config file; that is the CLI's 
 
 - [the probe](#the-probe) before every `show()` and `batch()`, as the CLI's before every run: each box asked,
   without logging in, whether it is there (a TCP connect and the SSH banner, `connect_timeout` each, 100 at
-  a time), and the run goes to the boxes that answered; a dead one is a failed result at once, its `error` in
+  a time, where its transport connects: the ssh configuration's `HostName` and `Port` on `openssh` and
+  `junos`, and a box behind a `ProxyJump` or `ProxyCommand` not probed but run), and the run goes to the
+  boxes that answered; a dead one is a failed result at once, its `error` in
   the probe's words (`probe: refused (connection refused by 10.0.1.2:830)`), and no worker is spent on it.
   `probe=False` skips it, for a fleet you know is up. `fleet.probe(slow_ms=10)` is the check alone: one
   `ProbeResult` per box in the targets' order, `device` (also `name`), `host`, `port`, `vendor`, `result`
-  (`live`, `refused`, `no route`, `name not found`, `timed out`, `silent`, `not SSH`) and `ok`, `connect_ms`
+  (`live`, `refused`, `no route`, `name not found`, `timed out`, `silent`, `not SSH`, `error`, `not probed`),
+  `ok` (live) and `dead` (every result but `live` and `not probed`), `connect_ms`
   (the TCP handshake's round trip as the kernel measured it), `banner_ms`, `banner` or `reason`, `slow` (the
   tag when the round trip is above `slow_ms`, else None) and `duration_ms`; `to_dict()` is the CLI's
   `--probe --json` record. With `store=` it is kept as a run of mode `probe`, a row per box;
@@ -1250,7 +1280,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1206 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1219 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

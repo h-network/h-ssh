@@ -42,11 +42,11 @@ DIALECTS = {d.name: d for d in _dialects.ALL}
 
 NETCONF = Transport("netconf", "NETCONF over SSH (PyEZ)", module="hssh.transports.netconf",
                     install="junos-eznc", default_port=830, formats=("text", "xml", "json"),
-                    pooled=True)
+                    pooled=True, ssh_config="paramiko")
 SSH = Transport("ssh", "SSH exec channel (paramiko)", module="hssh.transports.ssh",
                 install="paramiko", default_port=22)
 OPENSSH = Transport("openssh", "the OpenSSH client", module="hssh.transports.openssh",
-                    install="the OpenSSH client ('ssh' on PATH)", default_port=22)
+                    install="the OpenSSH client ('ssh' on PATH)", default_port=22, ssh_config="openssh")
 # Legacy fallback (2026-10-24): it inherits dialects and fixes, nothing else.
 TELNET = Transport("telnet", "telnet", module="hssh.transports.telnet", install="(built-in)",
                    default_port=23, banner=None, frozen=True)
