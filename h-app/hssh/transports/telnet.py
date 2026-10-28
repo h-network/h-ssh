@@ -17,7 +17,8 @@ from ..dialects.base import Dialect
 from ..drivers import results as R
 from .cli import (Cli, LOGIN_RE, PASSWORD_RE, MORE_PATTERNS, strip_ansi as _strip_ansi,  # noqa: F401
                   edit_policy, refuse_comment as _refuse_comment, refuse_commit_lines as _refuse_commit_lines,
-                  refuse_control_characters as _refuse_control_characters)
+                  refuse_control_characters as _refuse_control_characters,
+                  refuse_credentials as _refuse_credentials)
 
 AVAILABLE = True  # Raw sockets, always available
 
@@ -128,7 +129,12 @@ def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
                        port: int, session_timeout: int, dialect: Dialect) -> Cli:
     """Open the socket, negotiate telnet, log in: a CLI session at a prompt.
     Raises NotAppliedError when the device rejects the credentials or shows no
-    prompt within session_timeout, even after an Enter."""
+    prompt within session_timeout, even after an Enter. The login dialogue
+    types the username and the password as they are: one with a control
+    character in it (a line break would run the rest as commands once the
+    login succeeds) is a ValueError before the socket is opened, for every
+    function here."""
+    _refuse_credentials(user, passwd)
     channel = TelnetChannel.connect(host, port, session_timeout)
     session = Cli(channel, dialect, session_timeout, initial=channel.initial)
     session.login(user, passwd)

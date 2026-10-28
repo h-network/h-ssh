@@ -1153,6 +1153,25 @@ async def main() -> int:
         # probe logs in nowhere and asks for no password.
         print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
         return 2
+    if mode != "probe":
+        # The username the run logs in with is plain text: telnet types it at
+        # the login: prompt as it is, and what followed a line break in it ran
+        # as commands once the login succeeded, a commit too, in a run that
+        # only reads. No device takes such a name, so it is refused for every
+        # driver, before anything is written. Not quoted: what follows a line
+        # break in it may well be the password.
+        if args.user:
+            named, source = args.user, (f"run file '{args.run}': 'user'" if "user" in from_run_file
+                                        else "--user")
+        elif os.environ.get("HSSH_USER"):
+            named, source = os.environ["HSSH_USER"], "HSSH_USER"
+        else:
+            named = file_config.get("user")
+            source = f"{get_config_path() if args.config is None else args.config}: 'user'"
+        what = control_character(named or "", tabs=False)
+        if what:
+            print(f"ERROR: {source} has {what}; a username is plain text. Nothing was sent.", file=sys.stderr)
+            return 2
     # An edit that changes the network needs its question answered: without
     # a terminal or -y it is refused here, before the probe touches a box.
     commits = has_edits and not args.dry_run

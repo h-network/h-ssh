@@ -184,6 +184,8 @@ not over `openssh`.
 
 A password means the same on every transport: it is the credential, and no `~/.ssh/id_*` key and no agent key is offered first (`openssh` passes `PubkeyAuthentication=no` and `IdentitiesOnly=yes`), so a wrong password is a failed login on `junos`, `ssh` and `openssh` alike, never an OK by way of a key. Without a password the keys and the agent are what you log in with.
 
+The username is plain text. Telnet types it at the `login:` prompt as it is, where a line break would end it and run the rest as commands once the login succeeds, so one with a control character in it (a line break, an ESC, a Tab) is refused before a run that logs in starts, on every driver: exit 2, naming where it came from (`--user`, the run file's `user`, `HSSH_USER` or the config file), without quoting it. The password is checked where it is typed: `telnet` and its flavours refuse one with a control character other than a Tab before they connect, a FAIL of that device tried once, and the other drivers hand it to the SSH login as it is (see [Transports](#transports)).
+
 ## Modes
 
 | Flag | Mode | What it does |
@@ -459,7 +461,10 @@ driver before the run starts (exit 2) and lets a Tab through: it is text to `jun
 reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at no CLI. A set file
 indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
 `telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it fails
-without being typed.
+without being typed. The login dialogue is held to the same rule: a username with a control character or
+a Tab in it, or a password with a control character (a Tab is text at a password prompt), is refused by
+the telnet drivers before they connect, a `ValueError` for a library caller too, and the engine types
+neither at a login prompt on any channel. None of these refusals is tried again.
 
 `h-ssh --list-vendors` prints the registry: every driver a target may name, its aliases, transport,
 dialect, the formats `--format` can ask it for, what it supports, and where it came from (`built-in`,
@@ -1436,7 +1441,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1272 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1291 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

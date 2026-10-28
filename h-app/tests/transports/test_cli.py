@@ -105,6 +105,38 @@ def test_login_answers_the_dialogue_and_learns_the_devices_own_prompt():
     assert not s.prompt_re.search("other@R1> ") and not s.prompt_re.search("description noc@example.com>")
 
 
+def test_a_username_or_password_the_prompt_would_take_as_keys_is_never_typed():
+    """#139 review: the login dialogue typed the username and the password
+    as they were. A password of `pw`, CR, `configure exclusive`, CR, ...,
+    `commit comment x` logged in and ran the rest as commands, a commit for
+    good from a show. Neither is typed with a control character in it, the
+    channel is closed, and the refusal quotes neither. A Tab is text in a
+    password; a shell already at its prompt (SSH, which took the pair for
+    its own login) is asked for neither."""
+    first = "\r\nR1 (ttyp0)\r\n\r\nlogin: "
+    for user, passwd, what in (("lab\rconfigure exclusive", "secret", "the username has a carriage return"),
+                               ("lab", "pw\rcommit comment x", "the password has a carriage return"),
+                               ("lab\x03", "secret", "the username has a control character '\\x03'"),
+                               ("lab\t", "secret", "the username has a Tab"),
+                               ("lab", "pw\x15commit", "the password has a control character '\\x15'"),
+                               ("lab", "pw\x9bx", "the password has a control character '\\x9b'")):
+        ch = ScriptChannel(first, junos_device(lab="Password:"), echo=False)
+        with pytest.raises(ValueError) as refused:
+            Cli(ch, dialects.junos.DIALECT, 5).login(user, passwd)
+        assert str(refused.value) == f"{what}, which a login prompt takes as a key, not as text; it was not sent"
+        assert ch.typed == [] and ch.closed
+    ch = ScriptChannel("\r\nPassword: ", junos_device(), echo=False)
+    with pytest.raises(ValueError, match="^the password has a line break, which a login prompt takes as a key"):
+        Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\ncommit")
+    assert ch.typed == []
+    ch = ScriptChannel(first, junos_device(lab="Password:", **{"pw\tx": "\r\n" + OP}), echo=False)
+    Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\tx")
+    assert ch.typed == ["lab", "pw\tx"]
+    ch = ScriptChannel("\r\n" + OP, junos_device())
+    Cli(ch, dialects.junos.DIALECT, 5).login("lab\r", "pw\n")
+    assert ch.typed == []
+
+
 def test_a_rejected_login_is_not_applied_and_quotes_the_device():
     ch = ScriptChannel("\r\nlogin: ", {"lab": "Password:", "<else>": "\r\nLogin incorrect\r\nlogin: "}, echo=False)
     with pytest.raises(NotAppliedError, match="login failed: Login incorrect"):

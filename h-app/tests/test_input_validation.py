@@ -204,6 +204,44 @@ def test_an_edit_payload_keeps_its_line_breaks_but_no_other_control_character(mo
     assert rc == 0, err                                       # two set lines are a payload, not a mistake
 
 
+def test_a_username_with_a_control_character_is_refused_before_anything_runs(monkeypatch, capsys, tmp_path,
+                                                                            probed):
+    """#139 review: telnet types the username at the login: prompt as it is.
+    A run file's `user:` of `lab`, CR, `pw`, CR, `configure exclusive`, CR,
+    ..., `commit comment x` logged in and committed from a run with nothing
+    but a show in it; --user, HSSH_USER and the config file's `user` are the
+    same value. No device takes such a name: refused on every driver, exit 2
+    naming where it came from, before anything is probed, written or sent,
+    and not quoted, as what follows a line break may be the password."""
+    sent = []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: sent.append(a) or "ok")
+    monkeypatch.setitem(drivers.MODULES, "junos@telnet", fake)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    bad = "lab\rpw\rconfigure exclusive\rcommit comment x"
+    run = tmp_path / "run.json"
+    run.write_text(json.dumps({"devices": ["R1:10.0.0.1:telnet-junos"], "show": "show version", "user": bad}))
+    cfg = tmp_path / "config"
+    cfg.write_text("user = lab\x1bx\n")
+    for argv, env, config, said in (
+            (["--user", bad, "-sC", "show version", "R1:10.0.0.1:telnet-junos"], {}, os.devnull,
+             "--user has a carriage return"),
+            (["--run", str(run)], {}, os.devnull, f"run file '{run}': 'user' has a carriage return"),
+            (["-sC", "show version", "R1:10.0.0.1:junos"], {"HSSH_USER": "lab\tx"}, os.devnull, "HSSH_USER has a Tab"),
+            (["-sC", "show version", "R1:10.0.0.1:junos"], {}, str(cfg), f"{cfg}: 'user' has an ESC")):
+        for var, value in env.items():
+            monkeypatch.setenv(var, value)
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", config, *argv])
+        rc = asyncio.run(cli.main())
+        out, err = capsys.readouterr()
+        assert rc == 2 and err == f"ERROR: {said}; a username is plain text. Nothing was sent.\n", (argv, err)
+        for var in env:
+            monkeypatch.delenv(var)
+    assert sent == [] and probed == [] and not os.path.exists(os.environ["HSSH_STORE"])
+
+
 def test_a_batch_line_with_a_control_character_is_refused(monkeypatch, capsys, tmp_path):
     """#110: a NUL or an ESC in a batch line went to every device with the rest."""
     b = tmp_path / "cmds.txt"

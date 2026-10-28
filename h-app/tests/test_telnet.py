@@ -259,6 +259,33 @@ def _received(srv):
     return srv.received
 
 
+class NoDevice:
+    """A port on 127.0.0.1 that is listened on and never answered: a client
+    that connects waits in the accept queue, so connected() can count what a
+    refusal "before the socket is opened" must leave at none."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+
+    def connected(self):
+        """How many connections came, each closed unanswered."""
+        self.sock.setblocking(False)
+        n = 0
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except BlockingIOError:
+                return n
+            conn.close()
+            n += 1
+
+    def close(self):
+        self.sock.close()
+
+
 OP = "lab@R1> "
 CFG = "\r\n[edit]\r\nlab@R1# "
 
@@ -766,3 +793,66 @@ def test_a_payload_or_comment_the_cli_would_take_as_keys_is_refused_before_conne
                            comment='x"\nrollback 1\ncommit')
     srv.stop()
     assert srv.received == []
+
+
+def test_a_username_or_password_with_a_control_character_is_refused_before_connecting():
+    """#139 review: the login dialogue typed both as they were. A password
+    of `pw`, CR, `configure exclusive`, CR, `set ...`, CR, `commit comment x`
+    logged in and ran the rest as commands: a commit for good from a show,
+    and from a dry run before its own lock failed. Every telnet function
+    refuses one before the socket is opened, quoting neither. A Tab is text
+    in a password, which the prompt does not complete."""
+    from hssh.transports import telnet
+    dev = NoDevice()
+
+    def calls(user, passwd):
+        at = {"port": dev.port, "vendor_hint": "telnet-junos"}
+        yield lambda: telnet.show("127.0.0.1", user, passwd, "show version", 1, 1, **at)
+        yield lambda: telnet.show_batch("127.0.0.1", user, passwd, ["show version"], 1, 1, **at)
+        yield lambda: telnet.edit("127.0.0.1", user, passwd, "set system host-name x\n", 1, 1, dry_run=True, **at)
+        yield lambda: telnet.confirm("127.0.0.1", user, passwd, 1, 1, **at)
+        yield lambda: telnet.edit("127.0.0.1", user, passwd, "hostname x\n", 1, 1, port=dev.port,
+                                  vendor_hint="telnet-ios")
+    try:
+        for user, passwd, what in (
+                ("lab", "pw\rconfigure exclusive\rset system host-name x\rcommit comment x",
+                 "the password has a carriage return"),
+                ("lab\rpw\rconfigure exclusive\rcommit comment x", "pw", "the username has a carriage return"),
+                ("lab", "pw\x03", "the password has a control character '\\x03'"),
+                ("lab\x1b[2J", "pw", "the username has an ESC"),
+                ("lab\t", "pw", "the username has a Tab")):
+            for call in calls(user, passwd):
+                with pytest.raises(ValueError) as refused:
+                    call()
+                assert str(refused.value) == (f"{what}, which a login prompt takes as a key, not as text; "
+                                              "nothing was sent to the device")
+        assert dev.connected() == 0
+    finally:
+        dev.close()
+    srv = ScriptedTelnetServer(junos_cli(login=True))
+    out = telnet.show("127.0.0.1", "lab", "pass\tword", "show version", session_timeout=5, command_timeout=5,
+                      port=srv.port, vendor_hint="telnet-junos")
+    assert "Model: mx204" in out and _received(srv) == ["lab", "pass\tword", "show version"]
+
+
+def test_a_show_refused_for_its_password_is_tried_once():
+    """#139 review: a show is tried again unless the failure says it cannot
+    come out differently, and a refusal of what the engine would type said
+    nothing of the kind: three attempts, a backoff between them. A FAIL of
+    that device, tried once, nothing connected."""
+    from hssh import runner
+    from hssh.core import Target
+    dev = NoDevice()
+    t0 = time.monotonic()
+    try:
+        r = runner.run_for_target(
+            t=Target("R1", "127.0.0.1", "telnet-junos", dev.port), transport="telnet-junos", mode="show",
+            show_cmd="show version", edit_cmd=None, config_dir=None, broadcast_file=None, user="lab",
+            passwd="pw\rcommit", session_timeout=1, command_timeout=1, dry_run=False, commit_confirmed=None,
+            save_dir=None, quiet=True, max_attempts=3)
+        took = time.monotonic() - t0
+        assert r.ok is False and r.error == ("the password has a carriage return, which a login prompt takes as "
+                                             "a key, not as text; nothing was sent to the device")
+        assert took < 1 and dev.connected() == 0
+    finally:
+        dev.close()

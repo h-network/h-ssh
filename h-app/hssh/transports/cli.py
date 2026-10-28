@@ -101,6 +101,33 @@ def refuse_comment(comment: Optional[str]) -> None:
                          "nothing was sent to the device")
 
 
+def credential_fault(user: Optional[str], passwd: Optional[str]) -> Optional[str]:
+    """What keeps a username or password from being typed at a login prompt,
+    or None. A line break ends the answer there, and what follows it runs as
+    commands once the login succeeds, a `commit` too; ^C, ^U, DEL and the
+    other control characters are keys to the prompt. A Tab is text in a
+    password, which the prompt does not complete; a username has none.
+    Neither is quoted: what follows a line break in a username may well be
+    the password."""
+    what = control_character(user or "", tabs=False)
+    if what:
+        return f"the username has {what}"
+    what = control_character(passwd or "")
+    if what:
+        return f"the password has {what}"
+    return None
+
+
+def refuse_credentials(user: Optional[str], passwd: Optional[str]) -> None:
+    """A username or password a login dialogue would type with a control
+    character in it (credential_fault), refused before the device is
+    contacted."""
+    fault = credential_fault(user, passwd)
+    if fault:
+        raise ValueError(f"{fault}, which a login prompt takes as a key, not as text; "
+                         "nothing was sent to the device")
+
+
 def refuse_commit_lines(payload: str) -> None:
     """`commit` typed inside configure mode would commit (and confirm any
     pending timer) halfway through a payload. A confirm is `-eC "commit"`
@@ -223,11 +250,21 @@ class Cli:
         detail = f": {said}" if said else " (the device asked for credentials again)"
         raise NotAppliedError(f"login failed{detail}")
 
+    @staticmethod
+    def _refuse_typing(user: Optional[str], passwd: Optional[str]) -> None:
+        """The login dialogue types a credential as it is: one the prompt
+        would take as keys is not typed (credential_fault)."""
+        fault = credential_fault(user, passwd)
+        if fault:
+            raise ValueError(f"{fault}, which a login prompt takes as a key, not as text; it was not sent")
+
     def login(self, user: Optional[str], passwd: Optional[str]) -> None:
         """Get to a prompt. Raises NotAppliedError when the device rejects the
         credentials or shows no prompt within session_timeout, even after an
         Enter: no command was sent, and the runner treats a failed login as
-        permanent. The channel is closed on any failure."""
+        permanent. A username or password with a control character in it is
+        a ValueError before either is typed. The channel is closed on any
+        failure."""
         timeout = self.session_timeout
         try:
             try:
@@ -242,6 +279,7 @@ class Cli:
 
             last = initial
             if LOGIN_RE.search(initial):
+                self._refuse_typing(user, passwd)
                 self._send((user or "") + "\n")
                 last = self._read_until_prompt_or_login(timeout)
                 if PASSWORD_RE.search(last):
@@ -249,6 +287,7 @@ class Cli:
                     last = self._read_until_prompt_or_login(timeout)
                 self._check_login(last)
             elif PASSWORD_RE.search(initial):
+                self._refuse_typing(None, passwd)
                 self._send((passwd or "") + "\n")
                 last = self._read_until_prompt_or_login(timeout)
                 self._check_login(last)
