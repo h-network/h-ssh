@@ -370,7 +370,10 @@ class Cli:
         pending changes, and the device refuses entry while someone else holds
         the lock - reported before any set line is sent. With `expected_diff`
         (what a dry run showed) the candidate is committed only if
-        `show | compare` says the same again.
+        `show | compare` says the same again. An empty compare is NO CHANGES,
+        the candidate discarded and no commit typed, as over NETCONF: a
+        commit there would arm a timer over nothing, and on Junos confirm
+        another user's pending commit confirmed.
         """
         d, cli = self.dialect, self.cli
         refuse_control_characters(payload)
@@ -391,7 +394,7 @@ class Cli:
         diff = self.run(cli.compare, 30).strip()
         changed = expected_diff is not None and diff != expected_diff.strip()
 
-        if dry_run or errors or changed:
+        if dry_run or errors or changed or not diff:
             self.leave_quietly(cli.discard, cli.config_exit)
             if errors:
                 raise RuntimeError("; ".join(errors))
@@ -420,8 +423,6 @@ class Cli:
 
         self.leave_quietly(cli.config_exit)
 
-        if not diff:
-            return R.EditResult(R.NO_CHANGES)
         if confirmed_minutes and confirmed_minutes > 0:
             return R.EditResult(R.CONFIRMED, diff=diff, minutes=confirmed_minutes)
         return R.EditResult(R.COMMITTED, diff=diff)

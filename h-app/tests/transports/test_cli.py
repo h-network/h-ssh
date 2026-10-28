@@ -193,6 +193,20 @@ def test_no_diff_is_no_changes_and_a_changed_diff_commits_nothing():
     assert "commit" not in ch.typed and ch.typed[-2:] == ["rollback 0", "exit"]
 
 
+def test_an_empty_compare_types_no_commit():
+    """#139: with nothing in `show | compare` the engine typed `commit`, or
+    `commit confirmed 5`, and said NO CHANGES: a timer armed that the CLI's
+    reminder never mentions, and on Junos an empty commit also confirms
+    another user's pending commit confirmed. Nothing to commit is NO
+    CHANGES before any commit is typed, the candidate discarded, as over
+    NETCONF; a --show-diff preview that showed nothing is the same."""
+    for kw in ({}, {"confirmed_minutes": 5}, {"expected_diff": ""}):
+        s, ch = junos_session(**{"show | compare": CFG})
+        r = s.edit_candidate("set system host-name test\n", dry_run=False, **kw)
+        assert r.status == R.NO_CHANGES and not r.pending
+        assert ch.typed == ["configure exclusive", "set system host-name test", "show | compare", "rollback 0", "exit"]
+
+
 def test_a_refused_lock_sends_nothing_else_and_a_syntax_error_rolls_back():
     s, ch = junos_session(configure="\r\nerror: configuration database locked by: other\r\n" + OP)
     with pytest.raises(NotAppliedError, match="Failed to lock config"):
