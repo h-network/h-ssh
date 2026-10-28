@@ -668,8 +668,12 @@ class Transaction:
         return self._lease.dev
 
     def show(self, cmd: str) -> str:
+        """A show on the transaction's session, judged as show() judges
+        one: a reply that opens with the CLI's refusal raises (_shown). It
+        was handed back as the output, and a gate that looked for a word in
+        it went on to commit on a command the device refused (#143)."""
         self._require_open()
-        return _cli(self.dev, cmd)
+        return _shown(self.dev, cmd)
 
     def rpc(self, command: str, args: Optional[dict] = None, fmt: str = "json"):
         self._require_open()
