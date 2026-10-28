@@ -399,6 +399,27 @@ def test_what_is_not_a_secret_stays():
     assert redact_secrets("snmp-server community C0MM RO") == "snmp-server community [REDACTED] RO"
 
 
+def test_a_quoted_credential_command_is_redacted_and_a_description_is_kept_whole():
+    """#151 review: the openssh transport repeats a refused command in
+    quotes in its error, and a credential in it must still go, the closing
+    quote kept; a description keeps every word, wherever a keyword sits in
+    it, in text, XML and JSON alike."""
+    assert redact_secrets("'password hunter2' was refused by the device: bad command") == \
+        "'password [REDACTED]' was refused by the device: bad command"
+    assert redact_secrets('"set system login user bob authentication plain-text-password-value hunter2" was refused') == \
+        '"set system login user bob authentication plain-text-password-value [REDACTED]" was refused'
+    for line in ('set interfaces ge-0/0/0 description "customer password reset portal"',
+                 '    description "customer password reset portal";',
+                 "description 'secret sauce'",
+                 'description password-reset-portal',
+                 '<interface><description>customer password reset portal</description></interface>'):
+        assert redact_secrets(line) == line
+    assert redact_secrets('    description "customer password reset portal";\n    encrypted-password "$9$x";') == \
+        '    description "customer password reset portal";\n    encrypted-password [REDACTED];'
+    assert redact_values({"description": "customer password reset portal", "password": "x"}) == \
+        {"description": "customer password reset portal", "password": "[REDACTED]"}
+
+
 def test_the_comment_is_redacted_too(tmp_path):
     """An entry's `comment` was written as given, where every other text of
     the entry is redacted; a comment can quote the secret it rotated."""

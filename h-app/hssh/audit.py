@@ -28,10 +28,9 @@ _REDACT_PATTERNS = [
     # keyword [type words] value — Junos set/text, EOS and IOS alike:
     # `plain-text-password-value hunter2`, `authentication md5 1 key X`,
     # `ntp authentication-key 1 value "$9$.."`, `secret sha512 $6$..`,
-    # `tacacs-server key 7 X`, `key-string 7 X`, `privacy-key "$9$.."`.
-    # Not a keyword that opens a quoted string (`description "password
-    # reset portal"` keeps its words).
-    (re.compile(r'(?<!["\'])((?:encrypted-password|plain-text-password(?:-value)?|password(?:-value)?|secret|'
+    # `tacacs-server key 7 X`, `key-string 7 X`, `privacy-key "$9$.."`,
+    # and a quoted command an error repeats (`'password X' was refused`).
+    (re.compile(r'((?:encrypted-password|plain-text-password(?:-value)?|password(?:-value)?|secret|'
                 r'authentication-key|message-digest-key|md5-key|privacy-key|key-string)[ \t]+'
                 r'(?:(?:\d+|md5|sha512|sha256|sha1|sha|value|type[ \t]+\S+|hmac-\S+)[ \t]+)*)' + _VALUE,
                 re.IGNORECASE),
@@ -80,14 +79,24 @@ _REDACT_PATTERNS = [
 ]
 
 
+# What a description says is no secret, whatever words it uses
+# (`description "customer password reset portal"`): its value, quoted or
+# one word, and a <description> element's text are kept out of the
+# patterns' reach; redact_values() keeps a JSON "description" as it is.
+_DESCRIPTION = re.compile(r'(\bdescription[ \t]+|<description>)'
+                          r'((?<=>)[^<]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s;<"\']+)', re.IGNORECASE)
+_KEPT_KEY = re.compile(r'(?:^|[-_])description$')
+
+
 def redact_secrets(text: Optional[str]) -> Optional[str]:
     """Redact passwords and secrets from text."""
     if not text:
         return text
-    result = text
-    for pattern, repl in _REDACT_PATTERNS:
-        result = pattern.sub(repl, result)
-    return result
+    parts = _DESCRIPTION.split(text)      # text, a description's keyword, its value, text, …
+    for i in range(0, len(parts), 3):
+        for pattern, repl in _REDACT_PATTERNS:
+            parts[i] = pattern.sub(repl, parts[i])
+    return "".join(parts)
 
 
 # A JSON key whose whole value is a secret, known by its last word. A reply
@@ -107,7 +116,8 @@ def redact_values(data):
     if isinstance(data, list):
         return [redact_values(v) for v in data]
     if isinstance(data, dict):
-        return {k: ("[REDACTED]" if _SECRET_KEY.search(str(k).lower()) else redact_values(v))
+        return {k: ("[REDACTED]" if _SECRET_KEY.search(str(k).lower()) else
+                    v if _KEPT_KEY.search(str(k).lower()) else redact_values(v))
                 for k, v in data.items()}
     return data
 
