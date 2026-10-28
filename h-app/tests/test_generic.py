@@ -1886,6 +1886,58 @@ def test_a_lost_session_is_tried_again_for_a_read_and_fails_an_edit_once(exec_ss
     assert sent == ["set system host-name r1"]
 
 
+def status_then_lost(*lines):
+    """A device whose exit status goes out ahead of the rest of its output,
+    as OpenSSH's sshd sends it the moment the command exits, and whose
+    session is lost before the rest and the EOF."""
+    def reply(channel, command):
+        for line in lines:
+            channel.sendall(line.encode() + b"\n")
+        channel.send_exit_status(0)
+        _time.sleep(0.2)
+        channel.get_transport().close()
+    return reply
+
+
+def closed_without_eof(channel, command):
+    """A device that ends the command by closing its channel, with no EOF
+    before the close (SSH allows it) and no exit status, on a session that
+    stays up."""
+    channel.sendall(b"output-for: " + command.encode() + b"\n")
+    _time.sleep(0.1)
+    channel.eof_sent = True             # paramiko's close() sends an EOF first unless one went out
+    channel.close()
+
+
+def test_a_session_lost_after_the_exit_status_came_is_not_its_reply(exec_sshd, monkeypatch):
+    """Only paramiko's -1 counted as a lost session, and OpenSSH's sshd
+    (Junos's too) sends the status as soon as the command exits, with up to
+    a window of its output still to go: a session lost in the tail of a big
+    reply was status 0 and a complete reply, `show configuration | display
+    set` cut to two lines and stored as the baseline. No EOF and the
+    transport gone is a lost session whatever status came, and a read is
+    tried again; a channel the device closed with no EOF on a session that
+    stays up, which was called lost, is the device's answer."""
+    monkeypatch.setattr(runner, "_backoff", lambda attempt, steps=None: 0)
+    cmd = "show configuration | display set"
+    lost = f"connection to 127.0.0.1 lost before '{cmd}' finished"
+    port, sent = exec_sshd(status_then_lost("set system host-name r1", "set system services ssh"))
+    with pytest.raises(ConnectionError) as failed:
+        ssh.show("127.0.0.1", "u", "p", cmd, 5, 5, port=port)
+    assert str(failed.value) == lost and not runner.is_permanent_failure(failed.value)
+    assert list(ssh.show_batch("127.0.0.1", "u", "p", [cmd], 5, 5, port=port)) == [
+        {"command": cmd, "ok": False, "error": lost}]
+    del sent[:]
+    read = runner.run_for_target(
+        t=Target("R1", "127.0.0.1", "ssh", port), transport="ssh", mode="show", show_cmd=cmd,
+        edit_cmd=None, config_dir=None, broadcast_file=None, user="u", passwd="p", session_timeout=5,
+        command_timeout=5, dry_run=False, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3)
+    assert not read.ok and read.error == lost and sent == [cmd] * 3
+    port, _ = exec_sshd(closed_without_eof)
+    assert ssh.show("127.0.0.1", "u", "p", "show version", 5, 5, port=port) == (
+        "$ show version\noutput-for: show version\n")
+
+
 def test_a_refusal_on_stdout_fails_the_show_whatever_stderr_says(exits_with):
     """#143: a device that wrote anything to stderr (a warning) had its
     refusal of the show on stdout at exit 0 taken for the show's output."""

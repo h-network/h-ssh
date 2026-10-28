@@ -540,11 +540,13 @@ the lock.
 The default transport runs each line as its own `exec_command`. A command that exits non-zero is a
 failure, not output: an edit stops at that line and reports it, a batch marks the entry `ok: false`
 with the first line the device said about it (stderr, or stdout where the device puts its errors).
-So is a session lost before the command finished — the connection closed with no exit status and no
-end of output from the device — whatever the device had sent by then: `connection to HOST lost before
-'CMD' finished`. A read is tried again, an edit line is FAILED with its outcome unknown and never sent
-again, a batch marks that entry `ok: false`. A device that ends its output and closes without an exit
-status, as some network OSes do, has answered.
+So is a session lost before the command finished — the connection gone before the device ended its
+output — whatever the device had sent by then, an exit status too (OpenSSH's sshd, Junos's included,
+sends the status as soon as the command exits, with up to 2 MB of the reply still to come): `connection
+to HOST lost before 'CMD' finished`. A read is tried again, an edit line is FAILED with its outcome
+unknown and never sent again, a batch marks that entry `ok: false`. A device that ends its output, or
+closes the command's channel on a session that stays up, without an exit status, as some network OSes
+do, has answered.
 
 Host keys are pinned on first contact in `~/.h-ssh/known_hosts` (created 0600), and
 `~/.ssh/known_hosts` is honoured too. The policy is the same `HSSH_HOST_KEY_POLICY` the `openssh`
@@ -1536,7 +1538,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1376 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1377 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

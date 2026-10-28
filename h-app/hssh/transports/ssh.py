@@ -594,6 +594,27 @@ def _drain(stream, deadline: float, cmd: str) -> str:
         chunks.append(chunk)
 
 
+# How long a channel that closed with no EOF waits for its transport to be
+# gone: paramiko closes the channels of a session the server disconnected a
+# moment before it marks the transport inactive.
+_GONE_WAIT = 0.5
+
+
+def _lost(channel, deadline: float) -> bool:
+    """The session died under the command: the device never ended its
+    output (no EOF) and the transport is gone, whatever exit status came
+    first. A channel the device closed with no EOF on a session that stays
+    up was ended by the device, and is its reply."""
+    if channel.eof_received:
+        return False
+    transport = channel.get_transport()
+    if transport is None:
+        return False
+    if transport.saved_exception is None and transport.is_active():
+        transport.join(max(0.0, min(_GONE_WAIT, deadline - time.monotonic())))
+    return transport.saved_exception is not None or not transport.is_active()
+
+
 def _exec(client, host: str, cmd: str, command_timeout: int):
     """(exit status, stdout, stderr) of one command; -1 when the server sent no status.
 
@@ -601,12 +622,15 @@ def _exec(client, host: str, cmd: str, command_timeout: int):
     after them. A device that sends EOF and then neither a status nor a
     close once held a worker thread forever (and with it the whole run).
 
-    paramiko says -1 for two things: a device that ended its output (EOF)
-    and closed without a status, as some network OSes do, and a session
-    that died before the command finished, which closes the channel with
-    no EOF at all. Only the first is a reply. The second is a
-    ConnectionError: its output may be cut short, and it was read as a
-    whole reply, an empty one too, and an edit line as applied (#143)."""
+    A session lost before the device ended its output is a ConnectionError
+    (_lost), whatever exit status came first: its output may be cut short.
+    paramiko's -1 after a drop was read as "no status", an empty or cut
+    reply as the whole one and an edit line as applied; and OpenSSH's sshd,
+    Junos's too, sends the status as soon as the command exits, with up to
+    a window of its output (2 MB) still to go, so a drop in the tail of a
+    big reply came back as status 0 and a complete reply (#143). A device
+    that ends its output (EOF) and closes without a status, as some network
+    OSes do, has answered."""
     deadline = time.monotonic() + float(command_timeout)
     stdin, stdout, stderr = client.exec_command(cmd, timeout=float(command_timeout))
     channel = stdout.channel
@@ -623,7 +647,7 @@ def _exec(client, host: str, cmd: str, command_timeout: int):
             pass
         raise TimeoutError(f"'{cmd}': the device sent no exit status within {command_timeout}s; channel closed")
     rc = channel.recv_exit_status()
-    if rc == -1 and not channel.eof_received:
+    if _lost(channel, deadline):
         raise ConnectionError(f"connection to {host} lost before '{cmd}' finished")
     return rc, out, err
 
