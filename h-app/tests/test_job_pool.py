@@ -210,3 +210,33 @@ def test_a_job_counts_the_sessions_it_keeps_between_entries_against_the_open_fil
     assert rc == 0, err
     assert state["set"] == [(2 * 6 + 3 * 4 + 32, 65536)]     # 2 workers, 3 sessions kept, the base
     assert len(FakeDevice.instances) == 4
+
+
+def test_a_job_closes_none_of_the_sessions_the_open_file_limit_was_raised_for(monkeypatch, capsys, tmp_path):
+    """#147: the pool counted a device's session in flight twice, as the
+    worker's descriptors and as a session of four, where the job's fit
+    counts it once, as the worker's. Six devices with two entries and twelve
+    with one at four workers, the soft limit raised from 64 to 80 for them,
+    had the pool close two or three of the sessions kept between entries:
+    each a second login, on an entry that plan_logins counts as riding, so
+    --safety-file never counted it. Nothing is closed now, and every device
+    logs in once."""
+    import threading
+    from tests.test_transport_consistency import _rlimits
+    state = _rlimits(monkeypatch, 64, 4096)
+    four = threading.Barrier(4, timeout=10)      # the one-entry devices four at a time, all four in flight
+    real_cli = FakeDevice.cli
+
+    def cli(self, cmd, warning=True):
+        if self.params["host"].startswith("10.0.1."):
+            four.wait()
+        return real_cli(self, cmd, warning)
+    monkeypatch.setattr(FakeDevice, "cli", cli)
+    two = [{"target": f"M{i}:10.0.0.{i}:junos", "show": "show version"} for i in range(1, 7)]
+    one = [{"target": f"S{i}:10.0.1.{i}:junos", "show": "show version"} for i in range(1, 13)]
+    again = [{"target": f"M{i}:10.0.0.{i}:junos", "show": "show chassis alarms"} for i in range(1, 7)]
+    rc, out, err = _run(monkeypatch, capsys, tmp_path, two + one + again, "--workers", "4")
+    assert rc == 0, err
+    assert state["set"] == [(4 * 6 + 6 * 4 + 32, 4096)]     # 4 workers, 6 sessions kept, the base: 80
+    assert len(json.loads(out)) == 24
+    assert pool.POOL.stats["reaped"] == 0 and len(FakeDevice.instances) == 18    # one login per device

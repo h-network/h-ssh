@@ -188,12 +188,14 @@ class ConnectionPool:
         # allocated: an abandoned borrow ends wherever the collector frees
         # it, and on a thread inside _pool_lock that lock would hang it.
         self._stats_lock = threading.Lock()
-        # What the open-file limit is kept to (#147): the sessions open, the
-        # borrows in flight, the sessions closed since the last collection
-        # (each holds a descriptor until it runs, #58), and the closes still
-        # running. Counted as they change, under _stats_lock.
-        self._live = 0
+        # What the open-file limit is kept to (#147): the borrows in flight
+        # (a worker's descriptors each, its session's among them), the
+        # sessions open with no borrow in flight on them, the sessions closed
+        # since the last collection (each holds a descriptor until it runs,
+        # #58), and the closes still running. Counted as they change, under
+        # _stats_lock.
         self._in_flight = 0
+        self._idle = 0
         self._uncollected = 0
         self._closing: "collections.deque" = collections.deque()
         if idle_timeout is None:
@@ -322,7 +324,7 @@ class ConnectionPool:
         owner = threading.get_ident()
         nested = entry["lock"].count > 1     # re-entrant: >1 means a call nested in an open borrow
         if not nested:
-            self._count(in_flight=1)
+            self._fly(entry, True)
         lease = None
         abandoned = False
         try:
@@ -337,7 +339,7 @@ class ConnectionPool:
                 device = opener()
                 entry["device"], entry["closer"] = device, closer
                 entry["generation"] = self._generation
-                self._count("opens", live=1)
+                self._count("opens", idle=0 if entry["flight"] else 1)
                 log.info("Pool: opened new connection to %s", key)
             else:
                 self._count("reuses")
@@ -418,7 +420,6 @@ class ConnectionPool:
         if not last:
             entry["last_used"] = time.time()
             return
-        self._count(in_flight=-1)
         try:
             if entry["device"] is not None and (
                 entry["doomed"] or not self._enabled or entry["generation"] != self._generation
@@ -427,7 +428,21 @@ class ConnectionPool:
             entry["doomed"] = False
             entry["last_used"] = time.time()
         finally:
+            self._fly(entry, False)
             lock.release()
+
+    def _fly(self, entry: dict, on: bool) -> None:
+        """The outermost borrow of `entry` begins (on) or ends. A session
+        under a borrow in flight is counted as part of that borrow, the
+        FDS_PER_WORKER hssh.limits gives a worker, and as an idle one
+        (FDS_PER_SESSION) only once the borrow is over: once either way, as
+        the fit counts it. Counted twice, a --job's sessions the limit was
+        raised for were closed all the same (#147)."""
+        if entry["flight"] == on:
+            return
+        entry["flight"] = on
+        held = entry["device"] is not None
+        self._count(in_flight=1 if on else -1, idle=(-1 if on else 1) if held else 0)
 
     def _get_or_create_entry(self, key: Hashable) -> dict:
         with self._pool_lock:
@@ -439,6 +454,7 @@ class ConnectionPool:
                     "last_used": 0.0,
                     "generation": 0,
                     "doomed": False,
+                    "flight": False,    # an outermost borrow is in flight on it (_fly)
                     "open": set(),      # the leases holding the session open (Lease.hold_open)
                 }
             return self._connections[key]
@@ -461,7 +477,7 @@ class ConnectionPool:
         device, entry["device"] = entry["device"], None
         if device is None:
             return None
-        self._count(counter, live=-1, closed=1)
+        self._count(counter, idle=0 if entry["flight"] else -1, closed=1)
         try:
             closing = entry["closer"](device)
         except Exception as e:
@@ -471,11 +487,11 @@ class ConnectionPool:
             self._closing.append(closing)       # a deque: no lock, nothing the collector tracks
         return closing
 
-    def _count(self, name: Optional[str] = None, live: int = 0, in_flight: int = 0, closed: int = 0) -> None:
+    def _count(self, name: Optional[str] = None, idle: int = 0, in_flight: int = 0, closed: int = 0) -> None:
         with self._stats_lock:
             if name is not None:
                 self.stats[name] += 1
-            self._live += live
+            self._idle += idle
             self._in_flight += in_flight
             self._uncollected += closed
 
@@ -499,12 +515,13 @@ class ConnectionPool:
 
     def _descriptors(self) -> int:
         """The descriptors the pool's sessions hold, counted as hssh.limits
-        fits them: FDS_BASE, FDS_PER_WORKER for every borrow in flight,
-        FDS_PER_SESSION for every session open, and one for every session
-        closed since the last collection."""
+        fits them: FDS_BASE, FDS_PER_WORKER for every borrow in flight (its
+        session's among them), FDS_PER_SESSION for every session open with
+        no borrow in flight on it, and one for every session closed since
+        the last collection."""
         with self._stats_lock:
             return (limits.FDS_BASE + self._in_flight * limits.FDS_PER_WORKER
-                    + self._live * limits.FDS_PER_SESSION + self._uncollected)
+                    + self._idle * limits.FDS_PER_SESSION + self._uncollected)
 
     def _make_room(self, key: Hashable) -> None:
         """Before a session is opened for `key`: room for it under the soft
@@ -526,6 +543,8 @@ class ConnectionPool:
                            if k != key and e["device"] is not None and not e["lock"].count),
                           key=lambda item: item[0])
         over = self._descriptors() - soft
+        if over <= 0:
+            return          # a borrow ended, or a session closed, while it looked
         want = -(-over // limits.FDS_PER_SESSION) + len(idle) // 8
         closes = []
         for _, k, entry in idle:

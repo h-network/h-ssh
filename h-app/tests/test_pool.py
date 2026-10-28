@@ -1116,6 +1116,64 @@ def test_closed_sessions_are_collected_before_an_idle_one_is_closed(monkeypatch)
         p.disable()
 
 
+def test_a_session_under_a_call_in_flight_counts_once_against_the_open_file_limit(monkeypatch):
+    """A borrow in flight was counted as a worker's descriptors, its session's
+    among them, and its session's four again. A --job whose soft limit was
+    raised for the sessions it keeps between entries, its workers and the
+    base closed 32 of them all the same at 300 routers, each a login more
+    that the safety gate never counted. Two calls in flight on open sessions
+    and one session kept idle are what the limit was raised for: nothing is
+    closed."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 32 + 2 * 6 + 1 * 4)   # 2 workers, 1 kept
+    closed = []
+
+    def borrow(host):
+        return p.get_connection((host, 830, "u"), opener=lambda: host, closer=closed.append)
+    inside, done = threading.Event(), threading.Event()
+
+    def worker():
+        with borrow("a"):
+            inside.set()
+            done.wait(5)
+    try:
+        with borrow("kept"):
+            pass                                     # idle until its next entry
+        t = threading.Thread(target=worker)
+        t.start()
+        assert inside.wait(5)
+        with borrow("b"):                            # the second worker's session fills the limit
+            assert closed == [] and p.live() == 3
+        done.set()
+        t.join(5)
+        assert p.stats == {"opens": 3, "reuses": 0, "discards": 0, "reaped": 0}
+    finally:
+        done.set()
+        p.disable()
+
+
+def test_nothing_is_closed_when_a_borrow_ends_while_the_pool_looks_for_room(monkeypatch):
+    """Past the limit at its first look and back under it by the time it has
+    listed the idle sessions (a borrow ended, a session closed): an eighth of
+    the idle sessions were closed all the same."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 1000)
+    closed = []
+    try:
+        for i in range(16):
+            with p.get_connection((f"r{i}", 830, "u"), opener=lambda i=i: f"r{i}", closer=closed.append):
+                pass
+        looks = iter([1004])                         # over at its first look, room at the next
+        monkeypatch.setattr(p, "_descriptors", lambda: next(looks, 1000))
+        with p.get_connection(("new", 830, "u"), opener=lambda: "new", closer=closed.append):
+            pass
+        assert closed == [] and p.stats["reaped"] == 0 and p.live() == 17
+    finally:
+        p.disable()
+
+
 def test_release_closes_the_routers_session_now(pooled):
     """What a --job runs after a device's last entry (#147): the session
     goes then, not at the end of the run."""
