@@ -155,7 +155,8 @@ class Lease:
 
     def hold_open(self) -> None:
         """The session stays borrowed past this call, for as long as the
-        caller decides: a Transaction, until its commit() or abort(). Another
+        caller decides: a Transaction begin() hands back, until its commit()
+        or abort(); not the one edit() finishes within its call. Another
         thread that wants the router waits for a call in flight to its end,
         which the call's own timeouts bound, but for a session held open
         only its wait (get_connection), and is then refused: NotAppliedError,
@@ -290,8 +291,9 @@ class ConnectionPool:
             alive: alive(dev, idle_seconds) asked before a session is reused;
                 False or an exception means it is closed and a new one opened
             wait: how long to wait for the router while another thread holds
-                its session open (Lease.hold_open(): a Transaction not yet
-                committed or aborted): `timeout` when None, else BUSY_WAIT.
+                its session open (Lease.hold_open(): a Transaction begin()
+                handed back, not yet committed or aborted): `timeout` when
+                None, else BUSY_WAIT.
                 Then NotAppliedError('router busy: a transaction is open on
                 this session'), and nothing was sent. A call in flight there
                 is waited for to its end, which its own timeouts bound.

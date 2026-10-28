@@ -1034,6 +1034,31 @@ def test_a_borrower_behind_a_call_in_flight_waits_for_it_past_its_own_timeout(po
         a.join(5)
 
 
+def test_a_borrower_behind_an_edits_commit_waits_for_it_past_its_own_timeout(pooled, monkeypatch):
+    """edit() and rollback() run a transaction of their own and finish it
+    within the call: a call in flight, which its own timeouts bound. It was
+    held open as one begin() hands back is, and a show() from a monitoring
+    thread behind a 30-second commit was refused "router busy" after its
+    own command timeout, where it had waited for the commit."""
+    entered, release, result = threading.Event(), threading.Event(), {}
+
+    def slow_commit(config):
+        entered.set()
+        release.wait(5)
+    monkeypatch.setattr(FakeConfig, "on", {"commit": slow_commit})
+    a = threading.Thread(target=lambda: result.setdefault("edit", edit()))
+    a.start()
+    try:
+        assert entered.wait(5)
+        threading.Timer(1.5, release.set).start()
+        assert in_thread(lambda: show(timeout=1), 5) == ("done", "output of show version")
+    finally:
+        release.set()
+        a.join(5)
+    assert result["edit"].startswith("COMMIT OK")
+    assert len(devices()) == 1 and devices()[0].cli_calls == ["show version"]     # after the commit, on its session
+
+
 def test_close_all_waits_for_an_open_transaction_at_most_busy_wait_then_says_so(pooled):
     show(host="10.0.0.2")                            # an idle session beside it
     hold, opened = threading.Event(), threading.Event()

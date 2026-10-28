@@ -900,11 +900,7 @@ def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
                 cu.commit_check(timeout=command_timeout)
         except (ConfigLoadError, CommitError) as e:
             raise RuntimeError(f"Config error: {e}") from e
-        tx = Transaction(cm, lease, cu, diff, label, command_timeout)
-        # Held open from here for as long as the caller decides: another
-        # thread wanting this router waits for it only so long (#147).
-        lease.hold_open()
-        return tx
+        return Transaction(cm, lease, cu, diff, label, command_timeout)
     except BaseException as e:
         if isinstance(e, Exception) and (_session_lost(e) or _timed_out(e)):
             lease.discard()
@@ -964,13 +960,20 @@ def begin(host: str, user: str, passwd: str, payload: Optional[str],
         raise ValueError("begin() takes a payload or rollback=n, not both and not neither")
     if rollback is not None:
         n = _rollback_number(rollback)
-        return _begin(host, user, passwd, session_timeout, command_timeout, port,
-                      stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ", connect_timeout=connect_timeout)
-    fmt = _config_format(payload)
-    body = _strip_comments(payload) if fmt == "set" else payload
-    return _begin(host, user, passwd, session_timeout, command_timeout, port,
-                  stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="",
-                  connect_timeout=connect_timeout)
+        tx = _begin(host, user, passwd, session_timeout, command_timeout, port,
+                    stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ", connect_timeout=connect_timeout)
+    else:
+        fmt = _config_format(payload)
+        body = _strip_comments(payload) if fmt == "set" else payload
+        tx = _begin(host, user, passwd, session_timeout, command_timeout, port,
+                    stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="",
+                    connect_timeout=connect_timeout)
+    # Handed to the caller, held open for as long as it decides: another
+    # thread wanting this router waits for it only so long (#147). The
+    # transaction edit() and rollback() run is over within their call, a
+    # call in flight, which its own timeouts bound, and is waited for.
+    tx._lease.hold_open()
+    return tx
 
 
 # Load warnings that do not fail the device. A delete of a statement the
