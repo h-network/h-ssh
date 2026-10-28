@@ -669,13 +669,16 @@ def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout:
     """(client, session): a CLI session at the device's own prompt on a shell
     channel of a fresh connection; the caller closes both. The terminal is
     wide so the device never wraps the echo of a long line, which the engine
-    must recognise as the echo. There is no login dialogue over SSH: login()
-    reads the banner up to the prompt and learns this device's own."""
+    must recognise as the echo. There is no login dialogue over SSH: SSH has
+    logged in with the password, and login() is handed neither credential:
+    it reads the banner up to the prompt and learns this device's own. A
+    banner that ends in `Password: ` once got the password typed into the
+    device CLI, its echo the reply to the next command (#141)."""
     client = _connect(host, user, passwd, session_timeout, port, connect_timeout)
     try:
         chan = client.invoke_shell(term="vt100", width=511, height=1000)
         session = Cli(ShellChannel(chan), dialect, session_timeout)
-        session.login(user, passwd)
+        session.login()
     except BaseException:
         client.close()
         raise

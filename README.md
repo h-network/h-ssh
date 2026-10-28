@@ -444,13 +444,18 @@ Every transport runs a batch on one session per device.
 A dialect over SSH or telnet is typed at by one CLI engine (`hssh/transports/cli.py`): it logs in,
 learns the device's own prompt, answers paging, and runs the edit sequence the dialect describes (a
 candidate diffed and committed or discarded for Junos, lines applied in config mode for the IOS-shaped
-ones). An empty `show | compare` is `NO CHANGES`: the candidate is discarded and no `commit` is typed,
-plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over nothing and no other
-user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec channel, one command per
-channel; only edits and confirms open a shell. Over the OpenSSH binary the shell is `ssh -tt -e none`
-(no escape character, so a typed line that starts with `~` goes to the device as it is), with a
-password still handed over through `SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh`
-drivers (dialect `none`) never open a shell.
+ones). Only telnet has a login dialogue for it to answer (`login:`, `Password:`). Over SSH the session
+has logged in before the shell opens, so the engine reads the banner to the prompt and types neither the
+username nor the password, whatever the banner ends with: a banner ending in `Password: ` gets nothing,
+and the password cannot come back in a reply, to the screen, `--log`, the audit log or the store. A
+shell that asks for credentials after SSH has logged in (a console server's port) gets none and fails as
+a login that shows no prompt. An empty `show | compare` is `NO CHANGES`: the candidate is discarded and
+no `commit` is typed, plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over
+nothing and no other user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec
+channel, one command per channel; only edits and confirms open a shell. Over the OpenSSH binary the
+shell is `ssh -tt -e none` (no escape character, so a typed line that starts with `~` goes to the device
+as it is), with a password still handed over through `SSH_ASKPASS`, never typed at a prompt. The plain
+`ssh`/`openssh` drivers (dialect `none`) never open a shell.
 
 The engine types plain text only. A CLI acts on a control character as it arrives (^C drops the line
 typed so far, ^U kills it, DEL rubs out a character, a Tab completes the word), and what is left of the
@@ -463,10 +468,10 @@ reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at
 indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
 `telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it, or a
 batch with such a line, is refused before the socket is opened, `show()` and `show_batch()` for a library
-caller too. The login dialogue is held to the same rule: a username with a control character or
+caller too. The telnet login dialogue is held to the same rule: a username with a control character or
 a Tab in it, or a password with a control character (a Tab is text at a password prompt), is refused by
 the telnet drivers before they connect, a `ValueError` for a library caller too, and the engine types
-neither at a login prompt on any channel. None of these refusals is tried again.
+neither at a login prompt. None of these refusals is tried again.
 
 `h-ssh --list-vendors` prints the registry: every driver a target may name, its aliases, transport,
 dialect, the formats `--format` can ask it for, what it supports, and where it came from (`built-in`,
@@ -1466,7 +1471,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1323 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1328 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

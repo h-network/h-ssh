@@ -3,7 +3,9 @@ ios@openssh, nxos@openssh and eos@openssh run their shows on an exec like
 the plain `openssh` driver, and their edits and confirms through the CLI
 engine on `ssh -tt`. The ssh here is a fake on PATH that plays a device CLI
 on its pipes; no live device is needed."""
+import asyncio
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -13,7 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from hssh import drivers, runner
+from hssh import cli, drivers, runner
 from hssh.core import Target
 from hssh.drivers import contract
 from hssh.drivers import results as R
@@ -23,7 +25,9 @@ from hssh.transports import openssh
 FAKE_SSH = r'''
 """A fake ssh. `ssh -V` prints a version. With -tt it plays a device CLI on
 its stdin and stdout, a Junos one unless FAKE_SSH_FLAVOUR is ios, and appends
-every line typed at it to the file FAKE_SSH_TYPED names. Without -tt it
+every line typed at it to the file FAKE_SSH_TYPED names; with
+FAKE_SSH_BANNER=password its banner ends in `Password: ` and the prompt
+comes 0.7 s later, what was typed meanwhile read once it is out. Without -tt it
 answers the command on its command line the way the plain fake in
 test_openssh.py does, and a `| json` command with JSON. A password is checked
 through SSH_ASKPASS: anything but FAKE_SSH_PASSWORD is refused in the -E log
@@ -189,6 +193,11 @@ def ios(line):
 device = ios if os.environ.get("FAKE_SSH_FLAVOUR") == "ios" else junos
 if device is ios:
     say("\r\nRouter#")
+elif os.environ.get("FAKE_SSH_BANNER") == "password":
+    say("\r\n--- JUNOS 23.4R2.13\r\nAsk the NOC for the Password: ")
+    time.sleep(0.7)
+    say("\r\n" + OP)
+    time.sleep(0.1)
 else:
     say("--- JUNOS 23.4R2.13 Kernel 64-bit  JNPR-12.1-20240711.ae2a6ee_buil\r\n" + OP)
 
@@ -221,7 +230,8 @@ def device(tmp_path, monkeypatch):
     typed_path = tmp_path / "typed"
     monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("FAKE_SSH_TYPED", str(typed_path))
-    for var in ("FLAVOUR", "PENDING", "LOCKED", "COMMIT", "HANG", "RC", "STDERR", "STDOUT", "PASSWORD", "REFUSAL"):
+    for var in ("FLAVOUR", "PENDING", "LOCKED", "COMMIT", "HANG", "RC", "STDERR", "STDOUT", "PASSWORD", "REFUSAL",
+                "BANNER"):
         monkeypatch.delenv("FAKE_SSH_" + var, raising=False)
     monkeypatch.delenv("HSSH_PASSWORD", raising=False)
     monkeypatch.setattr(openssh, "AVAILABLE", True)
@@ -307,6 +317,49 @@ def test_a_dry_run_shows_the_diff_and_rolls_the_candidate_back(device):
     result = junos_edit(dry_run=True)
     assert result.status == R.DRY_RUN and result.diff == "[edit system]\n+  host-name test;"
     assert device.typed[-2:] == ["rollback 0", "exit"] and "commit" not in device.typed
+
+
+def test_a_shell_banner_that_asks_for_a_password_gets_nothing_typed(device):
+    """#141: the pty session's login() answered `Password:` as telnet's
+    dialogue does. A banner ending in `Password: `, the prompt 0.7 s later,
+    got the password typed into the device CLI on junos@openssh, a dry run
+    too, and its echo was the reply to `configure exclusive`. ssh has
+    authenticated through askpass: nothing is typed at the banner, the
+    first line the device gets is `configure exclusive`, and the dry run's
+    diff is the compare's."""
+    device.knobs(banner="password")
+    result = junos_edit(dry_run=True)
+    assert result.status == R.DRY_RUN and result.diff == "[edit system]\n+  host-name test;"
+    assert device.typed == ["configure exclusive", "set system host-name test", "show | compare", "rollback 0", "exit"]
+
+
+def test_the_password_never_reaches_the_runs_records(device, tmp_path, monkeypatch, capsys):
+    """#141: the password typed at such a banner came back in the reply,
+    so it was the run's error, and the screen, --log, the audit log and the
+    store all kept it. Nothing is typed, so no reply can hold it: a dry run
+    on junos@openssh behind that banner, every record written, the password
+    in none."""
+    secret = "Pa55-NOC-only"
+    device.knobs(banner="password", password=secret)
+    log, audit, store = tmp_path / "run.jsonl", tmp_path / "audit.jsonl", tmp_path / "runs.db"
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER", "HSSH_STORE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", secret)
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "lab",
+                                      "--target", "R1:10.0.0.1:junos@openssh", "-eC", "set system host-name x",
+                                      "--dry-run", "--log", str(log), "--audit-log", str(audit), "--store", str(store)])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 0 and "DRY-RUN" in out and "+  host-name x;" in out
+    assert device.typed[0] == "configure exclusive"
+    db = sqlite3.connect(str(store))
+    try:
+        kept = "\n".join(repr(row) for table in ("runs", "results") for row in db.execute(f"SELECT * FROM {table}"))
+    finally:
+        db.close()
+    for where, text in (("stdout", out), ("stderr", err), ("--log", log.read_text()),
+                        ("the audit log", audit.read_text()), ("the store", kept)):
+        assert text and secret not in text, where
 
 
 def test_a_commit_confirmed_arms_the_timer(device):

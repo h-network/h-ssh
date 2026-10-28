@@ -128,6 +128,8 @@ def _read_until_prompt(sock: socket.socket, prompt_re: re.Pattern, timeout: int,
 def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
                        port: int, session_timeout: int, dialect: Dialect) -> Cli:
     """Open the socket, negotiate telnet, log in: a CLI session at a prompt.
+    Telnet is the one transport with a login dialogue: the engine answers
+    the device's `login:` and `Password:` (the SSH shells type neither).
     Raises NotAppliedError when the device rejects the credentials or shows no
     prompt within session_timeout, even after an Enter. The login dialogue
     types the username and the password as they are: one with a control
@@ -137,7 +139,7 @@ def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
     _refuse_credentials(user, passwd)
     channel = TelnetChannel.connect(host, port, session_timeout)
     session = Cli(channel, dialect, session_timeout, initial=channel.initial)
-    session.login(user, passwd)
+    session.login(user, passwd, dialogue=True)
     return session
 
 

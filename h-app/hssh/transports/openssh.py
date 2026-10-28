@@ -560,19 +560,20 @@ def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout:
     """(channel, session): a CLI session at the device's own prompt on the
     pty of a fresh `ssh -tt`; the caller closes both (closing the channel
     ends the process). The askpass helper lives only until the prompt is
-    seen: ssh has authenticated by then. login() has session_timeout for the
-    connect, the authentication and the banner together, of which the TCP
-    connect and the banner have connect_timeout (the channel's clock, #126);
-    when either runs out before ssh got a session the error says how far
-    ssh came, as the exec path's does, and otherwise which line the device
-    stopped at."""
+    seen: ssh has authenticated by then, and login() is handed no
+    credentials to type at a banner that asks for one (#141). login() has
+    session_timeout for the connect, the authentication and the banner
+    together, of which the TCP connect and the banner have connect_timeout
+    (the channel's clock, #126); when either runs out before ssh got a
+    session the error says how far ssh came, as the exec path's does, and
+    otherwise which line the device stopped at."""
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
     with _AskPass(passwd) as askpass:
         channel = ProcessChannel.open(host, user, askpass, session_timeout, port, connect_timeout)
         session = Cli(channel, dialect, session_timeout)
         try:
-            session.login(user, passwd)
+            session.login()
         except BaseException as exc:
             log = channel.log()
             channel.close()

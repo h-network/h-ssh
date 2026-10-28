@@ -14,6 +14,8 @@ CFG = "\r\n[edit]\r\nlab@R1# "
 PENDING = ("\r\n0   2026-10-22 08:00:00 UTC by lab via cli commit confirmed, rollback in 5mins"
            "\r\n1   2026-10-21 17:10:03 UTC by lab via cli\r\n")
 CLEAN = "\r\n0   2026-10-22 08:00:00 UTC by lab via cli\r\n1   2026-10-21 17:10:03 UTC by lab via cli\r\n"
+# In what a ScriptChannel device says, a read ends at a PAUSE: what follows comes in the next one.
+PAUSE = "<pause>"
 
 
 class ScriptChannel:
@@ -21,7 +23,8 @@ class ScriptChannel:
     command (a callable gets the line). Typed lines are echoed as a tty does.
     `hang_on` names a command left unanswered, `close_on` one answered by
     hanging up. `split_at` makes the first read that holds that text end
-    right after it, as a device pausing there would."""
+    right after it, as a device pausing there would; a PAUSE in what it
+    says ends a read there every time."""
 
     def __init__(self, first, replies, echo=True, hang_on=None, close_on=None, split_at=None):
         self.queue = bytearray(first.encode())
@@ -35,6 +38,11 @@ class ScriptChannel:
         self.eof = False
 
     def recv(self, n, timeout):
+        pause = PAUSE.encode()
+        if self.queue.startswith(pause):
+            del self.queue[:len(pause)]
+        if pause in self.queue:
+            n = min(n, self.queue.index(pause))
         if self.split_at and self.split_at.encode() in self.queue:
             n = min(n, self.queue.index(self.split_at.encode()) + len(self.split_at))
             self.split_at = None
@@ -99,7 +107,7 @@ def test_login_answers_the_dialogue_and_learns_the_devices_own_prompt():
     replies = junos_device(**{"lab": "Password:", "secret": "\r\nLast login: Tue Oct 20\r\n--- JUNOS 23.4R2.13 ---\r\n\r\n" + OP})
     ch = ScriptChannel(first, replies, echo=False)
     s = Cli(ch, dialects.junos.DIALECT, 5)
-    s.login("lab", "secret")
+    s.login("lab", "secret", dialogue=True)
     assert ch.typed == ["lab", "secret"]
     assert s.prompt_re.pattern.startswith("lab@R1") and s.prompt_re.search("lab@R1# ")
     assert not s.prompt_re.search("other@R1> ") and not s.prompt_re.search("description noc@example.com>")
@@ -111,8 +119,7 @@ def test_a_username_or_password_the_prompt_would_take_as_keys_is_never_typed():
     `commit comment x` logged in and ran the rest as commands, a commit for
     good from a show. Neither is typed with a control character in it, the
     channel is closed, and the refusal quotes neither. A Tab is text in a
-    password; a shell already at its prompt (SSH, which took the pair for
-    its own login) is asked for neither."""
+    password; a console already at its prompt is asked for neither."""
     first = "\r\nR1 (ttyp0)\r\n\r\nlogin: "
     for user, passwd, what in (("lab\rconfigure exclusive", "secret", "the username has a carriage return"),
                                ("lab", "pw\rcommit comment x", "the password has a carriage return"),
@@ -122,25 +129,25 @@ def test_a_username_or_password_the_prompt_would_take_as_keys_is_never_typed():
                                ("lab", "pw\x9bx", "the password has a control character '\\x9b'")):
         ch = ScriptChannel(first, junos_device(lab="Password:"), echo=False)
         with pytest.raises(ValueError) as refused:
-            Cli(ch, dialects.junos.DIALECT, 5).login(user, passwd)
+            Cli(ch, dialects.junos.DIALECT, 5).login(user, passwd, dialogue=True)
         assert str(refused.value) == f"{what}, which a login prompt takes as a key, not as text; it was not sent"
         assert ch.typed == [] and ch.closed
     ch = ScriptChannel("\r\nPassword: ", junos_device(), echo=False)
     with pytest.raises(ValueError, match="^the password has a line break, which a login prompt takes as a key"):
-        Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\ncommit")
+        Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\ncommit", dialogue=True)
     assert ch.typed == []
     ch = ScriptChannel(first, junos_device(lab="Password:", **{"pw\tx": "\r\n" + OP}), echo=False)
-    Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\tx")
+    Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\tx", dialogue=True)
     assert ch.typed == ["lab", "pw\tx"]
     ch = ScriptChannel("\r\n" + OP, junos_device())
-    Cli(ch, dialects.junos.DIALECT, 5).login("lab\r", "pw\n")
+    Cli(ch, dialects.junos.DIALECT, 5).login("lab\r", "pw\n", dialogue=True)
     assert ch.typed == []
 
 
 def test_a_rejected_login_is_not_applied_and_quotes_the_device():
     ch = ScriptChannel("\r\nlogin: ", {"lab": "Password:", "<else>": "\r\nLogin incorrect\r\nlogin: "}, echo=False)
     with pytest.raises(NotAppliedError, match="login failed: Login incorrect"):
-        Cli(ch, dialects.junos.DIALECT, 2).login("lab", "wrong")
+        Cli(ch, dialects.junos.DIALECT, 2).login("lab", "wrong", dialogue=True)
     assert ch.closed
 
 
@@ -157,8 +164,29 @@ def test_a_silent_device_gets_one_enter_then_is_a_failed_login():
 def test_the_password_never_appears_in_a_timeout_message():
     ch = ScriptChannel("\r\nlogin: ", {"lab": "Password:", "s3cret": "s3cret\r\n"})   # echoes it, no prompt
     with pytest.raises(NotAppliedError) as e:
-        Cli(ch, dialects.junos.DIALECT, 1).login("lab", "s3cret")
+        Cli(ch, dialects.junos.DIALECT, 1).login("lab", "s3cret", dialogue=True)
     assert "s3cret" not in str(e.value) and "***" in str(e.value)
+
+
+def test_without_the_dialogue_a_banner_that_asks_for_a_password_gets_nothing_typed():
+    """#141: login() answered `login:` and `Password:` on every channel,
+    and the ssh and openssh shells called it with the SSH credentials: a
+    shell banner ending in `Password: `, the prompt in a later read, got
+    the password typed into the device CLI, and its echo came back as the
+    next command's reply. Without the dialogue, as the SSH shells log in
+    now, the engine reads to the prompt and types nothing, whatever the
+    banner ends with; telnet's dialogue answers a `Password: ` the device
+    waits at."""
+    asks = "\r\n--- JUNOS 23.4R2.13\r\nAsk the NOC for the Password: "
+    for credentials in (("lab", "secret"), ()):
+        ch = ScriptChannel(asks + PAUSE + "\r\n" + OP, junos_device())
+        s = Cli(ch, dialects.junos.DIALECT, 5)
+        s.login(*credentials)
+        assert ch.typed == [] and s.prompt_re.search("lab@R1> ")
+        assert s.run("show version", 5).strip() == "Hostname: R1\nModel: mx204"
+    ch = ScriptChannel(asks, junos_device(secret="\r\n" + OP), echo=False)
+    Cli(ch, dialects.junos.DIALECT, 5).login("lab", "secret", dialogue=True)
+    assert ch.typed == ["secret"]
 
 
 def test_the_initial_bytes_from_negotiation_count_as_the_banner():

@@ -171,8 +171,9 @@ def pending_in(history: str, dialect: Dialect) -> bool:
 class Cli:
     """One CLI session on a channel, in a dialect.
 
-    `login()` first: it reads the banner, answers a login/password dialogue
-    if the device holds one, and learns this device's own prompt. Then
+    `login()` first: it reads the banner up to this device's own prompt and
+    learns it, answering a login/password dialogue on the way where the
+    transport has one (telnet). Then
     `run()` for a command, `edit_lines()`/`edit_candidate()` for an edit,
     `confirm()` for a pending commit-confirmed. `close()` ends it."""
 
@@ -278,27 +279,40 @@ class Cli:
         if fault:
             raise ValueError(f"{fault}, which a login prompt takes as a key, not as text; it was not sent")
 
-    def login(self, user: Optional[str], passwd: Optional[str]) -> None:
-        """Get to a prompt. Raises NotAppliedError when the device rejects the
-        credentials or shows no prompt within session_timeout, even after an
-        Enter: no command was sent, and the runner treats a failed login as
+    def login(self, user: Optional[str] = None, passwd: Optional[str] = None, dialogue: bool = False) -> None:
+        """Get to a prompt and learn it.
+
+        With `dialogue` (telnet, where nothing has logged in yet) a `login:`
+        or `Password:` the device shows is answered with `user` and
+        `passwd`. Without it (an SSH shell: SSH has logged in already, with
+        the password) the engine reads to the prompt and types nothing but
+        one Enter, whatever the banner ends with: a banner ending in
+        `Password: ` once got the SSH password typed into the device CLI,
+        and its echo came back as the next command's reply (#141). A shell
+        that really asks for credentials gets none, and fails as one that
+        shows no prompt.
+
+        Raises NotAppliedError when the device rejects the credentials or
+        shows no prompt within session_timeout, even after an Enter: no
+        command was sent, and the runner treats a failed login as
         permanent. A username or password with a control character in it is
         a ValueError before either is typed. The channel is closed on any
         failure."""
         timeout = self.session_timeout
+        read = self._read_until_prompt_or_login if dialogue else self.read_until_prompt
         try:
             try:
-                initial = self._read_until_prompt_or_login(timeout, buffer=self._initial)
+                initial = read(timeout, buffer=self._initial)
             except TimeoutError:
                 # A console-server line left at a prompt, or at "Press RETURN to
                 # get started.", prints nothing until Enter. One Enter, only once
                 # the wait is up: typed ahead of a slow login prompt it would be
                 # taken as an empty username.
                 self._send("\n")
-                initial = self._read_until_prompt_or_login(timeout)
+                initial = read(timeout)
 
             last = initial
-            if LOGIN_RE.search(initial):
+            if dialogue and LOGIN_RE.search(initial):
                 self._refuse_typing(user, passwd)
                 self._send((user or "") + "\n")
                 last = self._read_until_prompt_or_login(timeout)
@@ -306,7 +320,7 @@ class Cli:
                     self._send((passwd or "") + "\n")
                     last = self._read_until_prompt_or_login(timeout)
                 self._check_login(last)
-            elif PASSWORD_RE.search(initial):
+            elif dialogue and PASSWORD_RE.search(initial):
                 self._refuse_typing(None, passwd)
                 self._send((passwd or "") + "\n")
                 last = self._read_until_prompt_or_login(timeout)
