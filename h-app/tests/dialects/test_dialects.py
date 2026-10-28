@@ -120,6 +120,7 @@ def test_an_ios_shaped_refusal_is_a_percent_first_a_space_after_it_or_not():
         for d in (ios, nxos, eos):
             assert refusal_line(f"\n{line}\nmore", dialect=d) == line, (d.name, line)
     for line in ("%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to up",
+                 "%OIR-SP-6-INSCARD: Card inserted in slot 3, interfaces are now online",
                  "%SYS-5-CONFIG_I: Configured from console by vty0 (10.0.0.1)",
                  "%SEC_LOGIN-5-LOGIN_SUCCESS: Login Success [user: lab]", "%ETHPORT-5-IF_UP: Interface Ethernet1/1 is up",
                  "%Portfast has been configured on GigabitEthernet0/1 but will only",

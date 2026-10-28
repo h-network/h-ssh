@@ -26,8 +26,9 @@ COMMENTS = ("!",)
 # The secret you entered is not a valid encrypted secret.`, and NX-OS's
 # word on a value it will not take). A syslog message the device prints
 # into the session, `%LINK-3-UPDOWN: Interface Gi0/1, changed state to up`
-# (a facility, a severity, a mnemonic, a colon), is not one (#142).
-REFUSED = re.compile(r"^\s*(% |%(?![A-Z0-9_]+-\d+-[A-Z0-9_]+:)\S|ERROR:)", re.M)
+# (a facility, a severity, a mnemonic, a colon; a Catalyst's SP or DFC puts
+# its source after the facility, `%OIR-SP-6-INSCARD:`), is not one (#142).
+REFUSED = re.compile(r"^\s*(% |%(?![A-Z0-9_]+(?:-[A-Z0-9_]+)*-\d+-[A-Z0-9_]+:)\S|ERROR:)", re.M)
 
 # What IOS says, a `%` first, of a line it took: a warning (`%Warning:
 # portfast should only be enabled on ports connected to a single host`,
