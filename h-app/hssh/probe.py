@@ -378,8 +378,11 @@ def _ssh_g(host: str, port: Optional[int], default: int, user: Optional[str], se
     binary nothing reads those files: HOST as it is, on `port` or the
     transport's `default`."""
     argv = [*SSH_G, *(["-p", str(port)] if port else []), "--", f"{user}@{host}" if user else host]
+    # The operator's HSSH_PASSWORD is h-ssh's to read, not ssh -G's to
+    # inherit, as for the openssh transport's credential-free children (#151).
+    env = {k: v for k, v in os.environ.items() if k != "HSSH_PASSWORD"}
     try:
-        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=seconds)
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=seconds, env=env)
     except FileNotFoundError:
         return Route(host, port or default)
     except subprocess.TimeoutExpired:
