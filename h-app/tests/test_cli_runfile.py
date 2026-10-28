@@ -2,6 +2,7 @@
 JSON. Every key is a flag name; a flag typed on the command line wins; the
 file never carries a credential; relative paths resolve against the file;
 an edit from a file must arm a commit-confirmed timer or be a dry run."""
+import argparse
 import asyncio
 import json
 import os
@@ -33,15 +34,25 @@ class Driver:
         return "COMMIT OK\n" if not dry_run else "DRY-RUN\n"
 
 
-def run(monkeypatch, capsys, tmp_path, argv, driver=None):
-    """cli.main() in-process against the fake driver; nothing is contacted."""
+def run(monkeypatch, capsys, tmp_path, argv, driver=None, env=None, watch=False):
+    """cli.main() in-process against the fake driver; nothing is contacted.
+    With `watch`, as the console script runs it: every tick of an --every,
+    with no pause between them."""
     drv = driver or Driver()
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", drv)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HSSH_PASSWORD", "p")
+    for var, value in (env or {}).items():
+        monkeypatch.setenv(var, value)
     monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull, *argv])
-    rc = asyncio.run(cli.main())
+    if watch:
+        monkeypatch.setattr(cli, "_watch_sleep", lambda seconds: None)
+        with pytest.raises(SystemExit) as e:
+            cli.main_sync()
+        rc = e.value.code
+    else:
+        rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
     return rc, out, err, drv
 
@@ -423,3 +434,170 @@ def test_connect_timeout_is_a_run_file_key(monkeypatch, capsys, tmp_path):
     f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nshow: show version\nconnect_timeout: 0\n")
     rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f], driver=Timed())
     assert rc == 2 and "'connect_timeout' must be at least 1, not 0" in err and drv.connects == []
+
+
+# --- #140: what the command line gives wins, whatever its value ---------------
+
+def test_typed_dests_holds_what_argv_gives_whatever_its_value():
+    """#140: the run file filled every option still at argparse's default,
+    so a flag typed with the default's value counted as not typed. The
+    second parse sees what argv gives (a default's value, a bare host, a
+    flag with no value, one given twice) and puts the defaults back."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--devices", default="devices.csv")
+    parser.add_argument("--format", choices=["text", "xml"], default="text")
+    parser.add_argument("-y", "--yes", action="store_true")
+    parser.add_argument("--target", action="append")
+    parser.add_argument("--commit-confirmed", type=int, nargs="?", const=10)
+    parser.add_argument("hosts", nargs="*")
+    assert cli.typed_dests(parser, []) == set()
+    assert cli.typed_dests(parser, ["--format", "text", "--devices", "devices.csv"]) == {"format", "devices"}
+    assert cli.typed_dests(parser, ["R1", "-y", "--target", "a:1", "R2", "--target", "b:2", "--commit-confirmed"]) == \
+        {"hosts", "yes", "target", "commit_confirmed"}
+    assert vars(parser.parse_intermixed_args([])) == {"devices": "devices.csv", "format": "text", "yes": False,
+                                                      "target": None, "commit_confirmed": None, "hosts": []}
+
+
+def test_a_typed_devices_replaces_the_files_inline_list_and_says_so(monkeypatch, capsys, tmp_path):
+    """#140: --devices lab.csv beside a run file holding an inline list of
+    production routers, an edit, commit-confirmed and yes committed on the
+    production routers, with no prompt and no word, and printed a confirm
+    command for them: the CLI read only the file's list. A typed --devices
+    replaces the file's `devices`, and one line on stderr says so."""
+    lab = write(tmp_path, "lab.csv", "lab1,10.0.9.1,junos\n")
+    f = write(tmp_path, "run.yaml", "devices: [prod1:10.0.0.1:junos, prod2:10.0.0.2:junos]\nuser: u\n"
+                                    "edit: set system location building B\ncommit-confirmed: 5\nyes: true\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--devices", lab])
+    assert rc == 0, err
+    assert drv.edits == [("10.0.9.1", "set system location building B", 5, False)]
+    assert f"Run file '{f}': 'devices' is ignored; --devices on the command line wins.\n" in err
+    assert f"Inventory: {lab}" in out and f'-eC "commit" --user u --devices {lab}' in out
+
+
+def test_a_typed_target_replaces_the_files_devices_and_says_so(monkeypatch, capsys, tmp_path):
+    """A target typed bare or with --target replaces the file's `devices`, a
+    list or a path, with the same line, once for a whole --every watch, not
+    once a tick; without one the file's are used and nothing is said."""
+    write(tmp_path, "prod.csv", "prod1,10.0.0.1,junos\n")
+    for devices in ("prod.csv", "[prod1:10.0.0.1:junos]"):
+        f = write(tmp_path, "run.yaml", f"devices: {devices}\nuser: u\nshow: show version\n")
+        for given in (["lab1:10.0.9.1:junos"], ["--target", "lab1:10.0.9.1:junos"]):
+            rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, *given])
+            assert rc == 0 and drv.shows == [("10.0.9.1", "show version", None)], (devices, given, err)
+            assert f"Run file '{f}': 'devices' is ignored; the targets on the command line win.\n" in err
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+        assert rc == 0 and drv.shows == [("10.0.0.1", "show version", None)] and "ignored" not in err, devices
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--every", "1", "--times", "3",
+                                                            "lab1:10.0.9.1:junos"], watch=True)
+    assert rc == 0 and drv.shows == [("10.0.9.1", "show version", None)] * 3, err
+    assert err.count("'devices' is ignored") == 1, err
+
+
+def test_a_flag_typed_with_its_defaults_value_still_wins(monkeypatch, capsys, tmp_path):
+    """#140: a flag whose value was argparse's default was taken for one not
+    typed: `--format text` lost to `format: xml`, `--devices devices.csv`
+    (the default's own spelling) to `devices: prod.csv`, an --audit-log
+    equal to $HSSH_AUDIT_LOG to `audit-log:`. Typed is typed; the file still
+    wins over the environment, and a typed --profile over the file's batch."""
+    class Rpc(Driver):
+        def __init__(self):
+            super().__init__()
+            self.rpcs = []
+
+        def rpc(self, host, user, passwd, cmd, st, ct, port=None, vendor_hint=None, fmt="json"):
+            self.rpcs.append((host, cmd, fmt))
+            return "<reply/>"
+    f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nshow: show version\nformat: xml\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f], driver=Rpc())
+    assert rc == 0 and drv.rpcs == [("10.0.0.1", "show version", "xml")] and drv.shows == [], err
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--format", "text"], driver=Rpc())
+    assert rc == 0 and drv.shows == [("10.0.0.1", "show version", None)] and drv.rpcs == [], err
+
+    monkeypatch.setenv("HOME", str(tmp_path))          # no ~/.h-ssh/devices.csv: the default is ./devices.csv
+    monkeypatch.chdir(tmp_path)
+    write(tmp_path, "devices.csv", "lab1,10.0.9.1,junos\n")
+    write(tmp_path, "prod.csv", "prod1,10.0.0.1,junos\n")
+    f = write(tmp_path, "run.yaml", "devices: prod.csv\nuser: u\nshow: show version\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--devices", "devices.csv"])
+    assert rc == 0 and drv.shows == [("10.0.9.1", "show version", None)], err
+    assert "'devices' is ignored; --devices on the command line wins." in err
+
+    site, other = tmp_path / "site-audit.jsonl", tmp_path / "other-audit.jsonl"
+    f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nshow: show version\n"
+                                    "audit-log: file-audit.jsonl\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--audit-log", str(site)],
+                            env={"HSSH_AUDIT_LOG": str(site)})
+    assert rc == 0 and site.is_file() and not (tmp_path / "file-audit.jsonl").exists(), err
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f], env={"HSSH_AUDIT_LOG": str(other)})
+    assert rc == 0 and (tmp_path / "file-audit.jsonl").is_file() and not other.exists(), err
+
+    mine = write(tmp_path, "mine.txt", "show route summary\n")
+    write(tmp_path, "cmds.txt", "show version\n")
+    f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nbatch: cmds.txt\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--profile", mine])
+    assert rc == 0 and drv.batches == [("10.0.0.1", ["show route summary"])], err
+
+
+def test_targets_typed_beside_a_job_are_refused(monkeypatch, capsys, tmp_path):
+    """#140: a job's targets are its entries. A target typed beside --job or
+    a run file's jobs, bare or --target, or a --devices (the default's own
+    spelling too), was ignored without a word: the job ran on every device
+    it names, exit 0, and with an edit entry and -y committed on a router
+    the operator had left out. Refused before the job is read, nothing
+    sent. The file's own `devices` beside its jobs is still not used."""
+    job = write(tmp_path, "job.json", json.dumps([
+        {"target": "R1:10.0.0.1:junos", "edit": "set system location building A"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"}]))
+    lab = write(tmp_path, "lab.csv", "lab1,10.0.9.1,junos\n")
+    for given, named in ((["lab1:10.0.9.1:junos"], "a bare host"), (["--target", "lab1:10.0.9.1:junos"], "--target"),
+                         (["--devices", lab], "--devices"), (["R9:10.0.0.9:junos", "--devices", lab],
+                                                            "a bare host, --devices")):
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--job", job, "-y", *given])
+        assert rc == 2 and drv.edits == drv.shows == [], (given, err)
+        assert f"ERROR: {named} beside --job: a job's targets are its entries.\n" in err
+    jobs = "jobs:\n  - {target: R1:10.0.0.1:junos, edit: set system location building A}\n"
+    f = write(tmp_path, "run.yaml", f"user: u\ncommit-confirmed: 5\nyes: true\n{jobs}")
+    for given, named in ((["--target", "lab1:10.0.9.1:junos"], "--target"), (["--devices", "devices.csv"], "--devices")):
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, *given])
+        assert rc == 2 and drv.edits == [], (given, err)
+        assert f"ERROR: {named} beside a run file's 'jobs': a job's targets are its entries.\n" in err
+    f = write(tmp_path, "run.yaml", f"devices: [lab1:10.0.9.1:junos]\nuser: u\ncommit-confirmed: 5\nyes: true\n{jobs}")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+    assert rc == 0 and drv.edits == [("10.0.0.1", "set system location building A", 5, False)], err
+
+
+def test_a_run_files_devices_beside_a_typed_job_are_refused(monkeypatch, capsys, tmp_path):
+    """#140 review: a run file's `devices` (a list or a path) beside a --job
+    typed next to the file was dropped without a word: the job ran on its
+    own entries and, with the file's timer and `yes`, committed on prod1
+    with no prompt, the confirm hint naming it. Refused as a typed target
+    beside a job is, nothing sent; a file without `devices` still lends a
+    typed job its options."""
+    job = write(tmp_path, "job.json", json.dumps([
+        {"target": "prod1:10.0.0.1:junos", "edit": "set system location building A"},
+        {"target": "prod2:10.0.0.2:junos", "show": "show version"}]))
+    write(tmp_path, "lab.csv", "lab1,10.0.9.1,junos\n")
+    options = {"user": "u", "commit-confirmed": 5, "yes": True}
+    for devices in (["lab1:10.0.9.1:junos"], "lab.csv"):
+        f = write(tmp_path, "run.json", json.dumps({"devices": devices, **options}))
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", job])
+        assert rc == 2 and drv.edits == drv.shows == [] and out == "", (devices, err)
+        assert err == f"ERROR: run file '{f}': 'devices' beside --job: a job's targets are its entries.\n", devices
+    f = write(tmp_path, "run.json", json.dumps(options))
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", job])
+    assert rc == 0 and drv.edits == [("10.0.0.1", "set system location building A", 5, False)], err
+    assert drv.shows == [("10.0.0.2", "show version", None)]
+
+
+def test_an_empty_path_user_or_comment_in_the_file_is_refused(monkeypatch, capsys, tmp_path):
+    """#140: a run file's empty value was the key left out: `audit_log: ''`
+    turned the HSSH_AUDIT_LOG trail off, `user: ''` fell back to HSSH_USER,
+    `save_output: ''` saved nothing. Every path, `user` and `comment` that
+    is empty is refused naming the key, exit 2, nothing sent."""
+    for key in ("devices", "user", "batch", "edit_dir", "edit_broadcast", "comment", "save_output", "log",
+                "audit_log", "safety_file"):
+        f = write(tmp_path, "run.json", json.dumps({"devices": ["R1:10.0.0.1:junos"], "user": "u",
+                                                    "show": "show version", key: ""}))
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+        assert rc == 2 and drv.shows == drv.batches == drv.edits == [], (key, err)
+        assert f"ERROR: run file '{f}': '{key}' is empty; give it a value or leave the key out\n" in err, key

@@ -241,3 +241,72 @@ def test_cli_junos_job_syntax_guard_applies_through_transport(monkeypatch, capsy
     rc, err, sent = _main(monkeypatch, capsys, "--transport", "junos", "--job", str(job_file))
     assert rc == 2 and "only accepts set-style commands" in err
     assert sent == []
+
+
+def test_diff_goes_with_a_show(monkeypatch, capsys, tmp_path):
+    """#140: --diff compares a show's replies across the devices. With an
+    edit (`-eC ... --dry-run --diff` printed no diff, exit 0), a job,
+    --rollback, --commit-status or --probe alone it was accepted and did
+    nothing; refused now, nothing sent, from a run file too. A show and a
+    batch keep it."""
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:192.0.2.1:junos", "show": "show version"},
+                               {"target": "R2:192.0.2.2:junos", "show": "show version"}]))
+    run_file = tmp_path / "run.yaml"
+    run_file.write_text("devices: [R1:192.0.2.1:junos]\nedit: set system location x\ncommit-confirmed: 5\ndiff: true\n")
+    two = ["--target", "R1:192.0.2.1:junos", "--target", "R2:192.0.2.2:junos"]
+    for argv in (["-eC", "set system location x", "--dry-run", "--diff", *two], ["--rollback", "1", "--diff", *two],
+                 ["--commit-status", "--diff", *two], ["--job", str(job), "--diff"], ["--probe", "--diff", *two],
+                 ["--run", str(run_file)]):
+        rc, err, sent = _main(monkeypatch, capsys, *argv)
+        assert rc == 2 and sent == [], (argv, err)
+        assert "ERROR: --diff goes with a show (-sC, --batch, --profile): it compares the replies across devices." in err
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\n")
+    for argv in (["-sC", "show version", "--diff", *two], ["--batch", str(batch), "--diff", *two]):
+        rc, err, sent = _main(monkeypatch, capsys, *argv)
+        assert rc == 0 and sorted(name for name, _, _ in sent) == ["R1", "R2"], (argv, err)
+
+
+def test_the_options_of_an_edit_need_an_edit(monkeypatch, capsys, tmp_path, probed):
+    """#140: on a show, --commit-confirmed, --skip-unreachable and
+    --allow-missing were accepted and did nothing, while --comment was
+    refused. Each is refused now on a run with no edit, as --comment is:
+    typed beside a show, a batch, --commit-status, --probe alone or a job
+    of shows, or set by a run file that reads; exit 2, nothing sent or
+    probed. With an edit the timer and --skip-unreachable go on as before,
+    and --allow-missing, which is for -eD, is let be beside any edit: a
+    run file that sets it still runs."""
+    edit_only = "goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits)."
+    said = {"--commit-confirmed": f"ERROR: --commit-confirmed {edit_only}\n",
+            "--skip-unreachable": f"ERROR: --skip-unreachable {edit_only}\n",
+            "--allow-missing": "ERROR: --allow-missing goes with -eD: it skips the devices that have no <NAME>.set.\n"}
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\n")
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:192.0.2.1:junos", "show": "show version"}]))
+    r1 = ["--target", "R1:192.0.2.1:junos"]
+    for read in (["-sC", "show version", *r1], ["--batch", str(batch), *r1], ["--commit-status", *r1],
+                 ["--probe", *r1], ["--job", str(job)]):
+        for flag, given in (("--commit-confirmed", ["--commit-confirmed", "5"]),
+                            ("--commit-confirmed", ["--commit-confirmed"]),      # N left out: 10
+                            ("--skip-unreachable", ["--skip-unreachable"]), ("--allow-missing", ["--allow-missing"])):
+            rc, err, sent = _main(monkeypatch, capsys, *read, *given)
+            assert rc == 2 and sent == [] and probed == [], (read, given, err)
+            assert err == said[flag], (read, given, err)
+    run_file = tmp_path / "run.yaml"
+    for key, flag in (("commit-confirmed: 5", "--commit-confirmed"), ("skip-unreachable: true", "--skip-unreachable"),
+                      ("allow-missing: true", "--allow-missing")):
+        run_file.write_text(f"devices: [R1:192.0.2.1:junos]\nshow: show version\n{key}\n")
+        rc, err, sent = _main(monkeypatch, capsys, "--run", str(run_file))
+        assert rc == 2 and sent == [] and probed == [], (key, err)
+        assert err == said[flag], (key, err)
+    rc, err, sent = _main(monkeypatch, capsys, "-eC", "set system location x", "--commit-confirmed", "5",
+                          "--skip-unreachable", *r1)
+    assert rc == 0 and sent == [("R1", "junos", "set system location x")], err
+    edit_file = tmp_path / "edit.yaml"
+    edit_file.write_text("devices: [R1:192.0.2.1:junos]\nedit: set system location x\ncommit-confirmed: 5\n"
+                         "allow-missing: true\n")
+    for argv in (["-eC", "set system location x", "--allow-missing", *r1], ["--run", str(edit_file)]):
+        rc, err, sent = _main(monkeypatch, capsys, *argv)
+        assert rc == 0 and sent == [("R1", "junos", "set system location x")], (argv, err)

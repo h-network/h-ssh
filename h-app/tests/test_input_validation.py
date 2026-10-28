@@ -299,3 +299,102 @@ def test_a_target_that_still_says_arista_is_refused_before_any_device(monkeypatc
     out, err = capsys.readouterr()
     assert rc == 2
     assert "ERROR: vendor 'arista' (eAPI over HTTPS) is no longer supported; EOS devices use the ssh or openssh transport" in err
+
+
+# --- #140: an empty value is not the flag left out ----------------------------
+
+@pytest.mark.parametrize("flag, shown", [
+    ("--devices", "--devices"), ("--user", "--user"), ("--config", "--config"), ("-eD", "-eD/--edit-dir"),
+    ("-eB", "-eB/--edit-broadcast"), ("--batch", "--batch"), ("--profile", "--profile"), ("--job", "--job"),
+    ("--run", "--run"), ("--comment", "--comment"), ("--save-output", "--save-output"), ("--log", "--log"),
+    ("--store", "--store"), ("--audit-log", "--audit-log"), ("--safety-file", "--safety-file"),
+])
+def test_an_empty_path_or_name_is_refused_not_taken_for_the_flag_left_out(monkeypatch, capsys, flag, shown):
+    """#140: an empty value was the flag left out, without a word:
+    `--config ''` read the default config, `--profile ''` ended in "choose
+    exactly one", `--user ''` logged in as HSSH_USER, `--save-output ''`
+    saved nothing, `--audit-log ''` turned HSSH_AUDIT_LOG's trail off. Each
+    is refused in one line naming the flag, exit 2."""
+    rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-sC", "show version", flag, ""])
+    assert rc == 2 and out == ""
+    assert f"error: argument {shown}: empty (an unset variable?); give it a value or leave the flag out" in err
+    assert "usage:" not in err and err.count("\n") == 1, err
+
+
+def test_an_empty_audit_log_never_turns_the_audit_trail_off(monkeypatch, capsys, tmp_path):
+    """#140: with HSSH_AUDIT_LOG set, `--audit-log ''` (an unset variable in
+    a pipeline) and a run file's `audit_log: ''` each committed an edit and
+    wrote no audit line. Both are refused before anything is sent. An
+    empty HSSH_AUDIT_LOG is no audit log, as it always was."""
+    sent = []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "ok",
+                                 edit=lambda host, *a, **kw: sent.append(host) or "COMMIT OK\n")
+    site = tmp_path / "site-audit.jsonl"
+
+    def main(argv, audit=str(site)):
+        monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
+        for var in ("HSSH_SAFETY_FILE", "HSSH_USER"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HSSH_AUDIT_LOG", audit)
+        monkeypatch.setenv("HSSH_PASSWORD", "p")
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *argv])
+        try:
+            rc = asyncio.run(cli.main())
+        except SystemExit as e:      # argparse
+            rc = e.code
+        return rc, capsys.readouterr().err
+
+    edit = ["-eC", "set system location x", "-y", "--target", "R1:10.0.0.1:junos"]
+    rc, err = main([*edit, "--audit-log", ""])
+    assert rc == 2 and sent == [] and "argument --audit-log: empty" in err
+    run_file = tmp_path / "run.yaml"
+    run_file.write_text("devices: [R1:10.0.0.1:junos]\nedit: set system location x\ncommit-confirmed: 5\n"
+                        "yes: true\naudit_log: ''\n")
+    rc, err = main(["--run", str(run_file)])
+    assert rc == 2 and sent == [] and f"ERROR: run file '{run_file}': 'audit_log' is empty" in err
+    assert not site.exists()
+    rc, err = main(edit)
+    assert rc == 0 and sent == ["10.0.0.1"] and site.is_file(), err
+    rc, err = main(["-sC", "show version", "--target", "R1:10.0.0.1:junos"], audit="")
+    assert rc == 0, err
+
+
+def test_an_empty_safety_file_never_turns_the_gate_off(monkeypatch, capsys, tmp_path):
+    """#140 review: HSSH_SAFETY_FILE reaches the gate through
+    --safety-file's default alone. With it set, `--safety-file ''` (which
+    fell back to the variable) and a run file's `safety_file: ''` are
+    refused before anything is sent; the variable's gate is made without
+    them. An empty HSSH_SAFETY_FILE is no gate, the run going ahead, as an
+    unset one is."""
+    sent, gates = [], []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda host, *a, **kw: sent.append(host) or "ok")
+    real_gate = cli.SafetyGate
+    gate = tmp_path / "gate" / "safety.json"
+
+    def main(argv, safety=str(gate)):
+        monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
+        monkeypatch.setattr(cli, "SafetyGate", lambda safety_file=None, **kw: gates.append(safety_file)
+                            or real_gate(safety_file=safety_file, **kw))
+        for var in ("HSSH_AUDIT_LOG", "HSSH_USER"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HSSH_SAFETY_FILE", safety)
+        monkeypatch.setenv("HSSH_PASSWORD", "p")
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *argv])
+        try:
+            rc = asyncio.run(cli.main())
+        except SystemExit as e:      # argparse
+            rc = e.code
+        return rc, capsys.readouterr().err
+
+    show = ["-sC", "show version", "--target", "R1:10.0.0.1:junos"]
+    rc, err = main([*show, "--safety-file", ""])
+    assert rc == 2 and sent == [] and "argument --safety-file: empty" in err
+    run_file = tmp_path / "run.yaml"
+    run_file.write_text("devices: [R1:10.0.0.1:junos]\nshow: show version\nsafety_file: ''\n")
+    rc, err = main(["--run", str(run_file)])
+    assert rc == 2 and sent == [] and f"ERROR: run file '{run_file}': 'safety_file' is empty" in err
+    assert gates == [] and not gate.exists()
+    rc, err = main(show)
+    assert rc == 0 and sent == ["10.0.0.1"] and gates == [str(gate)] and gate.is_file(), err
+    rc, err = main(show, safety="")
+    assert rc == 0 and sent == ["10.0.0.1", "10.0.0.1"] and gates == [str(gate)], err

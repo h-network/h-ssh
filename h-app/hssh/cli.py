@@ -150,6 +150,17 @@ def _ms_arg(text: str) -> float:
     return value
 
 
+def _not_empty(text: str) -> str:
+    """An argparse type for a flag that names a file, a directory, a user or
+    a profile (and --comment): an empty value is refused, not taken for the
+    flag left out (#140). `--audit-log "$AUDIT"` with the variable unset
+    turned the HSSH_AUDIT_LOG audit trail off, `--config ''` read the
+    default config, `--user ''` logged in as HSSH_USER."""
+    if text == "":
+        raise argparse.ArgumentTypeError("empty (an unset variable?); give it a value or leave the flag out")
+    return text
+
+
 def _ranged_int(low: int, high: Optional[int], what: str):
     """An argparse type: an integer within [low, high], or one line naming the
     range. The value a flag accepts is the value a config file accepts, so
@@ -202,6 +213,22 @@ class _Parser(argparse.ArgumentParser):
     that matters; on a 30-flag tool that buries it. One line, exit 2."""
     def error(self, message):
         self.exit(2, f"{self.prog}: error: {message} (see --help)\n")
+
+
+def typed_dests(parser: argparse.ArgumentParser, argv) -> set:
+    """The options argv gives, whatever their value: argv parsed again with
+    every default suppressed, so only what was typed lands in the namespace.
+    `--format text` or `--devices devices.csv` is typed though it is the
+    default, and a run file must not take its place (#140). A bare host is
+    `hosts`. The parser's defaults are put back as they were."""
+    saved = [(action, action.default) for action in parser._actions]
+    try:
+        for action, _ in saved:
+            action.default = argparse.SUPPRESS
+        return set(vars(parser.parse_intermixed_args(argv)))
+    finally:
+        for action, default in saved:
+            action.default = default
 
 
 
@@ -523,16 +550,16 @@ async def main() -> int:
                "when a pipeline runs h-ssh; there is no --password flag, and the config file never "
                "carries one.")
 
-    parser.add_argument("--devices", default=get_default_devices_path(),
+    parser.add_argument("--devices", type=_not_empty, default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
     parser.add_argument("--transport", choices=TRANSPORT_CHOICES, default=None,
                         help="Transport for targets that don't declare one (default: ssh)")
     parser.add_argument("--structured", action="store_true",
                         help="Return structured data where the vendor supports it "
                              "(junos NETCONF); falls back to text elsewhere")
-    parser.add_argument("--user", type=str,
+    parser.add_argument("--user", type=_not_empty,
                         help="Username (or HSSH_USER, or 'user' in ~/.h-ssh/config; default: the name you are logged in as)")
-    parser.add_argument("--config", type=str,
+    parser.add_argument("--config", type=_not_empty,
                         help="Config file with defaults (default: ~/.h-ssh/config)")
 
     # Modes
@@ -540,28 +567,28 @@ async def main() -> int:
                         help="Show command to run on all targets")
     parser.add_argument("-eC", "--edit-command", type=str,
                         help="Single config command (Junos expects 'set ...')")
-    parser.add_argument("-eD", "--edit-dir", type=str,
+    parser.add_argument("-eD", "--edit-dir", type=_not_empty,
                         help="Directory containing <NAME>.set files")
-    parser.add_argument("-eB", "--edit-broadcast", type=str,
+    parser.add_argument("-eB", "--edit-broadcast", type=_not_empty,
                         help="Multi-line config file for all devices (e.g., configs/all.set)")
     parser.add_argument("--allow-missing", action="store_true",
                         help="-eD: skip devices that have no <NAME>.set instead of refusing the run "
                              "(they count as skipped: exit 3)")
-    parser.add_argument("--batch", type=str,
+    parser.add_argument("--batch", type=_not_empty,
                         help="File containing show commands to run in batch (one per line, # comments)")
-    parser.add_argument("--profile", type=str, metavar="NAME",
+    parser.add_argument("--profile", type=_not_empty, metavar="NAME",
                         help="A named command set, run like --batch: ~/.h-ssh/profiles/NAME.txt, else one that "
                              "ships with h-ssh (--list-profiles shows both)")
-    parser.add_argument("--job", type=str,
+    parser.add_argument("--job", type=_not_empty,
                         help="JSON job file with per-device commands (use - for stdin)")
-    parser.add_argument("--run", type=str, metavar="FILE",
+    parser.add_argument("--run", type=_not_empty, metavar="FILE",
                         help="YAML or JSON run file: every key is a flag name (devices, show, commands, "
                              "edit, jobs, workers, ...); a flag on the command line wins over the file")
     parser.add_argument("--rollback", type=_ranged_int(0, 49, "--rollback"), metavar="N",
                         help="Return every target to rollback N (0-49), with the same gates as an edit (Junos only)")
     parser.add_argument("--commit-status", action="store_true",
                         help="Show the commit history as data: sequence, time, user, comment, pending commit-confirmed timer (Junos only)")
-    parser.add_argument("--comment", type=str, metavar="TEXT",
+    parser.add_argument("--comment", type=_not_empty, metavar="TEXT",
                         help="Log this comment with the commit; it shows in 'show system commit' (Junos only)")
     parser.add_argument("--show-diff", action="store_true",
                         help="Edits: run a dry-run on every target, print the diffs, then ask once before "
@@ -645,26 +672,29 @@ async def main() -> int:
     parser.add_argument("--format", choices=["text", "json", "xml"], default="text",
                         help="Show output as the router's own JSON or XML reply, through its RPC "
                              "translation of the command (junos only; default: text)")
-    parser.add_argument("--save-output", type=str,
+    parser.add_argument("--save-output", type=_not_empty,
                         help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted): "
                              "NAME.output, or NAME.json for a batch; a job's later entries for one device go to "
                              "NAME.2.output, NAME.3.output, ... in file order")
-    parser.add_argument("--log", type=str,
+    parser.add_argument("--log", type=_not_empty,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
-    parser.add_argument("--store", type=str,
+    parser.add_argument("--store", type=_not_empty,
                         help=f"The SQLite file every run is kept in: one row per command per device, the reply as "
                              f"the device gave it, 0600 (default ${STORE_ENV}, else `store` in the config file, "
                              f"else ./{STORE_DEFAULT}; read it with h-ssh-store)")
     parser.add_argument("--no-store", action="store_true",
                         help="Keep nothing of this run")
-    parser.add_argument("--audit-log", type=str,
-                        default=os.environ.get("HSSH_AUDIT_LOG"),
+    # An empty value is refused (_not_empty); an empty variable is no audit
+    # log or safety file, as it always was, and argparse never sees it.
+    parser.add_argument("--audit-log", type=_not_empty,
+                        default=os.environ.get("HSSH_AUDIT_LOG") or None,
                         help="Edit audit log path for JSONL audit trail (or set HSSH_AUDIT_LOG env var)")
-    parser.add_argument("--safety-file", type=str,
-                        default=os.environ.get("HSSH_SAFETY_FILE"),
+    parser.add_argument("--safety-file", type=_not_empty,
+                        default=os.environ.get("HSSH_SAFETY_FILE") or None,
                         help="Safety gate JSON file for per-device rate limiting and cooldown")
 
     args = parser.parse_intermixed_args()
+    typed = typed_dests(parser, sys.argv[1:])     # what the command line gave, for the run file (#140)
     if not args.verbose:
         _quiet_transport_logs()
     # A host typed bare is an inline target like any --target; from here on
@@ -694,22 +724,25 @@ async def main() -> int:
         except OSError as e:                 # a directory on the way that may not be searched
             print(f"ERROR reading profile '{args.profile}' ({e.filename}): {read_failure(e)}", file=sys.stderr)
             return 2
+        typed.add("batch")
     args.batch_commands = None   # the batch: a run file's commands, or the --batch/--profile file's lines read below
     args.jobs_data = None        # job entries from a run file
 
     # A run file sits between the command line and the config file: a flag
-    # typed on the command line wins, the file wins over the environment and
-    # ~/.h-ssh/config. It is read before anything else so the banner and the
-    # checks below see what the run will use.
+    # typed on the command line wins, whatever its value, the file wins over
+    # the environment and ~/.h-ssh/config. It is read before anything else so
+    # the banner and the checks below see what the run will use.
     from_run_file = []           # the options the run file set
+    devices_unused = False       # the file's `devices`, replaced by a typed --devices or target
     if args.run:
         try:
             run_data = validate_run(load_run_file(args.run), args.run, TRANSPORT_CHOICES, CONFIG_FLOORS,
                                     CONFIG_CEILINGS)
-            from_run_file = apply_run(args, run_data, parser)
+            from_run_file = apply_run(args, run_data, typed)
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
+        devices_unused = "devices" in run_data and "devices" not in from_run_file
 
     # Resolved before anything reads them, so --list-commands and the banner
     # see the same values the run will use. A --config named on the command
@@ -789,6 +822,24 @@ async def main() -> int:
             return 2
         if args.job and args.jobs_data:
             print("ERROR: --job and a run file's 'jobs' are two job lists; use one.", file=sys.stderr)
+            return 2
+        # A job's targets are its entries. A target typed beside it, or an
+        # inventory named with --devices, was ignored without a word: the
+        # job ran on every device it names, and with edit entries and -y it
+        # committed on routers the operator meant to leave out (#140).
+        beside = [what for what, given in (("a bare host", bare_hosts), ("--target", "target" in typed),
+                                            ("--devices", "devices" in typed)) if given]
+        if beside:
+            jobs = "--job" if args.job else "a run file's 'jobs'"
+            print(f"ERROR: {', '.join(beside)} beside {jobs}: a job's targets are its entries.", file=sys.stderr)
+            return 2
+        # So are a run file's `devices` beside a --job typed next to the
+        # file: the job ran and committed on its own entries, the file's
+        # devices dropped without a word (#140). Beside the file's own
+        # `jobs` they are not used, as the README says.
+        if args.job and "devices" in from_run_file:
+            print(f"ERROR: run file '{args.run}': 'devices' beside --job: a job's targets are its entries.",
+                  file=sys.stderr)
             return 2
         try:
             if args.job:
@@ -895,6 +946,12 @@ async def main() -> int:
             if what:
                 print(f"ERROR: {source}: {what} in {cmd!r}; a command is one line of text.", file=sys.stderr)
                 return 2
+
+        # A target typed on the command line, or a typed --devices, replaced
+        # the run file's `devices` (a list or a path); said once, not per tick.
+        if devices_unused and (args.every is None or not _WATCH["tick"]):
+            by = "the targets on the command line win" if args.target else "--devices on the command line wins"
+            print(f"Run file '{args.run}': 'devices' is ignored; {by}.", file=sys.stderr)
 
         # Load targets. A target that doesn't declare a vendor gets
         # --transport (or the config file's), the same for every form.
@@ -1043,8 +1100,28 @@ async def main() -> int:
 
         has_edits = mode.startswith("edit") or mode == "rollback"
 
+    # --diff compares a show's replies across the devices; with an edit, a
+    # job or any other mode it was accepted and did nothing (#140).
+    if args.diff and mode not in ("show", "show-batch"):
+        print("ERROR: --diff goes with a show (-sC, --batch, --profile): it compares the replies across devices.",
+              file=sys.stderr)
+        return 2
     if args.comment is not None and not has_edits:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
+        return 2
+    # So do the timer, the probe's go-ahead and --allow-missing: on a run
+    # with no edit they were accepted and did nothing (#140), typed or from
+    # a run file alike. --allow-missing is for -eD; beside another edit it
+    # changes nothing and is let be, so a run file that sets it for every
+    # edit still runs.
+    for flag, given in (("--commit-confirmed", args.commit_confirmed is not None),
+                        ("--skip-unreachable", args.skip_unreachable)):
+        if given and not has_edits:
+            print(f"ERROR: {flag} goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).",
+                  file=sys.stderr)
+            return 2
+    if args.allow_missing and not has_edits:
+        print("ERROR: --allow-missing goes with -eD: it skips the devices that have no <NAME>.set.", file=sys.stderr)
         return 2
     # Nobody watches a pipeline: a run file that commits must arm a timer, or
     # say it is a dry run. A flag on the command line may supply either, and
@@ -1231,7 +1308,7 @@ async def main() -> int:
         if store is not None:
             store.discard()
 
-    safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
+    safety_file = args.safety_file       # the flag, the run file's, or HSSH_SAFETY_FILE
     try:
         safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
     except OSError as e:
@@ -2100,7 +2177,9 @@ async def main() -> int:
                  if e.get("ok") and re.search(r"COMMIT (OK|CONFIRMED \()", str(e.get("output") or ""))]
         if args.commit_confirmed and not args.dry_run and has_edits and armed:
             # A job's timers are armed on its edit entries' targets, not on
-            # the inventory file or any --target given alongside it.
+            # the inventory file or a run file's `devices` beside its jobs (a
+            # target typed beside a job is refused, and so are a run file's
+            # `devices` beside a typed --job).
             specs = args.target
             if job_entries:
                 specs = list(dict.fromkeys(target_spec(je.target) for je in job_entries
