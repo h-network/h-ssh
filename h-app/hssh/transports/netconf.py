@@ -21,8 +21,9 @@ import time
 from contextlib import contextmanager
 from typing import List, Optional
 
-from ..core import check_confirm_minutes
-from ..dialects.junos import SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS, COMMIT_PENDING as _PENDING
+from ..core import check_confirm_minutes, refused_reply
+from ..dialects.junos import (SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS, COMMIT_PENDING as _PENDING,
+                              DIALECT as _JUNOS)
 # ConnectTimeoutError is h-ssh's (hssh.errors), not PyEZ's class of that name.
 from ..errors import AmbiguousCommitError, ConnectTimeoutError, NotAppliedError, NothingToConfirmError
 from ..drivers import results as R
@@ -510,18 +511,32 @@ def _cli(dev, cmd: str) -> str:
     return (out or "").rstrip()
 
 
+def _shown(dev, cmd: str) -> str:
+    """A show's reply: _cli's text, unless the CLI refused the command. Most
+    Junos refusals come back as an rpc-error, which PyEZ raises; one carried
+    as the reply's text (`<output>error: could not resolve file: ...`) was
+    handed back as the show's output, OK, where ssh and openssh fail it as
+    refused (#143). The runner tries a refusal once."""
+    text = _cli(dev, cmd)
+    refused = refused_reply("", text, dialect=_JUNOS)
+    if refused:
+        raise RuntimeError("'%s' was refused by the device: %s" % (cmd, refused))
+    return text
+
+
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
          port: int = None, vendor_hint: str = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
     """Execute a show command over NETCONF. A read finds a dead reused
     session and runs once more on a new one; anything else (`request …`)
-    is sent once, as rpc() does. `connect_timeout` bounds the TCP connect
-    and the SSH banner, never more than `session_timeout` (every function
-    here that opens a session takes it)."""
+    is sent once, as rpc() does. A reply that opens with the CLI's refusal
+    is a failure, not output (_shown). `connect_timeout` bounds the TCP
+    connect and the SSH banner, never more than `session_timeout` (every
+    function here that opens a session takes it)."""
     _require()
     run_on = _on_session if _is_read(cmd) else _on_session_once
     return run_on(host, user, passwd, session_timeout, command_timeout, port,
-                  lambda lease: _cli(lease.dev, cmd), connect_timeout)
+                  lambda lease: _shown(lease.dev, cmd), connect_timeout)
 
 
 def show_structured(host: str, user: str, passwd: str, cmd: str,
@@ -938,8 +953,9 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
     """Execute several show commands on one NETCONF session.
 
-    A rejected or timed-out command is reported in its own result and the
-    batch goes on (after a timeout the session is not kept, a late reply may
+    A rejected or timed-out command, or one whose reply opens with the
+    CLI's refusal (_shown), is reported in its own result and the batch
+    goes on (after a timeout the session is not kept, a late reply may
     still be coming). A session that dies is a failure of the whole batch;
     a reused one gets show()'s reopen-once treatment only when every command
     is a read, as rpc_batch() does."""
@@ -949,7 +965,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
         results = []
         for cmd in cmds:
             try:
-                results.append({"command": cmd, "ok": True, "output": _cli(lease.dev, cmd)})
+                results.append({"command": cmd, "ok": True, "output": _shown(lease.dev, cmd)})
             except Exception as e:
                 if _session_lost(e):
                     raise
