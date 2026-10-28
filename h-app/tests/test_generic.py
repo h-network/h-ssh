@@ -1637,6 +1637,59 @@ def junos_pty(received, banner=PASSWORD_BANNER, pause=0.7):
     return play
 
 
+def ios_pty(received, tail, lag=0.2):
+    """An IOS CLI behind an SSH shell: a banner whose last line ends in
+    `NOC-DESK>`, half a second of nothing, then `tail`, the rest of it and
+    the prompt. What was typed ahead is read once that is out; each line
+    is kept in `received`, and echoed and answered `lag` seconds after it
+    comes, as over a slow link. A line it does not know is refused."""
+    def play(channel):
+        def answer(line):
+            if line == "configure terminal":
+                return "\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nR1(config)#"
+            if line.startswith("interface "):
+                return "\r\nR1(config-if)#"
+            if line == "end":
+                return "\r\nR1#"
+            return "\r\n               ^\r\n% Invalid input detected at '^' marker.\r\n\r\nR1(config-if)#"
+        try:
+            channel.sendall(b"\r\nAuthorized users only - report misuse to NOC-DESK>")
+            _time.sleep(0.5)
+            channel.sendall(tail.encode())
+            pending = b""
+            while True:
+                data = channel.recv(4096)
+                if not data:
+                    return
+                pending += data
+                while b"\n" in pending:
+                    raw, pending = pending.split(b"\n", 1)
+                    line = raw.decode(errors="replace").rstrip("\r")
+                    received.append(line)
+                    _time.sleep(lag)
+                    channel.sendall((line + answer(line)).encode())
+        except (OSError, EOFError):
+            pass
+    return play
+
+
+def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(shell_sshd):
+    """#141 review: on ios@ssh a banner whose last line ends in `NOC-DESK>`,
+    the device pausing half a second before its line break, ended the
+    login there, and the rest of the banner was the reply to `configure
+    terminal`. With the device answering each line 0.2 s after it, every
+    later reply was the one before: the `% Invalid input` for a refused
+    line was read as the reply to `end`, and the edit said APPLIED. The
+    shell echoes what is typed, so the first reply is read through its
+    echo: the refused line fails the edit."""
+    received = []
+    port = shell_sshd(ios_pty(received, "\r\nChange window 22:00-02:00 only\r\n\r\nR1>"))
+    with pytest.raises(RuntimeError, match=r"^'ip addres 10\.0\.0\.1 255\.255\.255\.0': % Invalid input detected"):
+        ssh.edit("127.0.0.1", "lab", "pw", "interface Gi0/1\nip addres 10.0.0.1 255.255.255.0\n", 5, 10, port=port,
+                 vendor_hint="ios@ssh")
+    assert received == ["configure terminal", "interface Gi0/1", "ip addres 10.0.0.1 255.255.255.0", "end"]
+
+
 def test_a_shell_banner_that_asks_for_a_password_gets_nothing_typed(shell_sshd):
     """#141: login() answered `Password:` on the shell too. A banner ending
     in `Password: `, the prompt 0.7 s later, got the SSH password typed into

@@ -673,11 +673,13 @@ def _shell_session(host: str, user: str, passwd: Optional[str], session_timeout:
     logged in with the password, and login() is handed neither credential:
     it reads the banner up to the prompt and learns this device's own. A
     banner that ends in `Password: ` once got the password typed into the
-    device CLI, its echo the reply to the next command (#141)."""
+    device CLI, its echo the reply to the next command (#141). The pty
+    echoes every line typed, which the engine is told: the first reply is
+    read through its echo, never taken from the rest of a banner."""
     client = _connect(host, user, passwd, session_timeout, port, connect_timeout)
     try:
         chan = client.invoke_shell(term="vt100", width=511, height=1000)
-        session = Cli(ShellChannel(chan), dialect, session_timeout)
+        session = Cli(ShellChannel(chan), dialect, session_timeout, echoes=True)
         session.login()
     except BaseException:
         client.close()

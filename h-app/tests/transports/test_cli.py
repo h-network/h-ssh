@@ -38,14 +38,17 @@ class ScriptChannel:
     right after it, as a device pausing there would; a PAUSE in what it
     says ends a read there every time, and a later() one also holds back
     what follows it for its time, a read until then waiting as long as its
-    timeout lets it. With `blocking`, a read that finds nothing waits out
+    timeout lets it. `lag` is the time the device takes to echo and answer
+    each line typed. With `blocking`, a read that finds nothing waits out
     its timeout first, as a socket's does, and `waits` notes the line typed
     last before each such wait."""
 
-    def __init__(self, first, replies, echo=True, hang_on=None, close_on=None, split_at=None, blocking=False):
+    def __init__(self, first, replies, echo=True, hang_on=None, close_on=None, split_at=None, blocking=False,
+                 lag=0):
         self.queue = bytearray(first.encode())
         self.split_at = split_at
         self.blocking = blocking
+        self.lag = lag
         self.ready_at = 0.0          # what follows a later() pause is not there before this
         self.waits = []
         self.replies = replies
@@ -97,6 +100,8 @@ class ScriptChannel:
             return
         if word == self.hang_on:
             return
+        if self.lag:
+            self.queue += later(self.lag).encode()
         if self.echo:
             self.queue += (line + "\r\n").encode()
         reply = self.replies.get(line, self.replies.get(word, self.replies.get("<else>", "")))
@@ -258,6 +263,31 @@ def test_a_banner_line_shaped_like_a_prompt_does_not_end_the_login():
     s = Cli(ch, dialects.ios.DIALECT, 5)
     s.login("u", "pw", dialogue=True)
     assert ch.typed == [] and s.prompt_re.search("R1#")
+
+
+def test_on_a_channel_that_echoes_the_first_reply_is_read_through_its_echo():
+    """#141 review: a login that ended on a banner line shaped like a
+    prompt, the device pausing longer than SETTLE before its line break,
+    left the rest of the banner (blank lines, or more of it, and the real
+    prompt) to be read as the first command's reply, and with a device
+    slow to answer every reply after it was the one before: the `% Invalid
+    input` for a refused line was the reply to `end`, and the edit said
+    APPLIED. A pty echoes each line typed, and the ssh and openssh shells
+    say so: the first reply is read until the echo of its command and then
+    its prompt, what came before the echo is not part of it, and each reply
+    after it is the command's own."""
+    banner = "\r\nAuthorized users only - report misuse to NOC-DESK>" + later(0.3)
+    for tail in ("\r\n\r\nR1>", "\r\nChange window 22:00-02:00 only\r\n\r\nR1>"):
+        ch = ScriptChannel(banner + tail, IOS_LINES, lag=0.2)
+        s = Cli(ch, dialects.ios.DIALECT, 5, echoes=True)
+        s.login()
+        with pytest.raises(RuntimeError, match=r"^'ip addres 10\.0\.0\.1 255\.255\.255\.0': % Invalid input detected"):
+            s.edit_lines("interface Gi0/1\nip addres 10.0.0.1 255.255.255.0\n")
+        assert ch.typed == ["configure terminal", "interface Gi0/1", "ip addres 10.0.0.1 255.255.255.0", "end"]
+        assert ch.unread() == ""
+    s = Cli(ScriptChannel(banner + tail, IOS_LINES, lag=0.2), dialects.ios.DIALECT, 5, echoes=True)
+    s.login()
+    assert s.run("configure terminal", 5).strip() == "Enter configuration commands, one per line.  End with CNTL/Z."
 
 
 def test_the_initial_bytes_from_negotiation_count_as_the_banner():

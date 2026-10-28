@@ -27,7 +27,10 @@ FAKE_SSH = r'''
 its stdin and stdout, a Junos one unless FAKE_SSH_FLAVOUR is ios, and appends
 every line typed at it to the file FAKE_SSH_TYPED names; with
 FAKE_SSH_BANNER=password its banner ends in `Password: ` and the prompt
-comes 0.7 s later, what was typed meanwhile read once it is out. Without -tt it
+comes 0.7 s later, with FAKE_SSH_BANNER=noc its banner's last line ends in
+`NOC-DESK>` and the rest of it comes 0.5 s later, what was typed meanwhile
+read once it is out; FAKE_SSH_LAG is the time it takes to echo and answer
+each line. Without -tt it
 answers the command on its command line the way the plain fake in
 test_openssh.py does, and a `| json` command with JSON. A password is checked
 through SSH_ASKPASS: anything but FAKE_SSH_PASSWORD is refused in the -E log
@@ -191,7 +194,11 @@ def ios(line):
 
 
 device = ios if os.environ.get("FAKE_SSH_FLAVOUR") == "ios" else junos
-if device is ios:
+if os.environ.get("FAKE_SSH_BANNER") == "noc":
+    say("\r\nAuthorized users only - report misuse to NOC-DESK>")
+    time.sleep(0.5)
+    say("\r\nChange window 22:00-02:00 only\r\n\r\n" + ("Router#" if device is ios else OP))
+elif device is ios:
     say("\r\nRouter#")
 elif os.environ.get("FAKE_SSH_BANNER") == "password":
     say("\r\n--- JUNOS 23.4R2.13\r\nAsk the NOC for the Password: ")
@@ -201,6 +208,7 @@ elif os.environ.get("FAKE_SSH_BANNER") == "password":
 else:
     say("--- JUNOS 23.4R2.13 Kernel 64-bit  JNPR-12.1-20240711.ae2a6ee_buil\r\n" + OP)
 
+LAG = float(os.environ.get("FAKE_SSH_LAG") or 0)
 buf = b""
 while True:
     chunk = os.read(0, 4096)
@@ -214,6 +222,7 @@ while True:
         reply = device(line)
         if reply is None:
             sys.exit(0)
+        time.sleep(LAG)
         say(line + reply)          # the pty's echo of the line, then the device's reply
 '''
 
@@ -231,7 +240,7 @@ def device(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("FAKE_SSH_TYPED", str(typed_path))
     for var in ("FLAVOUR", "PENDING", "LOCKED", "COMMIT", "HANG", "RC", "STDERR", "STDOUT", "PASSWORD", "REFUSAL",
-                "BANNER"):
+                "BANNER", "LAG"):
         monkeypatch.delenv("FAKE_SSH_" + var, raising=False)
     monkeypatch.delenv("HSSH_PASSWORD", raising=False)
     monkeypatch.setattr(openssh, "AVAILABLE", True)
@@ -456,6 +465,21 @@ def test_an_ios_shaped_edit_reports_the_refused_line_and_still_leaves_config_mod
     with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.$"):
         openssh.edit("10.0.0.1", "u", "hunter2", "hostname bogus\n", 5, 10, vendor_hint="ios@openssh")
     assert device.typed == ["configure terminal", "hostname bogus", "end"]
+
+
+def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(device):
+    """#141 review: on ios@openssh a banner whose last line ends in
+    `NOC-DESK>`, the device pausing half a second before its line break,
+    ended the login there, and the rest of the banner was the reply to
+    `configure terminal`. With the device answering each line 0.2 s after
+    it, every later reply was the one before: the refusal of `hostname
+    bogus` was read as the reply to `end`, and the edit said APPLIED. The
+    pty echoes what is typed, so the first reply is read through its echo:
+    the refused line fails the edit."""
+    device.knobs(flavour="ios", banner="noc", lag=0.2)
+    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.$"):
+        openssh.edit("10.0.0.1", "u", "hunter2", "interface Gi0/1\nhostname bogus\n", 5, 10, vendor_hint="ios@openssh")
+    assert device.typed == ["configure terminal", "interface Gi0/1", "hostname bogus", "end"]
 
 
 def test_an_ios_shaped_dialect_refuses_what_only_a_candidate_can_do_before_connecting(no_ssh):

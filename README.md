@@ -453,7 +453,14 @@ a login that shows no prompt. A login ends at a prompt that is the last line, wi
 once the device has said nothing more for 0.15 s. A banner line that ends in `NOC-DESK>` is not the
 device's prompt once its line break has come, however long the pause after it, and a read that stops
 right after such a line (or one that is all `NOC-DESK>`) is read past when the banner goes on within
-that time. An empty `show | compare` is `NO CHANGES`: the candidate is discarded and no `commit` is
+that time. When the device pauses longer right after it, before the line break, the login ends there. A
+line that is all `NOC-DESK>` is then learned as the prompt, and every command fails on its timeout,
+nothing applied. One that only ends in it costs an SSH shell nothing: the shell echoes every line typed,
+so the first command after the login, always one of the engine's own (`configure exclusive`,
+`configure terminal`, `show system commit`), is read through its echo and then its prompt, and the rest
+of the banner is never taken for its reply. Over telnet, where the device need not echo, the rest of the
+banner is read as the first reply and each later reply as the one before, so a refused line can come
+back APPLIED. An empty `show | compare` is `NO CHANGES`: the candidate is discarded and no `commit` is
 typed, plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over nothing and no
 other user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec channel, one
 command per channel; only edits and confirms open a shell. Over the OpenSSH binary the shell is
@@ -1481,7 +1488,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1335 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1338 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

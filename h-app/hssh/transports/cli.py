@@ -197,15 +197,20 @@ class Cli:
     learns it, answering a login/password dialogue on the way where the
     transport has one (telnet). Then
     `run()` for a command, `edit_lines()`/`edit_candidate()` for an edit,
-    `confirm()` for a pending commit-confirmed. `close()` ends it."""
+    `confirm()` for a pending commit-confirmed. `close()` ends it.
 
-    def __init__(self, channel, dialect: Dialect, session_timeout: int, initial: str = ""):
+    `echoes`: the channel echoes every line typed, as a pty does (the ssh
+    and openssh shells); a telnet device need not."""
+
+    def __init__(self, channel, dialect: Dialect, session_timeout: int, initial: str = "", echoes: bool = False):
         self.channel = channel
         self.dialect = dialect
         self.cli: CliSyntax = dialect.cli
         self.session_timeout = session_timeout
         self.prompt_re = self.cli.prompt
         self._initial = initial      # what the channel already read while opening (telnet negotiation)
+        self.echoes = echoes
+        self._in_step = False        # a reply was read through the echo of its command (echoes only)
 
     # --- the wire -------------------------------------------------------------
 
@@ -408,6 +413,16 @@ class Cli:
         echo and the prompt, each line of an edit, is not waited on. Neither
         wait runs past command_timeout.
 
+        On a channel that echoes, the first reply after the login is read
+        until the line that is the echo of its command, always one of the
+        engine's own (`configure exclusive`, `configure terminal`, `show
+        system commit`), and then its prompt; what came before the echo is
+        what the banner still had to say, and is not the reply. A login
+        that ended on a banner line shaped like a prompt, the device then
+        pausing longer than SETTLE, once had the rest of the banner read as
+        the first reply and each later reply as the one before: a refused
+        line came back APPLIED (#141).
+
         A command with a control character or a Tab in it is not typed: the
         CLI would take it as a key (refuse_control_characters)."""
         what = control_character(cmd, tabs=False)
@@ -415,6 +430,7 @@ class Cli:
             raise ValueError(f"{cmd!r} has {what}, which a CLI takes as a key, not as text; it was not sent")
         self._send(cmd + "\n")
         prompt_re = self.prompt_re
+        through_echo = self.echoes and not self._in_step and bool(cmd.strip())
 
         def done(clean: str) -> bool:
             lines = clean.splitlines()
@@ -422,23 +438,30 @@ class Cli:
                 return False
             if len(lines) == 1 and is_echo(lines[0], cmd):
                 return False                      # only the echo so far
+            if through_echo and not any(is_echo(line, cmd) for line in lines[:-1]):
+                return False                      # what the banner had left, the echo still to come
             return self._at_prompt(clean, prompt_re)
 
         def settle(clean: str) -> float:
-            said = "\n".join(self._reply_lines(clean, cmd, prompt_re))
+            said = "\n".join(self._reply_lines(clean, cmd, prompt_re, through_echo))
             if not said.strip():
                 return 0                          # the echo and the prompt: a line of an edit
             return REFUSAL_SETTLE if self.dialect.refused.search(said) else SETTLE
 
         output = self._read_until(done, command_timeout, settle=settle)
-        return "\n".join(self._reply_lines(output, cmd, prompt_re))
+        if through_echo:
+            self._in_step = True
+        return "\n".join(self._reply_lines(output, cmd, prompt_re, through_echo))
 
-    def _reply_lines(self, clean: str, cmd: str, prompt_re: re.Pattern) -> list:
-        """The lines of a reply that are its own: not the echo of `cmd`, the
-        prompt that ends it, or the context banner the CLI prints with that
-        prompt."""
+    def _reply_lines(self, clean: str, cmd: str, prompt_re: re.Pattern, through_echo: bool = False) -> list:
+        """The lines of a reply that are its own: not the echo of `cmd` (with
+        `through_echo`, nor anything before it), the prompt that ends it, or
+        the context banner the CLI prints with that prompt."""
         lines = clean.splitlines()
-        if lines and is_echo(lines[0], cmd):
+        if through_echo:
+            echo = next((n for n, line in enumerate(lines) if is_echo(line, cmd)), -1)
+            lines = lines[echo + 1:]
+        elif lines and is_echo(lines[0], cmd):
             lines = lines[1:]
         if lines and self._is_prompt(lines[-1], prompt_re):
             lines = lines[:-1]
