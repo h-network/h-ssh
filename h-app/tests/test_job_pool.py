@@ -174,3 +174,39 @@ def test_a_run_that_ends_early_gives_the_closes_half_a_second_in_all(monkeypatch
     assert exc.value.code == 130 and "Interrupted" in capsys.readouterr().err
     assert 0.45 <= elapsed < 1.0, f"{elapsed:.2f}s"
     assert FakeDevice.instances[0].closed and pool.live() == 0
+
+
+def test_a_devices_session_closes_after_its_last_entry_not_at_the_end_of_the_run(monkeypatch, capsys, tmp_path):
+    """#147: a job kept every device's session open to the end of the run, so
+    one through 300 routers held 300 sessions at once and failed 46 of them
+    with "Too many open files" at the soft limit of 1024. A device's session
+    closes after its last entry now (one with more entries keeps it between
+    them: test_a_job_opens_one_session_per_device_not_per_entry)."""
+    seen = []
+    real_cli = FakeDevice.cli
+
+    def cli(self, cmd, warning=True):
+        seen.append(pool.live())             # the sessions open while this entry runs
+        return real_cli(self, cmd, warning)
+    monkeypatch.setattr(FakeDevice, "cli", cli)
+    rc, out, err = _run(monkeypatch, capsys, tmp_path, [
+        {"target": f"R{i}:10.0.0.{i}:junos", "show": "show version"} for i in range(1, 4)
+    ], "--workers", "1")
+    assert rc == 0, err
+    assert seen == [1, 1, 1]                 # the devices before it have let theirs go
+    assert len(FakeDevice.instances) == 3 and all(d.closed for d in FakeDevice.instances)
+
+
+def test_a_job_counts_the_sessions_it_keeps_between_entries_against_the_open_file_limit(monkeypatch, capsys,
+                                                                                         tmp_path):
+    """#147: a device with an entry after its first keeps its session in the
+    pool beside the workers, and the fit counted the workers alone. A device
+    with one entry keeps none: its session closes after it."""
+    from tests.test_transport_consistency import _rlimits
+    state = _rlimits(monkeypatch, 50, 65536)
+    entries = [{"target": f"R{i}:10.0.0.{i}:junos", "show": f"show {k}"} for k in range(2) for i in range(1, 4)]
+    entries.append({"target": "R9:10.0.0.9:junos", "show": "show version"})
+    rc, out, err = _run(monkeypatch, capsys, tmp_path, entries, "--workers", "2")
+    assert rc == 0, err
+    assert state["set"] == [(2 * 6 + 3 * 4 + 32, 65536)]     # 2 workers, 3 sessions kept, the base
+    assert len(FakeDevice.instances) == 4

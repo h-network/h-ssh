@@ -18,6 +18,10 @@ What a library needs on top, and only that:
   for a transaction held open there at most its command timeout, and a
   borrow nobody gives back (a Transaction dropped without commit or abort)
   closes its session instead of pooling it (#147)
+- room under the open-file limit before a session is opened, counted as
+  hssh.limits counts it: when even the hard limit cannot hold every session
+  kept, the least recently used idle one is closed first, rather than a
+  healthy router failed; a later call to it opens it again (#147)
 - entries are keyed by whatever the driver passes (host, port, user), the
   driver supplies the opener/closer, so the pool knows no vendor
 
@@ -28,6 +32,7 @@ What a library needs on top, and only that:
 """
 
 import atexit
+import collections
 import gc
 import logging
 import os
@@ -36,6 +41,7 @@ import time
 from contextlib import contextmanager
 from typing import Callable, Dict, Hashable, Optional
 
+from . import limits
 from .errors import NotAppliedError
 
 log = logging.getLogger("hssh.pool")
@@ -182,6 +188,14 @@ class ConnectionPool:
         # allocated: an abandoned borrow ends wherever the collector frees
         # it, and on a thread inside _pool_lock that lock would hang it.
         self._stats_lock = threading.Lock()
+        # What the open-file limit is kept to (#147): the sessions open, the
+        # borrows in flight, the sessions closed since the last collection
+        # (each holds a descriptor until it runs, #58), and the closes still
+        # running. Counted as they change, under _stats_lock.
+        self._live = 0
+        self._in_flight = 0
+        self._uncollected = 0
+        self._closing: "collections.deque" = collections.deque()
         if idle_timeout is None:
             self._idle_timeout = DEFAULT_IDLE_TIMEOUT
             env_val = os.getenv("HSSH_POOL_IDLE_TIMEOUT")
@@ -307,6 +321,8 @@ class ConnectionPool:
         self._take(entry, wait if wait is not None else BUSY_WAIT if timeout is None else timeout)
         owner = threading.get_ident()
         nested = entry["lock"].count > 1     # re-entrant: >1 means a call nested in an open borrow
+        if not nested:
+            self._count(in_flight=1)
         lease = None
         abandoned = False
         try:
@@ -317,10 +333,11 @@ class ConnectionPool:
                 self._drop(entry, "discards")
                 device, reused = None, False
             if device is None:
+                self._make_room(key)
                 device = opener()
                 entry["device"], entry["closer"] = device, closer
                 entry["generation"] = self._generation
-                self._count("opens")
+                self._count("opens", live=1)
                 log.info("Pool: opened new connection to %s", key)
             else:
                 self._count("reuses")
@@ -401,6 +418,7 @@ class ConnectionPool:
         if not last:
             entry["last_used"] = time.time()
             return
+        self._count(in_flight=-1)
         try:
             if entry["device"] is not None and (
                 entry["doomed"] or not self._enabled or entry["generation"] != self._generation
@@ -443,16 +461,114 @@ class ConnectionPool:
         device, entry["device"] = entry["device"], None
         if device is None:
             return None
-        self._count(counter)
+        self._count(counter, live=-1, closed=1)
         try:
-            return entry["closer"](device)
+            closing = entry["closer"](device)
         except Exception as e:
             log.debug("Pool: error closing connection: %s", e)
             return None
+        if isinstance(closing, threading.Thread):
+            self._closing.append(closing)       # a deque: no lock, nothing the collector tracks
+        return closing
 
-    def _count(self, name: str) -> None:
+    def _count(self, name: Optional[str] = None, live: int = 0, in_flight: int = 0, closed: int = 0) -> None:
         with self._stats_lock:
-            self.stats[name] += 1
+            if name is not None:
+                self.stats[name] += 1
+            self._live += live
+            self._in_flight += in_flight
+            self._uncollected += closed
+
+    def _collect(self, closes=None, wait: Optional[float] = None) -> None:
+        """What closed sessions leave to the garbage collector, collected
+        (#58): `closes` seen through first (every close started since the
+        last collection when None), `wait` seconds in all (CLOSE_WAIT if
+        None). The closes still running after that are counted as not
+        collected yet."""
+        pending = []
+        while True:
+            try:
+                pending.append(self._closing.popleft())
+            except IndexError:
+                break
+        _release_closed_sessions(pending if closes is None else closes, wait)
+        running = [t for t in pending if t.is_alive()]
+        self._closing.extend(running)
+        with self._stats_lock:
+            self._uncollected = len(running)
+
+    def _descriptors(self) -> int:
+        """The descriptors the pool's sessions hold, counted as hssh.limits
+        fits them: FDS_BASE, FDS_PER_WORKER for every borrow in flight,
+        FDS_PER_SESSION for every session open, and one for every session
+        closed since the last collection."""
+        with self._stats_lock:
+            return (limits.FDS_BASE + self._in_flight * limits.FDS_PER_WORKER
+                    + self._live * limits.FDS_PER_SESSION + self._uncollected)
+
+    def _make_room(self, key: Hashable) -> None:
+        """Before a session is opened for `key`: room for it under the soft
+        open-file limit, which a Fleet and a --job run have raised for the
+        sessions they keep (hssh.limits). Past it, the sessions closed since
+        the last collection are collected first; then the least recently
+        used idle sessions are closed, a few more than the one that must,
+        rather than a healthy router failed for want of a descriptor: a
+        later call to one of them opens it again (#147)."""
+        soft = limits.open_file_limit()
+        if soft is None or self._descriptors() <= soft:
+            return
+        if self._uncollected:
+            self._collect()
+            if self._descriptors() <= soft:
+                return
+        with self._pool_lock:
+            idle = sorted(((e["last_used"], k, e) for k, e in self._connections.items()
+                           if k != key and e["device"] is not None and not e["lock"].count),
+                          key=lambda item: item[0])
+        over = self._descriptors() - soft
+        want = -(-over // limits.FDS_PER_SESSION) + len(idle) // 8
+        closes = []
+        for _, k, entry in idle:
+            if len(closes) >= want:
+                break
+            if not entry["lock"].acquire(blocking=False):
+                continue                     # borrowed meanwhile
+            try:
+                if entry["device"] is not None and entry["lock"].count == 1:
+                    closes.append(self._drop(entry, "reaped"))
+                    log.info("Pool: closed the least recently used idle connection to %s: the open-file "
+                             "limit (%d) holds no more", k, soft)
+            finally:
+                entry["lock"].release()
+        if closes:
+            self._collect()
+
+    def release(self, key: Hashable, wait: Optional[float] = None) -> bool:
+        """Close the session pooled for `key` now: its caller is done with
+        that router (a --job device after its last entry, #147), and a run
+        through many routers keeps no session for the ones it has finished.
+        A borrow in flight is waited for, a session a transaction holds open
+        `wait` seconds at most (BUSY_WAIT if None), and then left to it; a
+        thread inside its own borrow of the router leaves the session to
+        that borrow, marked to close. True when a session was closed."""
+        with self._pool_lock:
+            entry = self._connections.get(key)
+        if entry is None or entry["device"] is None:
+            return False
+        try:
+            self._take(entry, BUSY_WAIT if wait is None else wait)
+        except NotAppliedError:
+            return False
+        try:
+            if entry["device"] is None:
+                return False
+            if entry["lock"].count > 1:
+                entry["doomed"] = True
+                return False
+            self._drop(entry, "discards")
+            return True
+        finally:
+            entry["lock"].release()
 
     def live(self) -> int:
         """How many sessions are open right now."""
@@ -512,7 +628,7 @@ class ConnectionPool:
             finally:
                 entry["lock"].release()
         if closed:
-            _release_closed_sessions(closes, wait)
+            self._collect(closes, wait)
         return closed
 
     reap = _cleanup_idle
@@ -570,7 +686,7 @@ class ConnectionPool:
         live = [item for item in entries if item[1]["device"] is not None]
         _side_by_side(close_one, live)
         if live:
-            _release_closed_sessions(closes, wait)
+            self._collect(closes, wait)
         log.info("Connection pool: all connections closed")
         if busy:
             raise NotAppliedError(f"{BUSY}: {len(busy)} session(s) left open, each closed when its "

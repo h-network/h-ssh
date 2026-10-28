@@ -1537,7 +1537,18 @@ async def main() -> int:
                     if resolved != raw:
                         print(f"Resolved '{raw}' -> '{resolved}' ({vendor})")
 
-    args.workers, fd_note = fit_workers_to_open_files(resolve_workers(args.workers))
+    # A job runs on the session pool: a device on a pooled transport keeps its
+    # session from one entry to the next, and those sessions count against
+    # the open-file limit beside the workers (#147).
+    pooled = 0
+    if job_entries:
+        per_box = {}
+        for t, _ in units:
+            if drivers.get(t.vendor).transport.pooled:
+                box = (t.host, resolve_target_port(t))
+                per_box[box] = per_box.get(box, 0) + 1
+        pooled = sum(1 for n in per_box.values() if n > 1)
+    args.workers, fd_note = fit_workers_to_open_files(resolve_workers(args.workers), pooled)
     if fd_note:
         print(f"WARNING: {fd_note}", file=sys.stderr)
 
@@ -1753,6 +1764,24 @@ async def main() -> int:
             return contextlib.nullcontext()
         return device_locks.setdefault((t.host, resolve_target_port(t)), asyncio.Lock())
 
+    # A job's device keeps its pooled session from one entry to the next,
+    # and no longer: after its last entry the session is closed, so a job
+    # through many routers holds none for the ones it is done with (#147).
+    last_entry = {}
+    if job_entries:
+        for i, (t, _) in enumerate(units):
+            if drivers.get(t.vendor).transport.pooled:
+                last_entry[(t.host, resolve_target_port(t))] = i
+    release_after = set(last_entry.values())
+
+    def _release_session(t) -> None:
+        release = getattr(drivers.module_of(drivers.get(t.vendor)), "release", None)
+        if callable(release):
+            try:
+                release(t.host, user, passwd, port=t.port)
+            except Exception:
+                pass        # the end of the run closes it all the same
+
     async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
                            started=None, seq=0, save=True, logs_in=True):
         async with _device_lock(t), sem:
@@ -1847,6 +1876,8 @@ async def main() -> int:
         else:
             result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark, save=save,
                                         logs_in=logs_in)
+        if i in release_after and pool.POOL.enabled:
+            await asyncio.to_thread(_release_session, t)
         if not isinstance(result, RunResult):
             # A stand-in runner that still returns the bare tuple: the error is
             # read from its text, as it always was.

@@ -449,6 +449,17 @@ def wait_for_closes(timeout: float = 1.0) -> int:
     return sum(1 for t in pending if t.is_alive())
 
 
+def release(host: str, user: str, passwd: Optional[str], port: Optional[int] = None) -> bool:
+    """Close the router's pooled session now, when the caller is done with
+    the router: a --job device after its last entry (#147), so that a run
+    through many routers holds no session for the ones it has finished.
+    True when one was closed. A call in flight on it is waited for; a
+    transaction another thread holds open on it, pool.BUSY_WAIT at most, and
+    then it is left to that transaction. With the pool off there is nothing
+    to close."""
+    return POOL.release(_pool_key(host, port, user, passwd))
+
+
 def _alive(dev, idle: float) -> bool:
     """Is a pooled session worth reusing? PyEZ only clears `connected` when it
     closed the session itself; one the router dropped without a FIN still

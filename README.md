@@ -1114,7 +1114,7 @@ reported, not retried, and after Ctrl-C it is a failure, not interrupted: lines 
 Retrying an authentication failure cannot succeed either, and on a fleet it spends three real login
 attempts per device against accounts that may lock out. Those stop at one.
 
-`--workers` defaults to 8; when the fleet is more than four waves of workers and `--workers` is under 64, the banner says so with a hint (`Hint: 250 devices at 8 workers is 32 waves; --workers 64 would be 4 (one session per router either way)`), since the workers spread over routers and each router still sees one session. It is honoured literally, up to 256, within the open-file limit: an in-flight NETCONF session costs about six descriptors, so the soft limit (`ulimit -n`) is raised towards the hard one when it is short, which needs no privilege, and only what is still short lowers the workers, with one warning naming the limit and the number run. The vendor calls block, so each in-flight device holds
+`--workers` defaults to 8; when the fleet is more than four waves of workers and `--workers` is under 64, the banner says so with a hint (`Hint: 250 devices at 8 workers is 32 waves; --workers 64 would be 4 (one session per router either way)`), since the workers spread over routers and each router still sees one session. It is honoured literally, up to 256, within the open-file limit: an in-flight NETCONF session costs about six descriptors, so the soft limit (`ulimit -n`) is raised towards the hard one when it is short, which needs no privilege, and only what is still short lowers the workers, with one warning naming the limit and the number run. A `--job` runs on the session pool, where a `junos` device keeps its session (about four descriptors) from one entry to the next and lets it go after its last entry: the sessions kept between entries are counted too, and when even the hard limit cannot hold them no worker is taken away and no router failed for it: the pool closes its least recently used idle session before it opens another (a later entry on that device logs in again), and the warning says how many it keeps. The vendor calls block, so each in-flight device holds
 a thread; h-ssh sizes the executor to `--workers` rather than leaving it at asyncio's default of
 `min(32, cpu+4)`, which on a 2-vCPU jump host is **6 threads no matter what you asked for** — and a
 device that does not answer holds one of those six through every attempt.
@@ -1279,8 +1279,10 @@ the pool's `HSSH_POOL_IDLE_TIMEOUT`, read when `hssh` is imported. What it does 
   tag when the round trip is above `slow_ms`, else None) and `duration_ms`; `to_dict()` is the CLI's
   `--probe --json` record. With `store=` it is kept as a run of mode `probe`, a row per box;
 - threads talk to the devices, `workers` at a time, lowered to what the open-file limit carries (the process's
-  soft `RLIMIT_NOFILE` is raised towards the hard one first, as the CLI does; a `RuntimeWarning` says when
-  fewer run); you iterate on your own thread and get one `DeviceResult` per device in the order they finish:
+  soft `RLIMIT_NOFILE` is raised towards the hard one first, as the CLI does, for them and for the session the
+  pool keeps for every `junos` device, about four descriptors each; a `RuntimeWarning` says when fewer run,
+  or how many of those sessions even the hard limit holds: the pool then closes its least recently used idle
+  session before it opens another, and a later call to that device opens it again); you iterate on your own thread and get one `DeviceResult` per device in the order they finish:
   `device`, `host`, `vendor`, `ok`, `output`, `error`, `duration_ms`, `ts`, `command`, and for a batch
   `commands` (one entry per command, in the batch's order); `result` is the driver's typed answer and `text`
   the runner's full report;
@@ -1302,7 +1304,7 @@ the pool's `HSSH_POOL_IDLE_TIMEOUT`, read when `hssh` is imported. What it does 
   raises `RuntimeError` (two runs would queue on the pool's per-router locks, and the time bound would then
   fail honest devices); a previous run whose devices have all returned is wrapped up first and stays readable;
 - on the `junos` (NETCONF) transport, one session per device, pooled for the Fleet's lifetime however
-  many commands you run; `ssh`, `openssh` and `telnet` have no pool and connect afresh for every
+  many commands you run, within the open-file limit (above); `ssh`, `openssh` and `telnet` have no pool and connect afresh for every
   `show()` or `batch()`. The pool is process-wide: the last Fleet to close turns it off only if a Fleet
   turned it on; a pool you enabled yourself is used and left on;
 - `close(wait=0)`, or leaving the `with` block, promises this much: devices not yet started are not started;
@@ -1524,7 +1526,7 @@ unlock that failed, an RPC timeout, the router closing it, or a `Transaction` dr
 `show_batch`, `rpc` and `rpc_batch` for a `show …` command or `get-*` RPC, every one of a batch) that
 finds its reused session dead opens a new one and runs once more; any other command (`request …`,
 `request-*`, …) and an edit never do —
-an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll), so size `ulimit -n` for the sessions you keep; what a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything, once the closes it started are done, since a close runs beside the work: `close_all()` and `reap()` wait up to a second for them (`wait=` to change it), the reaper's own thread, which nothing waits on, up to ten seconds. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
+an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; a device's session is closed after its last entry, and every one still open when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll): a Fleet and a `--job` raise the soft limit for the sessions they keep, and the pool keeps to the soft limit as it finds it, in your own script too. Before it opens a session past that, it collects what the sessions already closed have left, and then closes the least recently used idle session (counted under `reaped`; a later call to that router opens it again) rather than fail a healthy router with "Too many open files". What a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything, once the closes it started are done, since a close runs beside the work: `close_all()` and `reap()` wait up to a second for them (`wait=` to change it), the reaper's own thread, which nothing waits on, up to ten seconds. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
 
 ## Package structure
 
@@ -1537,7 +1539,7 @@ h-ssh/
 │   │   ├── cli.py           # argument parsing + orchestration
 │   │   ├── runner.py        # one device's run: the driver call, retries and their classification, the safety gate, the typed RunResult
 │   │   ├── fleet.py         # Fleet: show/batch across the fleet from a script, results as values, pooled sessions, the store
-│   │   ├── limits.py        # the worker and probe ceilings and the open-file limit both must fit under
+│   │   ├── limits.py        # the worker and probe ceilings and the open-file limit they and the pooled sessions must fit under
 │   │   ├── probe.py         # the probe: TCP connect and SSH banner per box, no login; the round trip from TCP_INFO
 │   │   ├── pool.py          # the NETCONF session pool: opt-in for the transports, on for a Fleet's lifetime and a --job run
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
@@ -1586,7 +1588,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1430 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1441 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

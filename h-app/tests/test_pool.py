@@ -1060,3 +1060,85 @@ def test_close_all_waits_for_an_open_transaction_at_most_busy_wait_then_says_so(
         hold.set()
         a.join(5)
     assert held.closed and pooled.live() == 0       # and that one once its transaction ended
+
+
+# --- #147: room under the open-file limit --------------------------------------------
+
+def test_the_least_recently_used_idle_session_is_closed_when_the_limit_holds_no_more(monkeypatch):
+    """With even the hard limit short of the sessions kept, the next open
+    failed with "Too many open files" for a healthy router. The least
+    recently used idle session is closed first now, and a later call to
+    that router opens it again."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    # FDS_BASE 32, one borrow in flight 6, two sessions open at 4: the third open fills it
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 32 + 6 + 2 * 4)
+    closed = []
+
+    def borrow(host):
+        with p.get_connection((host, 830, "u"), opener=lambda: host, closer=closed.append):
+            pass
+    try:
+        for host in ("r1", "r2", "r3"):
+            borrow(host)
+        assert closed == [] and p.live() == 3
+        borrow("r1")                                 # reused: r2 is now the least recently used
+        borrow("r4")
+        assert closed == ["r2"] and p.live() == 3 and p.stats["reaped"] == 1
+        borrow("r2")                                 # opened again, and r3 makes room for it
+        assert closed == ["r2", "r3"] and p.live() == 3
+        assert p.stats == {"opens": 5, "reuses": 1, "discards": 0, "reaped": 2}
+    finally:
+        p.disable()
+
+
+def test_closed_sessions_are_collected_before_an_idle_one_is_closed(monkeypatch):
+    """A closed session keeps a descriptor until the garbage collector runs
+    (#58), and a job that closes each device's session after its last entry
+    piles them up: near the limit they are collected first, and no session
+    a later call may want is closed for them."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 32 + 6 + 4 + 8)   # one kept, eight closed
+    collected, closed = [], []
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: collected.append(1))
+    try:
+        with p.get_connection(("keep", 830, "u"), opener=lambda: "keep", closer=closed.append):
+            pass
+        for i in range(10):
+            key = (f"r{i}", 830, "u")
+            with p.get_connection(key, opener=lambda i=i: f"r{i}", closer=closed.append):
+                pass
+            assert p.release(key) is True
+        assert len(collected) == 1 and p.stats["reaped"] == 0
+        assert "keep" not in closed and p.live() == 1
+    finally:
+        p.disable()
+
+
+def test_release_closes_the_routers_session_now(pooled):
+    """What a --job runs after a device's last entry (#147): the session
+    goes then, not at the end of the run."""
+    show()
+    assert netconf.release("10.0.0.1", "u", None) is True
+    assert devices()[0].closed and pooled.live() == 0
+    assert netconf.release("10.0.0.1", "u", None) is False          # nothing left to close
+    assert netconf.release("10.0.0.9", "u", None) is False          # never opened
+    show()
+    assert len(devices()) == 2                                       # a later call opens it again
+    hold, opened = threading.Event(), threading.Event()
+
+    def owner():
+        tx = tx_on()
+        opened.set()
+        hold.wait(10)
+        tx.abort()
+    a = threading.Thread(target=owner)
+    a.start()
+    try:
+        assert opened.wait(5)
+        assert pooled.release(KEY, wait=0.3) is False                # a transaction holds it: left to it
+        assert not devices()[1]._closed
+    finally:
+        hold.set()
+        a.join(5)
