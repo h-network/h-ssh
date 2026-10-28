@@ -67,6 +67,12 @@ class _RouterLock:
     asyncio.to_thread() opened it. An RLock stayed owned by the thread that
     took it, perhaps gone by then, and held the router for good (#147).
 
+    The holder is the Thread itself, not its ident: the system gives an
+    ident again to a thread started after its holder has ended, and a
+    transaction kept open past the thread that opened it (asyncio.to_thread
+    hands it back) let that later thread into its session as if it held it,
+    an edit there committing the open candidate with its own (#147).
+
     `count` is how many borrows the holder has open, nested ones included;
     `turns`, how many holders there have been. Nothing under `_mutex`
     allocates an object the garbage collector tracks, so no collection, and
@@ -77,14 +83,14 @@ class _RouterLock:
     def __init__(self):
         self._slot = threading.Lock()       # held while a borrow holds the router; any thread may let it go
         self._mutex = threading.Lock()      # owner, count and turns, read and written together
-        self.owner: Optional[int] = None
+        self.owner: Optional[threading.Thread] = None
         self.count = 0
         self.turns = 0
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
-        me = threading.get_ident()
+        me = threading.current_thread()
         with self._mutex:
-            if self.owner == me:
+            if self.owner is me:
                 self.count += 1
                 return True
         got = self._slot.acquire(True, timeout) if blocking else self._slot.acquire(False)
@@ -96,10 +102,10 @@ class _RouterLock:
 
     def release(self) -> None:
         """One of this thread's holds given back."""
-        me = threading.get_ident()
+        me = threading.current_thread()
         mine = free = False
         with self._mutex:
-            if self.owner == me and self.count > 0:
+            if self.owner is me and self.count > 0:
                 mine = True
                 self.count -= 1
                 if self.count == 0:
@@ -109,17 +115,17 @@ class _RouterLock:
         if free:
             self._slot.release()
 
-    def last(self, owner: int) -> bool:
+    def last(self, owner: threading.Thread) -> bool:
         """The end of a borrow taken on thread `owner`, here or on another
         thread. True when it was the holder's only borrow: the hold is now
         this thread's, to end with release() once the session's fate is
         settled. False when the holder has others open (an outer borrow, or
         a nested one): this borrow's share is given back, and the last of
         them settles the session."""
-        me = threading.get_ident()
+        me = threading.current_thread()
         held = alone = False
         with self._mutex:
-            if self.owner == owner and self.count > 0:
+            if self.owner is owner and self.count > 0:
                 held = True
                 if self.count == 1:
                     self.owner, alone = me, True
@@ -164,6 +170,15 @@ class Lease:
         if self._entry is not None:
             self._open = True
             self._entry["open"].add(id(self))
+
+    @property
+    def inside_open(self) -> bool:
+        """True when this borrow is nested in one that holds the session
+        open on this thread (hold_open(): a Transaction begin() handed back,
+        not yet committed or aborted). A read may ride it; a change made on
+        it would lock it again and commit that transaction's candidate with
+        its own (#147)."""
+        return bool(self._entry is not None and self._entry["open"] and not self._open)
 
     @property
     def doomed(self) -> bool:
@@ -323,7 +338,7 @@ class ConnectionPool:
 
         entry = self._get_or_create_entry(key)
         self._take(entry, wait if wait is not None else BUSY_WAIT if timeout is None else timeout)
-        owner = threading.get_ident()
+        owner = threading.current_thread()
         nested = entry["lock"].count > 1     # re-entrant: >1 means a call nested in an open borrow
         if not nested:
             self._fly(entry, True)
@@ -403,7 +418,7 @@ class ConnectionPool:
             if lock.acquire(timeout=step):
                 return
 
-    def _end(self, entry: dict, owner: int) -> None:
+    def _end(self, entry: dict, owner: threading.Thread) -> None:
         """A borrow taken on thread `owner` is over: on that thread, or
         abandoned and ended on this one for it. Only the holder's last
         borrow decides the session's fate: a nested call that found it dead

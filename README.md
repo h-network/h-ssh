@@ -1473,9 +1473,15 @@ sessions and then raises the same. A `Transaction` dropped without `commit()` or
 or wherever the garbage collector frees it, closes its session instead of returning it to the pool, so the
 router lets go of the lock and the candidate with it, where the next edit reused that session and committed
 the abandoned change with its own, and one freed on another thread kept every later call to that router
-waiting for good. Either way the thread holding it may keep using it, and only that thread can commit or
-abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that landed elsewhere) is
-refused before anything is sent, because the session's lock belongs to the thread that opened it.
+waiting for good. Either way the thread holding it may keep reading on it, but a change it asks for there —
+`edit()`, `rollback()`, `confirm()`, another `begin()` or `guarded_commit()` — raises `NotAppliedError: this
+thread holds a transaction open on this session: commit() or abort() it first, ...` with nothing sent, where
+it locked that session again and committed the transaction's candidate with its own (an `asyncio.to_thread`
+that landed on the thread holding one, a fallback edit in the `except` block of code that left one open). Only
+that thread can commit or abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that
+landed elsewhere) is refused before anything is sent, because the session's lock belongs to the thread that
+opened it — the thread itself, not its ident, which the system gives again to a thread started once that one
+has ended.
 
 ### Structured output from a script
 
@@ -1589,7 +1595,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1452 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1455 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

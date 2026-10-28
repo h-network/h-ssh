@@ -743,9 +743,12 @@ class Transaction:
     commit() aborts.
 
     The pooled session stays borrowed while the transaction is open: this
-    thread may keep using it; other threads wanting this router wait for it
-    up to their command timeout, then NotAppliedError ('router busy: a
-    transaction is open on this session'), nothing sent. A Transaction
+    thread may keep reading on it (show(), rpc() of a read), but a change it
+    asks for there (edit(), rollback(), confirm(), begin()) is refused,
+    NotAppliedError and nothing sent, since it would commit this candidate
+    with its own; other threads wanting this router wait for it up to their
+    command timeout, then NotAppliedError ('router busy: a transaction is
+    open on this session'), nothing sent. A Transaction
     dropped without commit() or abort(), here or wherever the garbage
     collector frees it, closes its session instead of returning it to the
     pool: the router lets go of the lock and the candidate with it, and the
@@ -760,9 +763,10 @@ class Transaction:
         self.label = label
         self._timeout = command_timeout
         self.open = True
-        # The pool's per-router lock is re-entrant and owned by this thread;
-        # only this thread can hand the session back.
-        self._owner = threading.get_ident()
+        # The pool's per-router lock is re-entrant and owned by this thread,
+        # the Thread itself, whose ident a later thread can be given (#147):
+        # only this thread finishes the transaction.
+        self._owner = threading.current_thread()
 
     @property
     def dev(self):
@@ -844,14 +848,14 @@ class Transaction:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self.open and threading.get_ident() == self._owner:
+        if self.open and threading.current_thread() is self._owner:
             self.abort()
         return False
 
     def _require_open(self) -> None:
         if not self.open:
             raise RuntimeError("transaction is no longer open")
-        if threading.get_ident() != self._owner:
+        if threading.current_thread() is not self._owner:
             # A commit from here would land on the device and then fail to
             # release the owner's lock, with the slot wedged for every other
             # caller. Refuse before any RPC: nothing is sent.
@@ -861,7 +865,7 @@ class Transaction:
     def _finish(self, rollback: bool, unlock: bool) -> None:
         if not self.open:
             return
-        if threading.get_ident() != self._owner:
+        if threading.current_thread() is not self._owner:
             raise RuntimeError("transaction must be used and finished on the thread that opened it; "
                                "nothing was sent to the device")
         self.open = False
@@ -877,19 +881,32 @@ class Transaction:
             self._cm.__exit__(None, None, None)
 
 
+# A change asked for on the thread that holds a transaction open on the
+# router's session, which the change would borrow too: an asyncio.to_thread()
+# that lands on the thread holding one, or a fallback edit in the except
+# block of the code that left one open. It locked that session again and
+# committed the transaction's candidate with its own (#147). A read still
+# rides the session.
+_NESTED = ("this thread holds a transaction open on this session: commit() or abort() it first, or its "
+           "candidate goes in with this change; nothing was sent")
+
+
 def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
            command_timeout: int, port: Optional[int], stage, label: str,
            connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> Transaction:
     """lock -> stage(cu) -> diff -> commit_check, left open as a Transaction.
     `stage` puts the change into the candidate: a load for edit(), a rollback
     for rollback(). Raises NotAppliedError for failures before anything could
-    change on the device and RuntimeError for rejected config; on any failure
-    the candidate is discarded and the lock released."""
+    change on the device, and on the thread that holds a transaction open on
+    the router's session (_NESTED), and RuntimeError for rejected config; on
+    any failure the candidate is discarded and the lock released."""
     cm = _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout)
     lease = cm.__enter__()
     cu = None
     locked = False
     try:
+        if lease.inside_open:
+            raise NotAppliedError(_NESTED)
         cu = JunosConfig(lease.dev)
         _lock(cu, lease)
         locked = True
@@ -1085,8 +1102,12 @@ def _confirm(host: str, user: str, passwd: Optional[str], session_timeout: int, 
     and the confirmation, as one could after a read made before the lock.
     The lock does not hold off the device's own rollback when the timer
     runs out: that can still land in between, and the confirmation then
-    reads COMMIT CONFIRMED OK for a change the device has rolled back."""
+    reads COMMIT CONFIRMED OK for a change the device has rolled back. On
+    the thread that holds a transaction open on the router's session it is
+    refused before anything is sent (_NESTED)."""
     with _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout) as lease:
+        if lease.inside_open:
+            raise NotAppliedError(_NESTED)
         # A plain commit with nothing waiting is not a confirmation: the
         # timer expired (the change is gone) or someone confirmed before.
         # Either way the operator must know; a commit would only hide it.

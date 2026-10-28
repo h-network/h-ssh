@@ -981,6 +981,109 @@ def test_an_abandoned_transaction_inside_an_open_borrow_leaves_the_session_to_it
     assert devices()[0].closed and pooled.live() == 0
 
 
+def test_a_change_nested_in_an_open_transaction_is_refused_and_sends_nothing(pooled):
+    """A change on the thread that holds a transaction open went into the
+    router's lock again, locked the transaction's session once more and
+    committed its candidate with its own: the abandoned change going in with
+    the next one, from the except block of code that raised before commit()
+    or abort(), where the traceback still holds the transaction. Refused
+    now, nothing sent; a read still rides the session."""
+    tx = tx_on()
+    changes = {
+        "edit": edit,
+        "rollback": lambda: netconf.rollback("10.0.0.1", "u", None, 1, 5, 30),
+        "confirm": lambda: netconf.confirm("10.0.0.1", "u", None, 5, 30),
+        "begin": tx_on,
+    }
+    try:
+        for name, change in changes.items():
+            with pytest.raises(NotAppliedError) as refused:
+                change()
+            assert str(refused.value) == ("this thread holds a transaction open on this session: commit() or abort() "
+                                          "it first, or its candidate goes in with this change; nothing was sent"), name
+        assert len(FakeConfig.instances) == 1 and cfg().names == ["lock", "load", "diff", "commit_check"]
+        assert show() == "output of show version"    # a read rides it
+        assert tx.commit().startswith("COMMIT OK")   # the transaction is still the caller's to finish
+    finally:
+        if tx.open:
+            tx.abort()
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+    assert edit().startswith("COMMIT OK") and len(devices()) == 1 and pooled.live() == 1
+
+
+def test_an_edit_that_lands_on_the_thread_holding_an_open_transaction_is_refused(pooled):
+    """asyncio.to_thread() runs each call on one of the executor's threads:
+    an edit() made while a transaction opened that way was still open landed
+    on the thread holding it, rode its session and committed the open
+    candidate with its own change."""
+    import asyncio
+    import concurrent.futures
+
+    async def main():
+        asyncio.get_running_loop().set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        tx = await asyncio.to_thread(tx_on)
+        try:
+            await asyncio.to_thread(edit, "set system host-name other\n")
+        except NotAppliedError as e:
+            return e
+        finally:
+            await asyncio.to_thread(tx.abort)
+    refused = asyncio.run(main())
+    assert isinstance(refused, NotAppliedError) and str(refused).endswith("nothing was sent"), refused
+    assert len(FakeConfig.instances) == 1
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "rollback", "unlock"]   # the abort, no commit
+
+
+def test_a_thread_given_the_ident_of_a_transactions_ended_thread_does_not_ride_its_session(pooled):
+    """The router's lock and the transaction knew their thread by its ident,
+    which the system gives again to a thread started once that one has
+    ended: a transaction opened on a thread that has ended (asyncio.to_thread
+    hands it back) let such a later thread into its session as if it held
+    it, to read, edit, or commit it. That thread waits for it as any other
+    thread does now, and cannot finish it."""
+    opened = []
+
+    def opener():
+        opened.append((threading.get_ident(), tx_on()))
+    t = threading.Thread(target=opener)
+    t.start()
+    t.join(5)
+    ident, tx = opened.pop()
+    held, out = [tx], []
+    del tx
+
+    def attempt(fn):
+        try:
+            return ("done", fn())
+        except Exception as e:                       # its text: a traceback would keep the transaction alive
+            return ("raised", type(e).__name__, str(e))
+
+    def later():
+        if threading.get_ident() != ident:
+            return
+        t0 = time.monotonic()
+        out.append(attempt(lambda: show(timeout=1)))
+        out.append(time.monotonic() - t0)
+        out.append(attempt(held[0].commit))
+    try:
+        for _ in range(200):                         # an ended thread's ident is handed out again, and soon
+            u = threading.Thread(target=later)
+            u.start()
+            u.join(10)
+            if out:
+                break
+        else:
+            pytest.skip("no thread was given that ident again")
+        waited_for, waited, finished = out
+        assert waited_for == ("raised", "NotAppliedError", "router busy: a transaction is open on this session")
+        assert 0.9 <= waited < 2.5, f"{waited:.2f}s"
+        assert finished[:2] == ("raised", "RuntimeError") and "thread that opened it" in finished[2], finished
+        assert devices()[0].cli_calls == [] and cfg().names == ["lock", "load", "diff", "commit_check"]
+    finally:
+        held.clear()                                 # dropped: its session closes, the router is free
+    assert devices()[0].closed and in_thread(show, 5) == ("done", "output of show version")
+
+
 def test_a_borrower_behind_an_open_transaction_gives_up_after_its_command_timeout(pooled):
     """show() from another thread behind an open Transaction waited with no
     end: while the transaction stayed open, and for good once it was
