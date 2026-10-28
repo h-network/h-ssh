@@ -1,5 +1,6 @@
 """Session pool: reuse, isolation per router, discard on failure, reaping,
 and the junos driver's behaviour on a pooled session."""
+import atexit
 import gc
 import os
 import subprocess
@@ -1328,3 +1329,80 @@ def test_release_closes_the_routers_session_now(pooled):
     finally:
         hold.set()
         a.join(5)
+
+
+# --- #147: a collection that starts inside the pool's own locks ------------------------
+
+class CollectOnExit:
+    """A lock that runs a collection in its exit before it lets go, as 3.10
+    and 3.11 can: the `with` exit builds a tuple to call the lock's
+    __exit__, and that allocation can start one."""
+
+    def __init__(self, lock):
+        self._lock = lock
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        gc.collect()
+        return self._lock.__exit__(*exc)
+
+
+@pytest.fixture
+def own_pool(monkeypatch):
+    """netconf on a pool of the test's own, and the collector off until the
+    test runs one: a pool the test leaves hung is not the one every later
+    test uses, and the exit does not wait on it."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    atexit.unregister(p.close_all)
+    p.enable()
+    monkeypatch.setattr(netconf, "POOL", p)
+    gc.disable()
+    yield p
+    gc.enable()
+
+
+def test_a_collection_inside_the_routers_lock_ends_an_abandoned_borrow_there(own_pool):
+    """A collection that freed an abandoned transaction while a thread
+    looking at that router held the router's lock (its exit, on 3.10 and
+    3.11) ended the transaction's borrow on that thread, which took the
+    same lock again: a plain Lock hung the thread there, and the router for
+    good."""
+    holder = {}
+
+    def open_one():
+        cycle = [tx_on()]
+        cycle.append(cycle)                          # only the collector frees it
+        holder["cycle"] = cycle
+    t = threading.Thread(target=open_one)
+    t.start()
+    t.join(5)
+    holder.clear()
+    lock = own_pool._connections[KEY]["lock"]
+    lock._mutex = CollectOnExit(lock._mutex)
+    how = in_thread(show, 5)                         # looks at the router: the collection runs in there
+    try:
+        assert how == ("done", "output of show version"), how
+        assert devices()[0].closed and len(devices()) == 2 and own_pool.live() == 1
+    finally:
+        if how[0] != "still waiting":
+            own_pool.disable()
+
+
+def test_a_collection_inside_the_counters_lock_ends_an_abandoned_borrow_there(own_pool):
+    """The same inside the lock of the pool's counters, which every borrow
+    takes: the abandoned borrow counted its end under it, on the same
+    thread, and a plain Lock hung that thread and every borrow in the pool
+    behind it."""
+    cycle = [tx_on()]
+    cycle.append(cycle)
+    del cycle                                        # dropped without commit or abort; only the collector frees it
+    own_pool._stats_lock = CollectOnExit(own_pool._stats_lock)
+    how = in_thread(lambda: show(host="10.0.0.2"), 5)    # another router: its borrow counts itself
+    try:
+        assert how == ("done", "output of show version"), how
+        assert devices()[0].closed and own_pool.live() == 1
+    finally:
+        if how[0] != "still waiting":
+            own_pool.disable()

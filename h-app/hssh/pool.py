@@ -74,15 +74,19 @@ class _RouterLock:
     an edit there committing the open candidate with its own (#147).
 
     `count` is how many borrows the holder has open, nested ones included;
-    `turns`, how many holders there have been. Nothing under `_mutex`
-    allocates an object the garbage collector tracks, so no collection, and
-    no abandoned borrow it ends, can start inside it on the same thread."""
+    `turns`, how many holders there have been, both under `_mutex`. That
+    one is re-entrant: a collection can start while a thread holds it (on
+    3.10 and 3.11 in the tuple the `with` exit builds to call the lock's
+    __exit__, before the lock is let go), and an abandoned borrow of this
+    router that it frees ends on that thread and takes `_mutex` again. A
+    plain Lock hung that thread there, and the router with it. No section
+    calls anything, so each has made its changes by then."""
 
     __slots__ = ("_slot", "_mutex", "owner", "count", "turns")
 
     def __init__(self):
         self._slot = threading.Lock()       # held while a borrow holds the router; any thread may let it go
-        self._mutex = threading.Lock()      # owner, count and turns, read and written together
+        self._mutex = threading.RLock()     # owner, count and turns, read and written together
         self.owner: Optional[threading.Thread] = None
         self.count = 0
         self.turns = 0
@@ -200,10 +204,14 @@ class ConnectionPool:
     def __init__(self, idle_timeout: Optional[float] = None):
         self._connections: Dict[Hashable, dict] = {}
         self._pool_lock = threading.Lock()
-        # The counters have a lock of their own, under which nothing is
-        # allocated: an abandoned borrow ends wherever the collector frees
-        # it, and on a thread inside _pool_lock that lock would hang it.
-        self._stats_lock = threading.Lock()
+        # The counters have a lock of their own: an abandoned borrow ends
+        # wherever the collector frees it, and on a thread inside _pool_lock
+        # that lock would hang it. Re-entrant, since that can be a thread
+        # inside this one too (a collection can start in the `with` exit, as
+        # for _RouterLock's), where a plain Lock hung the thread and every
+        # borrow in the pool behind it. No section calls anything, so each
+        # has made its changes by then.
+        self._stats_lock = threading.RLock()
         # What the open-file limit is kept to (#147): the borrows in flight
         # (a worker's descriptors each, its session's among them), the
         # sessions open with no borrow in flight on them, the sessions closed
@@ -527,8 +535,9 @@ class ConnectionPool:
         _release_closed_sessions(pending if closes is None else closes, wait)
         running = [t for t in pending if t.is_alive()]
         self._closing.extend(running)
+        left = len(running)         # not under the lock: on 3.12 a collection can start at a call
         with self._stats_lock:
-            self._uncollected = len(running)
+            self._uncollected = left
 
     def _descriptors(self) -> int:
         """The descriptors the pool's sessions hold, counted as hssh.limits
