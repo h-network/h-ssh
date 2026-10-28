@@ -386,7 +386,9 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
 
 
 _CLOSES: "set[threading.Thread]" = set()
-_CLOSES_LOCK = threading.Lock()
+# Re-entrant: a session whose borrow was abandoned (#147) is closed wherever
+# the garbage collector frees it, perhaps on a thread inside this lock.
+_CLOSES_LOCK = threading.RLock()
 
 
 def _close(dev) -> Optional[threading.Thread]:
@@ -672,8 +674,14 @@ class Transaction:
     the same session — before deciding. Leaving a `with` block without
     commit() aborts.
 
-    The pooled session stays borrowed while the transaction is open: other
-    threads wanting this router wait, this thread may keep using it.
+    The pooled session stays borrowed while the transaction is open: this
+    thread may keep using it; other threads wanting this router wait for it
+    up to their command timeout, then NotAppliedError ('router busy: a
+    transaction is open on this session'), nothing sent. A Transaction
+    dropped without commit() or abort(), here or wherever the garbage
+    collector frees it, closes its session instead of returning it to the
+    pool: the router lets go of the lock and the candidate with it, and the
+    next call opens a fresh session (#147).
     """
 
     def __init__(self, cm, lease, cu, diff: str, label: str, command_timeout: int):
@@ -824,7 +832,11 @@ def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
                 cu.commit_check(timeout=command_timeout)
         except (ConfigLoadError, CommitError) as e:
             raise RuntimeError(f"Config error: {e}") from e
-        return Transaction(cm, lease, cu, diff, label, command_timeout)
+        tx = Transaction(cm, lease, cu, diff, label, command_timeout)
+        # Held open from here for as long as the caller decides: another
+        # thread wanting this router waits for it only so long (#147).
+        lease.hold_open()
+        return tx
     except BaseException as e:
         if isinstance(e, Exception) and (_session_lost(e) or _timed_out(e)):
             lease.discard()

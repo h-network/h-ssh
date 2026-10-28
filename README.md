@@ -1461,10 +1461,18 @@ their error under `check_error`, because a `rollback 1` at that point would re-a
 failed its checks. The lock does not hold off the device's own rollback when the timer runs out, though:
 checks that end in the timer's last moments can have it land between the look and the confirmation, which
 then answers `confirmed` for a change the device has rolled back, so keep `check()` well inside `minutes`.
-With the pool on, a session with an open transaction stays borrowed and other threads wait for it. Either
-way the thread holding it may keep using it, and only that thread can commit or abort it: a `Transaction`
-finished from another thread (an `asyncio.to_thread` that landed elsewhere) is refused before anything is
-sent, because the session's lock belongs to the thread that opened it.
+With the pool on, a session with an open transaction stays borrowed. A call from another thread that wants
+the router waits for it at most its command timeout, then raises `NotAppliedError: router busy: a
+transaction is open on this session` with nothing sent (a call in flight there is waited for to its end,
+which its own timeouts bound), and `pool.close_all(shutdown=False)` waits for it at most `busy_wait=` seconds
+(60 by default), closes the other sessions and then raises the same. A `Transaction` dropped without
+`commit()` or `abort()`, on its own thread or wherever the garbage collector frees it, closes its session
+instead of returning it to the pool, so the router lets go of the lock and the candidate with it, where the
+next edit reused that session and committed the abandoned change with its own, and one freed on another
+thread kept every later call to that router waiting for good. Either way the thread holding it may keep
+using it, and only that thread can commit or abort it: a `Transaction` finished from another thread (an
+`asyncio.to_thread` that landed elsewhere) is refused before anything is sent, because the session's lock
+belongs to the thread that opened it.
 
 ### Structured output from a script
 
@@ -1508,9 +1516,11 @@ pool.close_all()                  # also runs at interpreter exit
 
 One session per `(host, port, user, credential)` — a digest of the password is part of the key, so a
 call with a different or wrong password never rides a session another credential opened. Calls against
-the same router from several threads queue on that session; different routers run in parallel as before. A session is dropped, never handed to
+the same router from several threads queue on that session (behind an open transaction, for their command
+timeout at most); different routers run in parallel as before. A session is dropped, never handed to
 the next caller, when something left it in doubt: a commit whose outcome is unknown, a rollback or
-unlock that failed, an RPC timeout, or the router closing it. A read (`show_structured`, and `show`,
+unlock that failed, an RPC timeout, the router closing it, or a `Transaction` dropped without `commit()` or
+`abort()`. A read (`show_structured`, and `show`,
 `show_batch`, `rpc` and `rpc_batch` for a `show …` command or `get-*` RPC, every one of a batch) that
 finds its reused session dead opens a new one and runs once more; any other command (`request …`,
 `request-*`, …) and an edit never do —
@@ -1576,7 +1586,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1423 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1430 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

@@ -14,7 +14,10 @@ What a library needs on top, and only that:
   knows the session is in doubt (ambiguous commit, failed unlock, ...)
 - an optional liveness check before a reused session is handed out
 - a re-entrant per-router lock, so a thread holding an open transaction
-  can keep using the same session through the pool
+  can keep using the same session through the pool; another thread waits
+  for a transaction held open there at most its command timeout, and a
+  borrow nobody gives back (a Transaction dropped without commit or abort)
+  closes its session instead of pooling it (#147)
 - entries are keyed by whatever the driver passes (host, port, user), the
   driver supplies the opener/closer, so the pool knows no vendor
 
@@ -33,12 +36,97 @@ import time
 from contextlib import contextmanager
 from typing import Callable, Dict, Hashable, Optional
 
+from .errors import NotAppliedError
+
 log = logging.getLogger("hssh.pool")
 
 DEFAULT_IDLE_TIMEOUT = 300
 CLEANUP_INTERVAL = 60
 CLOSE_WAIT = 1.0        # how long close_all() and reap() wait for the closes they started, in all
 REAPER_CLOSE_WAIT = 10.0   # the same for the cleanup thread, which nobody waits on
+# How long a borrower given no command timeout, and close_all(shutdown=False),
+# wait for a router whose session a transaction holds open on another thread.
+BUSY_WAIT = 60.0
+BUSY = "router busy: a transaction is open on this session"
+_POLL = 0.25            # how often a waiter looks again whether a transaction holds the router
+
+
+class _RouterLock:
+    """The per-router lock. Re-entrant for the thread that holds it, as an
+    RLock is: a thread with an open transaction keeps using its session
+    through the pool. Unlike an RLock, a borrow can be ended on another
+    thread for the thread that took it, which is how an abandoned borrow
+    ends: a Transaction the garbage collector frees on whatever thread it
+    runs on, or one dropped on the event loop's thread after
+    asyncio.to_thread() opened it. An RLock stayed owned by the thread that
+    took it, perhaps gone by then, and held the router for good (#147).
+
+    `count` is how many borrows the holder has open, nested ones included;
+    `turns`, how many holders there have been. Nothing under `_mutex`
+    allocates an object the garbage collector tracks, so no collection, and
+    no abandoned borrow it ends, can start inside it on the same thread."""
+
+    __slots__ = ("_slot", "_mutex", "owner", "count", "turns")
+
+    def __init__(self):
+        self._slot = threading.Lock()       # held while a borrow holds the router; any thread may let it go
+        self._mutex = threading.Lock()      # owner, count and turns, read and written together
+        self.owner: Optional[int] = None
+        self.count = 0
+        self.turns = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        me = threading.get_ident()
+        with self._mutex:
+            if self.owner == me:
+                self.count += 1
+                return True
+        got = self._slot.acquire(True, timeout) if blocking else self._slot.acquire(False)
+        if got:
+            with self._mutex:
+                self.owner, self.count = me, 1
+                self.turns += 1
+        return got
+
+    def release(self) -> None:
+        """One of this thread's holds given back."""
+        me = threading.get_ident()
+        mine = free = False
+        with self._mutex:
+            if self.owner == me and self.count > 0:
+                mine = True
+                self.count -= 1
+                if self.count == 0:
+                    self.owner, free = None, True
+        if not mine:
+            raise RuntimeError("cannot release un-acquired lock")
+        if free:
+            self._slot.release()
+
+    def last(self, owner: int) -> bool:
+        """The end of a borrow taken on thread `owner`, here or on another
+        thread. True when it was the holder's only borrow: the hold is now
+        this thread's, to end with release() once the session's fate is
+        settled. False when the holder has others open (an outer borrow, or
+        a nested one): this borrow's share is given back, and the last of
+        them settles the session."""
+        me = threading.get_ident()
+        held = alone = False
+        with self._mutex:
+            if self.owner == owner and self.count > 0:
+                held = True
+                if self.count == 1:
+                    self.owner, alone = me, True
+                else:
+                    self.count -= 1
+        if not held:
+            raise RuntimeError("the borrow does not hold this router")
+        return alone
+
+    __enter__ = acquire
+
+    def __exit__(self, *exc) -> None:
+        self.release()
 
 
 class Lease:
@@ -47,16 +135,28 @@ class Lease:
     borrow returns it — not before, so a call nested inside an open
     transaction cannot pull the session out from under it."""
 
-    __slots__ = ("dev", "reused", "discarded", "_entry")
+    __slots__ = ("dev", "reused", "discarded", "_entry", "_open")
 
     def __init__(self, dev, reused: bool, entry: Optional[dict] = None):
         self.dev = dev
         self.reused = reused
         self.discarded = False
         self._entry = entry
+        self._open = False
 
     def discard(self) -> None:
         self.discarded = True
+
+    def hold_open(self) -> None:
+        """The session stays borrowed past this call, for as long as the
+        caller decides: a Transaction, until its commit() or abort(). Another
+        thread that wants the router waits for a call in flight to its end,
+        which the call's own timeouts bound, but for a session held open
+        only its wait (get_connection), and is then refused: NotAppliedError,
+        router busy, nothing sent (#147)."""
+        if self._entry is not None:
+            self._open = True
+            self._entry["open"].add(id(self))
 
     @property
     def doomed(self) -> bool:
@@ -78,6 +178,10 @@ class ConnectionPool:
     def __init__(self, idle_timeout: Optional[float] = None):
         self._connections: Dict[Hashable, dict] = {}
         self._pool_lock = threading.Lock()
+        # The counters have a lock of their own, under which nothing is
+        # allocated: an abandoned borrow ends wherever the collector frees
+        # it, and on a thread inside _pool_lock that lock would hang it.
+        self._stats_lock = threading.Lock()
         if idle_timeout is None:
             self._idle_timeout = DEFAULT_IDLE_TIMEOUT
             env_val = os.getenv("HSSH_POOL_IDLE_TIMEOUT")
@@ -153,7 +257,8 @@ class ConnectionPool:
 
     @contextmanager
     def get_connection(self, key: Hashable, opener: Callable, closer: Callable,
-                       timeout: Optional[float] = None, alive: Optional[Callable] = None):
+                       timeout: Optional[float] = None, alive: Optional[Callable] = None,
+                       wait: Optional[float] = None):
         """Get a pooled device session. Creates or reuses as needed.
 
         Args:
@@ -168,6 +273,12 @@ class ConnectionPool:
             timeout: Command timeout to set on the device for this borrow
             alive: alive(dev, idle_seconds) asked before a session is reused;
                 False or an exception means it is closed and a new one opened
+            wait: how long to wait for the router while another thread holds
+                its session open (Lease.hold_open(): a Transaction not yet
+                committed or aborted): `timeout` when None, else BUSY_WAIT.
+                Then NotAppliedError('router busy: a transaction is open on
+                this session'), and nothing was sent. A call in flight there
+                is waited for to its end, which its own timeouts bound.
 
         Yields:
             A Lease: .dev is the open session, .reused says whether it came
@@ -175,7 +286,12 @@ class ConnectionPool:
 
         Note:
             The per-router lock serializes same-router work: other threads
-            wanting this router wait, the thread holding it may re-enter.
+            wanting this router wait, the thread holding it may re-enter. A
+            borrow nobody gives back, because what held it was dropped (a
+            Transaction left without commit() or abort(), freed on its own
+            thread or another), ends as a discarded one: its session is
+            closed, never pooled, so the device lets go of the configuration
+            lock and the candidate with it, and the router is free (#147).
         """
         if not self._enabled:
             dev = opener()
@@ -188,10 +304,11 @@ class ConnectionPool:
             return
 
         entry = self._get_or_create_entry(key)
-        entry["lock"].acquire()
-        entry["depth"] += 1          # re-entrant: >1 means a call nested in an open borrow
-        nested = entry["depth"] > 1
+        self._take(entry, wait if wait is not None else BUSY_WAIT if timeout is None else timeout)
+        owner = threading.get_ident()
+        nested = entry["lock"].count > 1     # re-entrant: >1 means a call nested in an open borrow
         lease = None
+        abandoned = False
         try:
             device = entry["device"]
             reused = device is not None
@@ -213,6 +330,15 @@ class ConnectionPool:
                 device.timeout = timeout
             lease = Lease(device, reused, entry)
             yield lease
+        except GeneratorExit:
+            # Nobody gave this borrow back: what held it was dropped, here or
+            # on the thread the garbage collector ran on. Its session may
+            # hold the device's configuration lock and a loaded candidate (a
+            # Transaction left without commit() or abort()), and the next
+            # edit would have committed that candidate with its own: it is
+            # closed instead of pooled, and the device lets go of both.
+            abandoned = True
+            raise
         except Exception:
             # Invalidate the pooled connection if the transport dropped; the
             # driver signals the other cases (an RPC that timed out, a commit
@@ -222,33 +348,68 @@ class ConnectionPool:
                 entry["doomed"] = True
             raise
         finally:
-            if lease is not None and lease.discarded:
+            if abandoned or (lease is not None and lease.discarded):
                 entry["doomed"] = True
-            entry["depth"] -= 1
-            # Only the outermost borrow closes: a nested call that found the
-            # session dead has marked it, and the holder of the outer borrow
-            # (a Transaction) still needs to finish on its own terms.
-            if entry["depth"] == 0:
-                if entry["device"] is not None and (
-                    entry["doomed"] or not self._enabled or entry["generation"] != self._generation
-                ):
-                    self._drop(entry, "discards")
-                entry["doomed"] = False
-            # Refresh last_used on every borrow — success OR failure. Otherwise a
-            # connection whose operation raised while still connected keeps
-            # last_used at 0.0, and the idle-cleanup loop (which requires
-            # last_used > 0) would never reap it.
-            entry["last_used"] = time.time()
-            try:
-                entry["lock"].release()
-            except RuntimeError:
-                # Released from a thread that does not own the RLock: the
-                # owner still holds it. Say so instead of hiding a sent
-                # commit behind a lock error.
-                log.error("Pool: borrow of %s returned from a thread that did not take it", key)
+            if lease is not None and lease._open:
+                entry["open"].discard(id(lease))
+            self._end(entry, owner)
 
     # kept for callers written against the first h-ssh pool
     lease = get_connection
+
+    def _take(self, entry: dict, wait: float) -> None:
+        """The router's lock, for this thread; a thread that holds it already
+        re-enters at once. A borrow in flight on another thread is waited for
+        to its end, which its own timeouts bound. A session a transaction
+        holds open there is waited for at most `wait` seconds of that
+        holder's turn, then NotAppliedError: nothing was sent (#147)."""
+        lock = entry["lock"]
+        if lock.acquire(blocking=False):
+            return
+        turn = since = None
+        while True:
+            if entry["open"]:
+                now = time.monotonic()
+                if since is None or turn != lock.turns:
+                    turn, since = lock.turns, now
+                left = since + wait - now
+                if left <= 0:
+                    raise NotAppliedError(BUSY)
+                step = min(left, _POLL)
+            else:
+                turn = since = None
+                step = _POLL
+            if lock.acquire(timeout=step):
+                return
+
+    def _end(self, entry: dict, owner: int) -> None:
+        """A borrow taken on thread `owner` is over: on that thread, or
+        abandoned and ended on this one for it. Only the holder's last
+        borrow decides the session's fate: a nested call that found it dead
+        has marked it, and the holder of the outer borrow (a Transaction)
+        still needs to finish on its own terms."""
+        lock = entry["lock"]
+        try:
+            last = lock.last(owner)
+        except RuntimeError as e:
+            log.debug("Pool: %s", e)
+            return
+        # Refresh last_used on every borrow — success OR failure. Otherwise a
+        # connection whose operation raised while still connected keeps
+        # last_used at 0.0, and the idle-cleanup loop (which requires
+        # last_used > 0) would never reap it.
+        if not last:
+            entry["last_used"] = time.time()
+            return
+        try:
+            if entry["device"] is not None and (
+                entry["doomed"] or not self._enabled or entry["generation"] != self._generation
+            ):
+                self._drop(entry, "discards")
+            entry["doomed"] = False
+            entry["last_used"] = time.time()
+        finally:
+            lock.release()
 
     def _get_or_create_entry(self, key: Hashable) -> dict:
         with self._pool_lock:
@@ -256,11 +417,11 @@ class ConnectionPool:
                 self._connections[key] = {
                     "device": None,
                     "closer": None,
-                    "lock": threading.RLock(),
+                    "lock": _RouterLock(),
                     "last_used": 0.0,
                     "generation": 0,
-                    "depth": 0,
                     "doomed": False,
+                    "open": set(),      # the leases holding the session open (Lease.hold_open)
                 }
             return self._connections[key]
 
@@ -290,7 +451,7 @@ class ConnectionPool:
             return None
 
     def _count(self, name: str) -> None:
-        with self._pool_lock:
+        with self._stats_lock:
             self.stats[name] += 1
 
     def live(self) -> int:
@@ -356,7 +517,8 @@ class ConnectionPool:
 
     reap = _cleanup_idle
 
-    def close_all(self, shutdown: bool = True, wait: Optional[float] = None) -> None:
+    def close_all(self, shutdown: bool = True, wait: Optional[float] = None,
+                  busy_wait: Optional[float] = None) -> None:
         """Close all pooled connections.
 
         Args:
@@ -365,7 +527,12 @@ class ConnectionPool:
                 them. Use at exit, so a SIGTERM during a long command doesn't
                 hang teardown. If False, wait for in-flight operations so a
                 live RPC is not severed — use when a run is over and the next
-                one must start from fresh sessions.
+                one must start from fresh sessions. A session a transaction
+                holds open on another thread is waited for at most
+                `busy_wait` seconds (BUSY_WAIT if None): the others are
+                closed, and then NotAppliedError('router busy: a transaction
+                is open on this session') says how many were left; each
+                closes when its transaction ends (#147).
             wait: Either way, the closes it starts get this long in all
                 (CLOSE_WAIT, a second, if None) to be acknowledged, so their
                 descriptors are freed with them (#113).
@@ -382,6 +549,7 @@ class ConnectionPool:
             entries = list(self._connections.items())
 
         closes = []     # what each close handed back, whichever thread ran it
+        busy = []       # the sessions a transaction held open past busy_wait
 
         def close_one(item):
             key, entry = item
@@ -389,7 +557,11 @@ class ConnectionPool:
                 if not entry["lock"].acquire(blocking=False):
                     return
             else:
-                entry["lock"].acquire()
+                try:
+                    self._take(entry, BUSY_WAIT if busy_wait is None else busy_wait)
+                except NotAppliedError:
+                    busy.append(key)
+                    return
             try:
                 closes.append(self._drop(entry, "discards"))
             finally:
@@ -400,6 +572,9 @@ class ConnectionPool:
         if live:
             _release_closed_sessions(closes, wait)
         log.info("Connection pool: all connections closed")
+        if busy:
+            raise NotAppliedError(f"{BUSY}: {len(busy)} session(s) left open, each closed when its "
+                                  "transaction ends")
 
 
 def _side_by_side(fn, items, workers: int = 32) -> None:
