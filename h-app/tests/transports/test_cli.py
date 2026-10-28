@@ -830,7 +830,8 @@ def test_a_line_the_cli_took_with_a_warning_is_applied_and_the_warning_comes_bac
             "'vrf forwarding CUST': % Interface GigabitEthernet0/1 IPv4 disabled and address(es) removed due to "
             "enabling VRF CUST",
             "'ip address 10.0.0.1 255.255.255.254': % Warning: use /31 mask on non point-to-point interface cautiously",
-            "'spanning-tree portfast': %Warning: portfast should only be enabled on ports connected to a single"))
+            "'spanning-tree portfast': %Warning: portfast should only be enabled on ports connected to a single",
+            "'spanning-tree portfast': %Portfast has been configured on GigabitEthernet0/1 but will only"))
         assert ch.typed == ["configure terminal", "interface Gi0/1", "vrf forwarding CUST",
                             "ip address 10.0.0.1 255.255.255.254", "spanning-tree portfast", "no shutdown", "end"]
 
@@ -858,6 +859,53 @@ def test_a_line_is_refused_as_the_dialect_says_not_by_the_words_in_its_reply():
     s.login()
     assert s.edit_lines("snmp-server community lab-error RO\nhostname x\n") == "(config applied)"
     assert ch.typed == ["configure terminal", "snmp-server community lab-error RO", "hostname x", "end"]
+
+
+# What IOS says of a line it refused without a `% ` first, and of two lines it took: its syslog note on an
+# interface come up, and its note on a default route out of an interface.
+NO_SPACE = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#",
+            "ip route 10.1.1.1 255.255.255.0 192.0.2.1": "\r\n%Inconsistent address and mask\r\nR1(config)#",
+            "username ops secret 5 notahash": (
+                "\r\nERROR: The secret you entered is not a valid encrypted secret.\r\n"
+                "To enter an UNENCRYPTED secret, do not specify type 5 encryption.\r\n"
+                "When you properly enter an UNENCRYPTED secret, it will be encrypted.\r\n\r\nR1(config)#"),
+            "no shutdown": "\r\n%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to up\r\nR1(config-if)#",
+            "ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0": (
+                "\r\n%Default route without gateway, if not a point-to-point interface, may impact performance"
+                "\r\nR1(config)#")}
+
+
+def test_a_refusal_with_no_space_after_its_percent_stops_a_lines_edit():
+    """#142: judged by `^\\s*% `, a line IOS refused with `%Inconsistent
+    address and mask`, or with `ERROR: The secret you entered is not a
+    valid encrypted secret.`, as NX-OS refuses a value, came back APPLIED,
+    and the lines after it were typed; when `error` or a `%` anywhere was a
+    refusal, it failed. The IOS-shaped dialects refuse with a `%` first,
+    a space after it or not, and with `ERROR:`: the edit stops there. A
+    syslog message the device prints meanwhile (`%LINK-3-UPDOWN: ...`) is
+    not a refusal, and IOS's note on a default route it took is applied,
+    the note coming back with the result."""
+    for d in (dialects.ios.DIALECT, dialects.nxos.DIALECT, dialects.eos.DIALECT):
+        for bad, said in (("ip route 10.1.1.1 255.255.255.0 192.0.2.1", "%Inconsistent address and mask"),
+                          ("username ops secret 5 notahash",
+                           "ERROR: The secret you entered is not a valid encrypted secret.")):
+            ch = ScriptChannel("\r\nR1#", NO_SPACE)
+            s = Cli(ch, d, 5)
+            s.login()
+            with pytest.raises(RuntimeError) as failed:
+                s.edit_lines(f"hostname before\n{bad}\nhostname after\n")
+            assert str(failed.value) == (f"'{bad}': {said}; applied before it: 'hostname before'; "
+                                         "not sent: 'hostname after'"), d.name
+            assert ch.typed == ["configure terminal", "hostname before", bad, "end"], d.name
+    ch = ScriptChannel("\r\nR1#", NO_SPACE)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    r = s.edit_lines("interface Gi0/1\n no shutdown\nip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0\nhostname after\n")
+    assert r.status == R.APPLIED and r == ("(config applied)\n'ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0': "
+                                           "%Default route without gateway, if not a point-to-point interface, "
+                                           "may impact performance")
+    assert ch.typed == ["configure terminal", "interface Gi0/1", "no shutdown",
+                        "ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0", "hostname after", "end"]
 
 
 def test_a_line_break_before_the_echo_leaves_the_echo_out_of_the_reply():

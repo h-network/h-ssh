@@ -102,6 +102,37 @@ def test_an_ios_warning_is_no_refusal():
     assert refusal_line("% Warning: use /31 mask", dialect=dialects.none.DIALECT) == "% Warning: use /31 mask"
 
 
+def test_an_ios_shaped_refusal_is_a_percent_first_a_space_after_it_or_not():
+    """#142: a lines edit took `error`, `invalid` or a `%` anywhere in a
+    reply for a refusal; judged by the IOS-shaped dialects' `^\\s*% `
+    instead, `%Inconsistent address and mask`, `ERROR: The secret you
+    entered is not a valid encrypted secret.` and NX-OS's `ERROR: ...`
+    were the device taking the line. A `%` first is a refusal, a space
+    after it or not, and so is `ERROR:`; a syslog message the device prints
+    into the session (`%LINK-3-UPDOWN: ...`) is not, and neither is what
+    IOS says, no space after its `%`, of a line it took (`informational`).
+    A show is held to the same rule: one whose reply opens with `%Error
+    opening ...` is refused, one that opens with a syslog line is output."""
+    ios, nxos, eos = dialects.ios.DIALECT, dialects.nxos.DIALECT, dialects.eos.DIALECT
+    for line in ("%Inconsistent address and mask", "%Error opening flash:x.cfg (No such file or directory)",
+                 "ERROR: The secret you entered is not a valid encrypted secret.",
+                 "ERROR: VLAN 4095 is a reserved VLAN", "% Invalid input detected at '^' marker."):
+        for d in (ios, nxos, eos):
+            assert refusal_line(f"\n{line}\nmore", dialect=d) == line, (d.name, line)
+    for line in ("%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to up",
+                 "%SYS-5-CONFIG_I: Configured from console by vty0 (10.0.0.1)",
+                 "%SEC_LOGIN-5-LOGIN_SUCCESS: Login Success [user: lab]", "%ETHPORT-5-IF_UP: Interface Ethernet1/1 is up",
+                 "%Portfast has been configured on GigabitEthernet0/1 but will only",
+                 "%Portfast will be configured in 10 interfaces due to the range command",
+                 "%Default route without gateway, if not a point-to-point interface, may impact performance",
+                 "%Command accepted but obsolete, unreleased or unsupported; see documentation.",
+                 "100% of the table in use", "Errors: 0"):
+        assert refusal_line(line, dialect=ios) is None, line
+    assert core.refused_reply("", "%Error opening flash:x.cfg (No such file or directory)\n", dialect=nxos) == \
+        "%Error opening flash:x.cfg (No such file or directory)"
+    assert core.refused_reply("", "%LINK-3-UPDOWN: Interface Gi0/1, changed state to up\n", dialect=ios) is None
+
+
 def test_the_dialect_says_what_starts_a_comment():
     """#142: `!` was a comment to every edit typed at a CLI, plain telnet's
     too, and to no check that an edit had anything in it, so a file of `!`

@@ -1,6 +1,7 @@
 """Cisco IOS and IOS-XE. Also the shape NX-OS, EOS and the `none` dialect
-borrow for their CLI: `Router>`, `Router#`, `Router(config-if)#`, a refusal
-that starts with `% `. NX-OS and EOS take its warnings too."""
+borrow for their CLI: `Router>`, `Router#`, `Router(config-if)#`. NX-OS and
+EOS take its refusals too, a line that starts with `%` or `ERROR:`, and its
+warnings."""
 
 import re
 
@@ -19,16 +20,30 @@ CLI = CliSyntax(
 # else has nothing to apply.
 COMMENTS = ("!",)
 
-REFUSED = re.compile(r"^\s*% ", re.M)
+# How an IOS-shaped CLI refuses a line: `% ` first (`% Invalid input
+# detected at '^' marker.`), a `%` with no space after it (`%Inconsistent
+# address and mask`, `%Error opening flash:x.cfg`), or `ERROR:` (`ERROR:
+# The secret you entered is not a valid encrypted secret.`, and NX-OS's
+# word on a value it will not take). A syslog message the device prints
+# into the session, `%LINK-3-UPDOWN: Interface Gi0/1, changed state to up`
+# (a facility, a severity, a mnemonic, a colon), is not one (#142).
+REFUSED = re.compile(r"^\s*(% |%(?![A-Z0-9_]+-\d+-[A-Z0-9_]+:)\S|ERROR:)", re.M)
 
 # What IOS says, a `%` first, of a line it took: a warning (`%Warning:
 # portfast should only be enabled on ports connected to a single host`,
-# `% Warning: use /31 mask on non point-to-point interface cautiously`),
-# or the note that a VRF enabled on an interface removed its addresses
-# (`% Interface Gi0/1 IPv4 disabled and address(es) removed due to
-# enabling VRF CUST`), which the payload's next line puts back. Neither is
-# a refusal: a lines edit goes on past it and reports it (#142).
-INFORMATIONAL = re.compile(r"^\s*%\s*(warning\b|interface \S+ .*\bremoved due to (en|dis)abling vrf\b)",
+# and the `%Portfast has been configured on Gi0/1 but will only have
+# effect ...` under it; `% Warning: use /31 mask on non point-to-point
+# interface cautiously`), its note on a default route out of an interface
+# (`%Default route without gateway, if not a point-to-point interface,
+# may impact performance`) or on a command it took and calls obsolete
+# (`%Command accepted but obsolete, unreleased or unsupported; see
+# documentation.`), or the note that a VRF enabled on an interface removed
+# its addresses (`% Interface Gi0/1 IPv4 disabled and address(es) removed
+# due to enabling VRF CUST`), which the payload's next line puts back. None
+# is a refusal: a lines edit goes on past it and reports it (#142).
+INFORMATIONAL = re.compile(r"^\s*%\s*(warning\b|portfast (has been|will be) configured\b"
+                           r"|default route without gateway\b|command accepted but obsolete\b"
+                           r"|interface \S+ .*\bremoved due to (en|dis)abling vrf\b)",
                            re.M | re.I)
 
 DIALECT = Dialect("ios", "IOS", "Cisco IOS and IOS-XE", refused=REFUSED, informational=INFORMATIONAL, cli=CLI,
