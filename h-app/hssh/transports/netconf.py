@@ -12,6 +12,7 @@ session and gives it back. A session that fails underneath a call is
 discarded, never handed to the next caller.
 """
 
+import getpass
 import hashlib
 import os
 import re
@@ -282,7 +283,7 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         except Exception:
             pass
         if isinstance(e, ConnectError):
-            reason = _connect_reason(e, host, user, params["port"], session_timeout,
+            reason = _connect_reason(e, host, _login(host, user, port, dev), params["port"], session_timeout,
                                      time.monotonic() - started, connect_timeout=connect_s, os_error=os_error)
             # A connect phase that ran out is retried; anything else in it is not.
             failed = ConnectTimeoutError if timed_out(reason) else NotAppliedError
@@ -292,6 +293,30 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         _DEADLINE.at = _DEADLINE.connect_at = _DEADLINE.connect_error = None
     dev.timeout = command_timeout
     return dev
+
+
+def _login(host: str, user: Optional[str], port: Optional[int] = None, dev=None) -> Optional[str]:
+    """The name a NETCONF session to `host` logs in as, worked out as PyEZ
+    and ncclient work it out, without connecting: `user` when there is one;
+    without, PyEZ's Device takes the `User` ~/.ssh/config gives the host,
+    else $USER (user=None is no user at all to it), and ncclient the name
+    getpass finds when PyEZ has none. `dev` is a Device already made for
+    the session, else one is made here and never opened. The history logs
+    a commit under this name, and a login refused is named by it."""
+    if user:
+        return user
+    try:
+        if dev is None:
+            dev = JunosDevice(host=host, user=user, port=port or DEFAULT_PORT, gather_facts=False)
+        name = dev.user
+    except Exception:
+        name = None
+    if not name:
+        try:
+            name = getpass.getuser()
+        except Exception:
+            name = None
+    return name
 
 
 def _connect_reason(exc: BaseException, host: str, user: str, port: int,
@@ -1197,9 +1222,10 @@ def _history_moved(ours: Optional[dict], entries: List[dict]) -> Optional[str]:
     return None
 
 
-def _ours(entry: Optional[dict], user: str, comment: Optional[str]) -> Optional[dict]:
-    """The pending entry when it is the commit this user just made (same
-    user, and the comment that was sent with it), else None."""
+def _ours(entry: Optional[dict], user: Optional[str], comment: Optional[str]) -> Optional[dict]:
+    """The pending entry when it is the commit this login just made (the
+    name the session logged in as, _login(), and the comment that was sent
+    with it), else None."""
     if entry is None or entry.get("seq") != 0 or entry.get("user") != user:
         return None
     if comment and entry.get("comment") != comment:
@@ -1219,23 +1245,30 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     the window closes. Returns {"final": "confirmed" | "rolled back" |
     "no changes", "commit": ..., "checks": ..., "confirm"/"rollback": ...}.
 
-    Before confirming or rolling back, `show system commit` is read again
-    and compared with the entry the commit confirmed made. When that is no
-    longer the pending one — another commit landed (which confirmed ours
-    too), or the checks outlasted the timer and the device rolled back by
-    itself — nothing is sent, since `rollback 1` would now re-apply the
-    change that just failed, and the result is "not confirmed" / "not
-    rolled back" with the reason and the history under "status" (for "not
-    rolled back" the check's own failure is under "check_error").
+    Its own commit is the pending entry at sequence 0 that the history
+    logged under the name the session logged in as: `user`, or with
+    user=None the one PyEZ takes (~/.ssh/config's User for the host, else
+    $USER). Before confirming or rolling back, `show system commit` is read
+    again and compared with that entry. When that is no longer the pending
+    one — another commit landed (which confirmed ours too), or the checks
+    outlasted the timer and the device rolled back by itself — nothing is
+    sent, since `rollback 1` would now re-apply the change that just
+    failed, and the result is "not confirmed" / "not rolled back" with the
+    reason and the history under "status" (for "not rolled back" the
+    check's own failure is under "check_error").
     """
     check_confirm_minutes(minutes)
+    # The history logs the commit under the name the session logged in as,
+    # with user=None PyEZ's (~/.ssh/config's User for the host, else $USER):
+    # that name, not None, is what our entry carries.
+    login = _login(host, user, port)
     out = edit(host, user, passwd, payload, session_timeout, command_timeout,
                commit_confirmed=minutes, port=port, comment=comment, connect_timeout=connect_timeout)
     if out.startswith("NO CHANGES"):
         return {"final": "no changes", "commit": out, "checks": None}
     ours = _ours(pending_commit(commit_status(host, user, passwd, session_timeout, command_timeout, port=port,
                                               connect_timeout=connect_timeout)),
-                 user, comment)
+                 login, comment)
     try:
         ok, reason = bool(check()), None
     except Exception as e:

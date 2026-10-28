@@ -1433,15 +1433,19 @@ the history (`note`) but is no longer waiting. `confirm()` commits under the con
 uncommitted edits refuse it (`NotAppliedError`, nothing sent) rather than going in with the confirmation.
 With no commit-confirmed waiting (the timer expired, or it was confirmed already) `confirm()` raises
 `hssh.errors.NothingToConfirmError` and sends nothing: a plain commit there would hide that the change
-is gone. `guarded_commit()` reads `show system commit` after its commit and again before it confirms or rolls back:
-when the pending commit is no longer the one it made — another commit landed, which also confirmed it, or
-the checks outlasted the timer and the device rolled back by itself — it sends nothing and answers
-`not confirmed` / `not rolled back` with the reason, the history under `status` and, when the checks
-failed, their error under `check_error`, because a `rollback 1` at that point would re-apply the change
-that just failed its checks. With the pool on, a session with an open transaction stays borrowed and
-other threads wait for it. Either way the thread holding it may keep using it, and only that thread can
-commit or abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that landed elsewhere) is
-refused before anything is sent, because the session's lock belongs to the thread that opened it.
+is gone. `guarded_commit()` reads `show system commit` after its commit and again before it confirms or rolls back.
+The commit it made is the pending one at sequence 0 logged under the name its session logged in as: with
+`user=None` the name PyEZ takes, the `User` `~/.ssh/config` gives the host, else `$USER` (a refused login names
+that user too, `authentication failed for USER at HOST:PORT`), so with no user given a failing check is rolled
+back and a passing one confirmed as well. When the pending commit is no longer the one it made — another
+commit landed, which also confirmed it, or the checks outlasted the timer and the device rolled back by
+itself — it sends nothing and answers `not confirmed` / `not rolled back` with the reason, the history under
+`status` and, when the checks failed, their error under `check_error`, because a `rollback 1` at that point
+would re-apply the change that just failed its checks. With the pool on, a session with an open transaction
+stays borrowed and other threads wait for it. Either way the thread holding it may keep using it, and only
+that thread can commit or abort it: a `Transaction` finished from another thread (an `asyncio.to_thread`
+that landed elsewhere) is refused before anything is sent, because the session's lock belongs to the
+thread that opened it.
 
 ### Structured output from a script
 
@@ -1553,7 +1557,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1395 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1399 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

@@ -17,6 +17,7 @@ class FakeDevice:
 
     def __init__(self, **params):
         self.params = params
+        self.user = params.get("user")      # as PyEZ's Device has it; this fake takes no $USER
         self.timeout = None
         self.opened = False
         self._closed = False
@@ -66,6 +67,7 @@ class FakeConfig:
     instances = []
     diff_text = "[edit]\n+  system host-name r1;"
     raise_on = {}
+    on_commit = None        # a Router logging the commit in its history
 
     def __init__(self, dev):
         self.dev = dev
@@ -96,6 +98,8 @@ class FakeConfig:
 
     def commit(self, confirm=None, timeout=None, comment=None):
         self._do("commit", confirm=confirm, comment=comment)
+        if FakeConfig.on_commit:
+            FakeConfig.on_commit(self, confirm, comment)
 
     def rollback(self, rb_id=0):
         self._do("rollback", rb_id)
@@ -113,6 +117,7 @@ def fake_pyez(monkeypatch):
     FakeConfig.instances = []
     FakeConfig.diff_text = "[edit]\n+  system host-name r1;"
     FakeConfig.raise_on = {}
+    FakeConfig.on_commit = None
     monkeypatch.setattr(netconf, "AVAILABLE", True)
     monkeypatch.setattr(netconf, "JunosDevice", FakeDevice)
     monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
@@ -570,6 +575,103 @@ def test_guarded_commit_only_trusts_the_latest_commit(monkeypatch):
     res = guarded(failing_check)
     assert res["final"] == "not rolled back" and "history changed" in res["reason"]
     assert len(FakeConfig.instances) == 1
+
+
+# --- #146: the commit guarded_commit() made, found by the name it logged in as ---
+
+class PyezUserDevice(FakeDevice):
+    """A FakeDevice whose `user` is the one PyEZ's own Device works out for
+    the same parameters, made and never opened: `user`, else the User
+    ~/.ssh/config gives the host, else $USER."""
+
+    def __init__(self, **params):
+        super().__init__(**params)
+        from jnpr.junos import Device
+        self.user = Device(host=params["host"], user=params.get("user"), gather_facts=False).user
+
+
+class Router:
+    """A router's commit history, newest first, as commit_status() reads it.
+    A commit FakeConfig makes is logged as the device logs one: under the
+    name its session logged in as (the device's `user`), with the comment
+    as the device keeps it (`keep`); a later commit ends the wait of the
+    commit confirmed before it."""
+
+    def __init__(self, monkeypatch, keep=lambda comment: comment):
+        self.entries = [dict(PRE, seq=0)]
+        self.keep = keep
+        FakeConfig.on_commit = lambda cfg, confirm, comment: self.log(cfg.dev.user, comment, confirm)
+        monkeypatch.setattr(netconf, "commit_status", lambda *a, **kw: [dict(e) for e in self.entries])
+        monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: netconf.pending_commit(self.entries))
+
+    def log(self, user, comment=None, confirm=None, client="netconf"):
+        for e in self.entries:
+            e["seq"] += 1
+            e["pending_rollback_minutes"] = None
+        at = 1792516751 + 60 * len(self.entries)
+        self.entries.insert(0, {"seq": 0, "user": user, "client": client, "time": f"@{at}", "epoch": float(at),
+                                "comment": self.keep(comment) if comment else None,
+                                "note": f"commit confirmed, rollback in {confirm}mins" if confirm else None,
+                                "pending_rollback_minutes": confirm})
+
+
+@pytest.fixture
+def pyez_login(monkeypatch, tmp_path):
+    """Sessions whose login is PyEZ's own: $USER set, and a home of the
+    test's, where a ~/.ssh/config may give the router a User."""
+    pytest.importorskip("jnpr.junos")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USER", "reviewer")
+    monkeypatch.setattr(netconf, "JunosDevice", PyezUserDevice)
+    return tmp_path
+
+
+def ssh_config_user(home, name):
+    (home / ".ssh").mkdir(exist_ok=True)
+    (home / ".ssh" / "config").write_text(f"Host 10.0.0.1\n  User {name}\n")
+
+
+@pytest.mark.parametrize("login, check, final", [
+    ("reviewer", lambda: True, "confirmed"),
+    ("reviewer", failing_check, "rolled back"),
+    ("cfguser", failing_check, "rolled back"),
+])
+def test_guarded_commit_without_a_user_finds_the_commit_it_made(monkeypatch, pyez_login, login, check, final):
+    """#146: with user=None the history logs the commit under the name PyEZ
+    logged in as ($USER, or the User ~/.ssh/config gives the router), and
+    guarded_commit() looked for None there: a failing check ended `not
+    rolled back` with nothing sent, the change that failed its checks live
+    until the timer, and a passing one `not confirmed`, the good change
+    reverted when the timer ran out. Each is its own commit now."""
+    if login == "cfguser":
+        ssh_config_user(pyez_login, "cfguser")
+    router = Router(monkeypatch)
+    res = netconf.guarded_commit("10.0.0.1", None, None, "set a b\n", 5, 30, minutes=5, check=check, comment="C1")
+    assert res["final"] == final, res.get("reason")
+    commits = [c for i in FakeConfig.instances for c in i.calls if c[0] in ("rollback", "commit")]
+    if final == "confirmed":
+        assert commits == [("commit", (), {"confirm": 5, "comment": "C1"}),
+                           ("commit", (), {"confirm": None, "comment": "C1 (confirmed)"})]
+    else:
+        assert "bgp down" in res["reason"]
+        assert commits == [("commit", (), {"confirm": 5, "comment": "C1"}), ("rollback", (1,), {}),
+                           ("commit", (), {"confirm": None, "comment": "C1 (rolled back: checks failed)"})]
+    assert [e["user"] for e in router.entries[:2]] == [login, login]
+    assert router.entries[0]["pending_rollback_minutes"] is None        # nothing left waiting
+
+
+def test_a_refused_login_without_a_user_names_the_login_pyez_used(pyez_login):
+    """#146: the reason read `authentication failed for None at ...`; it
+    names the login the session tried, $USER or the ~/.ssh/config User."""
+    from jnpr.junos.exception import ConnectAuthError
+    FakeDevice.open_error = ConnectAuthError(FakeHost())
+    with pytest.raises(NotAppliedError, match=r"authentication failed for reviewer at 10\.0\.0\.1:830$"):
+        netconf.show("10.0.0.1", None, None, "show version", 5, 30)
+    ssh_config_user(pyez_login, "cfguser")
+    with pytest.raises(NotAppliedError, match=r"authentication failed for cfguser at 10\.0\.0\.1:830$"):
+        netconf.show("10.0.0.1", None, None, "show version", 5, 30)
+    with pytest.raises(NotAppliedError, match=r"authentication failed for named at 10\.0\.0\.1:830$"):
+        netconf.show("10.0.0.1", "named", None, "show version", 5, 30)
 
 
 # --- #40: no timer means no commit, never a plain one ---------------------------
