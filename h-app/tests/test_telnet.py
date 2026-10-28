@@ -749,6 +749,38 @@ def test_a_reply_line_that_is_the_prompt_does_not_shift_the_replies():
     assert _received(srv) == ["show prompt", "show version"]
 
 
+def test_a_telnet_command_from_the_device_is_not_text():
+    """#141 review: the login waits a moment after `Password: ` and after
+    the prompt for the device to go on. A device that sent a telnet command
+    then (IAC WILL ECHO 20 ms after `Password: `) put bytes that are not
+    text after the prompt, which was then not the last line, and the login
+    failed on its timeout where it had logged in before. A telnet command
+    is negotiation, not what the device says, and is left out: after
+    `Password: `, after the prompt with a read cutting it in two, and
+    inside a reply."""
+    from hssh.transports.telnet import show
+
+    def handler(srv):
+        srv.send("\r\nUser Access Verification\r\n\r\nUsername: ")
+        srv.readline()
+        srv.send("\r\nPassword: ")
+        time.sleep(0.02)
+        srv.conn.sendall(b"\xff\xfb\x01")                      # IAC WILL ECHO
+        srv.readline()
+        srv.send("\r\n\r\nR1>")
+        time.sleep(0.02)
+        srv.conn.sendall(b"\xff")                              # IAC DO SGA, in two writes
+        time.sleep(0.02)
+        srv.conn.sendall(b"\xfd\x03")
+        while True:
+            line = srv.readline()
+            srv.conn.sendall(f"\r\nreply to {line}".encode() + b"\xff\xf1" + b" and more\r\nR1>")   # IAC NOP
+    srv = ScriptedTelnetServer(handler, echo=False)
+    out = show("127.0.0.1", "lab", "pw", "show clock", 3, 3, port=srv.port, vendor_hint="telnet-ios")
+    assert out == "\nreply to show clock and more"
+    assert _received(srv) == ["lab", "pw", "show clock"]
+
+
 def test_more_keeps_what_followed_the_marker_in_the_same_chunk():
     from hssh.transports.telnet import show
 

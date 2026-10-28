@@ -23,6 +23,14 @@ from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmErro
 # ANSI escape code stripper
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b[()][0-9A-B]|\x0f|\x00')
 
+# A telnet command in what the device sends: IAC (0xFF), then WILL, WONT, DO
+# or DONT and an option, a subnegotiation to its IAC SE, or a command of one
+# byte; IAC IAC is a 0xFF of data, which UTF-8 never has. The channel's own
+# negotiation is done when it opens; one the device starts later is not text.
+_TELNET_COMMAND = re.compile(rb"\xff(?:[\xfb-\xfe][\x00-\xff]|\xfa[\x00-\xff]*?\xff\xf0|[\xf0-\xf9\xff])")
+# The start of one that the end of a read cut off: kept for the next read.
+_TELNET_CUT = re.compile(rb"\xff[\xfb-\xfe]?\Z")
+
 # --More-- patterns for pagination
 MORE_PATTERNS = [
     re.compile(r'---?\(more( \d+%)?\)---?', re.IGNORECASE),
@@ -211,6 +219,7 @@ class Cli:
         self._initial = initial      # what the channel already read while opening (telnet negotiation)
         self.echoes = echoes
         self._in_step = False        # a reply was read through the echo of its command (echoes only)
+        self._cut = b""              # the start of a telnet command the last read ended in
 
     # --- the wire -------------------------------------------------------------
 
@@ -218,6 +227,21 @@ class Cli:
         # Strict: a character that cannot be encoded is never replaced by a
         # '?', which a Junos CLI takes as a request for help (#139).
         self.channel.send(data.encode("utf-8"))
+
+    def _recv(self, timeout: float) -> Optional[str]:
+        """What the device sends next, as text; None once it has hung up.
+        A telnet command in it (IAC WILL ECHO after a `Password: ` prompt)
+        is negotiation, not text, and is left out: the bytes after the
+        prompt kept it from being the last line, and the login failed on
+        its timeout (#141). The start of one that a read cut off waits for
+        the rest of it in the next read. TimeoutError when nothing came."""
+        data = self.channel.recv(4096, timeout)
+        if not data:
+            return None
+        data = _TELNET_COMMAND.sub(b"", self._cut + data)
+        cut = _TELNET_CUT.search(data)
+        self._cut = data[cut.start():] if cut else b""
+        return (data[:cut.start()] if cut else data).decode("utf-8", errors="replace")
 
     def _read_until(self, done: Callable[[str], bool], timeout: float, buffer: str = "",
                     settle: Optional[Callable[[str], float]] = None) -> str:
@@ -244,19 +268,19 @@ class Cli:
                 if quiet <= 0:
                     return clean
                 try:
-                    chunk = self.channel.recv(4096, quiet).decode("utf-8", errors="replace")
+                    chunk = self._recv(quiet)
                 except OSError:                  # nothing more (a TimeoutError), or gone after its prompt
                     return clean
-                if not chunk:
+                if chunk is None:
                     return clean
             else:
                 if remaining <= 0:
                     break
                 try:
-                    chunk = self.channel.recv(4096, min(remaining, 2.0)).decode("utf-8", errors="replace")
+                    chunk = self._recv(min(remaining, 2.0))
                 except TimeoutError:
                     continue
-                if not chunk:
+                if chunk is None:
                     raise ConnectionError("connection closed by the device")
             buf += chunk
             clean = strip_ansi(buf)

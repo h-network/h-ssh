@@ -497,6 +497,9 @@ its timeout or loses the connection is an error, never a partial reply passed of
 and a `login:`/`Password:` prompt back after the password is a failed login, reported once — not the
 command typed in as a username. A port that prints nothing until Enter — a console-server line left at
 a prompt — gets one Enter once the session timeout is up, before silence counts as a failed login.
+A telnet command the device sends once the session is open (`IAC WILL ECHO` after `Password: `, say)
+is negotiation, not text: it is left out of what is read, so the prompt before it is still the last
+line, and a reply holds none of it.
 The prompt is learned at login (`lab@R1` or `Router`, with its config-mode suffix) and ends a reply only
 as its whole last line, from the start with nothing after it, never as the echo of what was typed: a
 description ending in `>`, a community ending in `#` or a reply line `uplink to BackupRouter>` cannot be
@@ -1490,7 +1493,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1340 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1341 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
