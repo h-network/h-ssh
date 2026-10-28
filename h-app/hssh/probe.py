@@ -483,7 +483,7 @@ async def _ask(t: Target, port: int, run: _Shared) -> Tuple[Answer, int]:
     reached through a proxy is not probed; the others get a try, and one
     that did not answer one more after RETRY_PAUSE (a box that was busy, a
     packet lost in the burst). The slot is given back for the pause."""
-    why = run.held.get(t.host)
+    why = run.held.get((t.host, port))
     if why:
         return Answer(NOT_PROBED, why), port
     transport = drivers.get(t.vendor).transport
@@ -527,9 +527,9 @@ async def probe(targets: Sequence[Target], seconds: float, slow_ms: float = SLOW
     """Every target probed, at most `limit` at once, the results in the
     targets' order. `seconds` is each wait's (the TCP connect, then the
     banner): the connect timeout. `user` is the login the run will use,
-    which an ssh configuration may match on; `held` maps a host the probe
-    must not contact to why (the safety gate's cooldown): that box is not
-    probed."""
+    which an ssh configuration may match on; `held` maps a device the
+    probe must not contact, (host, port) as the safety gate keys it, to why
+    (its cooldown): that box is not probed."""
     run = _Shared(seconds, slow_ms, limit, user, held)
     return list(await asyncio.gather(*(_probe(t, run) for t in targets)))
 

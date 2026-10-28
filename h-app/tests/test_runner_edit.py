@@ -254,10 +254,10 @@ class FakeGate:
         self.events.append("check")
         return True, "ok"
 
-    def release_device(self, host):
+    def release_device(self, host, *a):
         self.events.append("release")
 
-    def set_cooldown(self, host):
+    def set_cooldown(self, host, *a):
         self.events.append("cooldown")
 
 

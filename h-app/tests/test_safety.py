@@ -74,6 +74,34 @@ def test_the_rate_limit_counts_logins_only():
     assert not allowed and reason.startswith("cooldown active")
 
 
+def test_a_device_is_its_host_and_its_port(tmp_path):
+    """Two routers behind one address are two devices (#145): each is
+    marked active, counted and cooled on its own, and the file keeps a
+    cooldown as `host|port`. An entry kept under the host alone (a caller
+    that names no port, a file an older h-ssh wrote) holds every port."""
+    path = str(tmp_path / "safety.json")
+    gate = SafetyGate(safety_file=path, rate_limit=1)
+    assert gate.check_device("10.0.0.1", 8301) == (True, "ok")
+    assert gate.check_device("10.0.0.1", 8302) == (True, "ok")          # not an "active connection"
+    gate.release_device("10.0.0.1", 8302)
+    assert gate.check_device("10.0.0.1", 8302) == (False, "rate limited 1/1")
+    gate.set_cooldown("10.0.0.1", 8301)
+    with open(path) as f:
+        assert list(json.load(f)) == ["10.0.0.1|8301"]
+    assert gate.check_device("10.0.0.1", 8301)[1].startswith("cooldown active")
+    assert list(gate.holds([("10.0.0.1", 8301), ("10.0.0.1", 8302)])) == [("10.0.0.1", 8301)]
+    gate.set_cooldown("10.0.0.1")                                         # the host alone: every port of it
+    assert sorted(gate.holds([("10.0.0.1", 8302), ("10.0.0.1", 22), ("10.0.0.2", 22)])) == [
+        ("10.0.0.1", 22), ("10.0.0.1", 8302)]
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"10.0.0.9": time.time() + 300}))           # as an h-ssh before #145 kept it
+    gate = SafetyGate(safety_file=str(old))
+    allowed, reason = gate.check_device("10.0.0.9", 830)
+    assert not allowed and reason.startswith("cooldown active")
+    assert list(gate.holds([("10.0.0.9", 22)])) == [("10.0.0.9", 22)]
+    assert gate.check_device("10.0.0.8", 830) == (True, "ok")
+
+
 # T5: Cooldown set
 def test_cooldown_set():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:

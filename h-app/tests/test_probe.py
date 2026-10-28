@@ -677,6 +677,30 @@ def test_a_box_the_safety_gate_holds_is_not_probed_either(monkeypatch, capsys, t
     assert '"ok": 1, "fail": 0, "skipped": 1' in err
 
 
+def test_the_safety_gate_holds_a_device_not_its_whole_address(monkeypatch, capsys, tmp_path, probed):
+    """A cooldown is the device's own, its host and its port (#145): one on
+    R1's NETCONF port does not keep the probe or the run from R2 on the ssh
+    port of the same address, where the gate held the address whole. One
+    an older h-ssh kept under the address alone still holds both."""
+    from hssh.safety import SafetyGate
+    safety = tmp_path / "safety.json"
+    gate = SafetyGate(safety_file=str(safety))
+    gate.set_cooldown("10.0.0.1", 830)
+    gate.close()
+    driver = Junos()
+    monkeypatch.setitem(drivers.MODULES, "junos@ssh", driver)
+    both = ["R1:10.0.0.1:junos", "R2:10.0.0.1:junos@ssh"]
+    rc, out, err, _, _ = run(monkeypatch, capsys, ["-sC", "show version", "--safety-file", str(safety), *both],
+                             driver=driver)
+    assert rc == 3, err
+    assert probed == [("10.0.0.1", 22)] and driver.calls == [("show", "10.0.0.1")]
+    assert ": 1 live, 1 not probed" in out and "ERROR: safety gate blocked: cooldown active (" in out
+    safety.write_text(json.dumps({"10.0.0.1": time.time() + 300}))
+    rc, out, err, _, _ = run(monkeypatch, capsys, ["-sC", "show version", "--safety-file", str(safety), *both],
+                             driver=driver)
+    assert rc == 3 and probed == [("10.0.0.1", 22)] and len(driver.calls) == 1, err
+
+
 # --- before an edit: the probe's question ---------------------------------------------
 
 @pytest.mark.parametrize("answer", ["y", "N"])

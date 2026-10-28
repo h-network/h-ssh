@@ -4,6 +4,12 @@ Two-tier design:
   Tier 1 (in-memory): active set, sliding window attempt tracker, thread safety.
   Tier 2 (file-based): atomic cooldown persistence with lockfile, merge-under-lock,
                        tempfile + os.replace, 0600 permissions, and fail-closed corrupt protection.
+
+A device is its host and the port its transport uses, as everywhere in
+h-ssh (#145): two routers behind one address on two ports are two devices.
+Both tiers key on it, `host|port` in the file; a caller that names no port
+keys on the host alone, as every key was before, and such an entry in the
+file holds every port of that host.
 """
 
 from contextlib import contextmanager
@@ -19,6 +25,11 @@ import time
 from typing import Generator, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _key(host: str, port: Optional[int]) -> str:
+    """A device's key in both tiers: `host|port`; the host alone without a port."""
+    return host if port is None else f"{host}|{port}"
 
 
 class SafetyGate:
@@ -71,11 +82,12 @@ class SafetyGate:
     def rate_window(self) -> float:
         return self._rate_window
 
-    def check_device(self, host: str, *, login: bool = True) -> tuple[bool, str]:
-        """Check whether a device is safe to contact.
+    def check_device(self, host: str, port: Optional[int] = None, *, login: bool = True) -> tuple[bool, str]:
+        """Check whether a device, `host` and `port`, is safe to contact.
 
-        Returns (allowed, reason). Host is added to _active BEFORE returning
-        True — crash before release_device() keeps it blocked (fail-closed).
+        Returns (allowed, reason). The device is added to _active BEFORE
+        returning True — crash before release_device() keeps it blocked
+        (fail-closed).
 
         The rate limit counts logins (#145): `login` False is an attempt
         that opens no session of its own, one that rides a session already
@@ -84,6 +96,7 @@ class SafetyGate:
         turned away by a cooldown or an active mark as any other, never by
         the rate limit, and is not counted.
         """
+        key = _key(host, port)
         with self._lock:
             # Re-read cooldowns from disk to catch external changes and check corruption
             if self._safety_file:
@@ -94,25 +107,22 @@ class SafetyGate:
 
             # Tier 2: cooldown check
             now = time.time()
-            expires = self._cooldowns.get(host)
+            expires = self._cooldown_ends(host, port, now)
             if expires is not None:
-                if now < expires:
-                    remaining = int(expires - now)
-                    return False, f"cooldown active ({remaining}s remaining)"
-                else:
-                    del self._cooldowns[host]
+                remaining = int(expires - now)
+                return False, f"cooldown active ({remaining}s remaining)"
 
             # Tier 1: active connection in this invocation
-            if host in self._active:
+            if key in self._active:
                 return False, "active connection"
 
             # Tier 1: sliding window rate limit, on the logins
             if login:
                 timestamps = [
-                    ts for ts in self._attempt_timestamps.get(host, [])
+                    ts for ts in self._attempt_timestamps.get(key, [])
                     if (now - ts) < self._rate_window
                 ]
-                self._attempt_timestamps[host] = timestamps
+                self._attempt_timestamps[key] = timestamps
 
                 count = len(timestamps)
                 if count >= self._rate_limit:
@@ -120,38 +130,53 @@ class SafetyGate:
                 timestamps.append(now)
 
             # Allow and mark active (fail-closed)
-            self._active.add(host)
+            self._active.add(key)
             return True, "ok"
 
-    def holds(self, hosts) -> dict:
-        """{host: why} for each of `hosts` that check_device() would turn
-        away now for a reason that outlasts this run: a cooldown, a corrupt
-        safety file. Nothing is recorded; the probe asks before it
-        connects, so a box in cooldown gets no connection from it either."""
+    def holds(self, devices) -> dict:
+        """{device: why} for each of `devices`, (host, port) pairs (or a
+        host alone), that check_device() would turn away now for a reason
+        that outlasts this run: a cooldown, a corrupt safety file. Nothing
+        is recorded; the probe asks before it connects, so a box in
+        cooldown gets no connection from it either."""
         with self._lock:
             if self._safety_file:
                 self._load_cooldowns()
                 if self._corrupt:
                     why = (f"safety file corrupted (fail-closed): check and remove "
                            f"{self._safety_file}.corrupt to clear it")
-                    return {host: why for host in hosts}
+                    return {device: why for device in devices}
             now = time.time()
-            return {host: f"cooldown active ({int(self._cooldowns[host] - now)}s remaining)"
-                    for host in hosts if now < self._cooldowns.get(host, now)}
+            held = {}
+            for device in devices:
+                host, port = device if isinstance(device, tuple) else (device, None)
+                expires = self._cooldown_ends(host, port, now)
+                if expires is not None:
+                    held[device] = f"cooldown active ({int(expires - now)}s remaining)"
+            return held
 
-    def release_device(self, host: str) -> None:
+    def release_device(self, host: str, port: Optional[int] = None) -> None:
         """Release a device from the active set after a successful operation."""
         with self._lock:
-            self._active.discard(host)
+            self._active.discard(_key(host, port))
 
-    def set_cooldown(self, host: str) -> None:
+    def set_cooldown(self, host: str, port: Optional[int] = None) -> None:
         """Set a cooldown on a device after a failure. Persists to file."""
+        key = _key(host, port)
         with self._lock:
-            self._active.discard(host)
+            self._active.discard(key)
             expires = time.time() + self._cooldown_seconds
-            self._cooldowns[host] = expires
+            self._cooldowns[key] = expires
             if self._safety_file:
                 self._save_cooldowns()
+
+    def _cooldown_ends(self, host: str, port: Optional[int], now: float) -> Optional[float]:
+        """When the device's cooldown ends; None when none is running. Its
+        own entry counts, and one kept under the host alone (by a caller
+        that names no port, or an h-ssh before #145), which holds every
+        port of the host; the later of the two."""
+        ends = [self._cooldowns[k] for k in {_key(host, port), host} if now < self._cooldowns.get(k, now)]
+        return max(ends) if ends else None
 
     def close(self) -> None:
         """Prune expired cooldowns and persist to file."""

@@ -32,7 +32,7 @@ from .core import (
 from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
                      opens_session, DEFAULT_CONNECT_TIMEOUT)
 from . import probe as probes
-from .transports.connect import budget as connect_budget
+from .transports.connect import budget as connect_budget, where as host_port
 from .drivers import results as R
 from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
@@ -434,37 +434,40 @@ def probe_summary(results, seconds: float, slow_ms: float, name_slow: bool = Tru
 
 
 def held_by(gate, targets) -> dict:
-    """{host: why} for the boxes the safety gate holds now (a cooldown, a
-    corrupt safety file): the probe does not contact them either, and the
-    run's gate turns them away as before."""
+    """{(host, port): why} for the boxes the safety gate holds now (a
+    cooldown, a corrupt safety file), each its host and the port its
+    transport uses, as the gate keys them: the probe does not contact them
+    either, and the run's gate turns them away as before."""
     if gate is None:
         return {}
-    return {host: f"safety gate: {why}" for host, why in gate.holds({t.host for t in targets}).items()}
+    boxes = {(t.host, resolve_target_port(t)) for t in targets}
+    return {box: f"safety gate: {why}" for box, why in gate.holds(boxes).items()}
 
 
 def plan_logins(units, mode: str, dry_run: bool, previews: bool):
     """The logins a run will make, for the safety gate's rate limit, which
-    counts logins (#145): ({host: the sessions the run opens to it}, {the
-    units that ride a session already open}). `units` are the run's
-    (target, job entry or None) in file order; `previews`: --show-diff
-    previews the edits first. A unit logs in once, and its preview once
-    more (the previews run before the session pool is on); a dry run of a
-    read logs in nowhere; a job's entries for one device on a pooled
-    transport (NETCONF) share one session (#57), so only the first of them
-    to open one logs in."""
+    counts logins (#145): ({(host, port): the sessions the run opens to
+    that device}, {the units that ride a session already open}). `units`
+    are the run's (target, job entry or None) in file order; `previews`:
+    --show-diff previews the edits first. A unit logs in once, and its
+    preview once more (the previews run before the session pool is on); a
+    dry run of a read logs in nowhere; a job's entries for one device on a
+    pooled transport (NETCONF) share one session (#57), so only the first
+    of them to open one logs in."""
     logins, rides, opened = {}, set(), set()
     for i, (t, je) in enumerate(units):
+        device = (t.host, resolve_target_port(t))
         unit_mode = je.mode if je is not None else mode
         n = 1 if previews and (je is None or unit_mode.startswith("edit")) else 0
         if opens_session(unit_mode, dry_run):
             pooled = je is not None and drivers.get(t.vendor).transport.pooled
-            if pooled and t.host in opened:
+            if pooled and device in opened:
                 rides.add(i)
             else:
                 n += 1
                 if pooled:
-                    opened.add(t.host)
-        logins[t.host] = logins.get(t.host, 0) + n
+                    opened.add(device)
+        logins[device] = logins.get(device, 0) + n
     return logins, rides
 
 
@@ -1420,13 +1423,13 @@ async def main() -> int:
     rides = set()        # the units that ride a session the run has open: no login of their own
     if safety_gate is not None and mode != "probe":
         logins, rides = plan_logins(units, mode, args.dry_run, bool(args.show_diff and commits))
-        crowded = {host: n for host, n in logins.items() if n > safety_gate.rate_limit}
+        crowded = {device: n for device, n in logins.items() if n > safety_gate.rate_limit}
         if crowded:
             _discard_store()
             names = {}
             for t, _ in units:
-                names.setdefault(t.host, t.name)
-            shown = ", ".join(f"{names[h]} ({h}) {n} times" for h, n in list(crowded.items())[:20])
+                names.setdefault((t.host, resolve_target_port(t)), t.name)
+            shown = ", ".join(f"{names[d]} ({host_port(*d)}) {n} times" for d, n in list(crowded.items())[:20])
             print(f"ERROR: --safety-file: the safety gate lets a device have {safety_gate.rate_limit} logins in "
                   f"{safety_gate.rate_window:g} s, and this run would log in more often: {shown}"
                   f"{' …' if len(crowded) > 20 else ''}. The gate would turn the rest away part way through; "
@@ -1724,18 +1727,20 @@ async def main() -> int:
 
 
     # A job may list one device in several entries. Those run one at a time
-    # per host, in file order, so a show after an edit sees the edit and the
-    # safety gate never meets the second entry as an "active connection".
-    host_locks = {}
+    # per device, in file order, so a show after an edit sees the edit and the
+    # safety gate never meets the second entry as an "active connection". A
+    # device is its host and the port its transport uses: two routers behind
+    # one address run side by side (#145).
+    device_locks = {}
 
-    def _host_lock(host):
+    def _device_lock(t):
         if not job_entries:
             return contextlib.nullcontext()
-        return host_locks.setdefault(host, asyncio.Lock())
+        return device_locks.setdefault((t.host, resolve_target_port(t)), asyncio.Lock())
 
     async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
                            started=None, seq=0, save=True, logs_in=True):
-        async with _host_lock(t.host), sem:
+        async with _device_lock(t), sem:
             if started is not None:
                 started()        # from here on the device may be touched
             dry_run = args.dry_run if dry_run is None else dry_run
