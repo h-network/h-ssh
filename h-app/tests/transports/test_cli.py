@@ -360,6 +360,21 @@ def test_a_line_with_a_control_character_or_a_tab_is_never_typed():
     assert ch.typed == []
 
 
+def test_a_string_that_is_not_text_is_never_typed():
+    """#139: the engine encoded what it typed with errors='replace', so a
+    byte that is not UTF-8 (a lone surrogate, from an argv or a JSON \\udcXX
+    escape) went out as '?', which a Junos CLI takes as a request for help.
+    It is refused before configure mode, and nothing is ever replaced."""
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match="a byte that is not UTF-8"):
+        s.edit_candidate("set system host-name a\udcffb\n", dry_run=True)
+    with pytest.raises(ValueError, match="a byte that is not UTF-8"):
+        s.run("show \udcff", 5)
+    with pytest.raises(UnicodeEncodeError):
+        s._send("show \udcff\n")
+    assert ch.typed == []
+
+
 def test_a_confirm_comment_is_one_line_of_text_without_a_double_quote():
     """#139: the comment went on the commit line as it was given: a line
     break ran `rollback 1` and a second commit, and the confirm said

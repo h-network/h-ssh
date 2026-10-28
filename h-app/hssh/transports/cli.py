@@ -187,7 +187,9 @@ class Cli:
     # --- the wire -------------------------------------------------------------
 
     def _send(self, data: str) -> None:
-        self.channel.send(data.encode("utf-8", errors="replace"))
+        # Strict: a character that cannot be encoded is never replaced by a
+        # '?', which a Junos CLI takes as a request for help (#139).
+        self.channel.send(data.encode("utf-8"))
 
     def _read_until(self, done: Callable[[str], bool], timeout: int, buffer: str = "") -> str:
         """Read until done(text) matches the cleaned buffer.

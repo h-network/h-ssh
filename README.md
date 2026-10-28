@@ -447,17 +447,18 @@ candidate diffed and committed or discarded for Junos, lines applied in config m
 ones). An empty `show | compare` is `NO CHANGES`: the candidate is discarded and no `commit` is typed,
 plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over nothing and no other
 user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec channel, one command per
-channel; only edits and confirms open a shell. Over the OpenSSH binary the shell is `ssh -tt`, with a
+channel; only edits and confirms open a shell. Over the OpenSSH binary the shell is `ssh -tt -e none`
+(no escape character, so a typed line that starts with `~` goes to the device as it is), with a
 password still handed over through `SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh`
 drivers (dialect `none`) never open a shell.
 
 The engine types plain text only. A CLI acts on a control character as it arrives (^C drops the line
 typed so far, ^U kills it, DEL rubs out a character, a Tab completes the word), and what is left of the
 line runs as typed, a `commit` too, under `--dry-run` as well. So `edit()` refuses a payload with a C0
-or C1 control character, DEL or a Tab in a line, and `confirm()` a `comment=` with one of those, a line
-break or a double quote (which would end it on the commit line): a `ValueError` before the device is
-contacted, nothing sent. The CLI refuses a control character in `-eC`, `-eD`, `-eB` or a job on every
-driver before the run starts (exit 2) and lets a Tab through: it is text to `junos`, whose `load set`
+or C1 control character, DEL, a Tab or a byte that is not UTF-8 in a line, and `confirm()` a `comment=`
+with one of those, a line break or a double quote (which would end it on the commit line): a
+`ValueError` before the device is contacted, nothing sent.
+The CLI refuses a control character in `-eC`, `-eD`, `-eB` or a job on every driver before the run starts (exit 2) and lets a Tab through: it is text to `junos`, whose `load set`
 reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at no CLI. A set file
 indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
 `telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it, or a
@@ -1443,7 +1444,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1294 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1297 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

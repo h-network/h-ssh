@@ -433,11 +433,14 @@ class ProcessChannel:
         authenticates before the engine reads a byte, through askpass with a
         password; -v to the -E log says how far it got. The terminal is
         vt100, as the paramiko shell asks for, so the device dresses its
-        output the same way on both transports."""
+        output the same way on both transports. The escape character is
+        off (-e none): with a forced tty ssh reads a ~ at the start of a typed
+        line as a command to itself (~R, ~B, ~.), keeps it from the device
+        and types the rest, so `~Rcommit` would reach it as `commit` (#139)."""
         connect_s = budget(connect_timeout, session_timeout)
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
         os.close(fd)
-        argv = (["ssh", "-tt", "-v", "-E", log_path]
+        argv = (["ssh", "-tt", "-e", "none", "-v", "-E", log_path]
                 + _base_opts(connect_s, port, None, askpass.passwd is not None)
                 + ["--", "%s@%s" % (user, host) if user else host])
         env = askpass.env

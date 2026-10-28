@@ -421,7 +421,9 @@ def read_failure(e: Exception) -> str:
 # What a command may not carry: the C0 and C1 control characters and DEL,
 # the line breaks among them. A tab is text, except to the CLI engine: the
 # one class with the Tab added, so the two cannot come apart.
-_CONTROL_CLASS = r"\x00-\x08\x0a-\x1f\x7f-\x9f"
+# C0 controls but Tab, DEL, C1 controls, and the lone surrogates Python makes
+# of bytes that are not UTF-8 (an argv, a JSON \udcXX escape): not text.
+_CONTROL_CLASS = r"\x00-\x08\x0a-\x1f\x7f-\x9f\ud800-\udfff"
 _CONTROL = re.compile(f"[{_CONTROL_CLASS}]")
 _CONTROL_OR_TAB = re.compile(f"[\\t{_CONTROL_CLASS}]")
 _CONTROL_NAMES = {"\n": "a line break", "\r": "a carriage return", "\x00": "a NUL", "\x1b": "an ESC",
@@ -440,6 +442,8 @@ def control_character(text: str, line_breaks: bool = False, tabs: bool = True) -
         ch = m.group()
         if line_breaks and ch in "\r\n":
             continue
+        if "\ud800" <= ch <= "\udfff":
+            return f"a byte that is not UTF-8 {ch!r}"
         return _CONTROL_NAMES.get(ch, f"a control character {ch!r}")
     return None
 

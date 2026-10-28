@@ -286,6 +286,23 @@ def test_the_shell_is_ssh_tt_on_pipes_with_the_password_through_askpass(device, 
     assert "BatchMode=yes" in keyed and "SSH_ASKPASS" not in keyed_kwargs["env"]
 
 
+def test_the_shell_ssh_has_no_escape_character(device, monkeypatch):
+    """#139: with a forced tty ssh reads a ~ at the start of a typed line as
+    a command to itself (~R rekeys, ~B sends a break) and types the rest, so
+    `~Rcommit comment x` reached the device as `commit comment x`, past the
+    commit rail, under a dry run. The shell's ssh has no escape character."""
+    seen = []
+    real = subprocess.Popen
+
+    def spy(argv, **kwargs):
+        if "-tt" in argv:
+            seen.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    junos_edit()
+    (argv,) = seen
+    assert argv[argv.index("-e") + 1] == "none"
+
 def test_a_dry_run_shows_the_diff_and_rolls_the_candidate_back(device):
     result = junos_edit(dry_run=True)
     assert result.status == R.DRY_RUN and result.diff == "[edit system]\n+  host-name test;"

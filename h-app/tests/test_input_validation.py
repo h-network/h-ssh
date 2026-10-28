@@ -195,6 +195,15 @@ def test_a_command_with_a_control_character_is_refused(monkeypatch, capsys, cmd,
     assert "Traceback" not in err
 
 
+def test_a_byte_that_is_not_utf8_is_refused_like_a_control_character(monkeypatch, capsys):
+    """#139: a byte that is not UTF-8 in an argument (Python hands it over as
+    a lone surrogate) was typed at a CLI as '?', the Junos help key. It is
+    not text, so it is refused as a control character is."""
+    rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos@ssh", "-eC",
+                                                  "set system host-name x\udcff", "-y"])
+    assert rc == 2 and "ERROR: -eC has a byte that is not UTF-8" in err
+
+
 def test_an_edit_payload_keeps_its_line_breaks_but_no_other_control_character(monkeypatch, capsys):
     """#110: an ESC typed into a device's CLI is a key, not configuration."""
     rc, out, err = run_main(monkeypatch, capsys, ["--target", "R1:10.0.0.1:junos", "-eC", "set system host-name x\x1b", "-y"])
