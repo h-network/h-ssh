@@ -179,8 +179,9 @@ Your own user password belongs in neither a file nor a shell profile; the enviro
 an account made for automation. h-ssh alone reads it: no `ssh` process the `openssh` transport runs
 inherits it, nor a `ProxyCommand` one of them runs (a process of the same user can read another's
 environment from `/proc/<pid>/environ`), and the password itself reaches `ssh` through an
-`SSH_ASKPASS` helper that prints a 0600 file in a private 0700 directory, made for the login and removed
-with it, never through the environment either. The same `ps` exposure holds for what the `openssh` driver sends: a
+`SSH_ASKPASS` helper that prints a 0600 file in a private 0700 directory, made for the call and removed
+with it (the login and the commands that ride its session; an edit typed into `ssh -tt` has it until the
+prompt is seen), never through the environment either. The same `ps` exposure holds for what the `openssh` driver sends: a
 show, and each line of an `openssh` edit, runs as the `ssh` process's argument, so a config line is
 readable from `ps` for the life of that process (a dialect's edit over the OpenSSH binary,
 `junos@openssh` and the like, is typed into `ssh -tt` instead); push secrets over NETCONF or paramiko,
@@ -601,7 +602,8 @@ read is retried, an edit is not.
 auth, and `SSH_ASKPASS` for password auth, because OpenSSH refuses to read a password from a pipe.
 The password reaches OpenSSH through a helper it execs itself, on a channel the session never
 touches — never through the terminal, where device output and auth prompts would share one stream.
-The helper reads it from a 0600 file in its own 0700 directory, kept for the login alone; no `ssh`
+The helper reads it from a 0600 file in its own 0700 directory, kept for the call alone (the login and
+the commands that ride its session; an edit typed into `ssh -tt` has it until the prompt is seen); no `ssh`
 process, and no `ProxyCommand` one runs, has it in its environment (see [Authentication](#authentication)).
 Each call logs in once, on an OpenSSH `ControlMaster` (`ssh -N`, which goes to the background once the
 session is up), and every command, a lone show's too, runs through it as an `ssh` of its own: a batch
@@ -1601,7 +1603,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1478 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1481 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
