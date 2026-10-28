@@ -489,9 +489,15 @@ its timeout or loses the connection is an error, never a partial reply passed of
 and a `login:`/`Password:` prompt back after the password is a failed login, reported once — not the
 command typed in as a username. A port that prints nothing until Enter — a console-server line left at
 a prompt — gets one Enter once the session timeout is up, before silence counts as a failed login.
-The prompt is learned at login (`lab@R1` or `Router`, with its config-mode suffix) and looked for on
-the last line of a reply only, never on the echo of what was typed, so a description ending in `>` or
-a community ending in `#` cannot be taken for the prompt and shift every later reply.
+The prompt is learned at login (`lab@R1` or `Router`, with its config-mode suffix) and ends a reply only
+as its whole last line, from the start with nothing after it, never as the echo of what was typed: a
+description ending in `>`, a community ending in `#` or a reply line `uplink to BackupRouter>` cannot be
+taken for the prompt and shift every later reply. A reply with output of its own is read on until the
+device has said nothing more for 0.15 s after its prompt (0.3 s after a refusal: a CLI on a pty refuses
+the Enter again after redrawing the line), so a reply line that is the prompt itself (`Router>`) does not
+end it when the reply goes on within that time. A reply that is only the echo and the prompt, with its
+`[edit]` banner (`{master}[edit]` on a router with two routing engines), as each line of an edit is, is
+not waited on, and a long edit costs no more. No wait runs past the command's timeout.
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
@@ -601,7 +607,7 @@ and nothing about connections; `hssh/dialects/ios.py` is the smallest that defin
 | `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. On an exec channel (`ssh`, `openssh`) every reply is read with it: a show whose reply opens with such a line is a failure, not output, and the plain drivers' line-by-line edit stops at the line that got one. Typed at a CLI (a shell on `ssh` or `openssh`, `telnet`), a candidate edit checks each line's reply with it and discards the candidate after the last line; a lines edit looks for `error`, `invalid` or `%` instead and fails after `end`, the other lines applied; a telnet show is not checked. A dialect on `ssh`, `openssh` or `telnet` must have one |
 | `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*`; a command with a line break in it is never a read, whatever the dialect says |
 | `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
-| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
+| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt, `{master}[edit]` with two routing engines: a reply of the echo, that line and the prompt is not waited on for more). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
 | `commit_pending` | a regex whose group 1 is the minutes left on a pending commit-confirmed, as `show system commit` prints them; `-eC commit` confirms only when it finds one |
 | `shortcuts` | the stem of a shipped library, `hssh/dialects/<stem>.json` — built-in dialects only, see below |
 
@@ -1475,7 +1481,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1329 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1334 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

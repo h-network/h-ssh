@@ -723,6 +723,32 @@ def test_the_learned_prompt_ignores_a_reply_line_that_looks_like_one():
     assert "more output" in out and out.strip().endswith("more output")
 
 
+def test_a_reply_line_that_is_the_prompt_does_not_shift_the_replies():
+    """#141: a reply line that is the prompt itself (`Router>`), with the
+    rest of the reply in the device's next write, ended the read: `show
+    prompt` returned `line one`, and the next command got the rest as its
+    own reply. A reply with output is read on until the device has said
+    nothing more for a moment after its prompt; each command in the batch
+    gets its own reply."""
+    from hssh.transports.telnet import show_batch
+
+    def handler(srv):
+        srv.send("\r\nRouter>")
+        while True:
+            line = srv.readline()
+            if line == "show prompt":
+                srv.send("line one\r\nRouter>")
+                time.sleep(0.02)
+                srv.send("\r\nline three\r\n\r\nRouter>")
+            else:
+                srv.send(f"reply to {line}\r\n\r\nRouter>")
+    srv = ScriptedTelnetServer(handler)
+    results = show_batch("127.0.0.1", "lab", "secret", ["show prompt", "show version"], session_timeout=5,
+                         command_timeout=5, port=srv.port, vendor_hint="telnet-ios")
+    assert [r["output"] for r in results] == ["line one\nRouter>\nline three\n", "reply to show version\n"]
+    assert _received(srv) == ["show prompt", "show version"]
+
+
 def test_more_keeps_what_followed_the_marker_in_the_same_chunk():
     from hssh.transports.telnet import show
 

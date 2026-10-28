@@ -31,11 +31,14 @@ class CliSyntax:
     `prompt` matches a line that is the device waiting for input; after login
     the transport narrows it to this device's own prompt: `prompt_name` finds
     the name in the first prompt seen (group 1), `prompt_tail` is what may
-    follow it. `config_enter`/`config_exit` bracket an edit. A dialect with a
+    follow it, and the narrowed prompt is the whole line from its start.
+    `config_enter`/`config_exit` bracket an edit. A dialect with a
     candidate configuration also has `compare` (the diff), `discard` and
     `commit`; one without applies each line as typed. `context` matches a
     line the CLI prints with its prompt rather than as part of a reply
-    (Junos's `[edit system]` banner in configuration mode)."""
+    (Junos's `[edit system]` banner in configuration mode, `{master}[edit]`
+    with two routing engines): a reply of nothing but the echo, that line
+    and the prompt (a line of an edit) is not waited on for more."""
     prompt: re.Pattern
     prompt_name: re.Pattern
     prompt_tail: str

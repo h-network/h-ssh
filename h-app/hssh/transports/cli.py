@@ -40,10 +40,19 @@ PASSWORD_RE = re.compile(r'(Password|password)\s*:\s*$', re.IGNORECASE)
 _LOGIN_REJECTED = ("login incorrect", "bad password", "login invalid",
                    "authentication failed", "access denied", "permission denied")
 
-# How long a login waits, after a prompt, for the device to say more: a
-# banner line shaped like a prompt, at a read boundary, is not the end of the
-# banner (#141). Seconds; never past the login's own timeout.
+# How long a read waits, after its prompt, for the device to say more. A
+# line shaped like the prompt at a read boundary is not the end of what the
+# device is saying: a banner line ending in `NOC-DESK>` once ended a login,
+# a reply line that is `Router>` a reply, and every reply after it was the
+# one before (#141). A login waits this long, and so does a reply with
+# output of its own; one that is only the echo and the prompt (each line of
+# an edit) does not wait at all. Seconds, never past the read's timeout.
 SETTLE = 0.15
+
+# The wait after a refusal: a CLI that checks a line as it is typed (Junos
+# on a pty) refuses the bad word, redraws the prompt and the line, then
+# refuses the Enter, and that complaint is still to come.
+REFUSAL_SETTLE = 0.3
 
 
 def strip_ansi(text: str) -> str:
@@ -258,31 +267,18 @@ class Cli:
         tail = f"; last line: {seen[-1][:80]!r}" if seen else ""
         raise TimeoutError(f"no prompt within {timeout}s{tail}")
 
-    def _settle(self, buffer: str, seconds: float) -> str:
-        """What else arrives within `seconds`, for a reply whose prompt may
-        not have been the last: a CLI that refused a line as it was typed
-        redraws the prompt and the line, then refuses the Enter after it."""
-        buf = buffer
-        deadline = time.monotonic() + seconds
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return buf
-            try:
-                chunk = self.channel.recv(4096, remaining).decode("utf-8", errors="replace")
-            except (TimeoutError, OSError):
-                return buf
-            if not chunk:
-                return buf
-            buf += chunk
-
     @staticmethod
-    def _at_prompt(clean: str, prompt_re: re.Pattern) -> bool:
+    def _is_prompt(line: str, prompt_re: re.Pattern) -> bool:
+        """`line`, whitespace around it aside, is a prompt."""
+        line = line.strip()
+        return bool(line) and prompt_re.search(line) is not None
+
+    @classmethod
+    def _at_prompt(cls, clean: str, prompt_re: re.Pattern) -> bool:
         """`clean` ends with a prompt: its last line, with nothing after it,
         is one. A prompt waits on its line for what is typed; a line break
         after prompt-shaped text is the device going on."""
-        line = last_line(clean).strip()
-        return bool(line) and prompt_re.search(line) is not None
+        return cls._is_prompt(last_line(clean), prompt_re)
 
     def read_until_prompt(self, timeout: int, buffer: str = "") -> str:
         return self._read_until(lambda clean: self._at_prompt(clean, self.prompt_re), timeout, buffer)
@@ -381,24 +377,36 @@ class Cli:
 
     def _learn_prompt(self, reply: str) -> re.Pattern:
         """The device's own prompt, from the first one seen after login: from
-        then on only `user@host` (or `Router`, with its config-mode suffix) ends a
-        reply, not any line that happens to end in `>` or `#`."""
+        then on only `user@host` (or `Router`, with its config-mode suffix),
+        the whole line from its start, ends a reply, not any line that happens
+        to end in `>` or `#`: `uplink to BackupRouter>` is not `Router>`,
+        though it ends in it (#141)."""
         seen = [l.strip() for l in reply.splitlines() if l.strip()]
         if not seen:
             return self.prompt_re
         m = self.cli.prompt_name.search(seen[-1])
-        return re.compile(re.escape(m.group(1)) + self.cli.prompt_tail) if m else self.prompt_re
+        return re.compile("^" + re.escape(m.group(1)) + self.cli.prompt_tail) if m else self.prompt_re
 
     # --- commands ---------------------------------------------------------------
 
     def run(self, cmd: str, command_timeout: int) -> str:
         """Send a command and return output (stripped of echo and trailing prompt).
 
-        The prompt is looked for on the last line only, and never on the echo:
-        a config line that itself ends in prompt-shaped text (`description
+        The prompt is the whole last line, and never the echo: a config line
+        that itself ends in prompt-shaped text (`description
         noc@example.com>`) once satisfied the match on its echo, left the real
         reply in the socket, and shifted every later read by one reply, so a
-        commit the device refused was reported as COMMIT OK.
+        commit the device refused was reported as COMMIT OK; a reply line
+        that ends in the prompt (`uplink to BackupRouter>`) once did the
+        same (#141).
+
+        A reply with output of its own is read on until the device has said
+        nothing more for SETTLE after its prompt (REFUSAL_SETTLE after a
+        refusal, whose Enter may still be refused), and must end with the
+        prompt still: a reply line that is the prompt itself, at a read
+        boundary, is not the end of the reply. A reply that is only the
+        echo and the prompt, each line of an edit, is not waited on. Neither
+        wait runs past command_timeout.
 
         A command with a control character or a Tab in it is not typed: the
         CLI would take it as a key (refuse_control_characters)."""
@@ -414,22 +422,29 @@ class Cli:
                 return False
             if len(lines) == 1 and is_echo(lines[0], cmd):
                 return False                      # only the echo so far
-            return prompt_re.search(lines[-1]) is not None
+            return self._at_prompt(clean, prompt_re)
 
-        output = self._read_until(done, command_timeout)
-        if self.dialect.refused.search(output):
-            # A refusal may have been typed-time: the prompt that ended the
-            # read was a redraw, and the Enter's own complaint is still coming.
-            output = strip_ansi(self._settle(output, 0.3))
+        def settle(clean: str) -> float:
+            said = "\n".join(self._reply_lines(clean, cmd, prompt_re))
+            if not said.strip():
+                return 0                          # the echo and the prompt: a line of an edit
+            return REFUSAL_SETTLE if self.dialect.refused.search(said) else SETTLE
 
-        lines = output.splitlines()
+        output = self._read_until(done, command_timeout, settle=settle)
+        return "\n".join(self._reply_lines(output, cmd, prompt_re))
+
+    def _reply_lines(self, clean: str, cmd: str, prompt_re: re.Pattern) -> list:
+        """The lines of a reply that are its own: not the echo of `cmd`, the
+        prompt that ends it, or the context banner the CLI prints with that
+        prompt."""
+        lines = clean.splitlines()
         if lines and is_echo(lines[0], cmd):
             lines = lines[1:]
-        if lines and prompt_re.search(lines[-1]):
+        if lines and self._is_prompt(lines[-1], prompt_re):
             lines = lines[:-1]
         if self.cli.context and lines and self.cli.context.match(lines[-1].strip()):
             lines = lines[:-1]            # the context banner is the prompt's, not the reply's
-        return "\n".join(lines)
+        return lines
 
     def leave_quietly(self, *cmds: str) -> None:
         """Send what ends an edit whose verdict is already known: rollback 0

@@ -2,6 +2,8 @@
 dialect's shape. Here the channel is a script in memory: the telnet tests
 drive the same engine over a real socket, the paramiko tests over a fake
 shell channel."""
+import time
+
 import pytest
 
 from hssh import dialects
@@ -24,11 +26,15 @@ class ScriptChannel:
     `hang_on` names a command left unanswered, `close_on` one answered by
     hanging up. `split_at` makes the first read that holds that text end
     right after it, as a device pausing there would; a PAUSE in what it
-    says ends a read there every time."""
+    says ends a read there every time. With `blocking`, a read that finds
+    nothing waits out its timeout first, as a socket's does, and `waits`
+    notes the line typed last before each such wait."""
 
-    def __init__(self, first, replies, echo=True, hang_on=None, close_on=None, split_at=None):
+    def __init__(self, first, replies, echo=True, hang_on=None, close_on=None, split_at=None, blocking=False):
         self.queue = bytearray(first.encode())
         self.split_at = split_at
+        self.blocking = blocking
+        self.waits = []
         self.replies = replies
         self.echo = echo
         self.hang_on = hang_on
@@ -52,6 +58,9 @@ class ScriptChannel:
             return data
         if self.eof:
             return b""
+        if self.blocking:
+            self.waits.append(self.typed[-1] if self.typed else None)
+            time.sleep(timeout)
         raise TimeoutError("nothing to read")
 
     def send(self, data):
@@ -113,7 +122,7 @@ def test_login_answers_the_dialogue_and_learns_the_devices_own_prompt():
     s = Cli(ch, dialects.junos.DIALECT, 5)
     s.login("lab", "secret", dialogue=True)
     assert ch.typed == ["lab", "secret"]
-    assert s.prompt_re.pattern.startswith("lab@R1") and s.prompt_re.search("lab@R1# ")
+    assert s.prompt_re.pattern.startswith("^lab@R1") and s.prompt_re.search("lab@R1# ")
     assert not s.prompt_re.search("other@R1> ") and not s.prompt_re.search("description noc@example.com>")
 
 
@@ -251,6 +260,70 @@ def test_run_times_out_and_notices_a_hangup_rather_than_return_a_partial_reply()
     s, ch = junos_session(close_on="show")
     with pytest.raises(ConnectionError, match="closed by the device"):
         s.run("show version", 1)
+
+
+def test_a_reply_line_that_is_the_prompt_does_not_end_the_reply():
+    """#141: a read whose last line was the learned prompt was the reply, so
+    a reply line that is the prompt itself (`Router>`), with the rest of the
+    reply in the device's next write, ended it there: `show prompt` gave
+    `line one`, and the next command got the rest as its own reply. A reply
+    with output is read on until the device has said nothing more for
+    SETTLE after its prompt, and must still end with one: each command gets
+    its own reply, every word of it."""
+    replies = {"show prompt": "line one\r\nRouter>" + PAUSE + "\r\nline three\r\n\r\nRouter>" + PAUSE,
+               "show version": "Cisco IOS Software\r\n\r\nRouter>" + PAUSE}
+    ch = ScriptChannel("\r\nRouter>" + PAUSE, replies)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    assert s.run("show prompt", 5) == "line one\nRouter>\nline three\n"
+    assert s.run("show version", 5) == "Cisco IOS Software\n"
+    assert ch.typed == ["show prompt", "show version"] and ch.unread() == ""
+
+
+def test_a_line_that_only_ends_in_the_prompt_never_ends_a_read():
+    """#141: the learned prompt was looked for anywhere in the last line,
+    so `uplink to BackupRouter>` was `Router>` to it: a reply line ending so,
+    at a read boundary, ended the read, and the rest of the reply was the
+    next command's. The learned prompt is the whole line from its start;
+    such a line never ends a read, however long the device pauses after it,
+    and a reply that stops there is no reply."""
+    replies = {"show cdp": "line one\r\nuplink to BackupRouter>" + PAUSE + "\r\nline three\r\n\r\nRouter>",
+               "show uplinks": "line one\r\nuplink to BackupRouter>"}
+    ch = ScriptChannel("\r\nRouter>", replies)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    assert not s.prompt_re.search("uplink to BackupRouter>") and s.prompt_re.search("Router(config-if)#")
+    assert s.run("show cdp", 5) == "line one\nuplink to BackupRouter>\nline three\n"
+    with pytest.raises(TimeoutError, match="^no prompt within 1s; last line: 'uplink to BackupRouter>'$"):
+        s.run("show uplinks", 1)
+
+
+@pytest.mark.parametrize("banner", ["[edit]", "{master}[edit]"])
+def test_a_line_of_an_edit_is_not_waited_on(banner):
+    """#141: a reply with output of its own is read on for SETTLE after its
+    prompt. One that is only the echo, the context banner and the prompt,
+    each set line of an edit (`{master}[edit]` on a router with two routing
+    engines), is not waited on at all, so a 1000-line edit costs what it
+    did: a few ms a line at most. The channel's reads block as a socket's
+    do, so a wait would cost its time; one after a set line ends the test."""
+    cfg = f"\r\n\r\n{banner}\r\nlab@R1# "
+    stamps = []
+
+    def set_line(line):
+        assert not (ch.waits and (ch.waits[-1] or "").startswith("set ")), "a set line's reply was waited on"
+        stamps.append(time.monotonic())
+        return cfg
+    ch = ScriptChannel("\r\n" + OP, junos_device(**{
+        "configure": "\r\nEntering configuration mode" + cfg, "set": set_line,
+        "show | compare": "\r\n[edit system]\r\n+  host-name test;" + cfg, "rollback": "\r\nload complete" + cfg}),
+        blocking=True)
+    s = Cli(ch, dialects.junos.DIALECT, 5)
+    s.login()
+    payload = "".join(f"set interfaces ge-0/0/{n} description x{n}\n" for n in range(1000))
+    r = s.edit_candidate(payload, dry_run=True)
+    assert r.status == R.DRY_RUN and r.diff == "[edit system]\n+  host-name test;"
+    assert ch.waits == [None, "configure exclusive", "show | compare", "rollback 0", "exit"]
+    assert len(stamps) == 1000 and (stamps[-1] - stamps[0]) / 999 < 0.003
 
 
 def test_paging_is_answered_and_the_marker_removed():

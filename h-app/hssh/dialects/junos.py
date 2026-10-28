@@ -85,7 +85,10 @@ CLI = CliSyntax(
     commit="commit",
     # "[edit]" / "[edit system]" before the configuration-mode prompt belongs
     # to the prompt: without this, an empty `show | compare` read as a diff.
-    context=re.compile(r"^\[edit[^\]]*\]\s*$"),
+    # A router with two routing engines (a virtual chassis, a cluster) puts
+    # the engine's role in front, "{master}[edit]": the engine waits after a
+    # reply with output of its own, and this is none (#141).
+    context=re.compile(r"^(\{[^{}]*\})?\[edit[^\]]*\]\s*$"),
 )
 
 DIALECT = Dialect("junos", "Junos", "Junos: set syntax, candidate configuration, commit confirmed",
