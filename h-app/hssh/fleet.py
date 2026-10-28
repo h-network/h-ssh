@@ -898,7 +898,10 @@ class Fleet:
     agent; an empty string is refused, since the transports do not agree on
     what it means. `workers`: devices in flight at once, lowered to what
     the open-file limit carries (the soft limit is raised towards the hard
-    one first, as the CLI does; a RuntimeWarning says when fewer run).
+    one first, as the CLI does, for them and for the session the pool keeps
+    for every junos device; a RuntimeWarning says when fewer run, or when
+    even the hard limit cannot hold those sessions, and the pool then closes
+    its least recently used idle one before it opens another).
     `session_timeout`, `command_timeout`: whole seconds, as the CLI's flags.
     `retries`: attempts after the first, for failures the runner's
     classification allows; 2 by default, as the CLI's --retries. `store`: a
@@ -1162,7 +1165,10 @@ class Fleet:
             if self._closed:
                 raise RuntimeError("this Fleet is closed")
             if self._workers is None:
-                fitted, note = limits.fit_workers_to_open_files(self.workers)
+                # The sessions the pool keeps for the Fleet's life count as
+                # well: one per device on a pooled transport (#147).
+                pooled = sum(1 for t in self.targets if drivers.get(t.vendor).transport.pooled)
+                fitted, note = limits.fit_workers_to_open_files(self.workers, pooled)
                 if note:
                     warnings.warn(note, RuntimeWarning, stacklevel=4)
                 self.workers = fitted

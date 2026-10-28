@@ -12,6 +12,7 @@ session and gives it back. A session that fails underneath a call is
 discarded, never handed to the next caller.
 """
 
+import errno
 import getpass
 import hashlib
 import os
@@ -22,11 +23,13 @@ import time
 from contextlib import contextmanager
 from typing import List, Optional
 
+from .. import limits
 from ..core import COMMENT_BYTES, check_comment, check_confirm_minutes, refused_reply
 from ..dialects.junos import (SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS, COMMIT_PENDING as _PENDING,
                               DIALECT as _JUNOS)
 # ConnectTimeoutError is h-ssh's (hssh.errors), not PyEZ's class of that name.
-from ..errors import AmbiguousCommitError, ConnectTimeoutError, NotAppliedError, NothingToConfirmError
+from ..errors import (AmbiguousCommitError, ConnectTimeoutError, NotAppliedError, NothingToConfirmError,
+                      OpenFileLimitError)
 from ..drivers import results as R
 from ..pool import POOL
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
@@ -183,7 +186,18 @@ if _paramiko is not None:
         left of this thread's connect phase, every address of the name
         together (ncclient gives each one the whole timeout again), and what
         the OS answered is kept: ncclient says only "Could not open socket",
-        where the reason should say refused, no route or no answer (#126)."""
+        where the reason should say refused, no route or no answer (#126).
+        So is what refused the socket itself, before any connect: EMFILE,
+        this process out of descriptors, was guessed "connection refused"
+        (#147)."""
+
+        def __init__(self, *args, **kwargs):
+            try:
+                super().__init__(*args, **kwargs)
+            except OSError as e:
+                if getattr(_DEADLINE, "connect_at", None) is not None:
+                    _DEADLINE.connect_error = e
+                raise
 
         def connect(self, address):
             at = getattr(_DEADLINE, "connect_at", None)
@@ -264,6 +278,14 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         # PyEZ validates the host itself: "only alphanumerics, dots,
         # underscores, hyphens, or bracketed IPv6 literals are permitted".
         raise NotAppliedError(f"NETCONF connect failed: PyEZ does not accept host {host!r}: {e}") from e
+    except OSError as e:
+        # PyEZ reads ~/.ssh/config here: a descriptor it cannot have is this
+        # machine's limit, said as such (#147); anything else as it was.
+        short = _out_of_descriptors(e)
+        if short is None:
+            raise
+        where = f"{host}:{params['port']}"
+        raise OpenFileLimitError(f"NETCONF connect failed: {_no_descriptor(where, short)}") from e
     started = time.monotonic()
     # One deadline for the session set-up, and a nearer one for its connect
     # phase: the TCP connect and the banner have --connect-timeout between
@@ -285,8 +307,10 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         if isinstance(e, ConnectError):
             reason = _connect_reason(e, host, _login(host, user, port, dev), params["port"], session_timeout,
                                      time.monotonic() - started, connect_timeout=connect_s, os_error=os_error)
-            # A connect phase that ran out is retried; anything else in it is not.
-            failed = ConnectTimeoutError if timed_out(reason) else NotAppliedError
+            # A connect phase that ran out is retried; anything else in it is
+            # not, and the open-file limit is this machine's, not the device's.
+            failed = (OpenFileLimitError if reason.startswith(_LOCAL_LIMIT)
+                      else ConnectTimeoutError if timed_out(reason) else NotAppliedError)
             raise failed(f"NETCONF connect failed: {reason}") from e
         raise
     finally:
@@ -339,6 +363,12 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     cause_kind = type(cause).__name__ if cause is not None else ""
     text = str(cause) if cause is not None else ""
     low = text.lower()
+    # Out of descriptors, for the socket (which ncclient swallows: its
+    # "Could not open socket" read as refused) or for ncclient's selector or
+    # paramiko's pipe after it: this machine's limit, never the device's.
+    short = _out_of_descriptors(os_error, exc, cause)
+    if short is not None:
+        return _no_descriptor(where, short)
     if kind == "ConnectAuthError" or cause_kind == "AuthenticationError":
         return f"authentication failed for {user} at {where}"
     if kind == "ConnectUnknownHostError" or isinstance(cause, socket.gaierror):
@@ -385,8 +415,37 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     return f"{kind} for {where}" + (f": {text}" if text else "")
 
 
+# How a session this machine had no descriptor for is said (#147).
+_LOCAL_LIMIT = "local open-file limit reached"
+
+
+def _out_of_descriptors(*errors) -> Optional[OSError]:
+    """The OSError among `errors`, or what they were raised from, that says
+    this machine is out of file descriptors (EMFILE, ENFILE); None if none."""
+    for err in errors:
+        if not isinstance(err, BaseException):
+            continue                # None, or PyEZ's _orig when it is a message
+        for e in _chain(err):
+            if isinstance(e, OSError) and e.errno in (errno.EMFILE, errno.ENFILE):
+                return e
+    return None
+
+
+def _no_descriptor(where: str, err: OSError) -> str:
+    """A session to `where` this machine had no descriptor for, said as the
+    local limit it is: not the device's answer, nothing sent (#147)."""
+    if err.errno == errno.ENFILE:
+        limit = "the system's file table is full: fs.file-max, not ulimit -n"
+    else:
+        soft = limits.open_file_limit()
+        limit = "ulimit -n" + (f" {soft}" if soft is not None else "")
+    return f"{_LOCAL_LIMIT} ({limit}): this machine had no descriptor for a session to {where}; nothing was sent"
+
+
 _CLOSES: "set[threading.Thread]" = set()
-_CLOSES_LOCK = threading.Lock()
+# Re-entrant: a session whose borrow was abandoned (#147) is closed wherever
+# the garbage collector frees it, perhaps on a thread inside this lock.
+_CLOSES_LOCK = threading.RLock()
 
 
 def _close(dev) -> Optional[threading.Thread]:
@@ -445,6 +504,17 @@ def wait_for_closes(timeout: float = 1.0) -> int:
         except RuntimeError:
             pass    # not started yet: _close() is between adding it and start()
     return sum(1 for t in pending if t.is_alive())
+
+
+def release(host: str, user: str, passwd: Optional[str], port: Optional[int] = None) -> bool:
+    """Close the router's pooled session now, when the caller is done with
+    the router: a --job device after its last entry (#147), so that a run
+    through many routers holds no session for the ones it has finished.
+    True when one was closed. A call in flight on it is waited for; a
+    transaction another thread holds open on it, pool.BUSY_WAIT at most, and
+    then it is left to that transaction. With the pool off there is nothing
+    to close."""
+    return POOL.release(_pool_key(host, port, user, passwd))
 
 
 def _alive(dev, idle: float) -> bool:
@@ -672,8 +742,17 @@ class Transaction:
     the same session — before deciding. Leaving a `with` block without
     commit() aborts.
 
-    The pooled session stays borrowed while the transaction is open: other
-    threads wanting this router wait, this thread may keep using it.
+    The pooled session stays borrowed while the transaction is open: this
+    thread may keep reading on it (show(), rpc() of a read), but a change it
+    asks for there (edit(), rollback(), confirm(), begin()) is refused,
+    NotAppliedError and nothing sent, since it would commit this candidate
+    with its own; other threads wanting this router wait for it up to their
+    command timeout, then NotAppliedError ('router busy: a transaction is
+    open on this session'), nothing sent. A Transaction
+    dropped without commit() or abort(), here or wherever the garbage
+    collector frees it, closes its session instead of returning it to the
+    pool: the router lets go of the lock and the candidate with it, and the
+    next call opens a fresh session (#147).
     """
 
     def __init__(self, cm, lease, cu, diff: str, label: str, command_timeout: int):
@@ -684,9 +763,10 @@ class Transaction:
         self.label = label
         self._timeout = command_timeout
         self.open = True
-        # The pool's per-router lock is re-entrant and owned by this thread;
-        # only this thread can hand the session back.
-        self._owner = threading.get_ident()
+        # The pool's per-router lock is re-entrant and owned by this thread,
+        # the Thread itself, whose ident a later thread can be given (#147):
+        # only this thread finishes the transaction.
+        self._owner = threading.current_thread()
 
     @property
     def dev(self):
@@ -768,14 +848,14 @@ class Transaction:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self.open and threading.get_ident() == self._owner:
+        if self.open and threading.current_thread() is self._owner:
             self.abort()
         return False
 
     def _require_open(self) -> None:
         if not self.open:
             raise RuntimeError("transaction is no longer open")
-        if threading.get_ident() != self._owner:
+        if threading.current_thread() is not self._owner:
             # A commit from here would land on the device and then fail to
             # release the owner's lock, with the slot wedged for every other
             # caller. Refuse before any RPC: nothing is sent.
@@ -785,7 +865,7 @@ class Transaction:
     def _finish(self, rollback: bool, unlock: bool) -> None:
         if not self.open:
             return
-        if threading.get_ident() != self._owner:
+        if threading.current_thread() is not self._owner:
             raise RuntimeError("transaction must be used and finished on the thread that opened it; "
                                "nothing was sent to the device")
         self.open = False
@@ -801,19 +881,32 @@ class Transaction:
             self._cm.__exit__(None, None, None)
 
 
+# A change asked for on the thread that holds a transaction open on the
+# router's session, which the change would borrow too: an asyncio.to_thread()
+# that lands on the thread holding one, or a fallback edit in the except
+# block of the code that left one open. It locked that session again and
+# committed the transaction's candidate with its own (#147). A read still
+# rides the session.
+_NESTED = ("this thread holds a transaction open on this session: commit() or abort() it first, or its "
+           "candidate goes in with this change; nothing was sent")
+
+
 def _begin(host: str, user: str, passwd: Optional[str], session_timeout: int,
            command_timeout: int, port: Optional[int], stage, label: str,
            connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> Transaction:
     """lock -> stage(cu) -> diff -> commit_check, left open as a Transaction.
     `stage` puts the change into the candidate: a load for edit(), a rollback
     for rollback(). Raises NotAppliedError for failures before anything could
-    change on the device and RuntimeError for rejected config; on any failure
-    the candidate is discarded and the lock released."""
+    change on the device, and on the thread that holds a transaction open on
+    the router's session (_NESTED), and RuntimeError for rejected config; on
+    any failure the candidate is discarded and the lock released."""
     cm = _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout)
     lease = cm.__enter__()
     cu = None
     locked = False
     try:
+        if lease.inside_open:
+            raise NotAppliedError(_NESTED)
         cu = JunosConfig(lease.dev)
         _lock(cu, lease)
         locked = True
@@ -884,13 +977,20 @@ def begin(host: str, user: str, passwd: str, payload: Optional[str],
         raise ValueError("begin() takes a payload or rollback=n, not both and not neither")
     if rollback is not None:
         n = _rollback_number(rollback)
-        return _begin(host, user, passwd, session_timeout, command_timeout, port,
-                      stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ", connect_timeout=connect_timeout)
-    fmt = _config_format(payload)
-    body = _strip_comments(payload) if fmt == "set" else payload
-    return _begin(host, user, passwd, session_timeout, command_timeout, port,
-                  stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="",
-                  connect_timeout=connect_timeout)
+        tx = _begin(host, user, passwd, session_timeout, command_timeout, port,
+                    stage=lambda cu: cu.rollback(n), label=f"ROLLBACK {n}: ", connect_timeout=connect_timeout)
+    else:
+        fmt = _config_format(payload)
+        body = _strip_comments(payload) if fmt == "set" else payload
+        tx = _begin(host, user, passwd, session_timeout, command_timeout, port,
+                    stage=lambda cu: cu.load(body, format=fmt, ignore_warning=IGNORED_LOAD_WARNINGS), label="",
+                    connect_timeout=connect_timeout)
+    # Handed to the caller, held open for as long as it decides: another
+    # thread wanting this router waits for it only so long (#147). The
+    # transaction edit() and rollback() run is over within their call, a
+    # call in flight, which its own timeouts bound, and is waited for.
+    tx._lease.hold_open()
+    return tx
 
 
 # Load warnings that do not fail the device. A delete of a statement the
@@ -1002,8 +1102,12 @@ def _confirm(host: str, user: str, passwd: Optional[str], session_timeout: int, 
     and the confirmation, as one could after a read made before the lock.
     The lock does not hold off the device's own rollback when the timer
     runs out: that can still land in between, and the confirmation then
-    reads COMMIT CONFIRMED OK for a change the device has rolled back."""
+    reads COMMIT CONFIRMED OK for a change the device has rolled back. On
+    the thread that holds a transaction open on the router's session it is
+    refused before anything is sent (_NESTED)."""
     with _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout) as lease:
+        if lease.inside_open:
+            raise NotAppliedError(_NESTED)
         # A plain commit with nothing waiting is not a confirmation: the
         # timer expired (the change is gone) or someone confirmed before.
         # Either way the operator must know; a commit would only hide it.

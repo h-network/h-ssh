@@ -1369,3 +1369,22 @@ def test_a_close_during_the_probe_ends_the_run_at_once(monkeypatch, tmp_path):
     assert time.monotonic() - started < 2.0
     with sqlite3.connect(str(path)) as con:
         assert con.execute("SELECT ok, failed, skipped, interrupted FROM runs").fetchall() == [(0, 0, 3, 1)]
+
+
+@pytest.mark.parametrize("err, limit", [(errno.EMFILE, "ulimit -n"), (errno.ENFILE, "fs.file-max")])
+def test_a_box_this_machine_has_no_descriptor_for_is_not_probed_not_dead(real_probe, monkeypatch, err, limit):
+    """#147 live check: a Fleet holding a pooled session for each of 250
+    routers at an open-file limit of 256 probed its second run with no
+    descriptor to spare, and every box whose socket() failed with EMFILE was
+    called dead ('no route ... Too many open files'), 110 of them. That is
+    this machine, not the box: it is not probed, and runs as under
+    --no-probe."""
+    real = socket.socket
+
+    def no_descriptor(family=-1, type=-1, proto=-1, fileno=None):
+        if fileno is None and family in (socket.AF_INET, socket.AF_INET6):   # the probe's, not the loop's own
+            raise OSError(err, os.strerror(err))
+        return real(family, type, proto, fileno)
+    monkeypatch.setattr(probe.socket, "socket", no_descriptor)
+    answer = asyncio.run(probe.attempt("127.0.0.1", 830, b"SSH-", 1.0))
+    assert answer.result == probe.NOT_PROBED and limit in answer.reason, answer

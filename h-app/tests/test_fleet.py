@@ -156,14 +156,37 @@ def test_workers_are_fitted_to_the_open_file_limit(monkeypatch):
     assert cli.fit_workers_to_open_files is limits.fit_workers_to_open_files      # one copy, the CLI's is it
     install(monkeypatch, show=show)
     monkeypatch.setattr(fleet_mod.limits, "fit_workers_to_open_files",      # a machine short of descriptors
-                        lambda workers: (2, f"the open-file limit of 44 (ulimit -n) carries 2 workers at ~6 "
-                                            f"descriptors each, not {workers}; running 2"))
+                        lambda workers, pooled=0: (2, f"the open-file limit of 44 (ulimit -n) carries 2 workers "
+                                                      f"at ~6 descriptors each, not {workers}; running 2"))
     hosts = [f"10.0.1.{i}" for i in range(1, 7)]
     with Fleet(hosts, transport="junos", user="u", workers=6) as fleet:
         with pytest.warns(RuntimeWarning, match="carries 2 workers at ~6 descriptors each, not 6; running 2"):
             got = list(fleet.show("show version"))
         assert fleet.workers == 2 and "workers=2" in repr(fleet)
     assert len(got) == 6 and state["peak"] <= 2
+
+
+def test_the_sessions_a_fleet_keeps_count_against_the_open_file_limit(monkeypatch):
+    """#147: a Fleet keeps a session per junos device for its life, and the
+    fit counted its workers alone: 300 routers at the common soft limit of
+    1024 failed 46 with "Too many open files", most of them said as
+    "connection refused". The soft limit is raised for those sessions too; a
+    device on a transport with no pool counts as a worker only. When even
+    the hard limit cannot hold them, the warning says how many it keeps."""
+    from tests.test_transport_consistency import _rlimits
+    install(monkeypatch, show=echo)
+    junos = [f"j{i}:10.0.2.{i}:junos" for i in range(1, 11)]
+    plain = ["s1:10.0.3.1:ssh", "s2:10.0.3.2:ssh"]
+    state = _rlimits(monkeypatch, 64, 65536)
+    with Fleet(junos + plain, user="u", workers=2) as fleet:
+        assert all(r.ok for r in fleet.show("show version"))
+    assert state["set"] == [(2 * 6 + 10 * 4 + 32, 65536)]
+    _rlimits(monkeypatch, 64, 64, settable=False)
+    with Fleet(junos + plain, user="u", workers=2) as fleet:
+        with pytest.warns(RuntimeWarning, match=r"^the open-file limit of 64 \(ulimit -n\) keeps 5 of the 10 "
+                                                r"pooled sessions open at ~4 descriptors each"):
+            assert all(r.ok for r in fleet.show("show version"))
+        assert fleet.workers == 2
 
 
 def test_a_failure_is_a_value_and_the_rest_still_run(monkeypatch):

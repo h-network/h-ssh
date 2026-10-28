@@ -138,6 +138,35 @@ def test_workers_are_lowered_to_what_the_limit_carries(monkeypatch):
     assert cli.fit_workers_to_open_files(256) == (256, None)
 
 
+def test_the_sessions_the_pool_keeps_are_counted_in_the_open_file_limit(monkeypatch):
+    """#147: the fit budgeted the workers alone, and every junos device of a
+    Fleet or a --job keeps a pooled session of ~4 descriptors beside them:
+    300 routers at the common soft limit of 1024 failed 46 of them with
+    "Too many open files". The soft limit is raised for those sessions too."""
+    from hssh import limits
+    state = _rlimits(monkeypatch, 1024, 65536)
+    assert cli.fit_workers_to_open_files(8, pooled=300) == (8, None)
+    assert state["set"] == [(8 * cli.FDS_PER_WORKER + 300 * limits.FDS_PER_SESSION + cli.FDS_BASE, 65536)]
+    assert limits.FDS_PER_SESSION == 4
+    assert cli.fit_workers_to_open_files(8, pooled=300) == (8, None) and len(state["set"]) == 1    # enough now
+
+
+def test_a_hard_limit_short_of_the_pooled_sessions_lowers_no_workers_and_says_what_it_keeps(monkeypatch):
+    """What even the hard limit cannot hold is not failed as healthy
+    routers, nor taken out of the workers: the pool keeps what fits and
+    closes its least recently used idle session for the next one."""
+    state = _rlimits(monkeypatch, 1024, 1024)
+    fit, note = cli.fit_workers_to_open_files(8, pooled=300)
+    assert fit == 8 and state["set"] == []                  # nothing to raise it to
+    assert note == ("the open-file limit of 1024 (ulimit -n) keeps 236 of the 300 pooled sessions open at "
+                    "~4 descriptors each: the least recently used idle one is closed when another must open, "
+                    "and opened again when it is wanted")
+    _rlimits(monkeypatch, 64, 64, settable=False)
+    fit, note = cli.fit_workers_to_open_files(64, pooled=10)
+    assert fit == 5 and note.startswith("the open-file limit of 64 (ulimit -n) carries 5 workers at ~6 descriptors "
+                                        "each, not 64; running 5, and it keeps 0 of the 10 pooled sessions open")
+
+
 def test_the_run_warns_once_and_runs_with_the_lowered_workers(monkeypatch, capsys):
     _rlimits(monkeypatch, 64, 64, settable=False)
     driver = types.SimpleNamespace(AVAILABLE=True, show=lambda *a, **kw: "ok")

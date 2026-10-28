@@ -1537,7 +1537,18 @@ async def main() -> int:
                     if resolved != raw:
                         print(f"Resolved '{raw}' -> '{resolved}' ({vendor})")
 
-    args.workers, fd_note = fit_workers_to_open_files(resolve_workers(args.workers))
+    # A job runs on the session pool: a device on a pooled transport keeps its
+    # session from one entry to the next, and those sessions count against
+    # the open-file limit beside the workers (#147).
+    pooled = 0
+    if job_entries:
+        per_box = {}
+        for t, _ in units:
+            if drivers.get(t.vendor).transport.pooled:
+                box = (t.host, resolve_target_port(t))
+                per_box[box] = per_box.get(box, 0) + 1
+        pooled = sum(1 for n in per_box.values() if n > 1)
+    args.workers, fd_note = fit_workers_to_open_files(resolve_workers(args.workers), pooled)
     if fd_note:
         print(f"WARNING: {fd_note}", file=sys.stderr)
 
@@ -1753,69 +1764,97 @@ async def main() -> int:
             return contextlib.nullcontext()
         return device_locks.setdefault((t.host, resolve_target_port(t)), asyncio.Lock())
 
+    # A job's device keeps its pooled session from one entry to the next,
+    # and no longer: after its last entry the session is closed, so a job
+    # through many routers holds none for the ones it is done with (#147).
+    last_entry = {}
+    if job_entries:
+        for i, (t, _) in enumerate(units):
+            if drivers.get(t.vendor).transport.pooled:
+                last_entry[(t.host, resolve_target_port(t))] = i
+    release_after = set(last_entry.values())
+
+    def _release_session(t) -> None:
+        release = getattr(drivers.module_of(drivers.get(t.vendor)), "release", None)
+        if callable(release):
+            try:
+                release(t.host, user, passwd, port=t.port)
+            except Exception:
+                pass        # the end of the run closes it all the same
+
     async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
-                           started=None, seq=0, save=True, logs_in=True):
+                           started=None, seq=0, save=True, logs_in=True, release=False):
         async with _device_lock(t), sem:
-            if started is not None:
-                started()        # from here on the device may be touched
-            dry_run = args.dry_run if dry_run is None else dry_run
-            # For job mode: each target has its own mode and command
-            actual_mode = mode_override or mode
-            actual_show_cmd = show_cmd
-            actual_edit_cmd = edit_cmd
-            if cmd_override is not None:
-                if actual_mode == "show":
-                    actual_show_cmd = cmd_override
-                elif actual_mode.startswith("edit"):
-                    actual_edit_cmd = cmd_override
+            try:
+                return await _unit_on_device(t, mode_override, cmd_override, dry_run, expected_diff, started, seq,
+                                             save, logs_in)
+            finally:
+                if release and pool.POOL.enabled:
+                    # The device's session goes before the worker's slot does, so the
+                    # next device's session is never opened beside it (#147).
+                    await asyncio.to_thread(_release_session, t)
 
-            # Resolve shortcuts against this target's own vendor. Job-mode
-            # entries go through here too, which they previously skipped.
-            binding = None
-            if actual_show_cmd:
-                if args.structured:
-                    binding = resolve_structured(actual_show_cmd, t.vendor)
-                actual_show_cmd = resolve_command(actual_show_cmd, t.vendor)
-            # Edit payloads are sent as typed: the template library is for
-            # show shortcuts, and a template could not pass the set-syntax
-            # guard that already approved the typed text.
-            target_batch_cmds = (
-                [resolve_command(c, t.vendor) for c in batch_cmds]
-                if batch_cmds else None
-            )
+    async def _unit_on_device(t, mode_override, cmd_override, dry_run, expected_diff, started, seq, save, logs_in):
+        if started is not None:
+            started()        # from here on the device may be touched
+        dry_run = args.dry_run if dry_run is None else dry_run
+        # For job mode: each target has its own mode and command
+        actual_mode = mode_override or mode
+        actual_show_cmd = show_cmd
+        actual_edit_cmd = edit_cmd
+        if cmd_override is not None:
+            if actual_mode == "show":
+                actual_show_cmd = cmd_override
+            elif actual_mode.startswith("edit"):
+                actual_edit_cmd = cmd_override
 
-            return await run_for_target_async(
-                t=t,
-                transport=t.vendor,
-                mode=actual_mode,
-                show_cmd=actual_show_cmd,
-                edit_cmd=actual_edit_cmd,
-                config_dir=args.edit_dir if not job_entries else None,
-                broadcast_file=args.edit_broadcast if not job_entries else None,
-                user=user,
-                passwd=passwd,
-                session_timeout=args.session_timeout,
-                connect_timeout=args.connect_timeout,
-                command_timeout=args.command_timeout,
-                dry_run=dry_run,
-                payload_text=(broadcast_text if actual_mode == "edit-broadcast"
-                              else edit_payloads.get(t.name) if actual_mode == "edit-dir" else None),
-                commit_confirmed=args.commit_confirmed,
-                save_dir=save_dir if save else None,
-                quiet=not show_progress,
-                max_attempts=max(1, args.retries + 1),
-                batch_cmds=target_batch_cmds,
-                safety_gate=safety_gate,
-                structured=args.structured,
-                rollback=args.rollback,
-                comment=args.comment,
-                structured_binding=binding,
-                fmt=args.format,
-                expected_diff=expected_diff,
-                seq=seq,
-                stop=stopped,
-                logs_in=logs_in,
-            )
+        # Resolve shortcuts against this target's own vendor. Job-mode
+        # entries go through here too, which they previously skipped.
+        binding = None
+        if actual_show_cmd:
+            if args.structured:
+                binding = resolve_structured(actual_show_cmd, t.vendor)
+            actual_show_cmd = resolve_command(actual_show_cmd, t.vendor)
+        # Edit payloads are sent as typed: the template library is for
+        # show shortcuts, and a template could not pass the set-syntax
+        # guard that already approved the typed text.
+        target_batch_cmds = (
+            [resolve_command(c, t.vendor) for c in batch_cmds]
+            if batch_cmds else None
+        )
+
+        return await run_for_target_async(
+            t=t,
+            transport=t.vendor,
+            mode=actual_mode,
+            show_cmd=actual_show_cmd,
+            edit_cmd=actual_edit_cmd,
+            config_dir=args.edit_dir if not job_entries else None,
+            broadcast_file=args.edit_broadcast if not job_entries else None,
+            user=user,
+            passwd=passwd,
+            session_timeout=args.session_timeout,
+            connect_timeout=args.connect_timeout,
+            command_timeout=args.command_timeout,
+            dry_run=dry_run,
+            payload_text=(broadcast_text if actual_mode == "edit-broadcast"
+                          else edit_payloads.get(t.name) if actual_mode == "edit-dir" else None),
+            commit_confirmed=args.commit_confirmed,
+            save_dir=save_dir if save else None,
+            quiet=not show_progress,
+            max_attempts=max(1, args.retries + 1),
+            batch_cmds=target_batch_cmds,
+            safety_gate=safety_gate,
+            structured=args.structured,
+            rollback=args.rollback,
+            comment=args.comment,
+            structured_binding=binding,
+            fmt=args.format,
+            expected_diff=expected_diff,
+            seq=seq,
+            stop=stopped,
+            logs_in=logs_in,
+        )
 
     started = set()      # unit indices whose device may already be in play
     inflight = set()     # of those, the ones still running when Ctrl-C came
@@ -1841,12 +1880,13 @@ async def main() -> int:
         if i in dead:
             return i, _dead_result(i)
         mark = lambda: started.add(i)
+        release = i in release_after
         if je is not None:
             result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
-                                        started=mark, seq=seq_of[i], save=save, logs_in=logs_in)
+                                        started=mark, seq=seq_of[i], save=save, logs_in=logs_in, release=release)
         else:
             result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark, save=save,
-                                        logs_in=logs_in)
+                                        logs_in=logs_in, release=release)
         if not isinstance(result, RunResult):
             # A stand-in runner that still returns the bare tuple: the error is
             # read from its text, as it always was.

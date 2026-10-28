@@ -1,5 +1,7 @@
 """Session pool: reuse, isolation per router, discard on failure, reaping,
 and the junos driver's behaviour on a pooled session."""
+import atexit
+import gc
 import os
 import subprocess
 import sys
@@ -896,3 +898,511 @@ def test_a_closer_that_returns_something_else_is_not_waited_for():
         assert time.monotonic() - t0 < 0.5
     finally:
         p.disable()
+
+
+# --- #147: a transaction nobody finishes, and a router another thread waits for -----
+
+def tx_on(host="10.0.0.1"):
+    return netconf.begin(host, "u", None, "set system host-name r1\n", 5, 30)
+
+
+def in_thread(fn, timeout):
+    """fn() on a thread of its own: ("done", value), ("raised", exception),
+    or ("still waiting", None) once `timeout` seconds have gone by."""
+    out = []
+
+    def run():
+        try:
+            out.append(("done", fn()))
+        except Exception as e:
+            out.append(("raised", e))
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    return out[0] if out else ("still waiting", None)
+
+
+def test_a_transaction_dropped_without_commit_or_abort_closes_its_session(pooled):
+    """A Transaction dropped on its own thread went back to the pool with the
+    device's lock and the loaded candidate: the next edit reused that
+    session, and its commit took the abandoned change with it."""
+    tx = tx_on()
+    first = devices()[0]
+    del tx
+    assert first.closed and pooled.live() == 0 and pooled.stats["discards"] == 1
+    assert FakeConfig.instances[0].names == ["lock", "load", "diff", "commit_check"]    # nothing more on it
+    assert edit().startswith("COMMIT OK")
+    assert len(devices()) == 2 and cfg().dev is devices()[1]                           # a fresh session
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+
+
+def test_a_transaction_dropped_on_another_thread_frees_the_router(pooled):
+    """Opened on a thread that has ended since (asyncio.to_thread hands it to
+    the event loop's thread) and dropped on another: the RLock stayed owned
+    by the thread that opened it, and every later borrower of the router
+    waited for good."""
+    made = []
+    t = threading.Thread(target=lambda: made.append(tx_on()))
+    t.start()
+    t.join(5)
+    first = devices()[0]
+    made.clear()                                     # the last reference, dropped on this thread
+    assert first.closed and pooled.live() == 0
+    assert in_thread(show, 5) == ("done", "output of show version")
+    assert len(devices()) == 2
+
+
+def test_a_transaction_in_a_reference_cycle_is_ended_wherever_the_collector_frees_it(pooled):
+    holder = {}
+
+    def open_one():
+        cycle = [tx_on()]
+        cycle.append(cycle)                          # only the garbage collector frees it
+        holder["cycle"] = cycle
+    t = threading.Thread(target=open_one)
+    t.start()
+    t.join(5)
+    first = devices()[0]
+    holder.clear()
+    collector = threading.Thread(target=gc.collect)  # neither the thread that opened it nor this one
+    collector.start()
+    collector.join(5)
+    assert first.closed and pooled.live() == 0
+    assert in_thread(show, 5) == ("done", "output of show version")
+
+
+def test_an_abandoned_transaction_inside_an_open_borrow_leaves_the_session_to_it(pooled):
+    """Nested in a borrow the same thread still holds, an abandoned
+    transaction does not pull the session from under it: it is marked, and
+    closed when that borrow ends."""
+    with pooled.get_connection(KEY, opener=lambda: FakeDevice(), closer=netconf._close) as outer:
+        tx = tx_on()                                 # the same thread, the same session
+        del tx
+        assert not devices()[0]._closed and outer.doomed
+    assert devices()[0].closed and pooled.live() == 0
+
+
+def test_a_change_nested_in_an_open_transaction_is_refused_and_sends_nothing(pooled):
+    """A change on the thread that holds a transaction open went into the
+    router's lock again, locked the transaction's session once more and
+    committed its candidate with its own: the abandoned change going in with
+    the next one, from the except block of code that raised before commit()
+    or abort(), where the traceback still holds the transaction. Refused
+    now, nothing sent; a read still rides the session."""
+    tx = tx_on()
+    changes = {
+        "edit": edit,
+        "rollback": lambda: netconf.rollback("10.0.0.1", "u", None, 1, 5, 30),
+        "confirm": lambda: netconf.confirm("10.0.0.1", "u", None, 5, 30),
+        "begin": tx_on,
+    }
+    try:
+        for name, change in changes.items():
+            with pytest.raises(NotAppliedError) as refused:
+                change()
+            assert str(refused.value) == ("this thread holds a transaction open on this session: commit() or abort() "
+                                          "it first, or its candidate goes in with this change; nothing was sent"), name
+        assert len(FakeConfig.instances) == 1 and cfg().names == ["lock", "load", "diff", "commit_check"]
+        assert show() == "output of show version"    # a read rides it
+        assert tx.commit().startswith("COMMIT OK")   # the transaction is still the caller's to finish
+    finally:
+        if tx.open:
+            tx.abort()
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+    assert edit().startswith("COMMIT OK") and len(devices()) == 1 and pooled.live() == 1
+
+
+def test_an_edit_that_lands_on_the_thread_holding_an_open_transaction_is_refused(pooled):
+    """asyncio.to_thread() runs each call on one of the executor's threads:
+    an edit() made while a transaction opened that way was still open landed
+    on the thread holding it, rode its session and committed the open
+    candidate with its own change."""
+    import asyncio
+    import concurrent.futures
+
+    async def main():
+        asyncio.get_running_loop().set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        tx = await asyncio.to_thread(tx_on)
+        try:
+            await asyncio.to_thread(edit, "set system host-name other\n")
+        except NotAppliedError as e:
+            return e
+        finally:
+            await asyncio.to_thread(tx.abort)
+    refused = asyncio.run(main())
+    assert isinstance(refused, NotAppliedError) and str(refused).endswith("nothing was sent"), refused
+    assert len(FakeConfig.instances) == 1
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "rollback", "unlock"]   # the abort, no commit
+
+
+def test_a_thread_given_the_ident_of_a_transactions_ended_thread_does_not_ride_its_session(pooled):
+    """The router's lock and the transaction knew their thread by its ident,
+    which the system gives again to a thread started once that one has
+    ended: a transaction opened on a thread that has ended (asyncio.to_thread
+    hands it back) let such a later thread into its session as if it held
+    it, to read, edit, or commit it. That thread waits for it as any other
+    thread does now, and cannot finish it."""
+    opened = []
+
+    def opener():
+        opened.append((threading.get_ident(), tx_on()))
+    t = threading.Thread(target=opener)
+    t.start()
+    t.join(5)
+    ident, tx = opened.pop()
+    held, out = [tx], []
+    del tx
+
+    def attempt(fn):
+        try:
+            return ("done", fn())
+        except Exception as e:                       # its text: a traceback would keep the transaction alive
+            return ("raised", type(e).__name__, str(e))
+
+    def later():
+        if threading.get_ident() != ident:
+            return
+        t0 = time.monotonic()
+        out.append(attempt(lambda: show(timeout=1)))
+        out.append(time.monotonic() - t0)
+        out.append(attempt(held[0].commit))
+    try:
+        for _ in range(200):                         # an ended thread's ident is handed out again, and soon
+            u = threading.Thread(target=later)
+            u.start()
+            u.join(10)
+            if out:
+                break
+        else:
+            pytest.skip("no thread was given that ident again")
+        waited_for, waited, finished = out
+        assert waited_for == ("raised", "NotAppliedError", "router busy: a transaction is open on this session")
+        assert 0.9 <= waited < 2.5, f"{waited:.2f}s"
+        assert finished[:2] == ("raised", "RuntimeError") and "thread that opened it" in finished[2], finished
+        assert devices()[0].cli_calls == [] and cfg().names == ["lock", "load", "diff", "commit_check"]
+    finally:
+        held.clear()                                 # dropped: its session closes, the router is free
+    assert devices()[0].closed and in_thread(show, 5) == ("done", "output of show version")
+
+
+def test_a_borrower_behind_an_open_transaction_gives_up_after_its_command_timeout(pooled):
+    """show() from another thread behind an open Transaction waited with no
+    end: while the transaction stayed open, and for good once it was
+    abandoned on a thread that could not give the router back."""
+    hold, opened, result = threading.Event(), threading.Event(), {}
+
+    def owner():
+        tx = tx_on()
+        opened.set()
+        hold.wait(10)
+        result["commit"] = tx.commit()
+    a = threading.Thread(target=owner)
+    a.start()
+    try:
+        assert opened.wait(5)
+        t0 = time.monotonic()
+        how, error = in_thread(lambda: show(timeout=1), 5)
+        elapsed = time.monotonic() - t0
+        assert how == "raised" and isinstance(error, NotAppliedError), (how, error)
+        assert str(error) == "router busy: a transaction is open on this session"
+        assert 0.9 <= elapsed < 2.5, f"{elapsed:.2f}s"
+        assert devices()[0].cli_calls == []          # nothing was sent
+    finally:
+        hold.set()
+        a.join(5)
+    assert result["commit"].startswith("COMMIT OK")  # the transaction is the owner's to finish
+    assert in_thread(show, 5) == ("done", "output of show version")
+
+
+def test_a_borrower_behind_a_call_in_flight_waits_for_it_past_its_own_timeout(pooled):
+    """Only a transaction held open is waited for at most the command timeout:
+    a call in flight is bounded by its own timeouts, and the waiter behind a
+    slow one gets the router when it ends."""
+    entered, release = threading.Event(), threading.Event()
+
+    class Slow(FakeDevice):
+        def cli(self, cmd, warning=True):
+            if cmd == "show slow":
+                entered.set()
+                release.wait(5)
+            return super().cli(cmd, warning)
+    netconf.JunosDevice = Slow
+    a = threading.Thread(target=lambda: show(cmd="show slow"))
+    a.start()
+    try:
+        assert entered.wait(5)
+        threading.Timer(1.5, release.set).start()
+        assert in_thread(lambda: show(timeout=1), 5) == ("done", "output of show version")
+    finally:
+        release.set()
+        a.join(5)
+
+
+def test_a_borrower_behind_an_edits_commit_waits_for_it_past_its_own_timeout(pooled, monkeypatch):
+    """edit() and rollback() run a transaction of their own and finish it
+    within the call: a call in flight, which its own timeouts bound. It was
+    held open as one begin() hands back is, and a show() from a monitoring
+    thread behind a 30-second commit was refused "router busy" after its
+    own command timeout, where it had waited for the commit."""
+    entered, release, result = threading.Event(), threading.Event(), {}
+
+    def slow_commit(config):
+        entered.set()
+        release.wait(5)
+    monkeypatch.setattr(FakeConfig, "on", {"commit": slow_commit})
+    a = threading.Thread(target=lambda: result.setdefault("edit", edit()))
+    a.start()
+    try:
+        assert entered.wait(5)
+        threading.Timer(1.5, release.set).start()
+        assert in_thread(lambda: show(timeout=1), 5) == ("done", "output of show version")
+    finally:
+        release.set()
+        a.join(5)
+    assert result["edit"].startswith("COMMIT OK")
+    assert len(devices()) == 1 and devices()[0].cli_calls == ["show version"]     # after the commit, on its session
+
+
+def test_close_all_waits_for_an_open_transaction_at_most_busy_wait_then_says_so(pooled):
+    show(host="10.0.0.2")                            # an idle session beside it
+    hold, opened = threading.Event(), threading.Event()
+
+    def owner():
+        tx = tx_on()
+        opened.set()
+        hold.wait(10)
+        tx.abort()
+    a = threading.Thread(target=owner)
+    a.start()
+    try:
+        assert opened.wait(5)
+        t0 = time.monotonic()
+        how, error = in_thread(lambda: pool.close_all(shutdown=False, busy_wait=0.5), 5)
+        elapsed = time.monotonic() - t0
+        assert how == "raised" and isinstance(error, NotAppliedError), (how, error)
+        assert str(error) == ("router busy: a transaction is open on this session: 1 session(s) left open, "
+                              "each closed when its transaction ends")
+        assert 0.4 <= elapsed < 2.0, f"{elapsed:.2f}s"
+        idle, held = sorted(devices(), key=lambda d: d.params["host"], reverse=True)
+        assert idle.closed and not held._closed      # the others are closed all the same
+    finally:
+        hold.set()
+        a.join(5)
+    assert held.closed and pooled.live() == 0       # and that one once its transaction ended
+
+
+# --- #147: room under the open-file limit --------------------------------------------
+
+def test_the_least_recently_used_idle_session_is_closed_when_the_limit_holds_no_more(monkeypatch):
+    """With even the hard limit short of the sessions kept, the next open
+    failed with "Too many open files" for a healthy router. The least
+    recently used idle session is closed first now, and a later call to
+    that router opens it again."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    # FDS_BASE 32, one borrow in flight 6, two sessions open at 4: the third open fills it
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 32 + 6 + 2 * 4)
+    closed = []
+
+    def borrow(host):
+        with p.get_connection((host, 830, "u"), opener=lambda: host, closer=closed.append):
+            pass
+    try:
+        for host in ("r1", "r2", "r3"):
+            borrow(host)
+        assert closed == [] and p.live() == 3
+        borrow("r1")                                 # reused: r2 is now the least recently used
+        borrow("r4")
+        assert closed == ["r2"] and p.live() == 3 and p.stats["reaped"] == 1
+        borrow("r2")                                 # opened again, and r3 makes room for it
+        assert closed == ["r2", "r3"] and p.live() == 3
+        assert p.stats == {"opens": 5, "reuses": 1, "discards": 0, "reaped": 2}
+    finally:
+        p.disable()
+
+
+def test_closed_sessions_are_collected_before_an_idle_one_is_closed(monkeypatch):
+    """A closed session keeps a descriptor until the garbage collector runs
+    (#58), and a job that closes each device's session after its last entry
+    piles them up: near the limit they are collected first, and no session
+    a later call may want is closed for them."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 32 + 6 + 4 + 8)   # one kept, eight closed
+    collected, closed = [], []
+    monkeypatch.setattr(pool.gc, "collect", lambda *a, **k: collected.append(1))
+    try:
+        with p.get_connection(("keep", 830, "u"), opener=lambda: "keep", closer=closed.append):
+            pass
+        for i in range(10):
+            key = (f"r{i}", 830, "u")
+            with p.get_connection(key, opener=lambda i=i: f"r{i}", closer=closed.append):
+                pass
+            assert p.release(key) is True
+        assert len(collected) == 1 and p.stats["reaped"] == 0
+        assert "keep" not in closed and p.live() == 1
+    finally:
+        p.disable()
+
+
+def test_a_session_under_a_call_in_flight_counts_once_against_the_open_file_limit(monkeypatch):
+    """A borrow in flight was counted as a worker's descriptors, its session's
+    among them, and its session's four again. A --job whose soft limit was
+    raised for the sessions it keeps between entries, its workers and the
+    base closed 32 of them all the same at 300 routers, each a login more
+    that the safety gate never counted. Two calls in flight on open sessions
+    and one session kept idle are what the limit was raised for: nothing is
+    closed."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 32 + 2 * 6 + 1 * 4)   # 2 workers, 1 kept
+    closed = []
+
+    def borrow(host):
+        return p.get_connection((host, 830, "u"), opener=lambda: host, closer=closed.append)
+    inside, done = threading.Event(), threading.Event()
+
+    def worker():
+        with borrow("a"):
+            inside.set()
+            done.wait(5)
+    try:
+        with borrow("kept"):
+            pass                                     # idle until its next entry
+        t = threading.Thread(target=worker)
+        t.start()
+        assert inside.wait(5)
+        with borrow("b"):                            # the second worker's session fills the limit
+            assert closed == [] and p.live() == 3
+        done.set()
+        t.join(5)
+        assert p.stats == {"opens": 3, "reuses": 0, "discards": 0, "reaped": 0}
+    finally:
+        done.set()
+        p.disable()
+
+
+def test_nothing_is_closed_when_a_borrow_ends_while_the_pool_looks_for_room(monkeypatch):
+    """Past the limit at its first look and back under it by the time it has
+    listed the idle sessions (a borrow ended, a session closed): an eighth of
+    the idle sessions were closed all the same."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    p.enable()
+    monkeypatch.setattr(pool.limits, "open_file_limit", lambda: 1000)
+    closed = []
+    try:
+        for i in range(16):
+            with p.get_connection((f"r{i}", 830, "u"), opener=lambda i=i: f"r{i}", closer=closed.append):
+                pass
+        looks = iter([1004])                         # over at its first look, room at the next
+        monkeypatch.setattr(p, "_descriptors", lambda: next(looks, 1000))
+        with p.get_connection(("new", 830, "u"), opener=lambda: "new", closer=closed.append):
+            pass
+        assert closed == [] and p.stats["reaped"] == 0 and p.live() == 17
+    finally:
+        p.disable()
+
+
+def test_release_closes_the_routers_session_now(pooled):
+    """What a --job runs after a device's last entry (#147): the session
+    goes then, not at the end of the run."""
+    show()
+    assert netconf.release("10.0.0.1", "u", None) is True
+    assert devices()[0].closed and pooled.live() == 0
+    assert netconf.release("10.0.0.1", "u", None) is False          # nothing left to close
+    assert netconf.release("10.0.0.9", "u", None) is False          # never opened
+    show()
+    assert len(devices()) == 2                                       # a later call opens it again
+    hold, opened = threading.Event(), threading.Event()
+
+    def owner():
+        tx = tx_on()
+        opened.set()
+        hold.wait(10)
+        tx.abort()
+    a = threading.Thread(target=owner)
+    a.start()
+    try:
+        assert opened.wait(5)
+        assert pooled.release(KEY, wait=0.3) is False                # a transaction holds it: left to it
+        assert not devices()[1]._closed
+    finally:
+        hold.set()
+        a.join(5)
+
+
+# --- #147: a collection that starts inside the pool's own locks ------------------------
+
+class CollectOnExit:
+    """A lock that runs a collection in its exit before it lets go, as 3.10
+    and 3.11 can: the `with` exit builds a tuple to call the lock's
+    __exit__, and that allocation can start one."""
+
+    def __init__(self, lock):
+        self._lock = lock
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc):
+        gc.collect()
+        return self._lock.__exit__(*exc)
+
+
+@pytest.fixture
+def own_pool(monkeypatch):
+    """netconf on a pool of the test's own, and the collector off until the
+    test runs one: a pool the test leaves hung is not the one every later
+    test uses, and the exit does not wait on it."""
+    p = pool.ConnectionPool(idle_timeout=300)
+    atexit.unregister(p.close_all)
+    p.enable()
+    monkeypatch.setattr(netconf, "POOL", p)
+    gc.disable()
+    yield p
+    gc.enable()
+
+
+def test_a_collection_inside_the_routers_lock_ends_an_abandoned_borrow_there(own_pool):
+    """A collection that freed an abandoned transaction while a thread
+    looking at that router held the router's lock (its exit, on 3.10 and
+    3.11) ended the transaction's borrow on that thread, which took the
+    same lock again: a plain Lock hung the thread there, and the router for
+    good."""
+    holder = {}
+
+    def open_one():
+        cycle = [tx_on()]
+        cycle.append(cycle)                          # only the collector frees it
+        holder["cycle"] = cycle
+    t = threading.Thread(target=open_one)
+    t.start()
+    t.join(5)
+    holder.clear()
+    lock = own_pool._connections[KEY]["lock"]
+    lock._mutex = CollectOnExit(lock._mutex)
+    how = in_thread(show, 5)                         # looks at the router: the collection runs in there
+    try:
+        assert how == ("done", "output of show version"), how
+        assert devices()[0].closed and len(devices()) == 2 and own_pool.live() == 1
+    finally:
+        if how[0] != "still waiting":
+            own_pool.disable()
+
+
+def test_a_collection_inside_the_counters_lock_ends_an_abandoned_borrow_there(own_pool):
+    """The same inside the lock of the pool's counters, which every borrow
+    takes: the abandoned borrow counted its end under it, on the same
+    thread, and a plain Lock hung that thread and every borrow in the pool
+    behind it."""
+    cycle = [tx_on()]
+    cycle.append(cycle)
+    del cycle                                        # dropped without commit or abort; only the collector frees it
+    own_pool._stats_lock = CollectOnExit(own_pool._stats_lock)
+    how = in_thread(lambda: show(host="10.0.0.2"), 5)    # another router: its borrow counts itself
+    try:
+        assert how == ("done", "output of show version"), how
+        assert devices()[0].closed and own_pool.live() == 1
+    finally:
+        if how[0] != "still waiting":
+            own_pool.disable()

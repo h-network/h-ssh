@@ -362,6 +362,12 @@ async def attempt(host: str, port: int, banner: Optional[bytes], seconds: float)
         sock.close()
     if failure is None or isinstance(failure, TimeoutError) or failure.errno == errno.ETIMEDOUT:
         return Answer(TIMED_OUT, tcp_timed_out(at, seconds))
+    if failure.errno in (errno.EMFILE, errno.ENFILE):
+        # This machine had no descriptor to spare (a Fleet's pooled sessions
+        # hold many): that says nothing about the box, which is not probed
+        # and is run as under --no-probe, never called dead (#147).
+        return Answer(NOT_PROBED, f"this machine had no file descriptor to probe {at} "
+                                  f"({'fs.file-max' if failure.errno == errno.ENFILE else 'ulimit -n'})")
     return Answer(REFUSED if failure.errno == errno.ECONNREFUSED else NO_ROUTE, answered(failure, at))
 
 

@@ -64,7 +64,7 @@ with `--audit-log` it lands in a JSONL audit trail.
                     └──────────── every edit ──────────────────┴──▶ --audit-log (JSONL)
 ```
 
-On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it); a reply whose text opens with the CLI's refusal (`error: could not resolve file: ...` as the `<output>`, where most refusals come back as an RPC error) is a failure, `'CMD' was refused by the device: ...`, as on the text transports, and is not tried again; a transaction's `tx.show()` raises it too. The NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted, the file read as the `ssh` transport reads it: its `@cert-authority` lines are passed over, and a key it marks `@revoked` is refused (`host key verification failed for HOST:PORT: its key is marked @revoked in FILE`). With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT` or `no route to host HOST:PORT` (what the OS answered the TCP connect, where ncclient says only "Could not open socket"), `TCP connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login after Ns (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns`, `no SSH session to HOST:PORT within Ns: the banner came, but key exchange did not finish`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts, and the router's NETCONF hello after it has `--session-timeout` of its own. Within that deadline `--connect-timeout` (3 s) bounds the TCP connect and the banner together, so a router that does not answer, or accepts TCP and then says nothing, costs 3 s an attempt and is tried again (see [Failure handling](#failure-handling)); a slow key exchange, login or hello still has the session timeout. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
+On Junos, show commands run through PyEZ `Device.cli()` over one NETCONF session (a batch shares it); a reply whose text opens with the CLI's refusal (`error: could not resolve file: ...` as the `<output>`, where most refusals come back as an RPC error) is a failure, `'CMD' was refused by the device: ...`, as on the text transports, and is not tried again; a transaction's `tx.show()` raises it too. The NETCONF port defaults to 830 for every Junos call; set the target's port to use NETCONF on 22. Config changes lock the candidate, load, diff, run `commit_check`, commit, and unlock, rolling back if any step fails. Confirming a commit-confirmed (`-eC "commit"`) first reads the commit history: with no commit-confirmed waiting (the timer expired, or it was confirmed already) the device fails with *nothing to confirm* and nothing is sent, because a plain commit there would hide that the change is already gone. It locks too, so another user's uncommitted edits in the shared candidate refuse it — nothing sent, retried like any other lock refusal — instead of riding along with the confirmation. The "don't forget to confirm" reminder prints only when at least one device actually armed a timer. A commit whose reply never arrives is reported as *outcome unknown* and is never retried or rolled back automatically — check the device (and any commit-confirmed timer) first. The NETCONF session does not verify the router's host key by default (the management network is the trusted path, and a re-keyed router must not stop a maintenance); `HSSH_NETCONF_HOSTKEY=yes` turns verification against `~/.ssh/known_hosts` on for a jump host on a path that is not trusted, the file read as the `ssh` transport reads it: its `@cert-authority` lines are passed over, and a key it marks `@revoked` is refused (`host key verification failed for HOST:PORT: its key is marked @revoked in FILE`). With a password, no `~/.ssh/id_*` key and no agent is tried first. A session that does not open is reported by what happened, not by PyEZ's label (which calls anything that fails within 3 s *refused*): `connection refused by HOST:PORT` or `no route to host HOST:PORT` (what the OS answered the TCP connect, where ncclient says only "Could not open socket"), `TCP connect to HOST:PORT timed out after Ns`, `HOST:PORT is not an SSH server: the banner is not text`, `HOST:PORT dropped the session before login after Ns (sshd connection limit?)`, `no SSH banner from HOST:PORT within Ns`, `no SSH session to HOST:PORT within Ns: the banner came, but key exchange did not finish`, `host key verification failed`, `authentication failed for USER at HOST:PORT`, `cannot resolve HOST`, and `local open-file limit reached (ulimit -n N): this machine had no descriptor for a session to HOST:PORT; nothing was sent` when this process is out of descriptors, for the socket (which ncclient swallows, so it read *connection refused* for a port that was listening) or for what the session opens after it; the system's file table full (ENFILE) says `fs.file-max, not ulimit -n` instead. That one is this machine's limit, not the device's answer: a `hssh.errors.OpenFileLimitError` (a `NotAppliedError` and a `LocalError`), not tried again, and no `--safety-file` cooldown for the device. A `delete` of a statement the device does not have is a no-op (`warning: statement not found` is the one load warning that is ignored, so a broadcast of deletes stays idempotent); every other warning still fails the device. `--session-timeout` is one deadline for the whole session set-up — TCP connect, SSH banner, key exchange, authentication — not PyEZ's connect timeout followed by paramiko's own 15 s banner, 15 s key-exchange and 30 s authentication timeouts, and the router's NETCONF hello after it has `--session-timeout` of its own. Within that deadline `--connect-timeout` (3 s) bounds the TCP connect and the banner together, so a router that does not answer, or accepts TCP and then says nothing, costs 3 s an attempt and is tried again (see [Failure handling](#failure-handling)); a slow key exchange, login or hello still has the session timeout. An IPv6 literal cannot be used on this transport at all (PyEZ refuses the bare form, ncclient cannot resolve the bracketed one); it is reported once, as such.
 
 ## Install
 
@@ -296,7 +296,7 @@ Each box gets one result:
 | `silent` | TCP accepted, and no banner within `--connect-timeout` (nothing at all, or the start of one and no more), or the connection closed without a word (a NAT or load balancer answering for a dead box, an sshd that hangs or is at its `MaxStartups`) |
 | `not SSH` | something else answered (`HOST:PORT answered '220 mail.example ESMTP', not an SSH banner`): a line and no `SSH-` line after it, or bytes that cannot begin one; a server that greets and then waits for the client is known when `--connect-timeout` runs out. A server that waits for the client to speak first, a web server say, sends nothing and is `silent` |
 | `error` | the probe itself failed on something it did not expect (`the probe of HOST:PORT failed: …`); that box counts as dead, and every other box is probed as usual |
-| `not probed` | the probe did not ask: the box is reached through a `ProxyJump` or a `ProxyCommand`, its ssh configuration cannot be read, or the safety gate holds it (a cooldown, or a corrupt safety file, which holds every box). It is not dead: the run goes to it as with `--no-probe` |
+| `not probed` | the probe did not ask: the box is reached through a `ProxyJump` or a `ProxyCommand`, its ssh configuration cannot be read, or the safety gate holds it (a cooldown, or a corrupt safety file, which holds every box), or this machine had no file descriptor to spare for the probe's socket (`ulimit -n`, or `fs.file-max`: a Fleet's pooled sessions can hold many), which says nothing about the box. It is not dead: the run goes to it as with `--no-probe` |
 
 Every result but `live` and `not probed` is a dead box.
 
@@ -1093,6 +1093,7 @@ once a run is under way, with the probe skipped or after it, is classified befor
 | A device that drops the session before login (`HOST dropped the session before login after Ns (…)`, an sshd at its connection limit) | on `ssh` a read is retried after 1 s and then 3 s, an edit is not; on `junos` it fails at once |
 | Authentication, host key, rejected command | fail immediately |
 | The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a pin file another h-ssh run keeps locked (`ssh`: `/home/you/.h-ssh/known_hosts is locked by another h-ssh run …`), a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
+| This machine out of descriptors opening a session (`junos`: `local open-file limit reached (ulimit -n N): …`) | fail immediately, with no cooldown: the next attempt meets the same limit, and the device did nothing |
 | Failures *after* connecting — command timeout, reset, broken pipe, a session lost before the command finished (`ssh`, and `openssh` unless the exit status had already come: `connection to HOST lost before 'CMD' finished`) | retried, `--retries` times (default 2), after 1 s and then 3 s |
 
 The split is whether the device answered. A box that does not answer at all — a dead or blackholed
@@ -1114,7 +1115,7 @@ reported, not retried, and after Ctrl-C it is a failure, not interrupted: lines 
 Retrying an authentication failure cannot succeed either, and on a fleet it spends three real login
 attempts per device against accounts that may lock out. Those stop at one.
 
-`--workers` defaults to 8; when the fleet is more than four waves of workers and `--workers` is under 64, the banner says so with a hint (`Hint: 250 devices at 8 workers is 32 waves; --workers 64 would be 4 (one session per router either way)`), since the workers spread over routers and each router still sees one session. It is honoured literally, up to 256, within the open-file limit: an in-flight NETCONF session costs about six descriptors, so the soft limit (`ulimit -n`) is raised towards the hard one when it is short, which needs no privilege, and only what is still short lowers the workers, with one warning naming the limit and the number run. The vendor calls block, so each in-flight device holds
+`--workers` defaults to 8; when the fleet is more than four waves of workers and `--workers` is under 64, the banner says so with a hint (`Hint: 250 devices at 8 workers is 32 waves; --workers 64 would be 4 (one session per router either way)`), since the workers spread over routers and each router still sees one session. It is honoured literally, up to 256, within the open-file limit: an in-flight NETCONF session costs about six descriptors, so the soft limit (`ulimit -n`) is raised towards the hard one when it is short, which needs no privilege, and only what is still short lowers the workers, with one warning naming the limit and the number run. A `--job` runs on the session pool, where a `junos` device keeps its session (about four descriptors) from one entry to the next and lets it go after its last entry: the sessions kept between entries are counted too (a device's session in flight once, as its worker's, the pool counting as the fit does, so none of them is closed while the limit holds them all), and when even the hard limit cannot hold them no worker is taken away and no router failed for it: the pool closes its least recently used idle session before it opens another (a later entry on that device logs in again), and the warning says how many it keeps. The vendor calls block, so each in-flight device holds
 a thread; h-ssh sizes the executor to `--workers` rather than leaving it at asyncio's default of
 `min(32, cpu+4)`, which on a 2-vCPU jump host is **6 threads no matter what you asked for** — and a
 device that does not answer holds one of those six through every attempt.
@@ -1155,7 +1156,7 @@ mode; the opt-in ones (`--safety-file`, `--audit-log`, `--log`) apply to every m
 | Run log | `--log PATH` | Per-device results of the run (command, output or error, duration) as JSONL, one line as each device finishes, appended with the same 0600 mode and secret redaction as the audit trail, and probed before the first device like the audit log |
 | Result store | *(always on)* `./h-ssh.db`; `--store PATH`, `HSSH_STORE`, `store =` in the config; `--no-store` | Every command's reply in one SQLite file, as the device gave it, one row per command per device plus a row per run; 0600, nothing redacted (it is a snapshot to restore from); opened before the first device, so a store that cannot be written is no run (exit 2). Read with `h-ssh-store` (see [The result store](#the-result-store)) |
 
-A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it, a pin file another h-ssh run holds locked) does not start a cooldown; only failures against the device do.
+A request h-ssh refuses before touching the device (bad arguments, a missing config file, `--dry-run` or `--commit-confirmed` on a transport that cannot honour it, a pin file another h-ssh run holds locked, the local open-file limit reached on `junos`) does not start a cooldown; only failures against the device do.
 
 The gate is deliberately fail-closed: a device is marked active *before* the attempt, so a second attempt on the same device (host and port) while one is in flight is refused rather than doubled up, and a failure cools it before anything else can try. The mark lives in memory; only cooldowns reach the file, so a crashed process blocks nothing in the next run.
 
@@ -1279,8 +1280,10 @@ the pool's `HSSH_POOL_IDLE_TIMEOUT`, read when `hssh` is imported. What it does 
   tag when the round trip is above `slow_ms`, else None) and `duration_ms`; `to_dict()` is the CLI's
   `--probe --json` record. With `store=` it is kept as a run of mode `probe`, a row per box;
 - threads talk to the devices, `workers` at a time, lowered to what the open-file limit carries (the process's
-  soft `RLIMIT_NOFILE` is raised towards the hard one first, as the CLI does; a `RuntimeWarning` says when
-  fewer run); you iterate on your own thread and get one `DeviceResult` per device in the order they finish:
+  soft `RLIMIT_NOFILE` is raised towards the hard one first, as the CLI does, for them and for the session the
+  pool keeps for every `junos` device, about four descriptors each; a `RuntimeWarning` says when fewer run,
+  or how many of those sessions even the hard limit holds: the pool then closes its least recently used idle
+  session before it opens another, and a later call to that device opens it again); you iterate on your own thread and get one `DeviceResult` per device in the order they finish:
   `device`, `host`, `vendor`, `ok`, `output`, `error`, `duration_ms`, `ts`, `command`, and for a batch
   `commands` (one entry per command, in the batch's order); `result` is the driver's typed answer and `text`
   the runner's full report;
@@ -1302,7 +1305,7 @@ the pool's `HSSH_POOL_IDLE_TIMEOUT`, read when `hssh` is imported. What it does 
   raises `RuntimeError` (two runs would queue on the pool's per-router locks, and the time bound would then
   fail honest devices); a previous run whose devices have all returned is wrapped up first and stays readable;
 - on the `junos` (NETCONF) transport, one session per device, pooled for the Fleet's lifetime however
-  many commands you run; `ssh`, `openssh` and `telnet` have no pool and connect afresh for every
+  many commands you run, within the open-file limit (above); `ssh`, `openssh` and `telnet` have no pool and connect afresh for every
   `show()` or `batch()`. The pool is process-wide: the last Fleet to close turns it off only if a Fleet
   turned it on; a pool you enabled yourself is used and left on;
 - `close(wait=0)`, or leaving the `with` block, promises this much: devices not yet started are not started;
@@ -1461,10 +1464,24 @@ their error under `check_error`, because a `rollback 1` at that point would re-a
 failed its checks. The lock does not hold off the device's own rollback when the timer runs out, though:
 checks that end in the timer's last moments can have it land between the look and the confirmation, which
 then answers `confirmed` for a change the device has rolled back, so keep `check()` well inside `minutes`.
-With the pool on, a session with an open transaction stays borrowed and other threads wait for it. Either
-way the thread holding it may keep using it, and only that thread can commit or abort it: a `Transaction`
-finished from another thread (an `asyncio.to_thread` that landed elsewhere) is refused before anything is
-sent, because the session's lock belongs to the thread that opened it.
+With the pool on, a session with an open transaction stays borrowed. A call from another thread that wants
+the router waits for it at most its command timeout, then raises `NotAppliedError: router busy: a transaction
+is open on this session` with nothing sent (a call in flight there is waited for to its end, which its own
+timeouts bound: `edit()` and `rollback()` among them, whose transaction ends within the call), and
+`pool.close_all(shutdown=False)` waits for it at most `busy_wait=` seconds (60 by default), closes the other
+sessions and then raises the same. A `Transaction` dropped without `commit()` or `abort()`, on its own thread
+or wherever the garbage collector frees it, closes its session instead of returning it to the pool, so the
+router lets go of the lock and the candidate with it, where the next edit reused that session and committed
+the abandoned change with its own, and one freed on another thread kept every later call to that router
+waiting for good. Either way the thread holding it may keep reading on it, but a change it asks for there —
+`edit()`, `rollback()`, `confirm()`, another `begin()` or `guarded_commit()` — raises `NotAppliedError: this
+thread holds a transaction open on this session: commit() or abort() it first, ...` with nothing sent, where
+it locked that session again and committed the transaction's candidate with its own (an `asyncio.to_thread`
+that landed on the thread holding one, a fallback edit in the `except` block of code that left one open). Only
+that thread can commit or abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that
+landed elsewhere) is refused before anything is sent, because the session's lock belongs to the thread that
+opened it — the thread itself, not its ident, which the system gives again to a thread started once that one
+has ended.
 
 ### Structured output from a script
 
@@ -1508,13 +1525,15 @@ pool.close_all()                  # also runs at interpreter exit
 
 One session per `(host, port, user, credential)` — a digest of the password is part of the key, so a
 call with a different or wrong password never rides a session another credential opened. Calls against
-the same router from several threads queue on that session; different routers run in parallel as before. A session is dropped, never handed to
+the same router from several threads queue on that session (behind a transaction `begin()` handed back, for
+their command timeout at most); different routers run in parallel as before. A session is dropped, never handed to
 the next caller, when something left it in doubt: a commit whose outcome is unknown, a rollback or
-unlock that failed, an RPC timeout, or the router closing it. A read (`show_structured`, and `show`,
+unlock that failed, an RPC timeout, the router closing it, or a `Transaction` dropped without `commit()` or
+`abort()`. A read (`show_structured`, and `show`,
 `show_batch`, `rpc` and `rpc_batch` for a `show …` command or `get-*` RPC, every one of a batch) that
 finds its reused session dead opens a new one and runs once more; any other command (`request …`,
 `request-*`, …) and an edit never do —
-an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; every session is closed when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll), so size `ulimit -n` for the sessions you keep; what a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything, once the closes it started are done, since a close runs beside the work: `close_all()` and `reap()` wait up to a second for them (`wait=` to change it), the reaper's own thread, which nothing waits on, up to ten seconds. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
+an edit reports `NotAppliedError` if the session died before the lock, and the usual verdicts after. The CLI enables the pool for a `--job` run only, so a job that lists one device in several entries logs in once per device and runs its entries on that session, in file order; a device's session is closed after its last entry, and every one still open when the run ends, on Ctrl-C too. `-sC`, `--batch` and the edit modes still open one session per device per run. While a session is open it holds four descriptors (its socket, paramiko's pipe pair, ncclient's epoll): a Fleet and a `--job` raise the soft limit for the sessions they keep, and the pool keeps to the soft limit as it finds it, in your own script too, counting as that fit does: 32 for the process, six for a call in flight (its session's four among them), four for a session idle between calls, and one for a session closed and not yet collected. Before it opens a session past that, it collects what the sessions already closed have left, and then closes the least recently used idle session (counted under `reaped`; a later call to that router opens it again) rather than fail a healthy router with "Too many open files". What a closed session leaves to the garbage collector is collected when `close_all()` or the reaper closes anything, once the closes it started are done, since a close runs beside the work: `close_all()` and `reap()` wait up to a second for them (`wait=` to change it), the reaper's own thread, which nothing waits on, up to ten seconds. A pooled session idle for more than 30 s is asked whether it is still there before it is reused; a refusal from the router (cRPD has no uptime RPC, a login class may withhold it) keeps the session, since the router answered, and only a transport failure or no answer within 5 s replaces it.
 
 ## Package structure
 
@@ -1527,13 +1546,13 @@ h-ssh/
 │   │   ├── cli.py           # argument parsing + orchestration
 │   │   ├── runner.py        # one device's run: the driver call, retries and their classification, the safety gate, the typed RunResult
 │   │   ├── fleet.py         # Fleet: show/batch across the fleet from a script, results as values, pooled sessions, the store
-│   │   ├── limits.py        # the worker and probe ceilings and the open-file limit both must fit under
+│   │   ├── limits.py        # the worker and probe ceilings and the open-file limit they and the pooled sessions must fit under
 │   │   ├── probe.py         # the probe: TCP connect and SSH banner per box, no login; the round trip from TCP_INFO
 │   │   ├── pool.py          # the NETCONF session pool: opt-in for the transports, on for a Fleet's lifetime and a --job run
 │   │   ├── safety.py        # SafetyGate — rate limit + cross-process cooldown
 │   │   ├── audit.py         # JSONL audit trail
 │   │   ├── store.py         # the result store (./h-ssh.db, every run): SQLite writer and the h-ssh-store reader
-│   │   ├── errors.py        # NotAppliedError, ConnectTimeoutError, AmbiguousCommitError, NothingToConfirmError, LocalError — what the retry logic keys on
+│   │   ├── errors.py        # NotAppliedError, ConnectTimeoutError, AmbiguousCommitError, NothingToConfirmError, LocalError, OpenFileLimitError — what the retry logic keys on
 │   │   ├── runfile.py       # --run FILE: a whole run in YAML or JSON, its keys named after the flags
 │   │   ├── profiles.py      # --profile and --list-profiles: named batch files, yours in ~/.h-ssh/profiles first
 │   │   ├── profiles/        # the profiles that ship: junos-health.txt, junos-snapshot.txt
@@ -1576,7 +1595,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1423 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1459 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

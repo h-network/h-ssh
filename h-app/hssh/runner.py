@@ -85,6 +85,9 @@ _PERMANENT = (
     # credential with a control character in it is refused the same way on
     # every attempt, before the device is contacted or before it is typed.
     "takes as a key, not as text",
+    # This machine out of descriptors (#147): the next attempt meets the
+    # same open-file limit, and the device did nothing.
+    "local open-file limit reached",
 )
 
 # Failures that happen before any session exists: nothing reached the device.
