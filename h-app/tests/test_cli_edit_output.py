@@ -480,6 +480,82 @@ def test_a_show_diff_edit_that_commits_nothing_leaves_no_run_in_the_store(monkey
     assert run_row["finished"] is not None and (run_row["mode"], run_row["ok"], run_row["failed"]) == ("edit-cmd", 1, 0)
 
 
+class JobPreviewDriver(PreviewDriver):
+    """PreviewDriver that answers a job's show entries too."""
+
+    def show(self, host, user, passwd, cmd, *a, **kw):
+        self.calls.append({"show": cmd, "host": host})
+        return f"{cmd} on {host}\n"
+
+
+def test_show_diff_refuses_a_job_with_more_than_one_edit_for_a_device(monkeypatch, capsys, tmp_path, probed):
+    """A preview is a dry run of one entry on the device as it is now, and a
+    job runs a device's entries one after another: `set system location
+    building b9` then `delete system location` on one device previewed the
+    delete as NO CHANGES, and after the y the set committed and the delete
+    failed `diff changed since preview; nothing committed`, exit 1, the job
+    half applied (#144). Refused (exit 2) naming the device, before the
+    password prompt, the store and the probe, nothing sent; a job with one
+    edit entry per device, a show beside one, previews and commits them all."""
+    job = [{"target": "R1:127.0.0.1:junos", "edit": "set system location building b9"},
+           {"target": "R2:127.0.0.1:831:junos", "edit": "set system location building b9"},
+           {"target": "R1:127.0.0.1:junos", "edit": "delete system location"}]
+    db, asked = tmp_path / "s.db", []
+    answer(monkeypatch, "y")
+    monkeypatch.setattr(cli, "_tty", lambda stream: True)
+    monkeypatch.setattr(cli, "_ask", lambda prompt, secret=False: asked.append(prompt) or "typed")
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, "--show-diff", "--store", str(db),
+                                   driver=JobPreviewDriver(), password=None)
+    assert rc == 2 and driver.calls == [] and probed == [] and asked == [] and out == "" and not db.exists()
+    assert "more than one edit entry for R1;" in err and "previewed one by one" in err and "R2" not in err
+    one_each = [job[0], job[1], {"target": "R1:127.0.0.1:junos", "show": "show system uptime"}]
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, one_each, "--show-diff", driver=JobPreviewDriver())
+    assert rc == 0, err
+    assert "--- R1: diff ---" in out and "--- R2: diff ---" in out and out.count("COMMIT OK") == 2
+    previews = [c for c in driver.calls if c.get("dry_run") is True]
+    commits = [c for c in driver.calls if c.get("dry_run") is False]
+    assert len(previews) == 2 and len(commits) == 2
+    assert all(c["expected_diff"] == driver.diff_of(c["payload"]) for c in commits)
+    assert [c for c in driver.calls if "show" in c] == [{"show": "show system uptime", "host": "127.0.0.1"}]
+
+
+def test_a_show_diff_job_previews_only_its_edits_and_saves_no_preview(monkeypatch, capsys, tmp_path):
+    """The previews ran every unit as a dry run with --save-output: an N
+    left DIR/R1.output holding the DRY-RUN text, written over the file that
+    was there, and a job's show entry was previewed as a `diff` and
+    audited as a show with dry_run (#144). Only the units that commit are
+    previewed and a preview is saved nowhere: an N leaves DIR as it was,
+    the previews list the edit alone and no show is audited with dry_run;
+    a preview that failed leaves DIR as it was too; a y runs the show as a
+    show and saves each entry's result."""
+    save, audit = tmp_path / "out", tmp_path / "audit.jsonl"
+    save.mkdir(mode=0o700)
+    (save / "R1.output").write_text("yesterday's backup\n")
+    job = [{"target": "R1:127.0.0.1:junos", "show": "show version"},
+           {"target": "R1:127.0.0.1:junos", "edit": "set system host-name R1-new"}]
+    argv = ["--show-diff", "--save-output", str(save), "--audit-log", str(audit)]
+    answer(monkeypatch, "n")
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, *argv, driver=JobPreviewDriver())
+    assert rc == 0 and "Aborted by user." in out
+    assert {p.name: p.read_text() for p in save.iterdir()} == {"R1.output": "yesterday's backup\n"}
+    assert out.count("--- R1: diff ---") == 1 and "DRY-RUN show" not in out and "R1-new" in out
+    assert [c["dry_run"] for c in driver.calls] == [True]
+    records = [json.loads(ln) for ln in audit.read_text().splitlines()]
+    assert not [r for r in records if r["mode"] == "show" and r["dry_run"]]
+    assert [(r["mode"], r["ok"]) for r in records if r["dry_run"]] == [("edit-cmd", True)]
+    failing = types.SimpleNamespace(AVAILABLE=True, edit=lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("commit check failed")))
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job, *argv, "-y", driver=failing)
+    assert rc == 1 and "dry-run failed on R1; nothing committed" in err
+    assert {p.name: p.read_text() for p in save.iterdir()} == {"R1.output": "yesterday's backup\n"}
+    answer(monkeypatch, "y")
+    rc, out, err, driver = run_job(monkeypatch, capsys, tmp_path, job, *argv, driver=JobPreviewDriver())
+    assert rc == 0, err
+    assert [c.get("dry_run") for c in driver.calls] == [True, None, False]
+    assert (save / "R1.output").read_text().endswith("\n\nshow version on 127.0.0.1\n")
+    assert "\n\nCOMMIT OK\n" in (save / "R1.2.output").read_text()
+
+
 # --- --log: the audit log's file mode and redaction -----------------------------
 
 def test_log_file_is_0600_and_redacted_like_the_audit_log(monkeypatch, capsys, tmp_path):

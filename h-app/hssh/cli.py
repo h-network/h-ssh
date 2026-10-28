@@ -1187,6 +1187,26 @@ async def main() -> int:
     if args.show_diff and (not has_edits or args.dry_run):
         print("ERROR: --show-diff goes with an edit that is not already a --dry-run.", file=sys.stderr)
         return 2
+    # A preview is a dry run of one entry on the device as it is now, and a
+    # job runs a device's entries one after another, each on the device as
+    # the one before left it. A device's second edit was previewed without
+    # its first (a delete of what the first sets: NO CHANGES), and after the
+    # y the first committed and the second failed `diff changed since
+    # preview`: the job half applied (#144). Refused, before anything is
+    # written or sent, until a device's edits are previewed as one candidate.
+    if args.show_diff and job_entries:
+        edits = {}
+        for je in job_entries:
+            if je.mode.startswith("edit"):
+                edits[je.target.name] = edits.get(je.target.name, 0) + 1
+        several = [name for name, n in edits.items() if n > 1]
+        if several:
+            shown = ", ".join(several[:20]) + (" …" if len(several) > 20 else "")
+            print(f"ERROR: --show-diff: the job has more than one edit entry for {shown}; its edits would be "
+                  "previewed one by one, each on the device as it is now, so a later one's preview would not "
+                  "see the ones before it. Put a device's edits in one entry, or drop --show-diff. "
+                  "Nothing was sent.", file=sys.stderr)
+            return 2
     # --format shapes a show's reply. An edit, --rollback or --commit-status
     # has none to shape, so it is refused rather than quietly ignored; a job
     # keeps it for its show entries.
@@ -1666,7 +1686,7 @@ async def main() -> int:
         return host_locks.setdefault(host, asyncio.Lock())
 
     async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
-                           started=None, seq=0):
+                           started=None, seq=0, save=True):
         async with _host_lock(t.host), sem:
             if started is not None:
                 started()        # from here on the device may be touched
@@ -1713,7 +1733,7 @@ async def main() -> int:
                 payload_text=(broadcast_text if actual_mode == "edit-broadcast"
                               else edit_payloads.get(t.name) if actual_mode == "edit-dir" else None),
                 commit_confirmed=args.commit_confirmed,
-                save_dir=save_dir,
+                save_dir=save_dir if save else None,
                 quiet=not show_progress,
                 max_attempts=max(1, args.retries + 1),
                 batch_cmds=target_batch_cmds,
@@ -1743,18 +1763,19 @@ async def main() -> int:
             secure_write(str(path_inside(save_dir, save_name(t.name, seq_of[i] if je else 0))), text)
         return RunResult(t.name, False, text, dead[i].duration_ms, error=error)
 
-    async def _run_unit(i, dry_run=None, expected_diff=None):
+    async def _run_unit(i, dry_run=None, expected_diff=None, save=True):
         """units[i] on its device, in its own mode and command for a job
-        entry; the index comes back with the result."""
+        entry; the index comes back with the result. save=False keeps its
+        result out of --save-output (a --show-diff preview)."""
         t, je = units[i]
         if i in dead:
             return i, _dead_result(i)
         mark = lambda: started.add(i)
         if je is not None:
             result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
-                                        started=mark, seq=seq_of[i])
+                                        started=mark, seq=seq_of[i], save=save)
         else:
-            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark)
+            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark, save=save)
         if not isinstance(result, RunResult):
             # A stand-in runner that still returns the bare tuple: the error is
             # read from its text, as it always was.
@@ -1762,11 +1783,16 @@ async def main() -> int:
             result = RunResult(name, ok, text, ms, error=None if ok else error_line(text))
         return i, result
 
-    # --show-diff: every target's diff first, one question, then the real
+    # --show-diff: every edit's diff first, one question, then the real
     # run, which commits each diff only if the device produces it again.
+    # Only the units that commit are previewed: a job's show is a read, run
+    # after the question. A preview is saved nowhere: --save-output keeps
+    # what the run did, so an answer other than y leaves its files as they
+    # were, where the preview was written over them (#144).
     expected = {}
     if args.show_diff and commits:
-        previews = [asyncio.create_task(_run_unit(i, dry_run=True)) for i in range(len(units)) if i not in dead]
+        previews = [asyncio.create_task(_run_unit(i, dry_run=True, save=False)) for i, (_, je) in enumerate(units)
+                    if i not in dead and (je is None or je.mode.startswith("edit"))]
         preview_failed = []
         for coro in asyncio.as_completed(previews):
             try:
