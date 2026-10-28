@@ -317,6 +317,7 @@ import shlex
 import shutil
 import socket
 import threading
+import time
 
 
 @pytest.fixture
@@ -342,14 +343,25 @@ def real_ssh(tmp_path, monkeypatch):
 def _device(channel, command):
     """A device's answer to an exec: Junos's refusal of `show foo` on
     stdout at exit 0, a `Permission denied` of its own on stderr at exit 1,
-    a warning of its own on stderr beside its output, and anything else's
+    a warning of its own on stderr beside its output, an exit 255 of its
+    own, a session lost under `show log auth` after a line of its reply and
+    under `set system services ssh` (sshd restarting), and anything else's
     output."""
     rc = 0
+    if command in ("show log auth", "set system services ssh"):
+        if command == "show log auth":
+            channel.sendall(b"Oct 28 r1 sshd[1]: Failed password for root: Permission denied\n")
+        time.sleep(0.2)
+        channel.get_transport().close()
+        return
     if command == "show foo":
         channel.sendall(b"error: syntax error, expecting <command>\n")
     elif command == "cat /etc/shadow":
         channel.sendall_stderr(b"cat: /etc/shadow: Permission denied\n")
         rc = 1
+    elif command == "request support information":
+        channel.sendall_stderr(b"error: another request is running\n")
+        rc = 255
     else:
         channel.sendall(b"output-for: " + command.encode() + b"\n")
         if command == "show log messages":
@@ -471,3 +483,44 @@ def test_a_devices_permission_denied_is_its_failure_not_a_failed_login(banner_ss
     with pytest.raises(RuntimeError, match=r"^Authentication failed\.$"):
         device(port, "show", "show version", passwd="wrong")
     assert logins == ["lab"] * 2
+
+
+def test_a_session_lost_under_a_command_is_lost_not_the_devices_words(banner_sshd, real_ssh, monkeypatch):
+    """Every command runs through the login's ControlMaster, and a session
+    lost under one takes the master with it: ssh exits 255 with nothing of
+    its own in its log, and that was read as the device's failure, in the
+    first line of the reply cut short. A line with `Permission denied` in
+    it made a lost read a permanent failure, sent once; in a batch the next
+    command logged in by itself, its banner in its stderr. The master gone
+    (`ssh -O check`) is a lost session, as on the ssh transport: a read is
+    tried again, an edit line FAILED once, never APPLIED, and the next
+    command of a batch logs in again."""
+    from hssh import runner
+    from hssh.core import Target
+    monkeypatch.setattr(runner, "_backoff", lambda attempt, steps=None: 0)
+    port, logins = banner_sshd("Welcome to r1\n")
+    lost = "connection to 127.0.0.1 lost before 'show log auth' finished"
+    with pytest.raises(ConnectionError) as failed:
+        device(port, "show", "show log auth")
+    assert str(failed.value) == lost and not runner.is_permanent_failure(failed.value)
+    assert device(port, "show_batch", ["show log auth", "show version"]) == [
+        {"command": "show log auth", "ok": False, "error": lost},
+        {"command": "show version", "ok": True, "output": "$ show version\noutput-for: show version"}]
+    with pytest.raises(RuntimeError) as failed:          # the device's own 255, the master still up
+        device(port, "show", "request support information")
+    assert str(failed.value) == "exit 255 from 'request support information': error: another request is running"
+
+    def run(**kw):
+        args = dict(t=Target("R1", "127.0.0.1", "openssh", port), transport="openssh", mode="show",
+                    show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None, user="lab",
+                    passwd="hunter2", session_timeout=10, command_timeout=10, dry_run=False,
+                    commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3)
+        args.update(kw)
+        return runner.run_for_target(**args)
+    del logins[:]
+    read = run(show_cmd="show log auth")
+    assert not read.ok and read.error == lost and logins == ["lab"] * 3      # one login an attempt
+    del logins[:]
+    edit = run(mode="edit-cmd", edit_cmd="set system services ssh")
+    assert not edit.ok and edit.error == "connection to 127.0.0.1 lost before 'set system services ssh' finished"
+    assert edit.result is None and "APPLIED" not in edit.text and logins == ["lab"]
