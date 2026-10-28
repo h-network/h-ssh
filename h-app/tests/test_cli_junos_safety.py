@@ -241,3 +241,28 @@ def test_cli_junos_job_syntax_guard_applies_through_transport(monkeypatch, capsy
     rc, err, sent = _main(monkeypatch, capsys, "--transport", "junos", "--job", str(job_file))
     assert rc == 2 and "only accepts set-style commands" in err
     assert sent == []
+
+
+def test_diff_goes_with_a_show(monkeypatch, capsys, tmp_path):
+    """#140: --diff compares a show's replies across the devices. With an
+    edit (`-eC ... --dry-run --diff` printed no diff, exit 0), a job,
+    --rollback, --commit-status or --probe alone it was accepted and did
+    nothing; refused now, nothing sent, from a run file too. A show and a
+    batch keep it."""
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:192.0.2.1:junos", "show": "show version"},
+                               {"target": "R2:192.0.2.2:junos", "show": "show version"}]))
+    run_file = tmp_path / "run.yaml"
+    run_file.write_text("devices: [R1:192.0.2.1:junos]\nedit: set system location x\ncommit-confirmed: 5\ndiff: true\n")
+    two = ["--target", "R1:192.0.2.1:junos", "--target", "R2:192.0.2.2:junos"]
+    for argv in (["-eC", "set system location x", "--dry-run", "--diff", *two], ["--rollback", "1", "--diff", *two],
+                 ["--commit-status", "--diff", *two], ["--job", str(job), "--diff"], ["--probe", "--diff", *two],
+                 ["--run", str(run_file)]):
+        rc, err, sent = _main(monkeypatch, capsys, *argv)
+        assert rc == 2 and sent == [], (argv, err)
+        assert "ERROR: --diff goes with a show (-sC, --batch, --profile): it compares the replies across devices." in err
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\n")
+    for argv in (["-sC", "show version", "--diff", *two], ["--batch", str(batch), "--diff", *two]):
+        rc, err, sent = _main(monkeypatch, capsys, *argv)
+        assert rc == 0 and sorted(name for name, _, _ in sent) == ["R1", "R2"], (argv, err)

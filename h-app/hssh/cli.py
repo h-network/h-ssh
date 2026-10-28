@@ -810,6 +810,16 @@ async def main() -> int:
         if args.job and args.jobs_data:
             print("ERROR: --job and a run file's 'jobs' are two job lists; use one.", file=sys.stderr)
             return 2
+        # A job's targets are its entries. A target typed beside it, or an
+        # inventory named with --devices, was ignored without a word: the
+        # job ran on every device it names, and with edit entries and -y it
+        # committed on routers the operator meant to leave out (#140).
+        beside = [what for what, given in (("a bare host", bare_hosts), ("--target", "target" in typed),
+                                            ("--devices", "devices" in typed)) if given]
+        if beside:
+            jobs = "--job" if args.job else "a run file's 'jobs'"
+            print(f"ERROR: {', '.join(beside)} beside {jobs}: a job's targets are its entries.", file=sys.stderr)
+            return 2
         try:
             if args.job:
                 job_entries = load_jobs(args.job, default_vendor=args.transport)
@@ -1069,6 +1079,12 @@ async def main() -> int:
 
         has_edits = mode.startswith("edit") or mode == "rollback"
 
+    # --diff compares a show's replies across the devices; with an edit, a
+    # job or any other mode it was accepted and did nothing (#140).
+    if args.diff and mode not in ("show", "show-batch"):
+        print("ERROR: --diff goes with a show (-sC, --batch, --profile): it compares the replies across devices.",
+              file=sys.stderr)
+        return 2
     if args.comment is not None and not has_edits:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
         return 2
@@ -2126,7 +2142,8 @@ async def main() -> int:
                  if e.get("ok") and re.search(r"COMMIT (OK|CONFIRMED \()", str(e.get("output") or ""))]
         if args.commit_confirmed and not args.dry_run and has_edits and armed:
             # A job's timers are armed on its edit entries' targets, not on
-            # the inventory file or any --target given alongside it.
+            # the inventory file or a run file's `devices` beside its jobs (a
+            # target typed beside a job is refused).
             specs = args.target
             if job_entries:
                 specs = list(dict.fromkeys(target_spec(je.target) for je in job_entries

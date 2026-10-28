@@ -196,7 +196,7 @@ The username is plain text. Telnet types it at the `login:` prompt as it is, whe
 | `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`; a file with nothing else in it, or with a control character other than a line break, ends the run before anything is sent, exit 2) |
 | `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
 | `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt` (or `NAME`; a name with a `/` is a path), or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
-| `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused) |
+| `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused). A job's targets are its entries: a target typed beside it (a bare host, `--target`) or a `--devices` is refused (exit 2, nothing sent) |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (NETCONF `junos` only) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (NETCONF `junos` only) |
 | `--probe` | Probe | Alone, with no command: every box checked without logging in, one line each with its result and times, a summary, kept in the store; exit 0 when every box is live, 1 when one is dead, 3 when none is but one was not probed, 4 when the store could not keep it. See [The probe](#the-probe) |
@@ -795,7 +795,9 @@ the command line wins.` Relative paths in the file (`devices`, `batch`,
 file's own directory, so a run directory with its inventory and set files moves as one.
 
 Three keys have no flag of their own. A file holds `commands` or `jobs`, not both; with `jobs` the
-targets are the entries', and `devices` is not used:
+targets are the entries', the file's `devices` is not used, and a target typed beside the file (bare or
+`--target`) or a `--devices` is refused, exit 2: `ERROR: --target beside a run file's 'jobs': a job's
+targets are its entries.`, as beside a `--job` file:
 
 ```yaml
 devices:                           # inline targets instead of a CSV
@@ -843,6 +845,7 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | `-v` | status plus a framed block per device |
 | `--raw` | device output only: no banner, progress lines or summary on stdout |
 | `--json` | one object per device (per entry for a `--job`): `device`, `host`, `vendor`, `ok`, `duration_ms`, then `command` and `output` for a show (a job's show entry too), a `commands` list (one entry per command) for `--batch`, `output` alone for an edit, a `commits` list for `--commit-status`, `error` for a failure; with `--diff` on a show or a batch the objects come in target order and, when two or more are `ok`, each of those has a `diff` against the first of them, the baseline: the unified diff or `(identical)`, for a batch a list of `{command, diff}` (`(baseline)` on the baseline itself). `--probe` alone prints the probe's records instead (see [The probe](#the-probe)) |
+| `--diff` | after the results, each device's reply against the first one in target order that answered (bare hosts, then `--target`; or the inventory's rows): the unified diff, or `(identical)`; for a batch, command by command. A show only (`-sC`, `--batch`, `--profile`): with an edit, a job, `--rollback`, `--commit-status` or `--probe` alone it is refused (exit 2, nothing sent), a run file's `diff` too |
 | `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (the NETCONF `junos` driver only; `junos@ssh`, `junos@openssh` and every other driver refuse it, nothing sent, a FAIL of that device): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2), under `--dry-run` too |
 
 A reader that stops early (`h-ssh ... | head`) is not an error and gets no traceback: whatever had
@@ -1450,7 +1453,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1301 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1303 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

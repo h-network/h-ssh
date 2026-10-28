@@ -161,16 +161,17 @@ def run_job(monkeypatch, capsys, tmp_path, job, *extra, driver=None, password="p
 
 def test_job_reminder_names_the_jobs_edit_targets(monkeypatch, capsys, tmp_path):
     """The timer is armed on the job's edit entries, so the hint names those:
-    not the inventory file, not the show entries, each device once."""
+    not the inventory file, not the show entries, each device once. (A
+    --devices typed beside the job is refused since #140.)"""
     rc, out, _, _ = run_job(monkeypatch, capsys, tmp_path, [
         {"target": "R1:10.0.0.1:junos", "show": "show version"},
         {"target": "R2:10.0.0.2:junos", "edit": "set system host-name R2-new", "port": 22},
         {"target": "R2:10.0.0.2:junos", "edit": "set system ntp server 10.0.0.9", "port": 22},
-    ], "--devices", "/lab/not-the-job.csv", "--commit-confirmed", "5", "-y")
+    ], "--commit-confirmed", "5", "-y")
     assert rc == 0
     assert "DON'T FORGET TO CONFIRM THE COMMIT!" in out
     assert '\n  ./h-app/h-ssh.py -eC "commit" --user u --target R2:10.0.0.2:junos:22\n' in out
-    assert "not-the-job.csv" not in out and "--target R1" not in out
+    assert "--devices" not in out and "--target R1" not in out
 
 
 def test_job_entries_for_one_device_keep_their_own_mode_and_payload(monkeypatch, capsys, tmp_path):

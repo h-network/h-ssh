@@ -524,3 +524,31 @@ def test_a_flag_typed_with_its_defaults_value_still_wins(monkeypatch, capsys, tm
     f = write(tmp_path, "run.yaml", "devices: [R1:10.0.0.1:junos]\nuser: u\nbatch: cmds.txt\n")
     rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--profile", mine])
     assert rc == 0 and drv.batches == [("10.0.0.1", ["show route summary"])], err
+
+
+def test_targets_typed_beside_a_job_are_refused(monkeypatch, capsys, tmp_path):
+    """#140: a job's targets are its entries. A target typed beside --job or
+    a run file's jobs, bare or --target, or a --devices (the default's own
+    spelling too), was ignored without a word: the job ran on every device
+    it names, exit 0, and with an edit entry and -y committed on a router
+    the operator had left out. Refused before the job is read, nothing
+    sent. The file's own `devices` beside its jobs is still not used."""
+    job = write(tmp_path, "job.json", json.dumps([
+        {"target": "R1:10.0.0.1:junos", "edit": "set system location building A"},
+        {"target": "R2:10.0.0.2:junos", "show": "show version"}]))
+    lab = write(tmp_path, "lab.csv", "lab1,10.0.9.1,junos\n")
+    for given, named in ((["lab1:10.0.9.1:junos"], "a bare host"), (["--target", "lab1:10.0.9.1:junos"], "--target"),
+                         (["--devices", lab], "--devices"), (["R9:10.0.0.9:junos", "--devices", lab],
+                                                            "a bare host, --devices")):
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--job", job, "-y", *given])
+        assert rc == 2 and drv.edits == drv.shows == [], (given, err)
+        assert f"ERROR: {named} beside --job: a job's targets are its entries.\n" in err
+    jobs = "jobs:\n  - {target: R1:10.0.0.1:junos, edit: set system location building A}\n"
+    f = write(tmp_path, "run.yaml", f"user: u\ncommit-confirmed: 5\nyes: true\n{jobs}")
+    for given, named in ((["--target", "lab1:10.0.9.1:junos"], "--target"), (["--devices", "devices.csv"], "--devices")):
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, *given])
+        assert rc == 2 and drv.edits == [], (given, err)
+        assert f"ERROR: {named} beside a run file's 'jobs': a job's targets are its entries.\n" in err
+    f = write(tmp_path, "run.yaml", f"devices: [lab1:10.0.9.1:junos]\nuser: u\ncommit-confirmed: 5\nyes: true\n{jobs}")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+    assert rc == 0 and drv.edits == [("10.0.0.1", "set system location building A", 5, False)], err
