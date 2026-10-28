@@ -132,7 +132,8 @@ def test_an_unwritable_safety_file_refuses_the_gate(tmp_path):
     assert allowed is False and "cooldown active" in reason
 
 
-# T9: Concurrent invocations (fcntl.flock prevents corruption)
+# T9: two gates on one file, one after the other: the second's save merges
+# the first's cooldown from the file (two at once: the two-process test below)
 def test_concurrent_file_access():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         tmp = f.name
@@ -158,6 +159,56 @@ def test_concurrent_file_access():
     finally:
         Path(tmp).unlink(missing_ok=True)
         Path(f"{tmp}.lock").unlink(missing_ok=True)
+
+
+def _save_a_cooldown(path, host, start, inside, wait):
+    """One run's set_cooldown(host) on the shared file, in a process of its
+    own. The two runs start together (`start`); each then stops inside its
+    save, after reading the file and just before its os.replace, until the
+    other is there too or `wait` seconds pass (`inside`)."""
+    import threading
+    from hssh import safety
+    gate = SafetyGate(safety_file=path, cooldown_seconds=300)
+    real_replace = safety.os.replace
+
+    def replace(src, dst):
+        try:
+            inside.wait(wait)
+        except threading.BrokenBarrierError:
+            pass                    # the other run is not in here: it waits for the lock
+        return real_replace(src, dst)
+    safety.os.replace = replace
+    start.wait(60)
+    gate.set_cooldown(host)
+
+
+def test_two_runs_saving_at_the_same_moment_keep_both_cooldowns(tmp_path):
+    """The flock around a save is all that keeps two runs from losing each
+    other's cooldowns (#145): a save reads the file, merges its own hosts
+    and replaces the file. Here two processes save at once. Under the lock
+    only one is inside at a time: the first writes after its wait, the
+    second then reads that file, and both hosts are kept. Without it both
+    read the file before either wrote it, and the second os.replace drops
+    the first one's host: with every fcntl.flock in safety.py stubbed out
+    this fails, where T9, whose two gates take turns, passed."""
+    import multiprocessing
+    path = str(tmp_path / "safety.json")
+    ctx = multiprocessing.get_context("spawn")          # no fork of a process with threads in it
+    start, inside = ctx.Barrier(2), ctx.Barrier(2)
+    runs = [ctx.Process(target=_save_a_cooldown, args=(path, host, start, inside, 1.0))
+            for host in ("10.0.0.1", "10.0.0.2")]
+    try:
+        for p in runs:
+            p.start()
+        for p in runs:
+            p.join(60)
+        assert [p.exitcode for p in runs] == [0, 0]
+    finally:
+        for p in runs:
+            if p.is_alive():
+                p.terminate()
+    with open(path) as f:
+        assert sorted(json.load(f)) == ["10.0.0.1", "10.0.0.2"]
 
 
 def test_fail_closed_on_corrupt_file():
