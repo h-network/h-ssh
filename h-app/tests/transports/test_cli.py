@@ -763,6 +763,38 @@ def test_lines_edit_applies_each_line_in_config_mode():
     assert ch.typed[-1] == "end"
 
 
+# An IOS device with no Gi0/9: a line it refuses leaves it in the mode it was in.
+NO_GI09 = {"configure terminal": "\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nR1(config)#",
+           "interface Gi0/1": "\r\nR1(config-if)#",
+           "interface Gi0/9": "\r\n" + " " * 17 + "^\r\n% Invalid input detected at '^' marker.\r\n\r\nR1(config-if)#",
+           "end": "\r\nR1#", "<else>": "\r\nR1(config-if)#"}
+
+
+def test_a_lines_edit_stops_at_the_first_refused_line():
+    """#142: a lines edit typed every line, refused or not, each in the mode
+    the device was then in. With `interface Gi0/9` refused, the device
+    still in Gi0/1's interface mode, the `shutdown` after it shut Gi0/1,
+    and the failure named only the refusal. The edit stops at the first
+    refused line, types `end` and fails, naming the line and the device's
+    complaint, the lines applied before it and the lines not sent."""
+    refused = "'interface Gi0/9': % Invalid input detected at '^' marker."
+    for payload, typed, said in (
+            ("interface Gi0/1\n description uplink-ok\ninterface Gi0/9\n shutdown\n",
+             ["interface Gi0/1", "description uplink-ok", "interface Gi0/9"],
+             "applied before it: 'interface Gi0/1', 'description uplink-ok'; not sent: 'shutdown'"),
+            ("interface Gi0/9\n shutdown\n no ip address\n", ["interface Gi0/9"],
+             "applied before it: none; not sent: 'shutdown', 'no ip address'"),
+            ("interface Gi0/1\n! the last line\ninterface Gi0/9\n", ["interface Gi0/1", "interface Gi0/9"],
+             "applied before it: 'interface Gi0/1'; not sent: none")):
+        ch = ScriptChannel("\r\nR1#", NO_GI09)
+        s = Cli(ch, dialects.ios.DIALECT, 5)
+        s.login()
+        with pytest.raises(RuntimeError) as failed:
+            s.edit_lines(payload)
+        assert str(failed.value) == f"{refused}; {said}"
+        assert ch.typed == ["configure terminal", *typed, "end"] and ch.unread() == ""
+
+
 # --- confirm ----------------------------------------------------------------------------
 
 def test_confirm_is_one_bare_commit_in_exclusive_mode():

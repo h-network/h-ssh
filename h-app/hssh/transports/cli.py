@@ -139,6 +139,11 @@ def complaint(output: str, dialect: Dialect) -> str:
     return output.strip()
 
 
+def quoted(lines: list) -> str:
+    """Lines of an edit as a failure names them: each in quotes, or `none`."""
+    return ", ".join(f"'{line}'" for line in lines) or "none"
+
+
 def refuse_control_characters(payload: str) -> None:
     """A CLI acts on a control character as it is typed: ^C drops the line
     typed so far, ^U kills it, DEL rubs out the character before it, a Tab
@@ -580,26 +585,30 @@ class Cli:
     # --- edits -------------------------------------------------------------------
 
     def edit_lines(self, payload: str) -> R.EditResult:
-        """Config mode without a candidate: configure terminal -> commands -> end."""
+        """Config mode without a candidate: configure terminal, the lines, end.
+
+        Each line is live once it is typed, and the next is typed in the mode
+        the device is then in: with `interface Gi0/9` refused, the device
+        still in Gi0/1's, a `shutdown` after it shut Gi0/1 (#142). So the
+        edit stops at the first line the CLI refuses, leaves config mode
+        (`end`) and fails, naming that line and the device's complaint, the
+        lines applied before it and the lines not sent."""
         cli = self.cli
         refuse_control_characters(payload)
+        lines = [ln.strip() for ln in payload.strip().splitlines()]
+        lines = [ln for ln in lines if ln and not ln.startswith(("!", "#"))]
         self.run(cli.config_enter, 10)
 
-        errors = []
-        for line in payload.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("!") or line.startswith("#"):
-                continue
+        for n, line in enumerate(lines):
             # The reply without the echoed line, so the line's own text is not
             # mistaken for the device's complaint about it.
             output = self.run(line, 10)
             if "invalid" in output.lower() or "error" in output.lower() or "%" in output:
-                errors.append(f"'{line}': {complaint(output, self.dialect)}")
+                self.leave_quietly(cli.config_exit)
+                raise RuntimeError(f"'{line}': {complaint(output, self.dialect)}; "
+                                   f"applied before it: {quoted(lines[:n])}; not sent: {quoted(lines[n + 1:])}")
 
         self.run(cli.config_exit, 10)
-
-        if errors:
-            raise RuntimeError("; ".join(errors))
         return R.EditResult(R.APPLIED, message="(config applied)")
 
     def edit_candidate(self, payload: str, dry_run: bool, confirmed_minutes: int = 0,

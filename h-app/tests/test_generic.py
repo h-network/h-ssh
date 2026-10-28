@@ -706,6 +706,22 @@ def test_an_ios_shaped_edit_over_ssh_types_the_lines_in_config_mode(shell, hint)
     assert shells[0].typed == ["configure terminal", "hostname x", "end"]
 
 
+@pytest.mark.parametrize("hint", ["ios@ssh", "nxos@ssh", "eos@ssh"])
+def test_an_ios_shaped_edit_over_ssh_stops_at_the_first_refused_line(shell, hint):
+    """#142: the lines after a refused line were typed in whatever mode the
+    device was in: `shutdown` after a refused `interface Gi0/9` shut the
+    interface before it. The edit stops there and types `end`."""
+    def no_gi09(line):
+        if line == "interface Gi0/9":
+            return "\r\n" + " " * 17 + "^\r\n% Invalid input detected at '^' marker.\r\n\r\nRouter(config-if)#"
+        return ios_cli(line)
+    shells = shell("\r\nRouter#", no_gi09)
+    with pytest.raises(RuntimeError, match=r"^'interface Gi0/9': % Invalid input detected at '\^' marker\.; "
+                                           r"applied before it: 'interface Gi0/1'; not sent: 'shutdown'$"):
+        ssh.edit("10.0.0.1", "u", "p", "interface Gi0/1\ninterface Gi0/9\n shutdown\n", 5, 10, vendor_hint=hint)
+    assert shells[0].typed == ["configure terminal", "interface Gi0/1", "interface Gi0/9", "end"] and shells[0].closed
+
+
 def test_an_ios_shaped_dialect_refuses_a_dry_run_before_connecting(no_connection):
     with pytest.raises(ValueError, match="not supported by ios@ssh; nothing was sent"):
         ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ios@ssh", dry_run=True)

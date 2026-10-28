@@ -956,3 +956,41 @@ def test_a_show_or_batch_line_the_engine_would_not_type_is_refused_before_connec
         assert took < 1 and dev.connected() == 0
     finally:
         dev.close()
+
+
+# --- #142: a lines edit stops at the first refused line ---------------------------
+
+def ios_without_gi09(srv):
+    """An IOS CLI on a console port, which echoes what is typed: it has no
+    Gi0/9, and a line it refuses leaves it in the mode it was in."""
+    mode = "R1#"
+    srv.send("\r\n" + mode)
+    while True:
+        line = srv.readline()
+        reply = ""
+        if line == "configure terminal":
+            mode, reply = "R1(config)#", "Enter configuration commands, one per line.  End with CNTL/Z.\r\n"
+        elif line == "interface Gi0/9":
+            reply = " " * 17 + "^\r\n% Invalid input detected at '^' marker.\r\n\r\n"
+        elif line.startswith("interface "):
+            mode = "R1(config-if)#"
+        elif line == "end":
+            mode = "R1#"
+        srv.send(reply + mode)
+
+
+def test_a_telnet_ios_edit_stops_at_the_first_refused_line():
+    """#142: telnet-ios typed every line of an edit, the ones after a
+    refused line too: with `interface Gi0/9` refused, the console still in
+    Gi0/1's interface mode, the `shutdown` after it shut Gi0/1. The edit
+    stops at the refused line, types `end`, and the failure names the
+    lines applied before it and the lines not sent."""
+    from hssh.transports.telnet import edit
+    srv = ScriptedTelnetServer(ios_without_gi09)
+    with pytest.raises(RuntimeError) as failed:
+        edit("127.0.0.1", "admin", "admin", "interface Gi0/1\n description uplink-ok\ninterface Gi0/9\n shutdown\n",
+             session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-ios")
+    assert str(failed.value) == ("'interface Gi0/9': % Invalid input detected at '^' marker.; applied before it: "
+                                 "'interface Gi0/1', 'description uplink-ok'; not sent: 'shutdown'")
+    assert _received(srv) == ["configure terminal", "interface Gi0/1", "description uplink-ok", "interface Gi0/9",
+                              "end"]

@@ -461,10 +461,15 @@ def test_an_ios_shaped_edit_types_the_lines_in_config_mode(device, hint):
 
 
 def test_an_ios_shaped_edit_reports_the_refused_line_and_still_leaves_config_mode(device):
+    """#142: and stops there: the lines after a refused one were typed in
+    whatever mode the device was in. They are not sent, and the failure
+    names them and the lines applied before it."""
     device.knobs(flavour="ios")
-    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.$"):
-        openssh.edit("10.0.0.1", "u", "hunter2", "hostname bogus\n", 5, 10, vendor_hint="ios@openssh")
-    assert device.typed == ["configure terminal", "hostname bogus", "end"]
+    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.; "
+                                           r"applied before it: 'interface Gi0/1'; not sent: 'shutdown'$"):
+        openssh.edit("10.0.0.1", "u", "hunter2", "interface Gi0/1\nhostname bogus\n shutdown\n", 5, 10,
+                     vendor_hint="ios@openssh")
+    assert device.typed == ["configure terminal", "interface Gi0/1", "hostname bogus", "end"]
 
 
 def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(device):
@@ -477,7 +482,8 @@ def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(device):
     pty echoes what is typed, so the first reply is read through its echo:
     the refused line fails the edit."""
     device.knobs(flavour="ios", banner="noc", lag=0.2)
-    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.$"):
+    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.; "
+                                           r"applied before it: 'interface Gi0/1'; not sent: none$"):
         openssh.edit("10.0.0.1", "u", "hunter2", "interface Gi0/1\nhostname bogus\n", 5, 10, vendor_hint="ios@openssh")
     assert device.typed == ["configure terminal", "interface Gi0/1", "hostname bogus", "end"]
 
