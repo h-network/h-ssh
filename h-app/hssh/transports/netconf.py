@@ -998,8 +998,11 @@ def _confirm(host: str, user: str, passwd: Optional[str], session_timeout: int, 
     guarded_commit() made, the history is read once the lock is held, and
     the plain commit goes only while that entry is still the one waiting
     at sequence 0; otherwise the lock is released, nothing committed, and
-    _Moved says why. A commit that lands after the lock cannot come
-    between that read and the confirmation; one read before it could."""
+    _Moved says why. No other session's commit can land between that read
+    and the confirmation, as one could after a read made before the lock.
+    The lock does not hold off the device's own rollback when the timer
+    runs out: that can still land in between, and the confirmation then
+    reads COMMIT CONFIRMED OK for a change the device has rolled back."""
     with _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout) as lease:
         # A plain commit with nothing waiting is not a confirmation: the
         # timer expired (the change is gone) or someone confirmed before.
@@ -1297,10 +1300,11 @@ def _ours(entries: List[dict], user: Optional[str], before: List[dict]) -> Optio
     still waiting, logged under the name the session logged in as
     (_login()), and the commit right after the one that was the latest when
     our lock was taken (`before`, the history read under the lock just
-    before the commit, when no other commit could land): its time is the
-    commit's. A commit that landed after ours, of this login too, puts ours
-    at sequence 1 and is not taken for it. Never the comment: Junos keeps
-    one as it keeps it (of one with a line break, only the last line)."""
+    before the commit, when no other session's commit could land): its
+    time is the commit's. A commit that landed after ours, of this login
+    too, puts ours at sequence 1 and is not taken for it. Never the
+    comment: Junos keeps one as it keeps it (of one with a line break,
+    only the last line)."""
     entry = entries[0] if entries else None
     if entry is None or entry.get("seq") != 0 or entry.get("user") != user:
         return None
@@ -1341,14 +1345,18 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     rollback each take the configuration lock first (the rollback with
     `rollback 1` loaded and checked, as begin(rollback=1) has it) and only
     then read the history again and compare it with that entry, so no
-    commit lands between the look and the commit. When that is no longer
-    the pending one — another commit landed (which confirmed ours too), or
-    the checks outlasted the timer and the device rolled back by itself —
-    nothing is committed and the lock is released, since `rollback 1`
-    would now re-apply the change that just failed, and the result is "not
-    confirmed" / "not rolled back" with the reason and the history under
-    "status" (for "not rolled back" the check's own failure is under
-    "check_error").
+    other session's commit lands between the look and the commit. When
+    that is no longer the pending one — another commit landed (which
+    confirmed ours too), or the checks outlasted the timer and the device
+    rolled back by itself — nothing is committed and the lock is released,
+    since `rollback 1` would now re-apply the change that just failed, and
+    the result is "not confirmed" / "not rolled back" with the reason and
+    the history under "status" (for "not rolled back" the check's own
+    failure is under "check_error"). The lock does not hold off the
+    device's own rollback when the timer runs out: checks that end in its
+    last moments can have that land between the look and the confirmation,
+    which then answers "confirmed" for a change the device has rolled
+    back. Keep `check()` well inside `minutes`.
 
     `comment` is held to edit()'s rule, and so are the comments logged with
     the confirmation and the rollback, it with " (confirmed)" or " (rolled
@@ -1370,8 +1378,10 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     login = _login(host, user, port)
     with begin(host, user, passwd, payload, session_timeout, command_timeout, port=port,
                connect_timeout=connect_timeout) as tx:
-        # The history under our lock: no other commit lands before ours
-        # while it is held, so ours is the one logged right after this.
+        # The history under our lock: no other session's commit lands
+        # before ours while it is held, so ours is the one logged right
+        # after this. The device's own rollback of a commit confirmed
+        # already waiting is not held off; if it lands, ours is not found.
         before = _history_on(tx.dev, command_timeout) if tx.diff.strip() else []
         out = tx.commit(confirmed=minutes, comment=comment)
     if out.startswith("NO CHANGES"):
@@ -1402,7 +1412,9 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     with begin(host, user, passwd, None, session_timeout, command_timeout, port=port, rollback=1,
                connect_timeout=connect_timeout) as tx:
         # Under the lock, `rollback 1` loaded and checked: the history is
-        # read now, and no commit lands between this look and the commit.
+        # read now, and no other session's commit lands between this look
+        # and the commit. The device's own rollback, if the timer runs out
+        # in between, is not held off by the lock.
         entries = _history_on(tx.dev, command_timeout)
         moved = _history_moved(ours, entries)
         if moved:
