@@ -68,6 +68,7 @@ class FakeConfig:
     diff_text = "[edit]\n+  system host-name r1;"
     raise_on = {}
     on_commit = None        # a Router logging the commit in its history
+    on = {}                 # call name -> what happens on the device as it is asked, fn(config)
 
     def __init__(self, dev):
         self.dev = dev
@@ -75,6 +76,8 @@ class FakeConfig:
         FakeConfig.instances.append(self)
 
     def _do(self, name, *a, **kw):
+        if name in FakeConfig.on:
+            FakeConfig.on[name](self)
         self.calls.append((name, a, kw))
         exc = FakeConfig.raise_on.get(name)
         if exc:
@@ -118,6 +121,7 @@ def fake_pyez(monkeypatch):
     FakeConfig.diff_text = "[edit]\n+  system host-name r1;"
     FakeConfig.raise_on = {}
     FakeConfig.on_commit = None
+    FakeConfig.on = {}
     monkeypatch.setattr(netconf, "AVAILABLE", True)
     monkeypatch.setattr(netconf, "JunosDevice", FakeDevice)
     monkeypatch.setattr(netconf, "JunosConfig", FakeConfig)
@@ -528,6 +532,9 @@ def committed():
 
 
 EDIT = ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+# The rollback that looked at the history under its lock and found it moved:
+# `rollback 1` loaded and checked, then discarded, nothing committed.
+LOOKED = ["lock", "rollback", "diff", "commit_check", "rollback", "unlock"]
 
 
 def test_guarded_commit_confirms_or_rolls_back(monkeypatch):
@@ -553,7 +560,7 @@ def test_guarded_commit_takes_the_timer_as_a_countdown_not_an_identity(monkeypat
     assert guarded(check)["final"] == "confirmed"
 
 
-def test_guarded_commit_sends_nothing_once_another_commit_landed(monkeypatch):
+def test_guarded_commit_commits_nothing_once_another_commit_landed(monkeypatch):
     """Their commit confirmed ours and is rollback 0 now: `rollback 1` would
     put back the change that just failed its checks."""
     router = Router(monkeypatch)
@@ -565,12 +572,12 @@ def test_guarded_commit_sends_nothing_once_another_commit_landed(monkeypatch):
     assert res["final"] == "not rolled back" and res["checks"] is False
     assert "history changed" in res["reason"] and "bgp down" in res["check_error"]
     assert res["status"] == router.entries and res["status"][0]["user"] == "other"
-    assert all_names() == EDIT                                 # the edit, nothing after
+    assert all_names() == EDIT + LOOKED                        # the edit, nothing committed after
     FakeConfig.instances.clear()
     res = guarded(lambda: theirs_then(lambda: True))
     assert res["final"] == "not confirmed" and res["checks"] is True and res["status"] == router.entries
     assert committed() == [(5, "C1")]
-    assert len(FakeConfig.instances) == 1
+    assert all_names() == EDIT + ["lock", "unlock"]
 
 
 def test_guarded_commit_does_not_roll_back_after_the_timer_ran_out(monkeypatch):
@@ -583,7 +590,7 @@ def test_guarded_commit_does_not_roll_back_after_the_timer_ran_out(monkeypatch):
         return False
     res = guarded(expired)
     assert res["final"] == "not rolled back" and res["check_error"] is None
-    assert res["status"] == router.entries and all_names() == EDIT
+    assert res["status"] == router.entries and all_names() == EDIT + LOOKED
 
 
 def test_guarded_commit_needs_its_own_commit_in_the_history(monkeypatch):
@@ -620,7 +627,56 @@ def test_guarded_commit_only_trusts_the_latest_commit(monkeypatch):
         raise RuntimeError("bgp down")
     res = guarded(later)
     assert res["final"] == "not rolled back" and "history changed" in res["reason"]
-    assert len(FakeConfig.instances) == 1
+    assert committed() == [(5, "C1")]
+
+
+# --- #146: the history looked at under the lock the confirmation or rollback holds ---
+
+@pytest.mark.parametrize("check, final, after", [
+    (failing_check, "not rolled back", LOOKED),
+    (lambda: True, "not confirmed", ["lock", "unlock"]),
+], ids=["rollback", "confirmation"])
+def test_guarded_commit_sees_a_commit_that_lands_before_its_lock(monkeypatch, check, final, after):
+    """#146: the history was read in a session of its own and the rollback
+    (or the confirmation) made in another, which checked only that some
+    commit confirmed was waiting. A commit that landed between that read
+    and the rollback's lock was not seen: `rollback 1` reverted it, the
+    change that failed its checks stayed committed, and the answer was
+    `rolled back`. The history is read under the lock the rollback or the
+    confirmation holds: nothing is committed after the edit, the lock is
+    released, and the answer says the history changed."""
+    router = Router(monkeypatch)
+    locks = []
+
+    def lands_before_the_lock(cfg):
+        locks.append(cfg)
+        if len(locks) == 2:                       # the confirmation's or the rollback's
+            router.log("other", "theirs", client="cli")
+    FakeConfig.on["lock"] = lands_before_the_lock
+    res = guarded(check)
+    assert res["final"] == final and "history changed" in res["reason"], res
+    assert res["status"] == router.entries and res["status"][0]["user"] == "other"
+    assert committed() == [(5, "C1")] and all_names() == EDIT + after
+
+
+@pytest.mark.parametrize("check, after", [(failing_check, ["rollback", "unlock"]), (lambda: True, ["lock", "unlock"])],
+                         ids=["rollback", "confirmation"])
+def test_guarded_commit_gives_the_lock_back_when_the_history_cannot_be_read_under_it(monkeypatch, check, after):
+    """#146: a history the router will not show under the lock (a login
+    class without the right to see it) commits nothing, releases the lock
+    and raises."""
+    router = Router(monkeypatch)
+    reads = []
+
+    def history_on(dev, t):
+        reads.append(dev)
+        if len(reads) == 2:                       # the one under the confirmation's or the rollback's lock
+            raise RuntimeError("permission denied")
+        return router.read()
+    monkeypatch.setattr(netconf, "_history_on", history_on)
+    with pytest.raises(RuntimeError, match="permission denied"):
+        guarded(check)
+    assert committed() == [(5, "C1")] and all_names()[-len(after):] == after
 
 
 # --- #146: the commit guarded_commit() made, found by the name it logged in as ---

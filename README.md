@@ -1443,16 +1443,18 @@ under the configuration lock, so someone else's uncommitted edits refuse it (`No
 sent) rather than going in with the confirmation. With no commit-confirmed waiting (the timer expired, or it
 was confirmed already) `confirm()` raises `hssh.errors.NothingToConfirmError` and sends nothing: a plain
 commit there would hide that the change is gone. `guarded_commit()` reads `show system commit` after its
-commit and again before it confirms or rolls back. The commit it made is the pending one at sequence 0
-logged under the name its session logged in as: with `user=None` the name PyEZ takes, the `User`
-`~/.ssh/config` gives the host, else `$USER` (a refused login names that user too, `authentication failed
-for USER at HOST:PORT`), so with no user given a failing check is rolled back and a passing one confirmed as
-well. It is also the commit logged right after the latest one the history held when its lock was taken (read
-under the lock, before committing, when no other commit can land): a commit confirmed made after it under
-the same login is not taken for it, and its comment, which Junos keeps as it likes, plays no part. When the
-pending commit is no longer the one it made — another commit landed, which also confirmed it, or the checks
-outlasted the timer and the device rolled back by itself — it sends nothing and answers `not confirmed` /
-`not rolled back` with the reason, the history under `status` and, when the checks failed, their error under
+commit, and again once its confirmation or its rollback holds the configuration lock (the rollback with
+`rollback 1` loaded and checked, as `begin(rollback=1)` has it), so no commit can land between that look and
+the commit it then makes. The commit it made is the pending one at sequence 0 logged under the name its
+session logged in as: with `user=None` the name PyEZ takes, the `User` `~/.ssh/config` gives the host, else
+`$USER` (a refused login names that user too, `authentication failed for USER at HOST:PORT`), so with no
+user given a failing check is rolled back and a passing one confirmed as well. It is also the commit logged
+right after the latest one the history held when its lock was taken (read under the lock, before committing,
+when no other commit can land): a commit confirmed made after it under the same login is not taken for it,
+and its comment, which Junos keeps as it likes, plays no part. When the pending commit is no longer the one
+it made — another commit landed, which also confirmed it, or the checks outlasted the timer and the device
+rolled back by itself — it commits nothing, releases the lock and answers `not confirmed` / `not rolled
+back` with the reason, the history under `status` and, when the checks failed, their error under
 `check_error`, because a `rollback 1` at that point would re-apply the change that just failed its checks.
 With the pool on, a session with an open transaction stays borrowed and other threads wait for it. Either
 way the thread holding it may keep using it, and only that thread can commit or abort it: a `Transaction`
@@ -1569,7 +1571,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1419 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1423 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

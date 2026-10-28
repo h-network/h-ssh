@@ -964,16 +964,58 @@ def confirm(host: str, user: str, passwd: str,
     in with the confirmation. A comment is held to edit()'s rule."""
     _require()
     comment = check_comment(comment)
+    return _confirm(host, user, passwd, session_timeout, command_timeout, port, comment, connect_timeout)
+
+
+class _Moved(Exception):
+    """The commit confirmed guarded_commit() made is no longer the one
+    waiting: why (`reason`), and the history read under the lock (`entries`)."""
+
+    def __init__(self, reason: str, entries: List[dict]):
+        super().__init__(reason)
+        self.reason = reason
+        self.entries = entries
+
+
+def _release_lock(cu, lease, exc: Optional[BaseException] = None) -> None:
+    """Give up the configuration lock taken on the borrowed session, nothing
+    committed: unlock it, or, after `exc` lost the session or left it in
+    doubt, drop the session and the lock with it."""
+    if exc is not None and (_session_lost(exc) or _timed_out(exc)):
+        lease.discard()
+    elif _unlock_quietly(cu) is not None:
+        lease.discard()
+
+
+def _confirm(host: str, user: str, passwd: Optional[str], session_timeout: int, command_timeout: int,
+             port: Optional[int], comment: Optional[str], connect_timeout: int,
+             ours: Optional[dict] = None) -> str:
+    """confirm(), and guarded_commit()'s. With `ours`, the commit confirmed
+    guarded_commit() made, the history is read once the lock is held, and
+    the plain commit goes only while that entry is still the one waiting
+    at sequence 0; otherwise the lock is released, nothing committed, and
+    _Moved says why. A commit that lands after the lock cannot come
+    between that read and the confirmation; one read before it could."""
     with _session(host, user, passwd, session_timeout, command_timeout, port, connect_timeout) as lease:
         # A plain commit with nothing waiting is not a confirmation: the
         # timer expired (the change is gone) or someone confirmed before.
         # Either way the operator must know; a commit would only hide it.
-        if _pending_on(lease.dev, command_timeout) is None:
+        if ours is None and _pending_on(lease.dev, command_timeout) is None:
             raise NothingToConfirmError(
                 "nothing to confirm: no commit-confirmed is pending on the device "
                 "(the timer expired, or it was confirmed already); nothing was sent")
         cu = JunosConfig(lease.dev)
         _lock(cu, lease)
+        if ours is not None:
+            try:
+                entries = _history_on(lease.dev, command_timeout)
+            except Exception as e:
+                _release_lock(cu, lease, e)
+                raise
+            moved = _history_moved(ours, entries)
+            if moved:
+                _release_lock(cu, lease)
+                raise _Moved(moved, entries)
         try:
             if comment:
                 cu.commit(timeout=command_timeout, comment=comment)
@@ -1291,14 +1333,18 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
     User for the host, else $USER) and right after the commit that was the
     latest when its lock was taken (the history is read under the lock,
     before the commit): found by its place and its login, never by the
-    comment, which Junos keeps as it likes. Before confirming or rolling
-    back, the history is read again and compared with that entry. When that
-    is no longer the pending one — another commit landed (which confirmed
-    ours too), or the checks outlasted the timer and the device rolled back
-    by itself — nothing is sent, since `rollback 1` would now re-apply the
-    change that just failed, and the result is "not confirmed" / "not
-    rolled back" with the reason and the history under "status" (for "not
-    rolled back" the check's own failure is under "check_error").
+    comment, which Junos keeps as it likes. The confirmation and the
+    rollback each take the configuration lock first (the rollback with
+    `rollback 1` loaded and checked, as begin(rollback=1) has it) and only
+    then read the history again and compare it with that entry, so no
+    commit lands between the look and the commit. When that is no longer
+    the pending one — another commit landed (which confirmed ours too), or
+    the checks outlasted the timer and the device rolled back by itself —
+    nothing is committed and the lock is released, since `rollback 1`
+    would now re-apply the change that just failed, and the result is "not
+    confirmed" / "not rolled back" with the reason and the history under
+    "status" (for "not rolled back" the check's own failure is under
+    "check_error").
 
     `comment` is held to edit()'s rule, and so are the comments logged with
     the confirmation and the rollback, it with " (confirmed)" or " (rolled
@@ -1332,18 +1378,32 @@ def guarded_commit(host: str, user: str, passwd: str, payload: str,
         ok, reason = bool(check()), None
     except Exception as e:
         ok, reason = False, f"{type(e).__name__}: {e}"
-    entries = commit_status(host, user, passwd, session_timeout, command_timeout, port=port,
-                            connect_timeout=connect_timeout)
-    moved = _history_moved(ours, entries)
-    if ok:
-        if moved:
+    if ours is None:
+        # No commit of ours to act on: the history as it is now, and nothing sent.
+        entries = commit_status(host, user, passwd, session_timeout, command_timeout, port=port,
+                                connect_timeout=connect_timeout)
+        moved = _history_moved(None, entries)
+        if ok:
             return {"final": "not confirmed", "commit": out, "checks": True, "reason": moved, "status": entries}
-        done = confirm(host, user, passwd, session_timeout, command_timeout, port=port,
-                       comment=confirmed_comment, connect_timeout=connect_timeout)
-        return {"final": "confirmed", "commit": out, "checks": True, "confirm": done}
-    if moved:
         return {"final": "not rolled back", "commit": out, "checks": False, "reason": moved,
                 "check_error": reason, "status": entries}
-    back = rollback(host, user, passwd, 1, session_timeout, command_timeout, port=port,
-                    comment=rollback_comment, connect_timeout=connect_timeout)
+    if ok:
+        try:
+            done = _confirm(host, user, passwd, session_timeout, command_timeout, port, confirmed_comment,
+                            connect_timeout, ours=ours)
+        except _Moved as e:
+            return {"final": "not confirmed", "commit": out, "checks": True, "reason": e.reason,
+                    "status": e.entries}
+        return {"final": "confirmed", "commit": out, "checks": True, "confirm": done}
+    with begin(host, user, passwd, None, session_timeout, command_timeout, port=port, rollback=1,
+               connect_timeout=connect_timeout) as tx:
+        # Under the lock, `rollback 1` loaded and checked: the history is
+        # read now, and no commit lands between this look and the commit.
+        entries = _history_on(tx.dev, command_timeout)
+        moved = _history_moved(ours, entries)
+        if moved:
+            tx.abort()
+            return {"final": "not rolled back", "commit": out, "checks": False, "reason": moved,
+                    "check_error": reason, "status": entries}
+        back = tx.commit(comment=rollback_comment)
     return {"final": "rolled back", "commit": out, "checks": False, "reason": reason, "rollback": back}
