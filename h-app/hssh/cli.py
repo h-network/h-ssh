@@ -204,6 +204,22 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2, f"{self.prog}: error: {message} (see --help)\n")
 
 
+def typed_dests(parser: argparse.ArgumentParser, argv) -> set:
+    """The options argv gives, whatever their value: argv parsed again with
+    every default suppressed, so only what was typed lands in the namespace.
+    `--format text` or `--devices devices.csv` is typed though it is the
+    default, and a run file must not take its place (#140). A bare host is
+    `hosts`. The parser's defaults are put back as they were."""
+    saved = [(action, action.default) for action in parser._actions]
+    try:
+        for action, _ in saved:
+            action.default = argparse.SUPPRESS
+        return set(vars(parser.parse_intermixed_args(argv)))
+    finally:
+        for action, default in saved:
+            action.default = default
+
+
 
 # Everything here may be set in ~/.h-ssh/config. The password may not: a config
 # file on a shared host is the wrong home for a secret.
@@ -665,6 +681,7 @@ async def main() -> int:
                         help="Safety gate JSON file for per-device rate limiting and cooldown")
 
     args = parser.parse_intermixed_args()
+    typed = typed_dests(parser, sys.argv[1:])     # what the command line gave, for the run file (#140)
     if not args.verbose:
         _quiet_transport_logs()
     # A host typed bare is an inline target like any --target; from here on
@@ -694,22 +711,25 @@ async def main() -> int:
         except OSError as e:                 # a directory on the way that may not be searched
             print(f"ERROR reading profile '{args.profile}' ({e.filename}): {read_failure(e)}", file=sys.stderr)
             return 2
+        typed.add("batch")
     args.batch_commands = None   # the batch: a run file's commands, or the --batch/--profile file's lines read below
     args.jobs_data = None        # job entries from a run file
 
     # A run file sits between the command line and the config file: a flag
-    # typed on the command line wins, the file wins over the environment and
-    # ~/.h-ssh/config. It is read before anything else so the banner and the
-    # checks below see what the run will use.
+    # typed on the command line wins, whatever its value, the file wins over
+    # the environment and ~/.h-ssh/config. It is read before anything else so
+    # the banner and the checks below see what the run will use.
     from_run_file = []           # the options the run file set
+    devices_unused = False       # the file's `devices`, replaced by a typed --devices or target
     if args.run:
         try:
             run_data = validate_run(load_run_file(args.run), args.run, TRANSPORT_CHOICES, CONFIG_FLOORS,
                                     CONFIG_CEILINGS)
-            from_run_file = apply_run(args, run_data, parser)
+            from_run_file = apply_run(args, run_data, typed)
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             return 2
+        devices_unused = "devices" in run_data and "devices" not in from_run_file
 
     # Resolved before anything reads them, so --list-commands and the banner
     # see the same values the run will use. A --config named on the command
@@ -895,6 +915,12 @@ async def main() -> int:
             if what:
                 print(f"ERROR: {source}: {what} in {cmd!r}; a command is one line of text.", file=sys.stderr)
                 return 2
+
+        # A target typed on the command line, or a typed --devices, replaced
+        # the run file's `devices` (a list or a path); said once, not per tick.
+        if devices_unused and (args.every is None or not _WATCH["tick"]):
+            by = "the targets on the command line win" if args.target else "--devices on the command line wins"
+            print(f"Run file '{args.run}': 'devices' is ignored; {by}.", file=sys.stderr)
 
         # Load targets. A target that doesn't declare a vendor gets
         # --transport (or the config file's), the same for every form.

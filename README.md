@@ -200,7 +200,7 @@ The username is plain text. Telnet types it at the `login:` prompt as it is, whe
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (NETCONF `junos` only) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (NETCONF `junos` only) |
 | `--probe` | Probe | Alone, with no command: every box checked without logging in, one line each with its result and times, a summary, kept in the store; exit 0 when every box is live, 1 when one is dead, 3 when none is but one was not probed, 4 when the store could not keep it. See [The probe](#the-probe) |
-| `--run FILE` | Run file | Any of the above but `--profile` and `--probe` alone, described in one YAML or JSON file: devices, commands, options, outputs (a profile's file can go in as `batch:`; `--profile` or `--probe` typed next to `--run` still work). See [Run files](#run-files) |
+| `--run FILE` | Run file | Any of the above but `--profile` and `--probe` alone, described in one YAML or JSON file: devices, commands, options, outputs (a profile's file can go in as `batch:`; `--profile` or `--probe` typed next to `--run` still work). A flag typed next to it wins over the file whatever its value, and a target or a `--devices` typed next to it replaces the file's `devices`. See [Run files](#run-files) |
 
 `-sC`, `-eC`, `-eD` and `-eB` are also `--show-command`, `--edit-command`, `--edit-dir` and
 `--edit-broadcast`; `-y` and `-v` are `--yes` and `--verbose`.
@@ -784,7 +784,13 @@ the flag's validation: a transport outside the list, `workers: 0`, `format: csv`
 exit 2 naming the key. `--store`, `--no-store`, `--every`, `--times`, `--profile`, `--job`, `--target`
 and `--config` have no key; give them on the command line. Precedence is
 command line → run file → environment → `~/.h-ssh/config` → built-in default, so a `--dry-run` from a
-pipeline variable overrides whatever the file says. Relative paths in the file (`devices`, `batch`,
+pipeline variable overrides whatever the file says. A flag typed on the command line wins whatever its
+value, the default's own included: `--format text` beside `format: xml` asks for text, `--devices
+devices.csv` beside `devices: prod.csv` reads `devices.csv`, and an `--audit-log` equal to
+`$HSSH_AUDIT_LOG` beside `audit-log:` writes where the flag says. A target typed on the command line
+(bare or `--target`) or a typed `--devices` replaces the file's `devices`, an inline list or a path
+alike, and one line on stderr says so: `Run file 'fleet-bgp.yaml': 'devices' is ignored; --devices on
+the command line wins.` Relative paths in the file (`devices`, `batch`,
 `edit-dir`, `edit-broadcast`, `log`, `audit-log`, `save-output`, `safety-file`) resolve against the
 file's own directory, so a run directory with its inventory and set files moves as one.
 
@@ -1444,7 +1450,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1297 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1301 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

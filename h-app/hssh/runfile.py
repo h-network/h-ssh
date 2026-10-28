@@ -4,11 +4,12 @@
 
 Every key is a flag name (`workers`, `session-timeout` or `session_timeout`,
 `commit_confirmed`, ...), held to the same validation as the config file. A
-flag typed on the command line wins over the file; the file wins over the
-environment and ~/.h-ssh/config. Relative paths in the file resolve against
-the file's directory, so a run directory moves as one. A run file never
-carries a credential: the password comes from HSSH_PASSWORD or the prompt,
-exactly as without a file.
+flag typed on the command line wins over the file, whatever its value, and a
+target or a --devices typed there replaces the file's `devices`; the file
+wins over the environment and ~/.h-ssh/config. Relative paths in the file
+resolve against the file's directory, so a run directory moves as one. A run
+file never carries a credential: the password comes from HSSH_PASSWORD or the
+prompt, exactly as without a file.
 
 Three keys have no flag of their own and are the reason the file exists:
 `devices:` may be an inline list of targets, `commands:` is an inline batch,
@@ -227,25 +228,28 @@ def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, 
     return out
 
 
-def apply_run(args, run: Dict[str, Any], parser) -> List[str]:
-    """Fill `args` from the run file where the command line did not set the
-    option: a value still at argparse's default is taken as unset. Returns the
-    option names the file set, for the banner."""
+def apply_run(args, run: Dict[str, Any], typed) -> List[str]:
+    """Fill `args` from the run file where the command line did not give the
+    option. `typed` holds the destinations the command line gave, whatever
+    their value: a flag typed with its default's value (`--format text`,
+    `--devices devices.csv`, an `--audit-log` equal to $HSSH_AUDIT_LOG) wins
+    over the file as any other does (#140). A target typed on the command
+    line (`hosts` bare, or `target`) or a typed `--devices` replaces the
+    file's `devices`, a list or a path. Returns the option names the file
+    set, for the banner."""
     applied: List[str] = []
     for key, value in run.items():
         dest, _ = RUN_KEYS[key]
-        if key == "devices" and isinstance(value, list):
-            if getattr(args, "target", None):
-                continue                  # --target on the command line wins
-            args.target = list(value)
+        if key == "devices":
+            if typed & {"devices", "target", "hosts"}:
+                continue                  # the command line names the devices
+            if isinstance(value, list):
+                args.target = list(value)
+            else:
+                args.devices = value
             applied.append(key)
             continue
-        if dest in ("batch_commands", "jobs_data"):
-            setattr(args, dest, value)
-            applied.append(key)
-            continue
-        current = getattr(args, dest, None)
-        if current is not None and current != parser.get_default(dest):
+        if dest in typed:
             continue                      # given on the command line
         setattr(args, dest, value)
         applied.append(key)
