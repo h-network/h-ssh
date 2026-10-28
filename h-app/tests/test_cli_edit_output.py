@@ -212,6 +212,55 @@ def test_job_entries_for_one_host_take_turns_at_the_safety_gate(monkeypatch, cap
     assert all(e["ok"] for e in json.loads(out)) and '"skipped": 0' in err
 
 
+def test_a_job_the_gates_rate_limit_would_stop_part_way_is_refused_before_anything_is_sent(monkeypatch, capsys,
+                                                                                            tmp_path):
+    """The gate lets a device have 10 logins in 60 s, and on the ssh
+    transport each job entry logs in again: eleven entries for one device
+    ran ten and turned the 11th away (`rate limited 10/10`, exit 3), a job
+    applied in part. The run's logins are counted before the first device
+    now (#145): eleven are refused whole (exit 2, nothing sent), ten all
+    run, and a dry run of the eleven, which logs in nowhere, answers all."""
+    safety = str(tmp_path / "safety.json")
+    driver = JobDriver()
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", driver)
+
+    def job(n):
+        return [{"target": "R1:10.0.0.1:ssh", "show": f"show version {i}"} for i in range(n)]
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(11), "--safety-file", safety, driver=driver)
+    assert rc == 2 and driver.calls == [], err
+    assert ("the safety gate lets a device have 10 logins in 60 s, and this run would log in more often: "
+            "R1 (10.0.0.1) 11 times" in err and err.rstrip().endswith("Nothing was sent."))
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(10), "--json", "--safety-file", safety, driver=driver)
+    assert rc == 0 and len(driver.calls) == 10 and all(e["ok"] for e in json.loads(out)), err
+    driver.calls.clear()
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(11), "--json", "--dry-run", "--safety-file", safety,
+                              driver=driver)
+    assert rc == 0 and driver.calls == [] and len(json.loads(out)) == 11, err
+
+
+def test_a_show_diff_preview_is_one_login_more_counted_before_it(monkeypatch, capsys, tmp_path):
+    """A --show-diff preview opens a session of its own, before the run.
+    One edit and nine shows for a junos@ssh device are eleven logins: the
+    preview and nine entries ran, and the last show was turned away after
+    the commit. Refused before the preview now (#145), nothing sent; with
+    eight shows the preview and all nine entries run."""
+    safety = str(tmp_path / "safety.json")
+    driver = JobDriver()
+    monkeypatch.setitem(drivers.MODULES, "junos@ssh", driver)
+
+    def job(shows):
+        return ([{"target": "R1:10.0.0.1:junos@ssh", "edit": "set system location building b1"}] +
+                [{"target": "R1:10.0.0.1:junos@ssh", "show": f"show version {i}"} for i in range(shows)])
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(9), "--show-diff", "-y", "--safety-file", safety,
+                              driver=driver)
+    assert rc == 2 and driver.calls == [] and "R1 (10.0.0.1) 11 times" in err, err
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(8), "--show-diff", "-y", "--json",
+                              "--safety-file", safety, driver=driver)
+    assert rc == 0, err
+    assert [c[0] for c in driver.calls] == ["edit", "edit"] + ["show"] * 8     # the preview, then the job in order
+    assert all(e["ok"] for e in json.loads(out))
+
+
 class EchoDriver(JobDriver):
     """Answers a show with the command and the host, so a saved file says
     which entry it holds; a command in `fail` is refused instead."""

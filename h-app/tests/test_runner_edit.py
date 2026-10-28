@@ -250,7 +250,7 @@ class FakeGate:
     def __init__(self):
         self.events = []
 
-    def check_device(self, host):
+    def check_device(self, host, *a, **kw):
         self.events.append("check")
         return True, "ok"
 

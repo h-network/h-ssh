@@ -55,6 +55,25 @@ def test_rate_limit():
     assert "rate limited 10/10" in reason
 
 
+def test_the_rate_limit_counts_logins_only():
+    """An attempt that opens no session of its own (a job's later entry on
+    the pooled NETCONF session, a dry run of a read) is not a login (#145):
+    past the limit it still goes, and it is not counted; a cooldown and an
+    active mark turn it away as before."""
+    gate = SafetyGate(rate_limit=2)
+    for _ in range(2):
+        assert gate.check_device("10.0.1.1") == (True, "ok")
+        gate.release_device("10.0.1.1")
+    assert gate.check_device("10.0.1.1") == (False, "rate limited 2/2")
+    assert gate.check_device("10.0.1.1", login=False) == (True, "ok")
+    assert gate.check_device("10.0.1.1", login=False) == (False, "active connection")
+    gate.release_device("10.0.1.1")
+    assert len(gate._attempt_timestamps["10.0.1.1"]) == 2
+    gate.set_cooldown("10.0.1.1")
+    allowed, reason = gate.check_device("10.0.1.1", login=False)
+    assert not allowed and reason.startswith("cooldown active")
+
+
 # T5: Cooldown set
 def test_cooldown_set():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:

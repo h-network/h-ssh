@@ -26,7 +26,7 @@ class SafetyGate:
 
     Args:
         safety_file: Path to JSON cooldown file. None = in-memory only.
-        rate_limit: Max attempts per device within rate_window (default 10).
+        rate_limit: Max logins per device within rate_window (default 10).
         cooldown_seconds: Seconds to block a device after failure (default 120).
         rate_window: Sliding window duration in seconds (default 60.0).
     """
@@ -62,11 +62,27 @@ class SafetyGate:
     # Public API
     # ------------------------------------------------------------------
 
-    def check_device(self, host: str) -> tuple[bool, str]:
+    @property
+    def rate_limit(self) -> int:
+        """The logins a device may have within rate_window."""
+        return self._rate_limit
+
+    @property
+    def rate_window(self) -> float:
+        return self._rate_window
+
+    def check_device(self, host: str, *, login: bool = True) -> tuple[bool, str]:
         """Check whether a device is safe to contact.
 
         Returns (allowed, reason). Host is added to _active BEFORE returning
         True — crash before release_device() keeps it blocked (fail-closed).
+
+        The rate limit counts logins (#145): `login` False is an attempt
+        that opens no session of its own, one that rides a session already
+        open to the device (a job's later entry on its pooled NETCONF
+        session) or contacts no device at all (a dry run of a read). It is
+        turned away by a cooldown or an active mark as any other, never by
+        the rate limit, and is not counted.
         """
         with self._lock:
             # Re-read cooldowns from disk to catch external changes and check corruption
@@ -90,20 +106,21 @@ class SafetyGate:
             if host in self._active:
                 return False, "active connection"
 
-            # Tier 1: sliding window rate limit
-            timestamps = [
-                ts for ts in self._attempt_timestamps.get(host, [])
-                if (now - ts) < self._rate_window
-            ]
-            self._attempt_timestamps[host] = timestamps
+            # Tier 1: sliding window rate limit, on the logins
+            if login:
+                timestamps = [
+                    ts for ts in self._attempt_timestamps.get(host, [])
+                    if (now - ts) < self._rate_window
+                ]
+                self._attempt_timestamps[host] = timestamps
 
-            count = len(timestamps)
-            if count >= self._rate_limit:
-                return False, f"rate limited {count}/{self._rate_limit}"
+                count = len(timestamps)
+                if count >= self._rate_limit:
+                    return False, f"rate limited {count}/{self._rate_limit}"
+                timestamps.append(now)
 
             # Allow and mark active (fail-closed)
             self._active.add(host)
-            self._attempt_timestamps[host].append(now)
             return True, "ok"
 
     def holds(self, hosts) -> dict:

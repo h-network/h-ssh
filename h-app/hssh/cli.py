@@ -30,7 +30,7 @@ from .core import (
     path_inside, set_file_payload, comments_named,
 )
 from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
-                     DEFAULT_CONNECT_TIMEOUT)
+                     opens_session, DEFAULT_CONNECT_TIMEOUT)
 from . import probe as probes
 from .transports.connect import budget as connect_budget
 from .drivers import results as R
@@ -440,6 +440,32 @@ def held_by(gate, targets) -> dict:
     if gate is None:
         return {}
     return {host: f"safety gate: {why}" for host, why in gate.holds({t.host for t in targets}).items()}
+
+
+def plan_logins(units, mode: str, dry_run: bool, previews: bool):
+    """The logins a run will make, for the safety gate's rate limit, which
+    counts logins (#145): ({host: the sessions the run opens to it}, {the
+    units that ride a session already open}). `units` are the run's
+    (target, job entry or None) in file order; `previews`: --show-diff
+    previews the edits first. A unit logs in once, and its preview once
+    more (the previews run before the session pool is on); a dry run of a
+    read logs in nowhere; a job's entries for one device on a pooled
+    transport (NETCONF) share one session (#57), so only the first of them
+    to open one logs in."""
+    logins, rides, opened = {}, set(), set()
+    for i, (t, je) in enumerate(units):
+        unit_mode = je.mode if je is not None else mode
+        n = 1 if previews and (je is None or unit_mode.startswith("edit")) else 0
+        if opens_session(unit_mode, dry_run):
+            pooled = je is not None and drivers.get(t.vendor).transport.pooled
+            if pooled and t.host in opened:
+                rides.add(i)
+            else:
+                n += 1
+                if pooled:
+                    opened.add(t.host)
+        logins[t.host] = logins.get(t.host, 0) + n
+    return logins, rides
 
 
 async def probe_alone(args, targets, store, user, json_mode: bool, safety_gate=None) -> int:
@@ -1380,6 +1406,33 @@ async def main() -> int:
         print(f"ERROR: --safety-file requested but unusable: {e}; refusing to start.", file=sys.stderr)
         return 2
 
+    # One unit of work per job entry, or per target. The entry (None outside
+    # job mode) travels with its result, so a job that names one device in
+    # two entries never has the second read as the first.
+    units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
+
+    # The gate's rate limit counts logins (#145). A job's entries, and the
+    # previews of --show-diff, were each counted as an attempt: past ten for
+    # one device the gate turned the rest away, and a change set confirmed
+    # whole was applied in part. What the run logs in to each device is known
+    # now; a run that would pass the limit is refused before anything is
+    # sent, and the run itself counts the same logins.
+    rides = set()        # the units that ride a session the run has open: no login of their own
+    if safety_gate is not None and mode != "probe":
+        logins, rides = plan_logins(units, mode, args.dry_run, bool(args.show_diff and commits))
+        crowded = {host: n for host, n in logins.items() if n > safety_gate.rate_limit}
+        if crowded:
+            _discard_store()
+            names = {}
+            for t, _ in units:
+                names.setdefault(t.host, t.name)
+            shown = ", ".join(f"{names[h]} ({h}) {n} times" for h, n in list(crowded.items())[:20])
+            print(f"ERROR: --safety-file: the safety gate lets a device have {safety_gate.rate_limit} logins in "
+                  f"{safety_gate.rate_window:g} s, and this run would log in more often: {shown}"
+                  f"{' …' if len(crowded) > 20 else ''}. The gate would turn the rest away part way through; "
+                  "split the run. Nothing was sent.", file=sys.stderr)
+            return 2
+
     if save_dir:
         # Raw device output (a config backup is the point), so the directory
         # and its files are the operator's alone: 0700 / 0600, never redacted.
@@ -1495,11 +1548,6 @@ async def main() -> int:
             # (not when the open-file limit just lowered them: that WARNING said why).
             print(f"Hint: {devices} devices at {args.workers} workers is {waves} waves; --workers 64 would be "
                   f"{-(-devices // 64)} (one session per router either way)")
-
-    # One unit of work per job entry, or per target. The entry (None outside
-    # job mode) travels with its result, so a job that names one device in
-    # two entries never has the second read as the first.
-    units = [(je.target, je) for je in job_entries] if job_entries else [(t, None) for t in targets]
 
     def _audit_aborted(error):
         """One audit line per unit for a run the operator did not confirm."""
@@ -1686,7 +1734,7 @@ async def main() -> int:
         return host_locks.setdefault(host, asyncio.Lock())
 
     async def _bounded_run(t, mode_override=None, cmd_override=None, dry_run=None, expected_diff=None,
-                           started=None, seq=0, save=True):
+                           started=None, seq=0, save=True, logs_in=True):
         async with _host_lock(t.host), sem:
             if started is not None:
                 started()        # from here on the device may be touched
@@ -1746,6 +1794,7 @@ async def main() -> int:
                 expected_diff=expected_diff,
                 seq=seq,
                 stop=stopped,
+                logs_in=logs_in,
             )
 
     started = set()      # unit indices whose device may already be in play
@@ -1763,19 +1812,21 @@ async def main() -> int:
             secure_write(str(path_inside(save_dir, save_name(t.name, seq_of[i] if je else 0))), text)
         return RunResult(t.name, False, text, dead[i].duration_ms, error=error)
 
-    async def _run_unit(i, dry_run=None, expected_diff=None, save=True):
+    async def _run_unit(i, dry_run=None, expected_diff=None, save=True, logs_in=True):
         """units[i] on its device, in its own mode and command for a job
         entry; the index comes back with the result. save=False keeps its
-        result out of --save-output (a --show-diff preview)."""
+        result out of --save-output (a --show-diff preview); logs_in=False
+        for a unit that rides the session the run has open to its device."""
         t, je = units[i]
         if i in dead:
             return i, _dead_result(i)
         mark = lambda: started.add(i)
         if je is not None:
             result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
-                                        started=mark, seq=seq_of[i], save=save)
+                                        started=mark, seq=seq_of[i], save=save, logs_in=logs_in)
         else:
-            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark, save=save)
+            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark, save=save,
+                                        logs_in=logs_in)
         if not isinstance(result, RunResult):
             # A stand-in runner that still returns the bare tuple: the error is
             # read from its text, as it always was.
@@ -1847,7 +1898,8 @@ async def main() -> int:
         # and an edit entry's session is clean again before the next one.
         pool.enable()
 
-    tasks = [] if interrupted else [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i)))
+    tasks = [] if interrupted else [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i),
+                                                                 logs_in=i not in rides))
                                     for i in range(len(units))]
     screen = _tty(sys.stdout)     # control sequences are stripped for a terminal, kept for a pipe
 
