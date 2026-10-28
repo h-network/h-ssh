@@ -229,17 +229,19 @@ class RunResult(tuple):
     `result` is the driver's typed answer (an EditResult, BatchResult or
     CommitStatus, a show's text or data) and `error` the failure in one line
     (what follows the last "ERROR:" in the text), so nothing has to be read
-    back out of the text."""
+    back out of the text; `not_saved` is why its --save-output file could
+    not be written, None when it was or none was asked for."""
 
     def __new__(cls, name: str, ok: bool, text: str, duration_ms: int, result: Any = None,
-                error: Optional[str] = None):
+                error: Optional[str] = None, not_saved: Optional[str] = None):
         self = super().__new__(cls, (name, ok, text, duration_ms))
         self.result = result
         self.error = error
+        self.not_saved = not_saved
         return self
 
     def __getnewargs__(self):
-        return (self[0], self[1], self[2], self[3], self.result, self.error)
+        return (self[0], self[1], self[2], self[3], self.result, self.error, self.not_saved)
 
     name = property(lambda self: self[0])
     ok = property(lambda self: self[1])
@@ -258,6 +260,22 @@ def save_name(name: str, seq: int = 0, ext: str = "output") -> str:
     `<name>.output` and the later ones are `<name>.2.output`,
     `<name>.3.output`, and so on."""
     return f"{name}.{ext}" if not seq else f"{name}.{seq + 1}.{ext}"
+
+
+def save_result(save_dir: Optional[str], seq: int, res: RunResult, ext: str = "output") -> RunResult:
+    """The result, its --save-output file written when a directory was asked
+    for. It is written once the verdict is in, and a file that cannot be
+    written (a directory or a FIFO in its place, a planted symlink, a full
+    disk, a name too long) is the result's `not_saved`, for the CLI to say
+    and count: never the device's failure, never its cooldown, never the
+    end of the run (#152: it escaped the worker after the commit, and the
+    commits went unaudited)."""
+    if save_dir:
+        try:
+            secure_write(str(path_inside(save_dir, save_name(res.name, seq, ext))), res.text)
+        except (OSError, ValueError) as e:
+            res.not_saved = str(e)
+    return res
 
 
 def error_line(text: str) -> Optional[str]:
@@ -445,21 +463,6 @@ def _run_for_target_sync(
     # transport uses, so two routers behind one address are two (#145).
     device = (host, resolve_target_port(t))
 
-    # Safety gate: check before contacting device. Its rate limit counts
-    # the logins: not a call that rides a session already open to the
-    # device, nor a dry run of a read, which contacts none.
-    if safety_gate is not None:
-        allowed, reason = safety_gate.check_device(*device, login=logs_in and opens_session(mode, dry_run))
-        if not allowed:
-            duration_ms = int((time.time() - start_time) * 1000)
-            err_out = f"DEVICE: {name}\nHOST:   {host}\nMODE:   {mode}\nVENDOR: {vendor}\n\nERROR: safety gate blocked: {reason}\n"
-            return RunResult(name, False, err_out, duration_ms, error=error_line(err_out))
-
-    if not quiet:
-        _say(f"{name:16s} STARTED")
-
-    b = bind(vendor)
-
     output = []
     output.append(f"DEVICE: {name}")
     output.append(f"HOST:   {host}")
@@ -467,8 +470,27 @@ def _run_for_target_sync(
     output.append(f"VENDOR: {vendor}")
     output.append("")
     typed = None   # the driver's answer, typed, for RunResult.result
+    admitted = False   # by the safety gate: what the handler may release or cool
 
     try:
+        # Safety gate: check before contacting device. Its rate limit counts
+        # the logins: not a call that rides a session already open to the
+        # device, nor a dry run of a read, which contacts none. Inside the
+        # try: whatever the gate raises is this device's failure and cools
+        # nothing, not the end of the run (#152).
+        if safety_gate is not None:
+            allowed, reason = safety_gate.check_device(*device, login=logs_in and opens_session(mode, dry_run))
+            if not allowed:
+                duration_ms = int((time.time() - start_time) * 1000)
+                err_out = f"DEVICE: {name}\nHOST:   {host}\nMODE:   {mode}\nVENDOR: {vendor}\n\nERROR: safety gate blocked: {reason}\n"
+                return RunResult(name, False, err_out, duration_ms, error=error_line(err_out))
+            admitted = True
+
+        if not quiet:
+            _say(f"{name:16s} STARTED")
+
+        b = bind(vendor)
+
         if mode == "show":
             if not show_cmd:
                 raise ValueError("No show command provided.")
@@ -637,8 +659,6 @@ def _run_for_target_sync(
             batch = R.as_batch(cmd_results)
             result_json = json.dumps(batch.to_list())
             duration_ms = int((time.time() - start_time) * 1000)
-            if save_dir:
-                secure_write(str(path_inside(save_dir, save_name(name, seq, "json"))), result_json)
             if safety_gate is not None:
                 # A command the batch kept going after (timed out, refused by
                 # the device, its session gone) failed against the device as
@@ -649,7 +669,9 @@ def _run_for_target_sync(
                     safety_gate.release_device(*device)
                 else:
                     safety_gate.set_cooldown(*device)
-            return RunResult(name, batch.ok, result_json, duration_ms, result=batch, error=batch.first_error)
+            return save_result(save_dir, seq,
+                               RunResult(name, batch.ok, result_json, duration_ms, result=batch, error=batch.first_error),
+                               "json")
 
         else:
             raise ValueError(f"Unknown mode: {mode}")
@@ -657,15 +679,12 @@ def _run_for_target_sync(
         final_out = "\n".join(output).strip() + "\n"
         duration_ms = int((time.time() - start_time) * 1000)
 
-        if save_dir:
-            secure_write(str(path_inside(save_dir, save_name(name, seq))), final_out)
-
         if safety_gate is not None:
             safety_gate.release_device(*device)
-        return RunResult(name, True, final_out, duration_ms, result=typed)
+        return save_result(save_dir, seq, RunResult(name, True, final_out, duration_ms, result=typed))
 
     except Exception as e:
-        if safety_gate is not None:
+        if safety_gate is not None and admitted:
             if _is_local_error(e):
                 # Nothing reached the device (bad arguments, missing file, a
                 # transport that refuses the request). Cooling the device for
@@ -676,9 +695,7 @@ def _run_for_target_sync(
         output.append(f"ERROR: {e}")
         final_out = "\n".join(output).strip() + "\n"
         duration_ms = int((time.time() - start_time) * 1000)
-        if save_dir:
-            secure_write(str(path_inside(save_dir, save_name(name, seq))), final_out)
-        return RunResult(name, False, final_out, duration_ms, error=error_line(final_out))
+        return save_result(save_dir, seq, RunResult(name, False, final_out, duration_ms, error=error_line(final_out)))
 
 
 def run_for_target(

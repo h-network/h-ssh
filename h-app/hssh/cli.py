@@ -15,6 +15,7 @@ import shlex
 import socket
 import sys
 import threading
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from .core import (
     path_inside, set_file_payload, comments_named,
 )
 from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
+                     save_result,
                      opens_session, DEFAULT_CONNECT_TIMEOUT)
 from . import probe as probes
 from .transports.connect import budget as connect_budget, where as host_port
@@ -39,7 +41,7 @@ from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
 from .safety import SafetyGate
 from . import pool
-from .audit import write_audit_entry, redact_values, secure_append, secure_write, probe_append
+from .audit import write_audit_entry, redact_values, secure_append, probe_append
 from .store import Store, StoreError, ENV_VAR as STORE_ENV, DEFAULT as STORE_DEFAULT, where as store_where
 from .store import _identity as store_identity
 from .screen import terminal_safe, is_terminal as _tty
@@ -1471,8 +1473,19 @@ async def _main(opened: list) -> int:
     if save_dir:
         # Raw device output (a config backup is the point), so the directory
         # and its files are the operator's alone: 0700 / 0600, never redacted.
+        # Proven writable before the first device, as the audit log is: a
+        # file that can be written, and every result's name within what the
+        # file system takes. A run never commits what it could not save (#152).
         try:
             Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, probe = tempfile.mkstemp(dir=save_dir, prefix=".h-ssh-", suffix=".tmp")
+            os.close(fd)
+            os.unlink(probe)
+            name_max = os.pathconf(save_dir, "PC_NAME_MAX")
+            for i, (t, je) in enumerate(units):
+                fname = save_name(t.name, seq_of[i] if je else 0)
+                if len(fname.encode()) > name_max:
+                    raise OSError(f"{fname}: file name too long ({name_max} bytes at most here)")
         except OSError as e:
             _discard_store()
             print(f"ERROR: --save-output {save_dir}: {e.strerror or e}", file=sys.stderr)
@@ -1763,6 +1776,7 @@ async def _main(opened: list) -> int:
     given_at = []        # each result's place in target order, for --diff
     run_start = time.time()
     store_tried = store_lost = 0      # device results handed to the store, and those it could not keep
+    not_saved = 0                     # results whose --save-output file could not be written (#152)
     store_reason = None
     unkept = []                       # --every: those results' rows, compared as the tick got them
     if has_edits and not (args.show_diff and commits) and not _begin_run():
@@ -1884,9 +1898,7 @@ async def _main(opened: list) -> int:
         error = f"probe: {dead[i].verdict}" + ("; skipped" if i in leave_out else "")
         text = (f"DEVICE: {t.name}\nHOST:   {t.host}\nMODE:   {je.mode if je else mode}\nVENDOR: {t.vendor}\n\n"
                 f"ERROR: {error}\n")
-        if save_dir:
-            secure_write(str(path_inside(save_dir, save_name(t.name, seq_of[i] if je else 0))), text)
-        return RunResult(t.name, False, text, dead[i].duration_ms, error=error)
+        return save_result(save_dir, seq_of[i] if je else 0, RunResult(t.name, False, text, dead[i].duration_ms, error=error))
 
     async def _run_unit(i, dry_run=None, expected_diff=None, save=True, logs_in=True):
         """units[i] on its device, in its own mode and command for a job
@@ -1898,12 +1910,24 @@ async def _main(opened: list) -> int:
             return i, _dead_result(i)
         mark = lambda: started.add(i)
         release = i in release_after
-        if je is not None:
-            result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
-                                        started=mark, seq=seq_of[i], save=save, logs_in=logs_in, release=release)
-        else:
-            result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark, save=save,
-                                        logs_in=logs_in, release=release)
+        began = time.monotonic()
+        try:
+            if je is not None:
+                result = await _bounded_run(t, je.mode, je.command, dry_run=dry_run, expected_diff=expected_diff,
+                                            started=mark, seq=seq_of[i], save=save, logs_in=logs_in, release=release)
+            else:
+                result = await _bounded_run(t, dry_run=dry_run, expected_diff=expected_diff, started=mark, save=save,
+                                            logs_in=logs_in, release=release)
+        except Exception as e:
+            # The runner answers for its own failures; one raised around it
+            # (the gate, a resolution, a stand-in runner) used to come back
+            # out of task.result() and end the run with the other devices'
+            # results unreported (#152). It is this device's failure.
+            text = (f"DEVICE: {t.name}\nHOST:   {t.host}\nMODE:   {je.mode if je else mode}\nVENDOR: {t.vendor}\n\n"
+                    f"ERROR: {type(e).__name__}: {e}\n")
+            result = save_result(save_dir if save else None, seq_of[i] if je else 0,
+                                 RunResult(t.name, False, text, int((time.monotonic() - began) * 1000),
+                                           error=error_line(text)))
         if not isinstance(result, RunResult):
             # A stand-in runner that still returns the bare tuple: the error is
             # read from its text, as it always was.
@@ -2019,6 +2043,12 @@ async def _main(opened: list) -> int:
 
     async for i, res in _completed():
         name, ok, out_text, duration_ms = res
+        if getattr(res, "not_saved", None):
+            # The result is shown, stored and audited like any other; its
+            # file is not there. Said once as it happens, counted at the end.
+            not_saved += 1
+            print(f"WARNING: --save-output: {res.not_saved}; the run goes on, this result is shown and kept but "
+                  "not saved", file=sys.stderr)
         shown = _screen(out_text)
         t, je = units[i]
         # A job entry runs in its own mode; everything else in the run's.
@@ -2411,6 +2441,7 @@ async def _main(opened: list) -> int:
         "skipped": skipped + not_run + unreachable + not_started,
         **({"interrupted": interrupted_connects} if interrupted else {}),
         **({"not_kept": not_kept} if not_kept else {}),
+        **({"not_saved": not_saved} if not_saved else {}),
         **({"probe_ms": probe_ms} if probe_ms is not None else {}),
         "elapsed_ms": elapsed_ms,
         "mode": stderr_mode,
@@ -2440,14 +2471,18 @@ async def _main(opened: list) -> int:
             _WATCH["again"] = not interrupted and (args.times is None or _WATCH["tick"] < args.times)
     if store is not None:
         store.close()
+    if not_saved:
+        print(f"WARNING: --save-output {save_dir}: {not_saved} of {len(json_results)} results were not saved",
+              file=sys.stderr)
 
     if safety_gate is not None:
         safety_gate.close()
 
     if interrupted:
         return 130  # 128 + SIGINT, the shell convention
-    if not_kept:
-        return 4    # the run's record is incomplete: results were not kept (before 1 and 3; `fail` is in the summary)
+    if not_kept or not_saved:
+        return 4    # the run's record is incomplete: results were not kept or not saved (before 1 and 3;
+                    # `fail` is in the summary)
     if failures:
         return 1
     return 3 if skipped or not_run or unreachable else 0   # 3: nothing failed, but not everything ran

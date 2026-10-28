@@ -522,3 +522,43 @@ def test_lock_file_that_is_a_symlink_is_not_followed(tmp_path):
     with pytest.raises(OSError, match="gate.json.lock: cannot be created or opened"):
         SafetyGate(safety_file=str(sf))             # #64: refused outright, not run unlocked
     assert victim.read_text() == "keep" and oct(victim.stat().st_mode & 0o777) == "0o644"
+
+
+# --- #152: a cooldown that is not a finite number ---------------------------------
+
+@pytest.mark.parametrize("content", ['{"h": 1e400}', '{"h": Infinity}', '{"h": NaN}', '{"h": "inf"}', '{"h": "never"}',
+                                     '{"h": {"until": 1}}', '{"h": true}'])
+def test_a_cooldown_that_is_not_a_finite_number_is_a_corrupt_file(tmp_path, content):
+    """1e400 and Infinity loaded as inf (json.load allows them, and float()
+    takes "inf" too), and check_device and holds then raised OverflowError
+    at int(expires - now); "never" and an object passed as no cooldown and
+    were erased by the next save, with no .corrupt (#152). A value that is
+    not a finite number or null is not h-ssh's writing: the file is kept as
+    .corrupt, the gate fails closed and writes nothing over it."""
+    path = tmp_path / "safety.json"
+    path.write_text(content)
+    gate = SafetyGate(safety_file=str(path))
+    allowed, reason = gate.check_device("h")
+    assert allowed is False and "corrupt" in reason, reason
+    assert gate.holds(["h", ("other", 22)]) == {"h": reason, ("other", 22): reason}
+    assert path.with_name("safety.json.corrupt").read_text() == content and not path.exists()
+    gate.set_cooldown("other", 22)
+    gate.close()
+    assert not path.exists()
+
+
+def test_the_gate_never_holds_a_cooldown_that_is_not_a_finite_number(tmp_path):
+    """SafetyGate(cooldown_seconds=inf) was accepted and wrote `Infinity`
+    into the file, which is not JSON and crashed the next run (#152)."""
+    path = tmp_path / "safety.json"
+    for bad in (float("inf"), float("nan"), "120", None):
+        with pytest.raises(ValueError, match="cooldown_seconds"):
+            SafetyGate(safety_file=str(path), cooldown_seconds=bad)
+    with pytest.raises(ValueError, match="rate_limit"):
+        SafetyGate(rate_limit=float("inf"))
+    assert not path.exists()
+    gate = SafetyGate(safety_file=str(path), cooldown_seconds=120)
+    gate.set_cooldown("h", 22)
+    gate.close()
+    (expires,) = json.loads(path.read_text()).values()
+    assert isinstance(expires, float) and time.time() < expires <= time.time() + 120
