@@ -151,8 +151,8 @@ def confirm(host: str, user: str, passwd: str,
     exclusive, a bare `commit` (`commit comment "…"` with a comment), exit.
     Without this the runner handed the word `commit` to the edit path, which
     committed twice and reported someone else's diff. A comment with a
-    control character, a Tab or a double quote in it is refused before
-    connecting (cli.refuse_comment)."""
+    control character, a Tab or a double quote in it, or with no text or
+    over 512 bytes, is refused before connecting (cli.refuse_comment)."""
     d = _dialect(vendor_hint)
     if d.commit_pending is None or not d.cli.has_candidate:
         raise ValueError(f"confirm is only for telnet-junos, not {vendor_hint}; nothing was sent")

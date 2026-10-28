@@ -471,6 +471,51 @@ def control_line(text: str, tabs: bool = True) -> Optional[Tuple[int, str, str]]
     return None
 
 
+# Junos logs a commit comment of 1 to 512 bytes of UTF-8; another fails the
+# commit at its commit check ("Length N is not within range (1..512)").
+COMMENT_BYTES = 512
+COMMENT_RULE = f"a commit comment is one line of text, at most {COMMENT_BYTES} bytes"
+
+
+def comment_fault(comment: str) -> Optional[str]:
+    """Why a commit comment, stripped already, cannot be logged as it is, or
+    None. Junos keeps only the last line of one with a line break, and fails
+    an empty one or one over 512 bytes at the commit check, after the lock,
+    the load and the diff; the XML that NETCONF carries it in has no room
+    for a control character (an ESC, a NUL) or for U+FFFE and U+FFFF; and
+    the CLI engine types it, where a control character or a Tab is a key."""
+    if not comment:
+        return "has no text"
+    what = control_character(comment, tabs=False)
+    if what:
+        return f"has {what}"
+    for ch in comment:
+        if ch in "\ufffe\uffff":
+            return f"has a character XML cannot carry {ch!r}"
+    size = len(comment.encode("utf-8"))
+    if size > COMMENT_BYTES:
+        return f"is {size} bytes"
+    return None
+
+
+def check_comment(comment, outcome: str = "nothing was sent to the device") -> Optional[str]:
+    """The commit comment to send: `comment` stripped of the blanks around
+    it (the line break a YAML block ends with among them), or None for none.
+    One that cannot be logged as it is (comment_fault) is a ValueError,
+    raised before anything is sent: a line break, a control character, only
+    blanks, '' or over 512 bytes. Its text ends with `outcome`, what the
+    refusal leaves on the device: nothing sent, or for a Transaction's
+    commit(), which begin() has locked, loaded and checked, its own."""
+    if comment is None:
+        return None
+    if not isinstance(comment, str):
+        raise ValueError(f"the comment must be text, not {type(comment).__name__}; {outcome}")
+    fault = comment_fault(comment.strip())
+    if fault:
+        raise ValueError(f"the comment {comment!r} {fault}; {COMMENT_RULE}; {outcome}")
+    return comment.strip()
+
+
 def read_command_file_lines(path: Path) -> List[str]:
     data = path.read_text(encoding="utf-8-sig").splitlines()
     out = []

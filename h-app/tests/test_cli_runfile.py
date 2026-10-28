@@ -18,7 +18,7 @@ class Driver:
     AVAILABLE = True
 
     def __init__(self):
-        self.shows, self.batches, self.edits = [], [], []
+        self.shows, self.batches, self.edits, self.comments = [], [], [], []
 
     def show(self, host, user, passwd, cmd, st, ct, port=None, vendor_hint=None):
         self.shows.append((host, cmd, port))
@@ -31,6 +31,7 @@ class Driver:
     def edit(self, host, user, passwd, payload, st, ct, commit_confirmed=None, port=None,
              dry_run=False, comment=None, expected_diff=None, vendor_hint=None):
         self.edits.append((host, payload.strip(), commit_confirmed, dry_run))
+        self.comments.append(comment)
         return "COMMIT OK\n" if not dry_run else "DRY-RUN\n"
 
 
@@ -601,3 +602,66 @@ def test_an_empty_path_user_or_comment_in_the_file_is_refused(monkeypatch, capsy
         rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
         assert rc == 2 and drv.shows == drv.batches == drv.edits == [], (key, err)
         assert f"ERROR: run file '{f}': '{key}' is empty; give it a value or leave the key out\n" in err, key
+
+
+# --- #146: a commit comment Junos would not log as given --------------------------
+
+def run_argv(monkeypatch, capsys, tmp_path, argv):
+    """run(), with a flag argparse refuses read as its exit code and stderr."""
+    drv = Driver()
+    try:
+        return run(monkeypatch, capsys, tmp_path, argv, driver=drv)
+    except SystemExit as e:
+        out, err = capsys.readouterr()
+        return e.code, out, err, drv
+
+
+RULE = "a commit comment is one line of text, at most 512 bytes"
+
+
+@pytest.mark.parametrize("comment, said", [
+    ("line one\nline two", f"'line one\\nline two' has a line break; {RULE}"),
+    ("é" * 257, f"{'é' * 257!r} is 514 bytes; {RULE}"),
+    ("   ", f"'   ' has no text; {RULE}"),
+    ("cutover \x1b[1m", f"'cutover \\x1b[1m' has an ESC; {RULE}"),
+], ids=["line break", "514 bytes", "blanks", "ESC"])
+def test_a_comment_junos_would_not_log_as_given_is_refused_before_the_probe(monkeypatch, capsys, tmp_path, probed,
+                                                                            comment, said):
+    """#146: --comment went to the driver as typed. Junos logged the last
+    line of one with a line break alone (guarded_commit() then found no
+    commit of its own), and 600 characters, 512 two-byte ones or only
+    spaces went through lock, load, diff and commit check on every router
+    before the commit failed, each router cooled under --safety-file. Each
+    is refused before the probe, exit 2, the driver never asked, as an
+    empty one is (#140)."""
+    rc, out, err, drv = run_argv(monkeypatch, capsys, tmp_path,
+                                 ["-eC", "set system location x", "--comment", comment, "-y", "R1:10.0.0.1:junos"])
+    assert rc == 2 and drv.edits == [] and probed == [] and out == "", err
+    assert err == f"h-ssh.py: error: argument --comment: {said} (see --help)\n"
+
+
+def test_a_comment_is_stripped_and_512_bytes_go_through(monkeypatch, capsys, tmp_path):
+    for comment, sent in (("A" * 512, "A" * 512), ("  C1 cutover \n", "C1 cutover")):
+        rc, out, err, drv = run_argv(monkeypatch, capsys, tmp_path,
+                                     ["-eC", "set system location x", "--comment", comment, "-y", "R1:10.0.0.1:junos"])
+        assert rc == 0 and drv.comments == [sent], err
+
+
+def test_a_run_files_comment_is_held_to_the_flags_rule(monkeypatch, capsys, tmp_path, probed):
+    """#146: the file's `comment` had no rule of its own: a YAML block
+    (`comment: |`) of two lines committed the last one alone. It is said as
+    the file's key, exit 2, nothing sent or probed; a block of one line is
+    that line, the line break the block ends with not part of it."""
+    head = "devices: [R1:10.0.0.1:junos]\nedit: set system location x\ncommit_confirmed: 5\nyes: true\n"
+    f = write(tmp_path, "run.yaml", head + "comment: |\n  C1 cutover\n  and the rest\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+    assert rc == 2 and drv.edits == [] and probed == [], err
+    assert err == (f"ERROR: run file '{f}': 'comment' has a line break ('C1 cutover\\nand the rest\\n'); "
+                   f"{RULE}\n")
+    for value, said in (("é" * 257, "is 514 bytes"), ("'   '", "has no text")):
+        f = write(tmp_path, "run.yaml", head + f"comment: {value}\n")
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+        assert rc == 2 and drv.edits == [] and probed == [] and f"'comment' {said} (" in err, err
+    f = write(tmp_path, "run.yaml", head + "comment: |\n  C1 cutover\n")
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+    assert rc == 0 and drv.comments == ["C1 cutover"], err

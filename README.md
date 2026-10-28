@@ -481,8 +481,9 @@ The engine types plain text only. A CLI acts on a control character as it arrive
 typed so far, ^U kills it, DEL rubs out a character, a Tab completes the word), and what is left of the
 line runs as typed, a `commit` too, under `--dry-run` as well. So `edit()` refuses a payload with a C0
 or C1 control character, DEL, a Tab or a byte that is not UTF-8 in a line, and `confirm()` a `comment=`
-with one of those, a line break or a double quote (which would end it on the commit line): a
-`ValueError` before the device is contacted, nothing sent.
+with one of those, a line break or a double quote (which would end it on the commit line), or, as every
+commit comment, with no text or over 512 bytes (it is typed stripped): a `ValueError` before the device
+is contacted, nothing sent.
 The CLI refuses a control character in `-eC`, `-eD`, `-eB` or a job on every driver before the run starts (exit 2) and lets a Tab through: it is text to `junos`, whose `load set`
 reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at no CLI. A set file
 indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
@@ -866,8 +867,10 @@ h-ssh --run fleet-bgp.yaml --dry-run       # a flag on the command line wins ove
 Every key is named after a flag, written with `-` or `_` (`show` for `-sC`, `edit` for `-eC`), and gets
 the flag's validation: a transport outside the list, `workers: 0`, `format: csv`, an unknown key or an
 empty path, `user` or `comment` (`audit-log: ''`, which would otherwise turn off the `HSSH_AUDIT_LOG`
-trail) is exit 2 naming the key. `--store`, `--no-store`, `--every`, `--times`, `--profile`, `--job`,
-`--target` and `--config` have no key; give them on the command line. Precedence is
+trail) is exit 2 naming the key, and so is a `comment` that `--comment` refuses (a YAML block of two
+lines, `comment: |`; the line break a block ends with is stripped, as `show`'s is). `--store`,
+`--no-store`, `--every`, `--times`, `--profile`, `--job`, `--target` and `--config` have no key; give
+them on the command line. Precedence is
 command line → run file → environment → `~/.h-ssh/config` → built-in default, so a `--dry-run` from a
 pipeline variable overrides whatever the file says. A flag typed on the command line wins whatever its
 value, the default's own included: `--format text` beside `format: xml` asks for text, `--devices
@@ -1143,7 +1146,7 @@ mode; the opt-in ones (`--safety-file`, `--audit-log`, `--log`) apply to every m
 | Confirmation | *(automatic)* | An edit that commits prompts `y/N` (with `--show-diff`, once, after the previews); a `--dry-run` gets no such prompt, only the probe's question when a box is dead. `-y` skips the prompt in automation. Without a terminal and without `-y` an edit that commits is refused (exit 2) before the probe touches a box, so nothing is sent |
 | Dry run | `--dry-run` | Junos over NETCONF: loads, diffs, runs `commit_check` (when there is a diff), then discards the candidate. `junos@ssh`, `junos@openssh` and `telnet-junos`: `configure exclusive`, loads, `show \| compare`, `rollback 0` — no commit check, so the diff is shown but not validated. Every other driver **refuses** `--dry-run` for edits instead of pretending (a FAIL of that device) |
 | Show diff, then ask | `--show-diff` | Edits: a dry run of every edit on its target (a `--job`'s show entries are not previewed; they run with the commits), every diff printed and, with `--audit-log`, audited with `dry_run: true`, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. A preview is not saved to `--save-output`, so an answer other than y leaves its files as they were. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed`. A `--job` with more than one edit entry for one device is refused (exit 2, nothing sent): a device's later edit would be previewed without the ones before it (see [Modes](#modes)) |
-| Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box. NETCONF `junos` only: `telnet-junos` and every other transport refuse it rather than drop it, and it needs an edit (`-eC`, `-eD`, `-eB`, `--rollback`, or a job with edits); an empty one is refused (exit 2) |
+| Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box. NETCONF `junos` only: `telnet-junos` and every other transport refuse it rather than drop it, and it needs an edit (`-eC`, `-eD`, `-eB`, `--rollback`, or a job with edits); an empty one is refused (exit 2). It is stripped and must be what Junos logs as given, one line of text of at most 512 bytes (UTF-8): a line break (Junos would keep the last line alone), an ESC or another control character, only blanks, or more than 512 bytes (which every router would fail at its commit check, after the lock, the load and the diff) is refused before the probe, exit 2 and nothing sent, from a run file's `comment` too |
 | Commit confirmed | `--commit-confirmed [N]` | Junos rolls back after N minutes (1 to 65535; 10 when N is omitted) unless confirmed (confirm with `-eC "commit"`; a run without `--json` ends by printing that command for its own targets, a `--job`'s edit entries included); `junos@ssh`, `junos@openssh` and `telnet-junos` send `commit confirmed N` (nothing at all when `show \| compare` is empty: `NO CHANGES`, no timer). Every other driver (`ssh`, `openssh`, `telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) refuses it rather than commit with no timer (a FAIL of that device). It needs an edit, as `--comment` does: with a show, a batch, `--commit-status`, `--probe` alone or a job without edits it is refused (exit 2), from a run file too |
 | Reply verdict (`ssh`, `openssh`, `junos`) | *(automatic)* | A show whose reply opens with `error: ...` (Junos) or `% ...` (IOS, EOS; to `ios@…`, `nxos@…` and `eos@…` also a `%` line with no space after the `%`, such as `%Error opening ...` or a feature's `%NTP is not enabled.`, and `ERROR: ...`, but not a syslog line such as `%LINK-3-UPDOWN: ...` or `%OIR-SP-6-INSCARD: ...`) is FAILED as refused, not reported as output: the reply is the command's stdout, judged by its first line whatever its stderr holds (a warning there hides no refusal), and stderr's first line only when stdout is empty; on `junos` the reply is the text of the NETCONF answer to the show, a batch's command too (`error: could not resolve file: ...`; most refusals come back there as an RPC error, and fail as one); an `error:` or `%` line further down a show's reply is output (a log, say). An edit line the device answers with `error: ...` (Junos) or `% ...` (IOS, Arista; on an IOS-shaped dialect also `%Inconsistent ...` or `ERROR: ...`) is FAILED with that line even when the command exits 0 (on an IOS-shaped dialect, a `% Warning: ...`, or a note the dialect's `informational` names, such as that a VRF removed an interface's addresses, is the device taking the line, and is printed with the result): a plain `ssh` or `openssh` edit stops there; a Junos edit typed at the CLI sends the rest, then discards the candidate; an IOS-shaped edit typed at the CLI stops there and types `end`, and fails naming the lines applied before it and the lines not sent |
 | Junos syntax guard | *(automatic)* | Enforces set-style syntax — each line must start with `set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect` or `unprotect`, lowercase — with `#`-only comments, for every Junos driver, `junos`, `junos@ssh`, `junos@openssh` and `telnet-junos` (checked when any target is one). `commit` (or `commit;`) is only valid as the single, exact command in `-eC` or a `--job` edit, never inside `-eD`/`-eB` configuration files |
@@ -1427,21 +1430,41 @@ netconf.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
 `begin(host, user, None, None, 30, 20, rollback=n)` opens `rollback n` the same way (a payload or
 `rollback=`, not both); its commit reads `ROLLBACK n: COMMIT OK`.
 
-`edit()`, `rollback()` and `confirm()` take `comment=` too; the device's own "rollback in N min" is what
-`pending_rollback_minutes` reports, on the latest commit only: once confirmed, a commit keeps that note in
-the history (`note`) but is no longer waiting. `confirm()` commits under the configuration lock, so someone else's
-uncommitted edits refuse it (`NotAppliedError`, nothing sent) rather than going in with the confirmation.
-With no commit-confirmed waiting (the timer expired, or it was confirmed already) `confirm()` raises
-`hssh.errors.NothingToConfirmError` and sends nothing: a plain commit there would hide that the change
-is gone. `guarded_commit()` reads `show system commit` after its commit and again before it confirms or rolls back:
-when the pending commit is no longer the one it made — another commit landed, which also confirmed it, or
-the checks outlasted the timer and the device rolled back by itself — it sends nothing and answers
-`not confirmed` / `not rolled back` with the reason, the history under `status` and, when the checks
-failed, their error under `check_error`, because a `rollback 1` at that point would re-apply the change
-that just failed its checks. With the pool on, a session with an open transaction stays borrowed and
-other threads wait for it. Either way the thread holding it may keep using it, and only that thread can
-commit or abort it: a `Transaction` finished from another thread (an `asyncio.to_thread` that landed elsewhere) is
-refused before anything is sent, because the session's lock belongs to the thread that opened it.
+`edit()`, `rollback()` and `confirm()` take `comment=` too. Every `comment=` (and `tx.commit()`'s and
+`guarded_commit()`'s) is sent stripped and held to `--comment`'s rule, one line of text of at most 512
+bytes: a line break, an ESC or another control character, only blanks, `''` (no longer dropped) or more
+raises `ValueError` before anything is sent. `tx.commit()` raises it before the commit is sent, after
+`begin()` has locked, loaded and checked: nothing was committed, so the candidate is discarded and the lock
+released, and the error ends `nothing was committed: the candidate was discarded and the lock released`,
+where a comment PyEZ refused read *commit outcome unknown* and left both to a dropped session.
+`guarded_commit()` logs its confirmation and its rollback with `(confirmed)` and `(rolled
+back: checks failed)` after the comment, so its comment leaves them room: 483 bytes at most. The device's
+own "rollback in N min" is what `pending_rollback_minutes` reports, on the latest commit only: once
+confirmed, a commit keeps that note in the history (`note`) but is no longer waiting. `confirm()` commits
+under the configuration lock, so someone else's uncommitted edits refuse it (`NotAppliedError`, nothing
+sent) rather than going in with the confirmation. With no commit-confirmed waiting (the timer expired, or it
+was confirmed already) `confirm()` raises `hssh.errors.NothingToConfirmError` and sends nothing: a plain
+commit there would hide that the change is gone. `guarded_commit()` reads `show system commit` after its
+commit, and again once its confirmation or its rollback holds the configuration lock (the rollback with
+`rollback 1` loaded and checked, as `begin(rollback=1)` has it), so no other session's commit can land
+between that look and the commit it then makes. The commit it made is the pending one at sequence 0 logged
+under the name its session logged in as: with `user=None` the name PyEZ takes, the `User` `~/.ssh/config`
+gives the host, else `$USER` (a refused login names that user too, `authentication failed for USER at
+HOST:PORT`), so with no user given a failing check is rolled back and a passing one confirmed as well. It is
+also the commit logged right after the latest one the history held when its lock was taken (read under the
+lock, before committing, when no other session's commit can land): a commit confirmed made after it under
+the same login is not taken for it, and its comment, which Junos keeps as it likes, plays no part. When the
+pending commit is no longer the one it made — another commit landed, which also confirmed it, or the checks
+outlasted the timer and the device rolled back by itself — it commits nothing, releases the lock and answers
+`not confirmed` / `not rolled back` with the reason, the history under `status` and, when the checks failed,
+their error under `check_error`, because a `rollback 1` at that point would re-apply the change that just
+failed its checks. The lock does not hold off the device's own rollback when the timer runs out, though:
+checks that end in the timer's last moments can have it land between the look and the confirmation, which
+then answers `confirmed` for a change the device has rolled back, so keep `check()` well inside `minutes`.
+With the pool on, a session with an open transaction stays borrowed and other threads wait for it. Either
+way the thread holding it may keep using it, and only that thread can commit or abort it: a `Transaction`
+finished from another thread (an `asyncio.to_thread` that landed elsewhere) is refused before anything is
+sent, because the session's lock belongs to the thread that opened it.
 
 ### Structured output from a script
 
@@ -1553,7 +1576,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1395 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1423 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
