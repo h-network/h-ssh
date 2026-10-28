@@ -2,6 +2,8 @@
 and the junos driver's behaviour on a pooled session."""
 import atexit
 import gc
+import hashlib
+import logging
 import os
 import subprocess
 import sys
@@ -1412,3 +1414,23 @@ def test_a_collection_inside_the_counters_lock_ends_an_abandoned_borrow_there(ow
     finally:
         if how[0] != "still waiting":
             own_pool.disable()
+
+
+# --- #151: the pool key tells nothing about the password ----------------------------
+
+def test_the_pool_key_tells_nothing_about_the_password(pooled, caplog):
+    """The key held sha256(password)[:16], and the pool logs its key as it
+    opens, reuses and closes a session: a dictionary found a weak password
+    from an INFO log at once. The credential still tells sessions apart, as
+    an HMAC under a key this process made up, so no log line carries a
+    digest of the password that another process could match."""
+    passwd = "hunter2"
+    digest = hashlib.sha256(passwd.encode()).hexdigest()[:16]
+    with caplog.at_level(logging.DEBUG, logger="hssh.pool"):
+        netconf.show("10.0.0.1", "u", passwd, "show version", 5, 30)
+        netconf.show("10.0.0.1", "u", passwd, "show version", 5, 30)     # the same session: the DEBUG line
+    said = "\n".join(r.getMessage() for r in caplog.records)
+    assert "opened new connection" in said and "reusing connection" in said
+    assert digest not in said and passwd not in said
+    assert len(devices()) == 1                                           # the key is stable within the process
+    assert netconf._pool_key("h", 830, "u", "a") != netconf._pool_key("h", 830, "u", "b")   # and the credential still counts

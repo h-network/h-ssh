@@ -14,9 +14,10 @@ discarded, never handed to the next caller.
 
 import errno
 import getpass
-import hashlib
+import hmac
 import os
 import re
+import secrets
 import socket
 import threading
 import time
@@ -555,10 +556,18 @@ def _timed_out(exc: BaseException) -> bool:
     return any(isinstance(e, RpcTimeoutError) for e in _chain(exc))
 
 
+# The credential's part of a pooled session's key: an HMAC under a key this
+# process made up at start. The pool logs its keys (a session opened, reused,
+# closed), and a plain digest there let a dictionary find a weak password (#151).
+_KEY_SALT = secrets.token_bytes(32)
+
+
 def _pool_key(host: str, port: Optional[int], user: str, passwd: Optional[str]) -> tuple:
-    """What identifies a pooled session: the router, the user and a digest of
-    the credential (never the password itself)."""
-    return (host, port or DEFAULT_PORT, user, hashlib.sha256((passwd or "").encode()).hexdigest()[:16])
+    """What identifies a pooled session: the router, the user and an HMAC of
+    the credential under this process's own key (never the password, nor a
+    digest of it that another process could match)."""
+    return (host, port or DEFAULT_PORT, user,
+            hmac.new(_KEY_SALT, (passwd or "").encode(), "sha256").hexdigest()[:16])
 
 
 @contextmanager
