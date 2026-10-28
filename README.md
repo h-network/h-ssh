@@ -296,7 +296,7 @@ Each box gets one result:
 | `silent` | TCP accepted, and no banner within `--connect-timeout` (nothing at all, or the start of one and no more), or the connection closed without a word (a NAT or load balancer answering for a dead box, an sshd that hangs or is at its `MaxStartups`) |
 | `not SSH` | something else answered (`HOST:PORT answered '220 mail.example ESMTP', not an SSH banner`): a line and no `SSH-` line after it, or bytes that cannot begin one; a server that greets and then waits for the client is known when `--connect-timeout` runs out. A server that waits for the client to speak first, a web server say, sends nothing and is `silent` |
 | `error` | the probe itself failed on something it did not expect (`the probe of HOST:PORT failed: …`); that box counts as dead, and every other box is probed as usual |
-| `not probed` | the probe did not ask: the box is reached through a `ProxyJump` or a `ProxyCommand`, its ssh configuration cannot be read, or the safety gate holds it (a cooldown, or a corrupt safety file, which holds every box). It is not dead: the run goes to it as with `--no-probe` |
+| `not probed` | the probe did not ask: the box is reached through a `ProxyJump` or a `ProxyCommand`, its ssh configuration cannot be read, or the safety gate holds it (a cooldown, or a corrupt safety file, which holds every box), or this machine had no file descriptor to spare for the probe's socket (`ulimit -n`, or `fs.file-max`: a Fleet's pooled sessions can hold many), which says nothing about the box. It is not dead: the run goes to it as with `--no-probe` |
 
 Every result but `live` and `not probed` is a dead box.
 
@@ -1595,7 +1595,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1457 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1459 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
