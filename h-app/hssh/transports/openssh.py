@@ -8,9 +8,12 @@ plus the `ssh` binary, which is already present wherever operators log in.
 Shows, and the none dialect's edits, run on an exec: one `ssh host cmd` per
 command, its exit status and its reply checked (a non-zero status is a
 failure, not output, and so is a reply the dialect's CLI opens with a
-refusal). Multiple commands reuse one TCP connection and one authentication
-via OpenSSH connection multiplexing (ControlMaster), so batch mode keeps
-per-command output cleanly separated instead of parsing one merged stream.
+refusal). Each call logs in once, on a ControlMaster (`ssh -N`, which goes
+to the background once the session is up), and every command, a lone
+show's too, runs through it as an ssh of its own: per-command output stays
+cleanly separated instead of parsed out of one merged stream, and OpenSSH's
+print of the server's login banner, which goes to the stderr of the ssh
+that logs in, never lands in a command's.
 A dialect's edits and confirms (junos@openssh, ios@openssh, nxos@openssh,
 eos@openssh) go through the CLI engine (hssh.transports.cli) on a pty shell:
 `ssh -tt host` with its stdin and stdout piped, because a candidate
@@ -214,11 +217,13 @@ _EXIT_GRACE = 2.0
 
 class _Result:
     """What _exec hands back: the command's own stdout and stderr, and ssh's
-    diagnostics (its non-debug log lines) apart from them."""
+    diagnostics (its non-debug log lines) apart from them; `lost` when the
+    session was lost under the command (_exec)."""
 
-    def __init__(self, args, returncode, stdout, stderr, diag, log=""):
+    def __init__(self, args, returncode, stdout, stderr, diag, log="", lost=False):
         self.args, self.returncode, self.stdout, self.stderr, self.diag = args, returncode, stdout, stderr, diag
         self.log = log      # ssh's whole -v log, for the phase a failure happened in
+        self.lost = lost
 
 
 def _own_lines(log: str) -> str:
@@ -285,21 +290,30 @@ def _unlink(path: str) -> None:
 
 def _exec(host: str, user: str, askpass, cmd: str,
           session_timeout: int, command_timeout: int, port: Optional[int],
-          control_path: Optional[str], connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> _Result:
+          control_path: Optional[str], connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
+          log_in: bool = False) -> _Result:
     """Run one command through ssh. ConnectTimeout bounds the TCP connect and
     the banner, nothing in OpenSSH bounds the key exchange after it (L9), so
     the session has --session-timeout from the start to be up, judged by ssh's
     own -v log, and the command has --command-timeout from that moment. The
     connect phase has --connect-timeout from the start (#126), on the same
-    clock: a ConnectTimeoutError when it runs out, whichever clock fires."""
+    clock: a ConnectTimeoutError when it runs out, whichever clock fires.
+    With `log_in` it runs no command: it is the ssh that logs in for `cmd`
+    and what comes after it (_log_in).
+
+    A command through the login's ControlMaster that exits 255 with nothing
+    of ssh's own in its log is the device's exit status, or a session lost
+    under the command: that takes the master with it, and this ssh, its
+    client, logs no word of it at -v. The master tells them apart
+    (_master_running): gone, the result is `lost` (#143)."""
     connect_s = budget(connect_timeout, session_timeout)
     # "--" ends the options: a host that starts with "-" is still the host,
     # which matters for a library caller that passes no user.
     fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
     os.close(fd)
-    argv = (["ssh", "-n", "-v", "-E", log_path]
+    argv = (["ssh", "-n"] + (["-N"] if log_in else []) + ["-v", "-E", log_path]
             + _base_opts(connect_s, port, control_path, askpass.passwd is not None)
-            + ["--", "%s@%s" % (user, host) if user else host, cmd])
+            + ["--", "%s@%s" % (user, host) if user else host] + ([] if log_in else [cmd]))
     try:
         with tempfile.TemporaryFile() as outf, tempfile.TemporaryFile() as errf:
             proc = subprocess.Popen(argv, stdout=outf, stderr=errf, env=askpass.env,
@@ -317,10 +331,13 @@ def _exec(host: str, user: str, askpass, cmd: str,
                 late = _ssh_ran_out(host, port, log, connect_s)
                 if late is not None:
                     raise late
+            said = _own_lines(log)
+            lost = (not log_in and control_path is not None and proc.returncode == 255 and not said
+                    and not _master_running(host, user, control_path, port, session_timeout))
             return _Result(argv, proc.returncode,
                            outf.read().decode("utf-8", "replace"),
                            errf.read().decode("utf-8", "replace"),
-                           _own_lines(log), log)
+                           said, log, lost)
     finally:
         try:
             os.unlink(log_path)
@@ -360,10 +377,58 @@ def _wait(proc, host: str, cmd: str, log_path: str, session_timeout: int, comman
             raise RuntimeError("Command timed out after %ds: %s" % (command_timeout, cmd))
 
 
-def _describe_failure(host: str, proc) -> str:
-    """OpenSSH reports the real reason in its own log; surface it instead of an exit code."""
-    detail = ((getattr(proc, "diag", "") or "").strip() or (proc.stderr or "").strip()
-              or (proc.stdout or "").strip())
+def _master_running(host: str, user: str, control_path: str, port: Optional[int], timeout: int) -> bool:
+    """Whether the login's ControlMaster still holds its session to the
+    device, as `ssh -O check` hears from it. A master whose session was lost
+    exits and removes its socket; one on its way out answers nothing."""
+    if not os.path.exists(control_path):
+        return False
+    try:
+        return subprocess.run(
+            ["ssh", "-O", "check", "-o", "ControlPath=%s" % control_path]
+            + (["-p", str(port)] if port else [])
+            + ["--", "%s@%s" % (user, host) if user else host],
+            capture_output=True, timeout=float(timeout)).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _log_in(host: str, user: str, askpass, cmd: str, session_timeout: int, command_timeout: int,
+            port: Optional[int], control_path: str, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> None:
+    """Log in once, for `cmd` and the commands after it: `ssh -N` as the
+    ControlMaster, which goes to the background once the session is up, so
+    each command then runs through it and logs in to nothing itself. OpenSSH
+    prints the server's login banner on the stderr of the ssh that logs in,
+    as soon as its log level is INFO or above, and `-v` puts it there over
+    `-o LogLevel=ERROR`: a login message became every command's STDERR block,
+    and one that starts `error:` failed every show as refused (#143). This
+    ssh's stderr is read only to say why the login failed."""
+    proc = _exec(host, user, askpass, cmd, session_timeout, command_timeout, port, control_path,
+                 connect_timeout, log_in=True)
+    if proc.returncode != 0:
+        raise RuntimeError(_describe_failure(host, proc))
+
+
+def _describe_failure(host: str, proc, cmd: Optional[str] = None) -> str:
+    """OpenSSH reports the real reason in its own log; surface it instead of
+    an exit code. With `cmd`, proc ran that command: ssh exits with the
+    command's own status, and 255 for a failure of its own, which its log
+    then says, or for a session lost under the command, which it does not
+    (`proc.lost`, the master gone with it): `connection to HOST lost before
+    'CMD' finished`, as on the ssh transport, not the first line of a reply
+    cut short. Any other status, or 255 with nothing in the log and the
+    master still up, is the device's word on a command that failed, from
+    its stderr or stdout, `exit N from 'cmd': ...`, never read as ssh's: a
+    device's `Permission denied` is not a failed login (#143)."""
+    said = (getattr(proc, "diag", "") or "").strip()
+    if cmd is not None and getattr(proc, "lost", False):
+        return "connection to %s lost before '%s' finished" % (host, cmd)
+    if cmd is not None and (proc.returncode != 255 or not said):
+        detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        if detail:
+            return "exit %d from '%s': %s" % (proc.returncode, cmd, detail.splitlines()[0])
+        return "exit %d from '%s' with no diagnostic output." % (proc.returncode, cmd)
+    detail = said or (proc.stderr or "").strip() or (proc.stdout or "").strip()
     first = detail.splitlines()[0] if detail else ""
     if "Permission denied" in detail or "Authentication failed" in detail:
         return "Authentication failed."
@@ -600,14 +665,17 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
-    tmpdir = tempfile.mkdtemp(prefix="hssh-") if len(commands) > 1 else None
+    tmpdir = tempfile.mkdtemp(prefix="hssh-")
     # Unix socket paths cap near 104 bytes, so keep the name short.
-    control_path = os.path.join(tmpdir, "cm") if tmpdir else None
+    control_path = os.path.join(tmpdir, "cm")
     try:
         with _AskPass(passwd) as askpass:
             outputs = []
             for i, cmd in enumerate(commands):
                 try:
+                    if i == 0:
+                        _log_in(host, user, askpass, cmd, session_timeout, command_timeout, port,
+                                control_path, connect_timeout)
                     proc = _exec(host, user, askpass, cmd, session_timeout,
                                  command_timeout, port, control_path, connect_timeout)
                 except ConnectTimeoutError as exc:
@@ -620,8 +688,10 @@ def _run_commands(host: str, user: str, passwd: Optional[str], commands: List[st
                     raise
                 except OSError as exc:
                     raise RuntimeError("SSH transport failed: %s" % exc)
+                if proc.lost:
+                    raise ConnectionError(_describe_failure(host, proc, cmd))
                 if proc.returncode != 0:
-                    raise RuntimeError(_describe_failure(host, proc))
+                    raise RuntimeError(_describe_failure(host, proc, cmd))
                 refused = (refusal_line(proc.stderr, proc.stdout, dialect=dialect) if edit
                            else refused_reply(proc.stderr, proc.stdout, dialect=dialect))
                 if refused:
@@ -726,13 +796,16 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
                port: int = None, vendor_hint: str = None,
                connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> List[dict]:
-    """Execute multiple commands over one multiplexed SSH connection. A
-    connect phase that runs out before any command ran ends the batch as
-    one failure, as on the other transports, where a batch has one
-    connection: each command after it would cost another connect timeout
-    for the same silence (#126). Once a command has its result, the results
-    stand: a connect that runs out after that is that command's failure,
-    and the batch goes on."""
+    """Execute multiple commands over one multiplexed SSH connection, logged
+    in once (_log_in). A connect phase that runs out before any command ran
+    ends the batch as one failure, as on the other transports, where a
+    batch has one connection: each command after it would cost another
+    connect timeout for the same silence (#126). A login that fails
+    otherwise is the command's failure, and the next command logs in
+    again, as it does after a command whose session was lost (the login
+    went with it). Once a command has its result, the results stand: a
+    connect that runs out after that is that command's failure, and the
+    batch goes on."""
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
 
@@ -742,14 +815,20 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
     try:
         with _AskPass(passwd) as askpass:
             results = []
+            logged_in = False
             for cmd in cmds:
                 try:
+                    if not logged_in:
+                        _log_in(host, user, askpass, cmd, session_timeout, command_timeout, port,
+                                control_path, connect_timeout)
+                        logged_in = True
                     proc = _exec(host, user, askpass, cmd, session_timeout,
                                  command_timeout, port, control_path, connect_timeout)
                     refused = refused_reply(proc.stderr, proc.stdout, dialect=d) if proc.returncode == 0 else None
                     if proc.returncode != 0:
                         results.append({"command": cmd, "ok": False,
-                                        "error": _describe_failure(host, proc)})
+                                        "error": _describe_failure(host, proc, cmd)})
+                        logged_in = not proc.lost
                     elif refused:
                         results.append({"command": cmd, "ok": False,
                                         "error": "'%s' was refused by the device: %s" % (cmd, refused)})
@@ -802,13 +881,23 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
     if not AVAILABLE:
         raise RuntimeError("no 'ssh' binary found on PATH.")
     full = f"{cmd} | json"
-    with _AskPass(passwd) as askpass:
-        try:
-            proc = _exec(host, user, askpass, full, session_timeout, command_timeout, port, None, connect_timeout)
-        except OSError as exc:
-            raise RuntimeError("SSH transport failed: %s" % exc)
+    tmpdir = tempfile.mkdtemp(prefix="hssh-")
+    control_path = os.path.join(tmpdir, "cm")
+    try:
+        with _AskPass(passwd) as askpass:
+            try:
+                _log_in(host, user, askpass, full, session_timeout, command_timeout, port, control_path,
+                        connect_timeout)
+                proc = _exec(host, user, askpass, full, session_timeout, command_timeout, port, control_path,
+                             connect_timeout)
+            except OSError as exc:
+                raise RuntimeError("SSH transport failed: %s" % exc)
+    finally:
+        _close_master(host, user, control_path, tmpdir, session_timeout, port)
+    if proc.lost:
+        raise ConnectionError(_describe_failure(host, proc, full))
     if proc.returncode != 0:
-        raise RuntimeError(_describe_failure(host, proc))
+        raise RuntimeError(_describe_failure(host, proc, full))
     refused = refused_reply(proc.stderr, proc.stdout, dialect=d)
     if refused:
         raise RuntimeError("'%s' was refused by the device: %s" % (full, refused))
@@ -821,7 +910,12 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
 
 def ssh_command_line(host: str, user: str, cmd: str, session_timeout: int = 8,
                      port: int = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
-    """The exact command line this module would run, for logs and bug reports."""
+    """The ssh this module runs for `cmd`, for logs and bug reports: the
+    command's half, its options without the -v log (`-E`) and the
+    ControlMaster ones. Each call first logs in on a ControlMaster, an
+    `ssh -N` with the same options, and the command runs through it; this
+    line run alone logs in by itself, and the server's login banner lands
+    in its stderr, where h-ssh keeps it out of the command's."""
     argv = (["ssh", "-n"] + _base_opts(budget(connect_timeout, session_timeout), port, None, False)
             + ["--", "%s@%s" % (user, host) if user else host, cmd])
     return " ".join(shlex.quote(part) for part in argv)

@@ -594,12 +594,43 @@ def _drain(stream, deadline: float, cmd: str) -> str:
         chunks.append(chunk)
 
 
-def _exec(client, cmd: str, command_timeout: int):
+# How long a channel that closed with no EOF waits for its transport to be
+# gone: paramiko closes the channels of a session the server disconnected a
+# moment before it marks the transport inactive.
+_GONE_WAIT = 0.5
+
+
+def _lost(channel, deadline: float) -> bool:
+    """The session died under the command: the device never ended its
+    output (no EOF) and the transport is gone, whatever exit status came
+    first. A channel the device closed with no EOF on a session that stays
+    up was ended by the device, and is its reply."""
+    if channel.eof_received:
+        return False
+    transport = channel.get_transport()
+    if transport is None:
+        return False
+    if transport.saved_exception is None and transport.is_active():
+        transport.join(max(0.0, min(_GONE_WAIT, deadline - time.monotonic())))
+    return transport.saved_exception is not None or not transport.is_active()
+
+
+def _exec(client, host: str, cmd: str, command_timeout: int):
     """(exit status, stdout, stderr) of one command; -1 when the server sent no status.
 
     Every wait is bounded by command_timeout: the reads, and the exit status
     after them. A device that sends EOF and then neither a status nor a
-    close once held a worker thread forever (and with it the whole run)."""
+    close once held a worker thread forever (and with it the whole run).
+
+    A session lost before the device ended its output is a ConnectionError
+    (_lost), whatever exit status came first: its output may be cut short.
+    paramiko's -1 after a drop was read as "no status", an empty or cut
+    reply as the whole one and an edit line as applied; and OpenSSH's sshd,
+    Junos's too, sends the status as soon as the command exits, with up to
+    a window of its output (2 MB) still to go, so a drop in the tail of a
+    big reply came back as status 0 and a complete reply (#143). A device
+    that ends its output (EOF) and closes without a status, as some network
+    OSes do, has answered."""
     deadline = time.monotonic() + float(command_timeout)
     stdin, stdout, stderr = client.exec_command(cmd, timeout=float(command_timeout))
     channel = stdout.channel
@@ -615,7 +646,10 @@ def _exec(client, cmd: str, command_timeout: int):
         except Exception:
             pass
         raise TimeoutError(f"'{cmd}': the device sent no exit status within {command_timeout}s; channel closed")
-    return channel.recv_exit_status(), out, err
+    rc = channel.recv_exit_status()
+    if _lost(channel, deadline):
+        raise ConnectionError(f"connection to {host} lost before '{cmd}' finished")
+    return rc, out, err
 
 
 def _describe_failure(cmd: str, rc: int, out: str, err: str) -> str:
@@ -787,7 +821,7 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
     full = f"{cmd} | json"
     client = _connect(host, user, passwd, session_timeout, port, connect_timeout)
     try:
-        rc, out, err = _exec(client, full, command_timeout)
+        rc, out, err = _exec(client, host, full, command_timeout)
     finally:
         client.close()
     if rc > 0:
@@ -816,9 +850,10 @@ def _run_commands(host: str, user: str, passwd: str, commands: List[str],
     try:
         outputs = []
         for cmd in commands:
-            rc, out, err = _exec(client, cmd, command_timeout)
-            # A server that reports no status at all (-1) is not reporting
-            # a failure; some network OSes never send one.
+            rc, out, err = _exec(client, host, cmd, command_timeout)
+            # A server that reports no status at all (-1) after the end of
+            # its output is not reporting a failure; some network OSes never
+            # send one. A session lost before that end raised in _exec.
             if rc > 0:
                 raise RuntimeError(_describe_failure(cmd, rc, out, err))
             refused = (refusal_line(err, out, dialect=dialect) if edit
@@ -843,7 +878,7 @@ def show_batch(host: str, user: str, passwd: str, cmds: List[str],
         results = []
         for cmd in cmds:
             try:
-                rc, out, err = _exec(client, cmd, command_timeout)
+                rc, out, err = _exec(client, host, cmd, command_timeout)
                 refused = refused_reply(err, out, dialect=d) if rc <= 0 else None
                 if rc > 0:
                     results.append({"command": cmd, "ok": False,

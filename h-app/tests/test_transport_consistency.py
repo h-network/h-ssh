@@ -52,6 +52,20 @@ def test_refused_reply_is_a_refusal_that_opens_the_reply():
     assert refused_reply("", "") is None and refused_reply("", "100% done\n") is None
 
 
+def test_a_line_on_stderr_does_not_hide_a_refusal_that_opens_stdout():
+    """#143: refused_reply stopped at the first line of the first text it
+    was given, stderr's: a warning there, or a login message, hid the
+    refusal opening stdout, and `show foo` was an OK show with the refusal
+    for its output, stored as the baseline. The reply is stdout, judged
+    first; stderr only when stdout says nothing."""
+    from hssh.core import refused_reply
+    refusal = "error: syntax error, expecting <command>"
+    assert refused_reply("warning: y", refusal) == refusal
+    assert refused_reply("Welcome to r1\n", "\n" + refusal + ": foo\n", dialect=drivers.JUNOS) == refusal + ": foo"
+    assert refused_reply("error: in maintenance window\n", "Hostname: r1\n", dialect=drivers.JUNOS) is None
+    assert refused_reply("% Invalid input detected\n", "\n   \n") == "% Invalid input detected"
+
+
 @pytest.fixture
 def fake_ssh(tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
@@ -381,3 +395,126 @@ def test_a_job_edit_of_whitespace_is_refused_before_anything_is_sent(monkeypatch
         rc, err = _main(monkeypatch, capsys, "--job", str(job), "--json", ask=asked)
         assert rc == 2 and "ERROR: Invalid job file: Job entry 1 (R2): 'edit' is empty" in err, err
         assert calls == [] and asked == [] and probed == []
+
+
+# --- #143: a NETCONF show answered with an error as its output text ----------------
+
+import re
+import socket
+import threading
+
+from hssh import runner
+from hssh.core import Target
+
+_NETCONF_HELLO = (b'<hello xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"><capabilities>'
+                  b'<capability>urn:ietf:params:netconf:base:1.0</capability></capabilities>'
+                  b'<session-id>1</session-id></hello>]]>]]>')
+
+
+@pytest.fixture
+def netconf_sshd():
+    """netconf_sshd(output) -> (port, commands): a NETCONF server on
+    127.0.0.1 (paramiko's, the netconf subsystem, anyone in with a password)
+    that answers every <command> RPC with `output` as the <output> text of
+    its reply, as Junos carries what its CLI said, and <close-session> with
+    <ok/>; `commands` is every <command> it answered."""
+    paramiko = pytest.importorskip("paramiko")
+    pytest.importorskip("jnpr.junos")
+    from hssh.transports import netconf
+    key = paramiko.ECDSAKey.generate()
+    opened = []
+
+    class Sshd(paramiko.ServerInterface):
+        def __init__(self, output, commands):
+            self.output, self.commands = output, commands
+
+        def get_allowed_auths(self, username):
+            return "password"
+
+        def check_auth_password(self, username, password):
+            return paramiko.AUTH_SUCCESSFUL
+
+        def check_channel_request(self, kind, chanid):
+            return paramiko.OPEN_SUCCEEDED
+
+        def check_channel_subsystem_request(self, channel, name):
+            if name != "netconf":
+                return False
+            threading.Thread(target=self.serve, args=(channel,), daemon=True).start()
+            return True
+
+        def serve(self, channel):
+            channel.sendall(_NETCONF_HELLO)
+            pending = b""
+            while True:
+                data = channel.recv(65536)
+                if not data:
+                    return
+                pending += data
+                while b"]]>]]>" in pending:
+                    message, pending = pending.split(b"]]>]]>", 1)
+                    mid = re.search(rb'message-id="([^"]+)"', message)
+                    if mid is None:
+                        continue                         # the client's hello
+                    reply = (b'<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="'
+                             + mid.group(1) + b'">')
+                    if b"close-session" in message:
+                        channel.sendall(reply + b"<ok/></rpc-reply>]]>]]>")
+                        channel.close()
+                        return
+                    command = re.search(rb"<command[^>]*>(.*?)</command>", message, re.S)
+                    if command:
+                        self.commands.append(command.group(1).decode())
+                    channel.sendall(reply + b"<output>" + self.output.encode() + b"</output></rpc-reply>]]>]]>")
+
+    def make(output):
+        commands = []
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        opened.append(srv)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                t = paramiko.Transport(conn)
+                t.add_server_key(key)
+                opened.append(t)
+                try:
+                    t.start_server(server=Sshd(output, commands))
+                except (paramiko.SSHException, EOFError, OSError):
+                    pass
+        threading.Thread(target=serve, daemon=True).start()
+        return srv.getsockname()[1], commands
+    yield make
+    netconf.wait_for_closes(5)
+    for each in opened:
+        each.close()
+
+
+def test_a_netconf_show_answered_with_an_error_for_its_output_is_refused(netconf_sshd):
+    """netconf.show handed back the text of the <command> reply with no
+    look at it, where ssh and openssh run the reply verdict: a router that
+    answered `show log nosuchfile` with `error: could not resolve file:
+    nosuchfile` as its <output> was an OK show (most refusals come as an
+    rpc-error, and fail as one). Refused now, alone and in a batch, and the
+    runner sends it once."""
+    from hssh.transports import netconf
+    port, commands = netconf_sshd("\nerror: could not resolve file: nosuchfile\n")
+    refused = "'show log nosuchfile' was refused by the device: error: could not resolve file: nosuchfile"
+    with pytest.raises(RuntimeError) as failed:
+        netconf.show("127.0.0.1", "u", "p", "show log nosuchfile", 10, 10, port=port)
+    assert str(failed.value) == refused
+    assert list(netconf.show_batch("127.0.0.1", "u", "p", ["show log nosuchfile"], 10, 10, port=port)) == [
+        {"command": "show log nosuchfile", "ok": False, "error": refused}]
+    assert commands == ["show log nosuchfile"] * 2
+    result = runner.run_for_target(
+        t=Target("R1", "127.0.0.1", "junos", port), transport="junos", mode="show",
+        show_cmd="show log nosuchfile", edit_cmd=None, config_dir=None, broadcast_file=None, user="u",
+        passwd="p", session_timeout=10, command_timeout=10, dry_run=False, commit_confirmed=None,
+        save_dir=None, quiet=True, max_attempts=3)
+    assert not result.ok and result.error == refused
+    assert commands == ["show log nosuchfile"] * 3                 # one attempt: a refusal is not tried again

@@ -156,8 +156,10 @@ def test_host_follows_an_end_of_options_marker(fake_ssh, tmp_path):
         openssh._close_master("-oProxyCommand=x", None, str(mux / "cm"), str(mux), 5, None)   # run
     finally:
         subprocess.run, subprocess.Popen = real_run, real_popen
-    assert seen[0][-3:] == ["--", "-oProxyCommand=x", "uptime"]
-    assert seen[1][-2:] == ["--", "-oProxyCommand=x"]
+    login, command, close = seen[:3]        # (subprocess.run's own Popen comes after)
+    assert login[-2:] == ["--", "-oProxyCommand=x"] and "-N" in login
+    assert command[-3:] == ["--", "-oProxyCommand=x", "uptime"]
+    assert close[-2:] == ["--", "-oProxyCommand=x"]
     line = openssh.ssh_command_line("-oProxyCommand=x", None, "uptime")
     assert line.endswith(" -- -oProxyCommand=x uptime")
 
@@ -307,3 +309,218 @@ def test_the_child_environment_does_not_carry_hssh_password(monkeypatch):
         assert "HSSH_PASSWORD" not in env and env["HSSH_ASKPASS_SECRET"] == "Pa55w0rd-FROM-ENV"
     with _AskPass(None) as ap:
         assert "HSSH_PASSWORD" not in ap.env
+
+
+# --- #143: the server's login banner is not a command's stderr ----------------------
+
+import shlex
+import shutil
+import socket
+import threading
+import time
+
+
+@pytest.fixture
+def real_ssh(tmp_path, monkeypatch):
+    """The OpenSSH client on PATH, behind a wrapper that keeps the user's
+    ~/.ssh/config out of it, with a private HOME; skipped where there is
+    none, or one too old for a password through askpass."""
+    found = shutil.which("ssh")
+    if found is None:
+        pytest.skip("no ssh binary on PATH")
+    bindir = tmp_path / "realbin"
+    bindir.mkdir()
+    wrapper = bindir / "ssh"
+    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(found)} -F /dev/null "$@"\n')
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(openssh, "AVAILABLE", True)
+    if openssh._openssh_version() < (8, 4):
+        pytest.skip("password auth needs OpenSSH 8.4")
+
+
+def _device(channel, command):
+    """A device's answer to an exec: Junos's refusal of `show foo` on
+    stdout at exit 0, a `Permission denied` of its own on stderr at exit 1,
+    a warning of its own on stderr beside its output, an exit 255 of its
+    own, a session lost under `show log auth` after a line of its reply and
+    under `set system services ssh` (sshd restarting), and anything else's
+    output."""
+    rc = 0
+    if command in ("show log auth", "set system services ssh"):
+        if command == "show log auth":
+            channel.sendall(b"Oct 28 r1 sshd[1]: Failed password for root: Permission denied\n")
+        time.sleep(0.2)
+        channel.get_transport().close()
+        return
+    if command == "show foo":
+        channel.sendall(b"error: syntax error, expecting <command>\n")
+    elif command == "cat /etc/shadow":
+        channel.sendall_stderr(b"cat: /etc/shadow: Permission denied\n")
+        rc = 1
+    elif command == "request support information":
+        channel.sendall_stderr(b"error: another request is running\n")
+        rc = 255
+    else:
+        channel.sendall(b"output-for: " + command.encode() + b"\n")
+        if command == "show log messages":
+            channel.sendall_stderr(b"warning: log file rotated\n")
+    channel.send_exit_status(rc)
+    channel.close()
+
+
+@pytest.fixture
+def banner_sshd():
+    """banner_sshd(banner) -> (port, logins): a paramiko SSH server on
+    127.0.0.1 that sends `banner` as its login message (SSH's userauth
+    banner, the Junos `system login message`), lets user lab in with
+    password hunter2 and answers each exec as _device does; `logins` is
+    every login that got in."""
+    paramiko = pytest.importorskip("paramiko")
+    key = paramiko.ECDSAKey.generate()
+    opened = []
+
+    class Sshd(paramiko.ServerInterface):
+        def __init__(self, banner, logins):
+            self.banner, self.logins = banner, logins
+
+        def get_banner(self):
+            return self.banner, "en-US"
+
+        def get_allowed_auths(self, username):
+            return "password"
+
+        def check_auth_password(self, username, password):
+            if (username, password) != ("lab", "hunter2"):
+                return paramiko.AUTH_FAILED
+            self.logins.append(username)
+            return paramiko.AUTH_SUCCESSFUL
+
+        def check_channel_request(self, kind, chanid):
+            return paramiko.OPEN_SUCCEEDED
+
+        def check_channel_exec_request(self, channel, command):
+            threading.Thread(target=_device, args=(channel, command.decode()), daemon=True).start()
+            return True
+
+    def make(banner):
+        logins = []
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        opened.append(srv)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                t = paramiko.Transport(conn)
+                t.add_server_key(key)
+                opened.append(t)
+                try:
+                    t.start_server(server=Sshd(banner, logins))
+                except (paramiko.SSHException, EOFError, OSError):
+                    pass
+        threading.Thread(target=serve, daemon=True).start()
+        return srv.getsockname()[1], logins
+    yield make
+    for each in opened:
+        each.close()
+
+
+def device(port, call, *args, **kw):
+    """openssh.<call>("127.0.0.1", "lab", "hunter2", *args, 10, 10, port=port, **kw)"""
+    return getattr(openssh, call)("127.0.0.1", "lab", kw.pop("passwd", "hunter2"), *args, 10, 10, port=port, **kw)
+
+
+def test_the_login_banner_is_kept_out_of_every_commands_stderr(banner_sshd, real_ssh):
+    """`-v` put ssh's log level over `-o LogLevel=ERROR`, so OpenSSH printed
+    the server's login message into the command's stderr: a STDERR block
+    on every output and store row, and on junos@openssh a refusal on stdout
+    hidden behind it, `show foo` an OK show and the refusal its output.
+    Each call logs in once, on a ControlMaster whose stderr is its own; the
+    device's stderr is still the device's."""
+    port, logins = banner_sshd("Welcome to r1\n")
+    assert device(port, "show", "show version") == "$ show version\noutput-for: show version\n"
+    assert device(port, "show_batch", ["show version", "show chassis hardware"]) == [
+        {"command": "show version", "ok": True, "output": "$ show version\noutput-for: show version"},
+        {"command": "show chassis hardware", "ok": True,
+         "output": "$ show chassis hardware\noutput-for: show chassis hardware"}]
+    assert device(port, "show", "show log messages") == (
+        "$ show log messages\noutput-for: show log messages\nSTDERR:\nwarning: log file rotated\n")
+    with pytest.raises(RuntimeError, match=r"^'show foo' was refused by the device: error: syntax error, "
+                                           r"expecting <command>$"):
+        device(port, "show", "show foo", vendor_hint="junos@openssh")
+    assert logins == ["lab"] * 4                       # one login a call, the batch's too
+
+
+def test_a_login_message_that_starts_with_error_fails_no_show(banner_sshd, real_ssh):
+    """A cRPD with `system login message "error: in maintenance window"`
+    failed every show over openssh as refused by the device, while ssh
+    was OK; a show the device refuses still fails."""
+    port, _ = banner_sshd("error: in maintenance window\n")
+    assert device(port, "show", "show version", vendor_hint="junos@openssh") == (
+        "$ show version\noutput-for: show version\n")
+    results = device(port, "show_batch", ["show version", "show foo"], vendor_hint="junos@openssh")
+    assert [r["ok"] for r in results] == [True, False]
+    assert results[1]["error"] == "'show foo' was refused by the device: error: syntax error, expecting <command>"
+
+
+def test_a_devices_permission_denied_is_its_failure_not_a_failed_login(banner_sshd, real_ssh):
+    """What a command says on its stderr is the device's, not ssh's: a
+    command the device answered `Permission denied` at exit 1 was
+    "Authentication failed.", which a failed login still is."""
+    port, logins = banner_sshd("Welcome to r1\n")
+    said = "exit 1 from 'cat /etc/shadow': cat: /etc/shadow: Permission denied"
+    with pytest.raises(RuntimeError) as failed:
+        device(port, "show", "cat /etc/shadow")
+    assert str(failed.value) == said
+    (entry,) = device(port, "show_batch", ["cat /etc/shadow"])
+    assert entry == {"command": "cat /etc/shadow", "ok": False, "error": said}
+    with pytest.raises(RuntimeError, match=r"^Authentication failed\.$"):
+        device(port, "show", "show version", passwd="wrong")
+    assert logins == ["lab"] * 2
+
+
+def test_a_session_lost_under_a_command_is_lost_not_the_devices_words(banner_sshd, real_ssh, monkeypatch):
+    """Every command runs through the login's ControlMaster, and a session
+    lost under one takes the master with it: ssh exits 255 with nothing of
+    its own in its log, and that was read as the device's failure, in the
+    first line of the reply cut short. A line with `Permission denied` in
+    it made a lost read a permanent failure, sent once; in a batch the next
+    command logged in by itself, its banner in its stderr. The master gone
+    (`ssh -O check`) is a lost session, as on the ssh transport: a read is
+    tried again, an edit line FAILED once, never APPLIED, and the next
+    command of a batch logs in again."""
+    from hssh import runner
+    from hssh.core import Target
+    monkeypatch.setattr(runner, "_backoff", lambda attempt, steps=None: 0)
+    port, logins = banner_sshd("Welcome to r1\n")
+    lost = "connection to 127.0.0.1 lost before 'show log auth' finished"
+    with pytest.raises(ConnectionError) as failed:
+        device(port, "show", "show log auth")
+    assert str(failed.value) == lost and not runner.is_permanent_failure(failed.value)
+    assert device(port, "show_batch", ["show log auth", "show version"]) == [
+        {"command": "show log auth", "ok": False, "error": lost},
+        {"command": "show version", "ok": True, "output": "$ show version\noutput-for: show version"}]
+    with pytest.raises(RuntimeError) as failed:          # the device's own 255, the master still up
+        device(port, "show", "request support information")
+    assert str(failed.value) == "exit 255 from 'request support information': error: another request is running"
+
+    def run(**kw):
+        args = dict(t=Target("R1", "127.0.0.1", "openssh", port), transport="openssh", mode="show",
+                    show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None, user="lab",
+                    passwd="hunter2", session_timeout=10, command_timeout=10, dry_run=False,
+                    commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3)
+        args.update(kw)
+        return runner.run_for_target(**args)
+    del logins[:]
+    read = run(show_cmd="show log auth")
+    assert not read.ok and read.error == lost and logins == ["lab"] * 3      # one login an attempt
+    del logins[:]
+    edit = run(mode="edit-cmd", edit_cmd="set system services ssh")
+    assert not edit.ok and edit.error == "connection to 127.0.0.1 lost before 'set system services ssh' finished"
+    assert edit.result is None and "APPLIED" not in edit.text and logins == ["lab"]

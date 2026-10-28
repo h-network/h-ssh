@@ -241,14 +241,17 @@ def test_a_router_that_sends_the_banner_and_then_nothing_is_named_on_junos_too()
 @pytest.fixture
 def fake_ssh(tmp_path, monkeypatch):
     """A stub ssh that logs what FAKE_SSH_LOG says to the -E file, sleeps
-    FAKE_SSH_SLEEP, and exits FAKE_SSH_RC."""
+    FAKE_SSH_SLEEP, and exits FAKE_SSH_RC. The ssh that logs in (`-N`)
+    goes to the background as soon as that log has the session up, as
+    OpenSSH's ControlMaster does: the command after it is what sleeps."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
     script = bindir / "ssh"
     script.write_text(
         "#!/bin/sh\n"
-        'while [ $# -gt 0 ]; do case "$1" in -E) shift; LOG="$1";; esac; shift; done\n'
+        'while [ $# -gt 0 ]; do case "$1" in -E) shift; LOG="$1";; -N) LOGIN=1;; esac; shift; done\n'
         'if [ -n "$LOG" ]; then printf "%b" "$FAKE_SSH_LOG" >> "$LOG"; fi\n'
+        'case "$LOGIN$FAKE_SSH_LOG" in 1*"Authenticated to "*|1*"master session id"*) exit 0;; esac\n'
         'if [ -n "$FAKE_SSH_STDERR" ]; then echo "$FAKE_SSH_STDERR" >&2; fi\n'
         'echo "device output"\n'
         'sleep "${FAKE_SSH_SLEEP:-0}"\n'
@@ -769,7 +772,9 @@ def test_opensshs_connect_timeout_is_the_connect_timeout(fake_ssh, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", spy)
     openssh.show("h", "u", None, "show version", 30, 10, connect_timeout=4)
     openssh.show("h", "u", None, "show version", 2, 10, connect_timeout=4)
-    assert "ConnectTimeout=4" in seen[0] and "ConnectTimeout=2" in seen[1]
+    (login, command), (login2, command2) = seen[:2], seen[2:]          # each logs in, then runs the show
+    assert "ConnectTimeout=4" in login and "ConnectTimeout=4" in command
+    assert "ConnectTimeout=2" in login2 and "ConnectTimeout=2" in command2
     assert "ConnectTimeout=3" in openssh.ssh_command_line("h", "u", "show version", session_timeout=30)
 
 
@@ -817,16 +822,18 @@ def test_an_openssh_batch_whose_connect_runs_out_fails_as_one(fake_ssh, monkeypa
 
 
 def _ssh_that_answers_once(tmp_path, monkeypatch, said):
-    """A stub ssh whose first run is a session that prints `said` and exits
-    0, and whose every later run gets no TCP answer. Returns the file that
-    counts the runs."""
+    """A stub ssh that logs in (`-N`) at once, whose first command is a
+    session that prints `said` and exits 0, and whose every later command
+    gets no TCP answer: the session it ran through was lost, and the next
+    connect finds the box gone. Returns the file that counts the commands."""
     count = tmp_path / "count"
     bindir = tmp_path / "bin"
     bindir.mkdir()
     script = bindir / "ssh"
     script.write_text(
         "#!/bin/sh\n"
-        'while [ $# -gt 0 ]; do case "$1" in -E) shift; LOG="$1";; esac; shift; done\n'
+        'while [ $# -gt 0 ]; do case "$1" in -E) shift; LOG="$1";; -N) LOGIN=1;; esac; shift; done\n'
+        'if [ -n "$LOGIN" ]; then echo "Authenticated to h ([10.0.0.1]:22) using publickey." >> "$LOG"; exit 0; fi\n'
         f'n=$(cat {shlex.quote(str(count))} 2>/dev/null || echo 0); n=$((n + 1)); echo $n > {shlex.quote(str(count))}\n'
         'if [ "$n" -eq 1 ]; then echo "Authenticated to h ([10.0.0.1]:22) using publickey." >> "$LOG"; '
         f'echo {shlex.quote(said)}; exit 0; fi\n'

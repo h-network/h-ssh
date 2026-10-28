@@ -406,6 +406,23 @@ def test_begin_abort_and_leaving_the_block():
     assert not tx.open and cfg().names[-2:] == ["rollback", "unlock"]
 
 
+def test_a_transactions_show_the_cli_refused_is_a_failure_not_output():
+    """#143: tx.show(), the gate's look at the device on the transaction's
+    session, handed back a refusal carried as the reply's text as the
+    show's output, where netconf.show() fails it: a gate that looks for a
+    word in the output (`'down' not in tx.show(...)`) went on to commit on
+    a command the device refused. It raises as show() does, and leaving
+    the block aborts with nothing committed."""
+    FakeDevice.cli_outputs = {"show log nosuchfile": "\nerror: could not resolve file: nosuchfile\n"}
+    with pytest.raises(RuntimeError) as failed:
+        with begin() as tx:
+            if "down" not in tx.show("show log nosuchfile"):
+                tx.commit()
+    assert str(failed.value) == ("'show log nosuchfile' was refused by the device: "
+                                 "error: could not resolve file: nosuchfile")
+    assert not tx.open and cfg().names == ["lock", "load", "diff", "commit_check", "rollback", "unlock"]
+
+
 def test_begin_with_rollback_and_no_changes():
     tx = begin(None, rollback=2)
     assert tx.label == "ROLLBACK 2: " and cfg().calls[1] == ("rollback", (2,), {})

@@ -603,14 +603,18 @@ def refusal_line(*texts: str, dialect=None):
     return None
 
 
-def refused_reply(*texts: str, dialect=None):
+def refused_reply(err: str, out: str, dialect=None):
     """The refusal a show got instead of an answer, or None. A CLI that
     refuses a show says so first: Junos answers "error: syntax error, …"
     and nothing else, IOS a caret line then "% Invalid input …". So only a
     refusal that opens the reply counts (blank and caret-only lines
-    skipped); "error:" further down is the device's output, as in a log."""
+    skipped); "error:" further down is the device's output, as in a log.
+    The reply is stdout (`out`), judged first, and stderr (`err`) only when
+    stdout has no line to judge: anything on stderr, a warning or a login
+    message, stopped the look there and hid a refusal opening stdout, and
+    the refused show came back OK (#143)."""
     pattern = (dialect or drivers.NONE).refused
-    for text in texts:
+    for text in (out, err):
         for line in (text or "").splitlines():
             if not line.strip() or set(line.strip()) == {"^"}:
                 continue
