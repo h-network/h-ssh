@@ -299,7 +299,8 @@ def test_the_shell_is_ssh_tt_on_pipes_with_the_password_through_askpass(device, 
     assert "PubkeyAuthentication=no" in argv and "BatchMode=yes" not in argv
     assert kwargs["stdin"] is subprocess.PIPE and kwargs["stdout"] is subprocess.PIPE
     env = kwargs["env"]
-    assert env["SSH_ASKPASS_REQUIRE"] == "force" and env["HSSH_ASKPASS_SECRET"] == "hunter2"
+    assert env["SSH_ASKPASS_REQUIRE"] == "force" and env["SSH_ASKPASS"].endswith("/askpass")
+    assert "hunter2" not in env.values()                   # #151: the helper reads it from its file, not from here
     assert env["TERM"] == "vt100" and "HSSH_PASSWORD" not in env
     assert "hunter2" not in " ".join(argv)
     assert "BatchMode=yes" in keyed and "SSH_ASKPASS" not in keyed_kwargs["env"]

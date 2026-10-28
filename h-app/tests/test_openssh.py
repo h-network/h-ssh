@@ -1,4 +1,5 @@
 """OpenSSH transport tests — a fake `ssh` binary on PATH, no live devices needed."""
+import json
 import os
 import stat
 import sys
@@ -235,7 +236,10 @@ def test_device_output_is_never_rewritten(askpass_ssh):
     assert "authentication-order password:" in out
 
 
-def test_secret_is_not_written_to_disk(askpass_ssh, tmp_path):
+def test_the_helper_holds_no_secret_and_the_secret_file_beside_it_is_0600(askpass_ssh, tmp_path):
+    """The helper is a script; the password is a 0600 file beside it in the
+    helper's 0700 directory, for the login alone (#151: it travelled in the
+    ssh process's environment before)."""
     captured = {}
     real = openssh._AskPass.__enter__
 
@@ -244,6 +248,9 @@ def test_secret_is_not_written_to_disk(askpass_ssh, tmp_path):
         if self.path:
             captured["helper"] = open(self.path).read()
             captured["mode"] = stat.S_IMODE(os.stat(self.path).st_mode)
+            captured["dir_mode"] = stat.S_IMODE(os.stat(self.dir).st_mode)
+            captured["secret"] = open(self.secret).read()
+            captured["secret_mode"] = stat.S_IMODE(os.stat(self.secret).st_mode)
         return result
 
     openssh._AskPass.__enter__ = spy
@@ -252,7 +259,8 @@ def test_secret_is_not_written_to_disk(askpass_ssh, tmp_path):
     finally:
         openssh._AskPass.__enter__ = real
     assert "hunter2" not in captured["helper"]
-    assert captured["mode"] == 0o700
+    assert captured["mode"] == 0o700 and captured["dir_mode"] == 0o700
+    assert captured["secret"] == "hunter2\n" and captured["secret_mode"] == 0o600
 
 
 def test_askpass_helper_is_removed_afterwards(askpass_ssh):
@@ -262,6 +270,7 @@ def test_askpass_helper_is_removed_afterwards(askpass_ssh):
     def spy(self):
         result = real(self)
         seen["path"] = self.path
+        seen["secret"] = self.secret
         seen["dir"] = self.dir
         return result
 
@@ -271,6 +280,7 @@ def test_askpass_helper_is_removed_afterwards(askpass_ssh):
     finally:
         openssh._AskPass.__enter__ = real
     assert not os.path.exists(seen["path"])
+    assert not os.path.exists(seen["secret"])
     assert not os.path.exists(seen["dir"])
 
 
@@ -306,9 +316,63 @@ def test_the_child_environment_does_not_carry_hssh_password(monkeypatch):
     monkeypatch.setenv("HSSH_PASSWORD", "Pa55w0rd-FROM-ENV")
     with _AskPass("Pa55w0rd-FROM-ENV") as ap:
         env = ap.env
-        assert "HSSH_PASSWORD" not in env and env["HSSH_ASKPASS_SECRET"] == "Pa55w0rd-FROM-ENV"
+        assert "HSSH_PASSWORD" not in env and env["SSH_ASKPASS"] == ap.path
+        assert "Pa55w0rd-FROM-ENV" not in env.values()           # #151: nor in HSSH_ASKPASS_SECRET, as it was
+        assert open(ap.secret).read() == "Pa55w0rd-FROM-ENV\n"   # the helper reads it from here
     with _AskPass(None) as ap:
         assert "HSSH_PASSWORD" not in ap.env
+
+
+@pytest.fixture
+def recording_ssh(askpass_ssh):
+    """askpass_ssh, recording every invocation's arguments and environment
+    in FAKE_SSH_ENV_LOG, answering `ssh -V` as OpenSSH 9.6, making the
+    ControlPath on the login (`-N`) and removing it on `-O exit`, as ssh
+    does, so every child a call runs is seen."""
+    askpass_ssh.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, subprocess, sys\n"
+        "with open(os.environ['FAKE_SSH_ENV_LOG'], 'a') as f:\n"
+        "    f.write(json.dumps({'argv': sys.argv[1:], 'env': dict(os.environ)}) + '\\n')\n"
+        "if '-V' in sys.argv:\n"
+        "    sys.stderr.write('OpenSSH_9.6p1\\n'); sys.exit(0)\n"
+        "cp = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('ControlPath=')), None)\n"
+        "if '-O' in sys.argv:\n"
+        "    if 'exit' in sys.argv and cp and os.path.exists(cp):\n"
+        "        os.unlink(cp)\n"
+        "    sys.exit(0)\n"
+        "helper = os.environ.get('SSH_ASKPASS')\n"
+        "if not helper or os.environ.get('SSH_ASKPASS_REQUIRE') != 'force':\n"
+        "    sys.stderr.write('no askpass configured\\n'); sys.exit(255)\n"
+        "got = subprocess.run([helper, 'p'], capture_output=True, text=True).stdout.strip()\n"
+        "if got != 'hunter2':\n"
+        "    sys.stderr.write('Permission denied (password).\\n'); sys.exit(255)\n"
+        "if '-N' in sys.argv and cp:\n"
+        "    open(cp, 'w').close()\n"
+        "print('radius-server 10.0.0.1;')\n"
+    )
+    return askpass_ssh
+
+
+def test_no_ssh_child_carries_the_password_in_its_environment(recording_ssh, tmp_path, monkeypatch):
+    """#151: the password rode in HSSH_ASKPASS_SECRET in the environment of
+    every ssh (the login, each command, the -tt edit session), which a
+    same-user process reads from /proc/<pid>/environ and a ProxyCommand
+    inherits; `ssh -V` and `ssh -O exit` ran with HSSH_PASSWORD. The helper
+    reads the secret from the 0600 file beside it, and the children that
+    need no credential get no HSSH_PASSWORD either."""
+    log = tmp_path / "ssh-env.jsonl"
+    monkeypatch.setenv("FAKE_SSH_ENV_LOG", str(log))
+    monkeypatch.setenv("HSSH_PASSWORD", "hunter2")
+    out = openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
+    assert "radius-server 10.0.0.1;" in out                                 # authenticated, through the helper
+    calls = [json.loads(ln) for ln in log.read_text().splitlines()]
+    kinds = [("-V" if "-V" in c["argv"] else "-O" if "-O" in c["argv"] else "-N" if "-N" in c["argv"] else "command")
+             for c in calls]
+    assert sorted(kinds) == ["-N", "-O", "-V", "command"], kinds             # the version, the login, the command, the master's exit
+    for c in calls:
+        assert "hunter2" not in json.dumps(c["env"]), c["argv"]
+        assert "HSSH_PASSWORD" not in c["env"] and "HSSH_ASKPASS_SECRET" not in c["env"], c["argv"]
 
 
 # --- #143: the server's login banner is not a command's stderr ----------------------
