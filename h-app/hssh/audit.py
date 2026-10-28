@@ -17,6 +17,12 @@ logger = logging.getLogger(__name__)
 # never the next line's first word (blanks between the words, not `\s`).
 _VALUE = r'("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s;"\']+)'
 
+# The last word of a JSON key whose whole value is a secret (see _SECRET_KEY
+# and redact_values below): "encrypted-password", "hello-authentication-key",
+# "chap-secret", "api_token".
+_SECRET_WORDS = (r'password(?:-value)?|passwd|secret|key|key-string|key-hex|hexadecimal|'
+                 r'ascii-text|token|community')
+
 # Patterns for redaction of sensitive credentials/tokens. Order matters: the
 # Junos "## SECRET-DATA" rule goes first, it knows the value is the last token
 # whatever the keyword.
@@ -50,6 +56,12 @@ _REDACT_PATTERNS = [
                 r'ascii-text|hexadecimal|key-hex|token|api_key)>)[^<]*(?=</)', re.IGNORECASE),
      r'\1[REDACTED]'),
     (re.compile(r'(<community>\s*<name>)[^<]*(?=</name>)', re.IGNORECASE), r'\1[REDACTED]'),
+    # JSON carried as text (`show configuration | display json` on junos@ssh
+    # or openssh): the quoted key known by the last-word rule redact_values
+    # uses for parsed data, its scalar replaced as the parsed reply would read.
+    (re.compile(r'("(?:[^"\\\n]*[-_])?(?:' + _SECRET_WORDS + r')"[ \t]*:[ \t]*)'
+                r'(?:"(?:\\.|[^"\\\n])*"|[^\s,{}\[\]"]+)', re.IGNORECASE),
+     r'\1"[REDACTED]"'),
     (re.compile(r'((?:password|secret|token|api[_-]?key|passwd)[ \t]*[:=][ \t]*)'
                 r'(?:("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s,;"\']+))', re.IGNORECASE),
      r'\1[REDACTED]'),
@@ -96,8 +108,7 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
 # carried as data (--format json) puts "encrypted-password" (or
 # "hello-authentication-key", "chap-secret") in the key and the hash in the
 # value, out of reach of the text patterns above.
-_SECRET_KEY = re.compile(r'(?:^|[-_])(?:password(?:-value)?|passwd|secret|key|key-string|key-hex|hexadecimal|'
-                         r'ascii-text|token|community)$')
+_SECRET_KEY = re.compile(r'(?:^|[-_])(?:' + _SECRET_WORDS + r')$')
 
 
 def redact_values(data):

@@ -378,6 +378,32 @@ def test_xml_and_json_names_ending_in_a_secret_word_are_redacted():
                                    "description": "key customer uplink"}
 
 
+def test_a_json_reply_carried_as_text_is_redacted_like_parsed_data():
+    """`show configuration | display json` on junos@ssh and openssh comes
+    back as JSON text, not data, and --log kept the five secrets the tester
+    planted on a cRPD: the key's closing quote put `"encrypted-password" :
+    "$6$…"` out of the `password:` pattern's reach, and redact_values only
+    sees parsed data. A quoted key is known by the last-word rule
+    redact_values uses and its scalar goes, so the text reads as the parsed
+    reply would; the names and key-ids beside the secrets stay."""
+    text = json.dumps({"configuration": {
+        "system": {"login": {"user": [{"name": "t151", "authentication": {"encrypted-password": "$6$ROOT"}}]}},
+        "protocols": {
+            "bgp": {"group": [{"name": "peers", "authentication-key": "$9$BGP"}]},
+            "ospf": {"area": [{"name": "0.0.0.0", "interface": [{"name": "ge-0/0/0.0", "authentication": {
+                "md5": [{"name": 1, "key": "$9$MD5"}], "simple-password": "$9$OSPF"}}]}]},
+            "isis": {"interface": [{"name": "ge-0/0/0.0", "hello-authentication-key": "$9$ISIS"}]}}}},
+        indent=4, separators=(",", " : "))
+    out = redact_secrets(text)
+    for secret in ("$6$ROOT", "$9$BGP", "$9$MD5", "$9$OSPF", "$9$ISIS"):
+        assert secret not in out, out
+    assert json.loads(out) == redact_values(json.loads(text))
+    assert '"name" : "t151"' in out and '"name" : 1' in out and out.count('"[REDACTED]"') == 5
+    compact = '{"password":"x","api_token":123,"keyboard":"qwerty","key":null,"key-chain":"K"}'
+    assert redact_secrets(compact) == ('{"password":"[REDACTED]","api_token":"[REDACTED]","keyboard":"qwerty",'
+                                       '"key":"[REDACTED]","key-chain":"K"}')
+
+
 def test_what_is_not_a_secret_stays():
     """Over-redaction the review found: a `key N` line took the next line's
     first word for its value (a key-string keyword, a cryptographic-algorithm),
