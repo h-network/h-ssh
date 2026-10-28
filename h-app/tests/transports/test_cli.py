@@ -2,6 +2,7 @@
 dialect's shape. Here the channel is a script in memory: the telnet tests
 drive the same engine over a real socket, the paramiko tests over a fake
 shell channel."""
+import re
 import time
 
 import pytest
@@ -20,20 +21,32 @@ CLEAN = "\r\n0   2026-10-22 08:00:00 UTC by lab via cli\r\n1   2026-10-21 17:10:
 PAUSE = "<pause>"
 
 
+def later(seconds):
+    """A PAUSE that takes time: what follows it comes `seconds` after the
+    read that reached it, as from a device that says nothing for that long."""
+    return f"<pause {seconds}>"
+
+
+_PAUSES = re.compile(rb"<pause(?: ([0-9.]+))?>")
+
+
 class ScriptChannel:
     """A device played from a dict: what it says first, then a reply per
     command (a callable gets the line). Typed lines are echoed as a tty does.
     `hang_on` names a command left unanswered, `close_on` one answered by
     hanging up. `split_at` makes the first read that holds that text end
     right after it, as a device pausing there would; a PAUSE in what it
-    says ends a read there every time. With `blocking`, a read that finds
-    nothing waits out its timeout first, as a socket's does, and `waits`
-    notes the line typed last before each such wait."""
+    says ends a read there every time, and a later() one also holds back
+    what follows it for its time, a read until then waiting as long as its
+    timeout lets it. With `blocking`, a read that finds nothing waits out
+    its timeout first, as a socket's does, and `waits` notes the line typed
+    last before each such wait."""
 
     def __init__(self, first, replies, echo=True, hang_on=None, close_on=None, split_at=None, blocking=False):
         self.queue = bytearray(first.encode())
         self.split_at = split_at
         self.blocking = blocking
+        self.ready_at = 0.0          # what follows a later() pause is not there before this
         self.waits = []
         self.replies = replies
         self.echo = echo
@@ -44,11 +57,19 @@ class ScriptChannel:
         self.eof = False
 
     def recv(self, n, timeout):
-        pause = PAUSE.encode()
-        if self.queue.startswith(pause):
-            del self.queue[:len(pause)]
-        if pause in self.queue:
-            n = min(n, self.queue.index(pause))
+        head = _PAUSES.match(bytes(self.queue))
+        if head:
+            del self.queue[:head.end()]
+            if head.group(1):
+                self.ready_at = time.monotonic() + float(head.group(1))
+        wait = self.ready_at - time.monotonic()
+        if wait > 0:
+            time.sleep(min(wait, timeout))
+            if wait > timeout:
+                raise TimeoutError("nothing to read yet")
+        pause = _PAUSES.search(self.queue)
+        if pause:
+            n = min(n, pause.start())
         if self.split_at and self.split_at.encode() in self.queue:
             n = min(n, self.queue.index(self.split_at.encode()) + len(self.split_at))
             self.split_at = None
@@ -86,7 +107,7 @@ class ScriptChannel:
 
     def unread(self):
         """What the device said that nothing read, the pauses left out."""
-        return bytes(self.queue).replace(PAUSE.encode(), b"").decode()
+        return _PAUSES.sub(b"", bytes(self.queue)).decode()
 
 
 def junos_device(**over):
@@ -216,12 +237,13 @@ def test_a_banner_line_shaped_like_a_prompt_does_not_end_the_login():
     learned was the wrong one and every reply after it the one before, so
     the `% Invalid input` for a refused line was read as the reply to `end`
     and the edit said APPLIED. A prompt is the last line with nothing after
-    it, and a login waits SETTLE after one for the device to say more: the
-    edit fails on its refused line, every reply read by the command it
-    answers. Telnet's dialogue reads past a `Password: ` in a banner the
-    same way."""
+    it, however long the device pauses once its line break has come (half
+    a second here, past SETTLE), and a login waits SETTLE after one for the
+    device to say more: the edit fails on its refused line, every reply
+    read by the command it answers. Telnet's dialogue reads past a
+    `Password: ` in a banner the same way."""
     replies = {said: reply + PAUSE for said, reply in IOS_LINES.items()}
-    for banner in ("\r\nAuthorized users only - report misuse to NOC-DESK>\r\n" + PAUSE + "\r\nR1>",
+    for banner in ("\r\nAuthorized users only - report misuse to NOC-DESK>\r\n" + later(0.5) + "\r\nR1>",
                    "\r\nAuthorized users only - report misuse to NOC-DESK>" + PAUSE + "\r\n\r\nR1>",
                    "\r\nAuthorized users only. Report misuse to:\r\nNOC-DESK>" + PAUSE + "\r\n\r\nR1>"):
         ch = ScriptChannel(banner + PAUSE, replies)
@@ -270,14 +292,35 @@ def test_a_reply_line_that_is_the_prompt_does_not_end_the_reply():
     with output is read on until the device has said nothing more for
     SETTLE after its prompt, and must still end with one: each command gets
     its own reply, every word of it."""
-    replies = {"show prompt": "line one\r\nRouter>" + PAUSE + "\r\nline three\r\n\r\nRouter>" + PAUSE,
-               "show version": "Cisco IOS Software\r\n\r\nRouter>" + PAUSE}
-    ch = ScriptChannel("\r\nRouter>" + PAUSE, replies)
+    for prompt_line in ("line one\r\nRouter>" + PAUSE + "\r\nline three",
+                        # its line break come, the prompt line is the reply's however long the pause
+                        "line one\r\nRouter>\r\n" + later(0.5) + "line three",
+                        # what comes during the settle is no prompt, and the read goes on to one
+                        "line one\r\nRouter>" + later(0.05) + "\r\nline three" + later(0.3)):
+        replies = {"show prompt": prompt_line + "\r\n\r\nRouter>" + PAUSE,
+                   "show version": "Cisco IOS Software\r\n\r\nRouter>" + PAUSE}
+        ch = ScriptChannel("\r\nRouter>" + PAUSE, replies)
+        s = Cli(ch, dialects.ios.DIALECT, 5)
+        s.login()
+        assert s.run("show prompt", 5) == "line one\nRouter>\nline three\n"
+        assert s.run("show version", 5) == "Cisco IOS Software\n"
+        assert ch.typed == ["show prompt", "show version"] and ch.unread() == ""
+
+
+def test_the_wait_after_a_prompt_never_runs_past_the_command_timeout():
+    """#141: a reply with output is read on while the device goes on after
+    its prompt, each new prompt waited on again. A device that never stops
+    talking, every write of it ending in the prompt, is read no longer than
+    the command timeout: what came by then, ending in the prompt, is the
+    reply."""
+    stream = "".join(f"x{n}\r\nRouter>" + later(0.05) + "\r\n" for n in range(60))
+    ch = ScriptChannel("\r\nRouter>", {"show stream": stream})
     s = Cli(ch, dialects.ios.DIALECT, 5)
     s.login()
-    assert s.run("show prompt", 5) == "line one\nRouter>\nline three\n"
-    assert s.run("show version", 5) == "Cisco IOS Software\n"
-    assert ch.typed == ["show prompt", "show version"] and ch.unread() == ""
+    started = time.monotonic()
+    out = s.run("show stream", 1)
+    assert time.monotonic() - started < 1.5
+    assert out.startswith("x0\nRouter>\nx1\nRouter>\nx2\n") and not out.endswith("Router>")
 
 
 def test_a_line_that_only_ends_in_the_prompt_never_ends_a_read():
