@@ -1433,9 +1433,11 @@ netconf.guarded_commit(host, user, None, payload, 30, 20, minutes=10,
 `edit()`, `rollback()` and `confirm()` take `comment=` too. Every `comment=` (and `tx.commit()`'s and
 `guarded_commit()`'s) is sent stripped and held to `--comment`'s rule, one line of text of at most 512
 bytes: a line break, an ESC or another control character, only blanks, `''` (no longer dropped) or more
-raises `ValueError` before anything is sent; in `tx.commit()` nothing was committed, so the candidate is
-discarded and the lock released, where a comment PyEZ refused read *commit outcome unknown* and left both to
-a dropped session. `guarded_commit()` logs its confirmation and its rollback with `(confirmed)` and `(rolled
+raises `ValueError` before anything is sent. `tx.commit()` raises it before the commit is sent, after
+`begin()` has locked, loaded and checked: nothing was committed, so the candidate is discarded and the lock
+released, and the error ends `nothing was committed: the candidate was discarded and the lock released`,
+where a comment PyEZ refused read *commit outcome unknown* and left both to a dropped session.
+`guarded_commit()` logs its confirmation and its rollback with `(confirmed)` and `(rolled
 back: checks failed)` after the comment, so its comment leaves them room: 483 bytes at most. The device's
 own "rollback in N min" is what `pending_rollback_minutes` reports, on the latest commit only: once
 confirmed, a commit keeps that note in the history (`note`) but is no longer waiting. `confirm()` commits

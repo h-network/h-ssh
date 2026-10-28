@@ -722,12 +722,16 @@ class Transaction:
             self._finish(rollback=False, unlock=False)
             raise NotAppliedError("NETCONF session lost during the transaction; nothing committed")
         try:
-            comment = check_comment(comment)
+            comment = check_comment(comment, outcome="nothing was committed: the candidate was discarded "
+                                                     "and the lock released")
         except ValueError:
             # An ESC reached PyEZ, which refused it before the RPC was sent,
             # and the except below called that an unknown outcome: the
             # session dropped, the candidate and the lock left to it (#146).
-            # Nothing was sent, so nothing was committed.
+            # No commit was sent, so nothing was committed. begin() has sent
+            # the lock, the load and the check, and the abort sends the
+            # rollback and the unlock: the error says so, not "nothing was
+            # sent".
             self.abort()
             raise
         if not self.diff.strip():

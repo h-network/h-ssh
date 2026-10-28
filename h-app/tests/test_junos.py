@@ -810,15 +810,22 @@ def test_guarded_commit_needs_room_for_the_comments_it_adds(monkeypatch):
     assert len(router.entries[0]["comment"].encode()) == 512
 
 
+TX_REFUSED = "; nothing was committed: the candidate was discarded and the lock released$"
+
+
 def test_a_transaction_refusing_its_comment_rolls_back_and_unlocks():
     """#146: an ESC reached PyEZ, which refused it before the commit RPC was
     built, and the except around the commit took that for a commit in
     flight: `commit outcome unknown`, the session dropped with the candidate
     loaded and the lock held. Nothing was committed: the candidate is
-    discarded and the lock released, and the error says what was wrong."""
+    discarded and the lock released, and the error says what was wrong and
+    that much. It read `nothing was sent to the device`, with the lock, the
+    load, the diff and the commit check sent before it and the rollback and
+    the unlock after."""
     tx = begin()
-    with pytest.raises(ValueError, match=r"^the comment 'cutover \\x1b\[1m' has an ESC; .*nothing was sent"):
+    with pytest.raises(ValueError, match=r"^the comment 'cutover \\x1b\[1m' has an ESC; .*" + TX_REFUSED) as exc:
         tx.commit(confirmed=5, comment="cutover \x1b[1m")
+    assert "nothing was sent" not in str(exc.value)
     assert cfg().names == ["lock", "load", "diff", "commit_check", "rollback", "unlock"] and not tx.open
     assert FakeDevice.instances[0].closed                # given back, not dropped as in doubt
 
@@ -827,7 +834,8 @@ def test_a_transaction_on_pyez_sends_no_commit_for_a_refused_comment(monkeypatch
     """#146, as found: PyEZ's own Config on a device that answers every RPC.
     An ESC in the comment sent no commit RPC and ended `commit outcome
     unknown` with neither rollback nor unlock; now the candidate's rollback
-    and the unlock are what goes out after the commit check."""
+    and the unlock are what goes out after the commit check, and the error
+    says nothing was committed, not that nothing was sent."""
     pytest.importorskip("jnpr.junos")
     from lxml import etree
     from jnpr.junos.rpcmeta import _RpcMetaExec
@@ -851,7 +859,7 @@ def test_a_transaction_on_pyez_sends_no_commit_for_a_refused_comment(monkeypatch
     monkeypatch.setattr(netconf, "JunosDevice", Dev)
     monkeypatch.setattr(netconf, "JunosConfig", Config)
     tx = netconf.begin("10.0.0.1", "u", "p", "set system location x\n", 5, 30)
-    with pytest.raises(ValueError, match="has an ESC"):
+    with pytest.raises(ValueError, match="has an ESC; .*" + TX_REFUSED):
         tx.commit(confirmed=5, comment="cutover \x1b[1m")
     tags = [etree.fromstring(r).tag for r in sent]
     assert tags == ["lock-configuration", "load-configuration", "get-configuration", "commit-configuration",

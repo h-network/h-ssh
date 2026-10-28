@@ -498,19 +498,21 @@ def comment_fault(comment: str) -> Optional[str]:
     return None
 
 
-def check_comment(comment) -> Optional[str]:
+def check_comment(comment, outcome: str = "nothing was sent to the device") -> Optional[str]:
     """The commit comment to send: `comment` stripped of the blanks around
     it (the line break a YAML block ends with among them), or None for none.
     One that cannot be logged as it is (comment_fault) is a ValueError,
     raised before anything is sent: a line break, a control character, only
-    blanks, '' or over 512 bytes."""
+    blanks, '' or over 512 bytes. Its text ends with `outcome`, what the
+    refusal leaves on the device: nothing sent, or for a Transaction's
+    commit(), which begin() has locked, loaded and checked, its own."""
     if comment is None:
         return None
     if not isinstance(comment, str):
-        raise ValueError(f"the comment must be text, not {type(comment).__name__}; nothing was sent to the device")
+        raise ValueError(f"the comment must be text, not {type(comment).__name__}; {outcome}")
     fault = comment_fault(comment.strip())
     if fault:
-        raise ValueError(f"the comment {comment!r} {fault}; {COMMENT_RULE}; nothing was sent to the device")
+        raise ValueError(f"the comment {comment!r} {fault}; {COMMENT_RULE}; {outcome}")
     return comment.strip()
 
 
