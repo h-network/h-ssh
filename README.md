@@ -633,7 +633,8 @@ driver pairing one with an existing transport, without a fork of h-ssh. Four pie
 
 **A dialect file.** A `Dialect` (`hssh/dialects/base.py`) is everything h-ssh knows about the device
 and nothing about connections; `hssh/dialects/ios.py` is the smallest that defines its own CLI, and
-`nxos.py` and `eos.py` reuse it in a few lines.
+`nxos.py` and `eos.py` reuse it in a few lines. A field h-ssh adds goes after the ones it had, so a
+dialect that gives its fields in order, not by name, keeps each where it was.
 
 | Field | What it is |
 |---|---|
@@ -1524,7 +1525,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1367 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1368 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

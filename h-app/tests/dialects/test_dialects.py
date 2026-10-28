@@ -12,7 +12,7 @@ import pytest
 
 from hssh import cli, core, dialects, drivers, runner
 from hssh.core import Target, refusal_line, resolve_command, get_available_commands
-from hssh.dialects.base import CliSyntax, Dialect
+from hssh.dialects.base import CliSyntax, Dialect, is_read
 from hssh.transports import telnet
 from tests.test_cli_runfile import run as run_cli
 
@@ -146,6 +146,18 @@ def test_the_dialect_says_what_starts_a_comment():
     assert core.set_file_payload("! a\n  ! b\n\n# c\n", dialects.eos.DIALECT.comment_prefixes) == ""
     assert core.set_file_payload("! a\n  ! b\n\n# c\n", dialects.none.DIALECT.comment_prefixes) == "! a\n  ! b\n"
     assert core.set_file_payload("! a\n# c\nset x\n") == "! a\nset x\n"        # '#' alone, as before
+
+
+def test_a_dialect_built_with_its_fields_in_order_keeps_them():
+    """#142: `informational` went in between `refused` and `cli`, so every
+    field after it moved one place along: a package's `Dialect("acme",
+    "AcmeOS", "x", None, None, is_read, REFUSED, CLI)` got no CLI, its
+    edits refused for want of one, and a CliSyntax for its
+    `informational`. The fields #142 adds come after the ones it had."""
+    refused, pending = re.compile(r"^\s*% ", re.M), re.compile(r"rollback in (\d+)mins")
+    d = Dialect("acme", "AcmeOS", "x", None, None, is_read, refused, dialects.ios.CLI, pending)
+    assert d.refused is refused and d.cli is dialects.ios.CLI and d.commit_pending is pending
+    assert d.informational is None and d.comments == () and d.comment_prefixes == ("#",)
 
 
 def test_a_cli_that_commits_needs_compare_and_discard():

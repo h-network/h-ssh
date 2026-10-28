@@ -72,13 +72,15 @@ class Dialect:
     check_edit: Optional[Callable[[str, bool], Tuple[bool, str]]] = None
     is_read: Callable[[str], bool] = is_read
     refused: Optional[re.Pattern] = None   # a line in which the CLI refused the command (MULTILINE)
+    cli: Optional[CliSyntax] = None
+    commit_pending: Optional[re.Pattern] = None   # group 1: minutes left on a pending commit-confirmed
+    # A new field goes last (#142): a package that built its Dialect with
+    # the fields above in order, not by name, keeps each where it was.
     # A line in which the CLI took the command and warned about it, though
     # `refused` may match it (MULTILINE): no refusal, and a lines edit goes
     # on and reports it with its result. None: every line `refused` matches
     # is one.
     informational: Optional[re.Pattern] = None
-    cli: Optional[CliSyntax] = None
-    commit_pending: Optional[re.Pattern] = None   # group 1: minutes left on a pending commit-confirmed
     # What starts a full-line comment in an edit payload besides h-ssh's own
     # `#`, which is one on every driver (#133): IOS's `!`. See comment_prefixes.
     comments: Tuple[str, ...] = ()
