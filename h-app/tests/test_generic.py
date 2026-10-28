@@ -1885,3 +1885,14 @@ def test_a_lost_session_is_tried_again_for_a_read_and_fails_an_edit_once(exec_ss
     assert edit.result is None and "APPLIED" not in edit.text
     assert sent == ["set system host-name r1"]
 
+
+def test_a_refusal_on_stdout_fails_the_show_whatever_stderr_says(exits_with):
+    """#143: a device that wrote anything to stderr (a warning) had its
+    refusal of the show on stdout at exit 0 taken for the show's output."""
+    exits_with(0, stderr=b"warning: y\n", stdout=b"error: syntax error, expecting <command>: %s\n")
+    refused = "'show foo' was refused by the device: error: syntax error, expecting <command>: show foo"
+    with pytest.raises(RuntimeError) as failed:
+        ssh.show("10.0.0.1", "u", "p", "show foo", 5, 10)
+    assert str(failed.value) == refused
+    assert list(ssh.show_batch("10.0.0.1", "u", "p", ["show foo"], 5, 10)) == [
+        {"command": "show foo", "ok": False, "error": refused}]

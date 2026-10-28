@@ -52,6 +52,20 @@ def test_refused_reply_is_a_refusal_that_opens_the_reply():
     assert refused_reply("", "") is None and refused_reply("", "100% done\n") is None
 
 
+def test_a_line_on_stderr_does_not_hide_a_refusal_that_opens_stdout():
+    """#143: refused_reply stopped at the first line of the first text it
+    was given, stderr's: a warning there, or a login message, hid the
+    refusal opening stdout, and `show foo` was an OK show with the refusal
+    for its output, stored as the baseline. The reply is stdout, judged
+    first; stderr only when stdout says nothing."""
+    from hssh.core import refused_reply
+    refusal = "error: syntax error, expecting <command>"
+    assert refused_reply("warning: y", refusal) == refusal
+    assert refused_reply("Welcome to r1\n", "\n" + refusal + ": foo\n", dialect=drivers.JUNOS) == refusal + ": foo"
+    assert refused_reply("error: in maintenance window\n", "Hostname: r1\n", dialect=drivers.JUNOS) is None
+    assert refused_reply("% Invalid input detected\n", "\n   \n") == "% Invalid input detected"
+
+
 @pytest.fixture
 def fake_ssh(tmp_path, monkeypatch):
     bindir = tmp_path / "bin"
