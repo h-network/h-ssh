@@ -82,6 +82,36 @@ def is_echo(line: str, cmd: str) -> bool:
     return line.strip().endswith(cmd.strip())
 
 
+def render(line: str) -> str:
+    """One line as a terminal shows it: a carriage return goes back to its
+    start and a backspace one column, and what is written there overwrites
+    what was."""
+    shown, col = [], 0
+    for ch in line:
+        if ch == "\r":
+            col = 0
+        elif ch == "\b":
+            col = max(0, col - 1)
+        else:
+            if col < len(shown):
+                shown[col] = ch
+            else:
+                shown.append(ch)
+            col += 1
+    return "".join(shown)
+
+
+def shown_echo(shown: str, cmd: str) -> bool:
+    """The echo of `cmd` on a line as a terminal shows it: the command at its
+    end or, when a Junos CLI narrower than the line scrolled it (an 80-column
+    pty: `ssh -tt` on pipes), the command's end after the CLI's `...`."""
+    shown, cmd = shown.rstrip(), cmd.strip()
+    if shown.endswith(cmd):
+        return True
+    _, dots, tail = shown.rpartition("...")
+    return bool(dots) and len(tail) >= 8 and cmd.endswith(tail)
+
+
 def drawn_echo(line: str, cmd: str, prompt: re.Pattern) -> bool:
     """The echo as a pty draws it: the command, after nothing or after a
     prompt. A banner line that merely ends in the command (`Edits: always
@@ -512,6 +542,12 @@ class Cli:
             lines, echoed = lines[echo + 1:], echo >= 0
         elif lines and is_echo(lines[0], cmd):
             lines, echoed = lines[1:], True
+        elif self.echoes and cmd.strip():
+            # A CLI narrower than the line redraws it as it is typed: the
+            # echo is one line on the terminal, several to splitlines().
+            first = clean.split("\n", 1)[0]
+            if shown_echo(render(first), cmd):
+                lines, echoed = lines[len(first.splitlines()):], True
         if lines and self._is_prompt(lines[-1], prompt_re):
             lines = lines[:-1]
         while self.cli.context and lines and self.cli.context.match(lines[-1].strip()):

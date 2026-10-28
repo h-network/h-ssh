@@ -425,6 +425,43 @@ def test_a_line_of_an_edit_is_not_waited_on(banner):
     assert len(stamps) == 1000 and (stamps[-1] - stamps[0]) / 999 < 0.003
 
 
+def test_a_long_line_junos_scrolls_on_a_narrow_pty_is_not_waited_on():
+    """#141 live check: on `junos@openssh` (an 80-column pty) a 200-line dry
+    run took 34 s instead of 5. Junos draws a set line longer than the pty
+    as it is typed, then scrolls it: its start, a carriage return, the
+    prompt and `...` with the line's end, spaces and backspaces over them.
+    That echo, several lines to splitlines(), was taken for output and each
+    line of the edit waited SETTLE. It is the echo; a refusal after it
+    still fails the edit."""
+    def scrolled(line):
+        if len(line) <= 50:
+            return line
+        return line[:50] + "\rlab@R1# ..." + line[-30:-2] + " " * 22 + "\b" * 22 + line[-2:] + " "
+
+    def line_of_an_edit(line):
+        assert not (ch.waits and (ch.waits[-1] or "").startswith("set ")), "a set line's reply was waited on"
+        stamps.append(time.monotonic())
+        return ("\r\nerror: invalid prefix" if "bogus" in line else "") + cfg
+
+    stamps, cfg = [], "\r\n\r\n[edit]\r\nlab@R1# "
+    junos = junos_device(**{"configure": "\r\nEntering configuration mode" + cfg, "set": line_of_an_edit,
+                            "show | compare": "\r\n[edit policy-options]\r\n+  prefix-list big { ... }" + cfg,
+                            "rollback": "\r\nload complete" + cfg})
+    ch = ScriptChannel("\r\n" + OP, junos, blocking=True, echo=scrolled)
+    s = Cli(ch, dialects.junos.DIALECT, 5, echoes=True)
+    s.login()
+    payload = "".join(f"set policy-options prefix-list lab141-big 192.0.2.{n}/32\n" for n in range(1, 201))
+    r = s.edit_candidate(payload, dry_run=True)
+    assert r.status == R.DRY_RUN and ch.waits == [None, "configure exclusive", "show | compare", "rollback 0", "exit"]
+    assert len(stamps) == 200 and (stamps[-1] - stamps[0]) / 199 < 0.003
+    ch = ScriptChannel("\r\n" + OP, junos, echo=scrolled)
+    s = Cli(ch, dialects.junos.DIALECT, 5, echoes=True)
+    s.login()
+    with pytest.raises(RuntimeError, match=r"^'set policy-options prefix-list lab141-big bogus/32': error: invalid prefix$"):
+        s.edit_candidate("set policy-options prefix-list lab141-big 192.0.2.1/32\n"
+                         "set policy-options prefix-list lab141-big bogus/32\n", dry_run=True)
+
+
 def test_a_line_whose_echo_the_cli_redraws_is_not_waited_on():
     """#141 review: a reply that is only the echo and the prompt is not
     waited on, and the echo was known only as the line typed. A Junos CLI
