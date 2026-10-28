@@ -17,7 +17,7 @@ from ..dialects.base import Dialect
 from ..drivers import results as R
 from .cli import (Cli, LOGIN_RE, PASSWORD_RE, MORE_PATTERNS, strip_ansi as _strip_ansi,  # noqa: F401
                   edit_policy, refuse_comment as _refuse_comment, refuse_commit_lines as _refuse_commit_lines,
-                  refuse_control_characters as _refuse_control_characters,
+                  refuse_command as _refuse_command, refuse_control_characters as _refuse_control_characters,
                   refuse_credentials as _refuse_credentials)
 
 AVAILABLE = True  # Raw sockets, always available
@@ -165,7 +165,10 @@ def confirm(host: str, user: str, passwd: str,
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
          port: int = None, vendor_hint: str = "telnet") -> str:
-    """Send a single show command via raw-socket telnet."""
+    """Send a single show command via raw-socket telnet. One the engine would
+    not type, a control character or a Tab in it, is a ValueError before the
+    socket is opened (cli.refuse_command)."""
+    _refuse_command(cmd)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23,
                                  session_timeout, _dialect(vendor_hint))
     try:
@@ -207,7 +210,11 @@ def edit(host: str, user: str, passwd: str, payload: str,
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
                port: int = None, vendor_hint: str = "telnet") -> R.BatchResult:
-    """Execute multiple show commands on a single telnet connection."""
+    """Execute multiple show commands on a single telnet connection. A batch
+    with a command the engine would not type in it is a ValueError before the
+    socket is opened, as the CLI refuses a batch with a line it cannot send."""
+    for cmd in cmds:
+        _refuse_command(cmd)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23,
                                  session_timeout, _dialect(vendor_hint))
     try:

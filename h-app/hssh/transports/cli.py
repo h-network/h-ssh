@@ -84,6 +84,16 @@ def refuse_control_characters(payload: str) -> None:
                          "nothing was sent to the device")
 
 
+def refuse_command(cmd: str) -> None:
+    """A command Cli.run would not type, a control character or a Tab in it
+    (a CLI completes the word on a Tab), refused before the device is
+    contacted: the same refusal comes on every attempt."""
+    what = control_character(cmd, tabs=False)
+    if what:
+        raise ValueError(f"{cmd!r} has {what}, which a CLI takes as a key, not as text; "
+                         "nothing was sent to the device")
+
+
 def refuse_comment(comment: Optional[str]) -> None:
     """confirm()'s comment goes on the commit line in double quotes: a line
     break in it runs what follows as commands of their own (`rollback 1`, a

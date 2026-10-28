@@ -856,3 +856,39 @@ def test_a_show_refused_for_its_password_is_tried_once():
         assert took < 1 and dev.connected() == 0
     finally:
         dev.close()
+
+
+def test_a_show_or_batch_line_the_engine_would_not_type_is_refused_before_connecting():
+    """#139 review: `-sC 'show version<TAB>'` on telnet-junos logged in, was
+    refused by the engine before it was typed, and was tried twice more:
+    three logins for a command that can never be sent. A show, or a batch
+    with such a line in it, is refused before the socket is opened, as the
+    CLI refuses a batch with a line it cannot send, and is a FAIL of that
+    device tried once."""
+    from hssh import runner
+    from hssh.core import Target
+    from hssh.transports import telnet
+    dev = NoDevice()
+    try:
+        for cmd, what in (("show version\t", "a Tab"), ("show version\nrequest system reboot", "a line break"),
+                          ("show version\x1b[A", "an ESC")):
+            said = f"{cmd!r} has {what}, which a CLI takes as a key, not as text; nothing was sent to the device"
+            with pytest.raises(ValueError) as refused:
+                telnet.show("127.0.0.1", "lab", "pw", cmd, 1, 1, port=dev.port, vendor_hint="telnet-junos")
+            assert str(refused.value) == said
+            with pytest.raises(ValueError) as refused:
+                telnet.show_batch("127.0.0.1", "lab", "pw", ["show version", cmd], 1, 1, port=dev.port,
+                                  vendor_hint="telnet-ios")
+            assert str(refused.value) == said
+        t0 = time.monotonic()
+        r = runner.run_for_target(
+            t=Target("R1", "127.0.0.1", "telnet-junos", dev.port), transport="telnet-junos", mode="show",
+            show_cmd="show version\t", edit_cmd=None, config_dir=None, broadcast_file=None, user="lab", passwd="pw",
+            session_timeout=1, command_timeout=1, dry_run=False, commit_confirmed=None, save_dir=None, quiet=True,
+            max_attempts=3)
+        took = time.monotonic() - t0
+        assert r.ok is False and r.error == ("'show version\\t' has a Tab, which a CLI takes as a key, not as text; "
+                                             "nothing was sent to the device")
+        assert took < 1 and dev.connected() == 0
+    finally:
+        dev.close()

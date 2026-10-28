@@ -460,8 +460,9 @@ contacted, nothing sent. The CLI refuses a control character in `-eC`, `-eD`, `-
 driver before the run starts (exit 2) and lets a Tab through: it is text to `junos`, whose `load set`
 reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at no CLI. A set file
 indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
-`telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it fails
-without being typed. The login dialogue is held to the same rule: a username with a control character or
+`telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it, or a
+batch with such a line, is refused before the socket is opened, `show()` and `show_batch()` for a library
+caller too. The login dialogue is held to the same rule: a username with a control character or
 a Tab in it, or a password with a control character (a Tab is text at a password prompt), is refused by
 the telnet drivers before they connect, a `ValueError` for a library caller too, and the engine types
 neither at a login prompt on any channel. None of these refusals is tried again.
@@ -1441,7 +1442,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1291 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1292 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
