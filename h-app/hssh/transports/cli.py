@@ -15,7 +15,7 @@ import re
 import time
 from typing import Callable, Optional
 
-from ..core import check_confirm_minutes, refusal_line
+from ..core import check_confirm_minutes, control_character, control_line, refusal_line
 from ..dialects.base import CliSyntax, Dialect
 from ..drivers import results as R
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
@@ -69,14 +69,95 @@ def complaint(output: str, dialect: Dialect) -> str:
     return output.strip()
 
 
+def refuse_control_characters(payload: str) -> None:
+    """A CLI acts on a control character as it is typed: ^C drops the line
+    typed so far, ^U kills it, DEL rubs out the character before it, a Tab
+    completes the word. What is left of the line then runs as typed: `set
+    system host-name x`, ^C, `commit comment y` commits for good, dry run or
+    not. Every line the engine types is plain text, line breaks only between
+    lines; a C0 or C1 control character, DEL or a Tab is refused before the
+    device is contacted."""
+    found = control_line(payload, tabs=False)
+    if found:
+        _, line, what = found
+        raise ValueError(f"{line!r} has {what}, which a CLI takes as a key, not as text; "
+                         "nothing was sent to the device")
+
+
+def refuse_command(cmd: str) -> None:
+    """A command Cli.run would not type, a control character or a Tab in it
+    (a CLI completes the word on a Tab), refused before the device is
+    contacted: the same refusal comes on every attempt."""
+    what = control_character(cmd, tabs=False)
+    if what:
+        raise ValueError(f"{cmd!r} has {what}, which a CLI takes as a key, not as text; "
+                         "nothing was sent to the device")
+
+
+def refuse_comment(comment: Optional[str]) -> None:
+    """confirm()'s comment goes on the commit line in double quotes: a line
+    break in it runs what follows as commands of their own (`rollback 1`, a
+    second commit), another control character or a Tab is a key to the CLI,
+    and a double quote ends the comment, the rest read as more of the
+    commit. Refused before the device is contacted."""
+    if not comment:
+        return
+    what = control_character(comment, tabs=False)
+    if what:
+        raise ValueError(f"the comment {comment!r} has {what}, which a CLI takes as a key, not as text; "
+                         "nothing was sent to the device")
+    if '"' in comment:
+        raise ValueError(f"the comment {comment!r} has a double quote, which would end it on the commit line; "
+                         "nothing was sent to the device")
+
+
+def credential_fault(user: Optional[str], passwd: Optional[str]) -> Optional[str]:
+    """What keeps a username or password from being typed at a login prompt,
+    or None. A line break ends the answer there, and what follows it runs as
+    commands once the login succeeds, a `commit` too; ^C, ^U, DEL and the
+    other control characters are keys to the prompt. A Tab is text in a
+    password, which the prompt does not complete; a username has none.
+    Neither is quoted: what follows a line break in a username may well be
+    the password."""
+    what = control_character(user or "", tabs=False)
+    if what:
+        return f"the username has {what}"
+    what = control_character(passwd or "")
+    if what:
+        return f"the password has {what}"
+    return None
+
+
+def refuse_credentials(user: Optional[str], passwd: Optional[str]) -> None:
+    """A username or password a login dialogue would type with a control
+    character in it (credential_fault), refused before the device is
+    contacted."""
+    fault = credential_fault(user, passwd)
+    if fault:
+        raise ValueError(f"{fault}, which a login prompt takes as a key, not as text; "
+                         "nothing was sent to the device")
+
+
+# The shortest word a Junos CLI completes to `commit` in configuration mode:
+# it takes a unique prefix of a command, and `co` is `copy` as well.
+_COMMIT_SHORTEST = 3
+
+
 def refuse_commit_lines(payload: str) -> None:
     """`commit` typed inside configure mode would commit (and confirm any
     pending timer) halfway through a payload. A confirm is `-eC "commit"`
     on its own, which confirm() handles; here it is refused before the
-    device is contacted."""
+    device is contacted. The word is the line's first, whatever whitespace
+    follows it, with a closing ';' taken off: `commit;` is a commit to the
+    set-syntax guard too (dialects.junos.check_edit), and for a library
+    caller this is the only rail. The CLI completes `com`, `comm` and
+    `commi` to `commit` as it does `sh` to `show`, so they are refused too."""
     for line in payload.strip().splitlines():
-        if line.strip().split(" ")[0] == "commit":
-            raise ValueError("'commit' is not configuration; a pending commit-confirmed is confirmed "
+        words = line.split()
+        word = words[0].rstrip(";") if words else ""
+        if len(word) >= _COMMIT_SHORTEST and "commit".startswith(word):
+            said = "'commit'" if word == "commit" else f"{word!r} is 'commit' to a Junos CLI, and 'commit'"
+            raise ValueError(f"{said} is not configuration; a pending commit-confirmed is confirmed "
                              "with -eC \"commit\" alone. Nothing was sent to the device")
 
 
@@ -106,7 +187,9 @@ class Cli:
     # --- the wire -------------------------------------------------------------
 
     def _send(self, data: str) -> None:
-        self.channel.send(data.encode("utf-8", errors="replace"))
+        # Strict: a character that cannot be encoded is never replaced by a
+        # '?', which a Junos CLI takes as a request for help (#139).
+        self.channel.send(data.encode("utf-8"))
 
     def _read_until(self, done: Callable[[str], bool], timeout: int, buffer: str = "") -> str:
         """Read until done(text) matches the cleaned buffer.
@@ -187,11 +270,21 @@ class Cli:
         detail = f": {said}" if said else " (the device asked for credentials again)"
         raise NotAppliedError(f"login failed{detail}")
 
+    @staticmethod
+    def _refuse_typing(user: Optional[str], passwd: Optional[str]) -> None:
+        """The login dialogue types a credential as it is: one the prompt
+        would take as keys is not typed (credential_fault)."""
+        fault = credential_fault(user, passwd)
+        if fault:
+            raise ValueError(f"{fault}, which a login prompt takes as a key, not as text; it was not sent")
+
     def login(self, user: Optional[str], passwd: Optional[str]) -> None:
         """Get to a prompt. Raises NotAppliedError when the device rejects the
         credentials or shows no prompt within session_timeout, even after an
         Enter: no command was sent, and the runner treats a failed login as
-        permanent. The channel is closed on any failure."""
+        permanent. A username or password with a control character in it is
+        a ValueError before either is typed. The channel is closed on any
+        failure."""
         timeout = self.session_timeout
         try:
             try:
@@ -206,6 +299,7 @@ class Cli:
 
             last = initial
             if LOGIN_RE.search(initial):
+                self._refuse_typing(user, passwd)
                 self._send((user or "") + "\n")
                 last = self._read_until_prompt_or_login(timeout)
                 if PASSWORD_RE.search(last):
@@ -213,6 +307,7 @@ class Cli:
                     last = self._read_until_prompt_or_login(timeout)
                 self._check_login(last)
             elif PASSWORD_RE.search(initial):
+                self._refuse_typing(None, passwd)
                 self._send((passwd or "") + "\n")
                 last = self._read_until_prompt_or_login(timeout)
                 self._check_login(last)
@@ -248,7 +343,13 @@ class Cli:
         a config line that itself ends in prompt-shaped text (`description
         noc@example.com>`) once satisfied the match on its echo, left the real
         reply in the socket, and shifted every later read by one reply, so a
-        commit the device refused was reported as COMMIT OK."""
+        commit the device refused was reported as COMMIT OK.
+
+        A command with a control character or a Tab in it is not typed: the
+        CLI would take it as a key (refuse_control_characters)."""
+        what = control_character(cmd, tabs=False)
+        if what:
+            raise ValueError(f"{cmd!r} has {what}, which a CLI takes as a key, not as text; it was not sent")
         self._send(cmd + "\n")
         prompt_re = self.prompt_re
 
@@ -299,6 +400,7 @@ class Cli:
     def edit_lines(self, payload: str) -> R.EditResult:
         """Config mode without a candidate: configure terminal -> commands -> end."""
         cli = self.cli
+        refuse_control_characters(payload)
         self.run(cli.config_enter, 10)
 
         errors = []
@@ -327,9 +429,13 @@ class Cli:
         pending changes, and the device refuses entry while someone else holds
         the lock - reported before any set line is sent. With `expected_diff`
         (what a dry run showed) the candidate is committed only if
-        `show | compare` says the same again.
+        `show | compare` says the same again. An empty compare is NO CHANGES,
+        the candidate discarded and no commit typed, as over NETCONF: a
+        commit there would arm a timer over nothing, and on Junos confirm
+        another user's pending commit confirmed.
         """
         d, cli = self.dialect, self.cli
+        refuse_control_characters(payload)
         refuse_commit_lines(payload)
         reply = self.run(cli.config_enter, 10)
         if d.refused.search(reply):
@@ -347,7 +453,7 @@ class Cli:
         diff = self.run(cli.compare, 30).strip()
         changed = expected_diff is not None and diff != expected_diff.strip()
 
-        if dry_run or errors or changed:
+        if dry_run or errors or changed or not diff:
             self.leave_quietly(cli.discard, cli.config_exit)
             if errors:
                 raise RuntimeError("; ".join(errors))
@@ -376,8 +482,6 @@ class Cli:
 
         self.leave_quietly(cli.config_exit)
 
-        if not diff:
-            return R.EditResult(R.NO_CHANGES)
         if confirmed_minutes and confirmed_minutes > 0:
             return R.EditResult(R.CONFIRMED, diff=diff, minutes=confirmed_minutes)
         return R.EditResult(R.COMMITTED, diff=diff)
@@ -388,6 +492,7 @@ class Cli:
         means the timer expired or it was confirmed already; a commit now
         would hide that from the operator."""
         d, cli = self.dialect, self.cli
+        refuse_comment(comment)
         history = self.run("show system commit", command_timeout)
         if not pending_in(history, d):
             raise NothingToConfirmError(

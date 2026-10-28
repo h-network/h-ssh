@@ -16,7 +16,9 @@ from .. import drivers
 from ..dialects.base import Dialect
 from ..drivers import results as R
 from .cli import (Cli, LOGIN_RE, PASSWORD_RE, MORE_PATTERNS, strip_ansi as _strip_ansi,  # noqa: F401
-                  edit_policy, refuse_commit_lines as _refuse_commit_lines)
+                  edit_policy, refuse_comment as _refuse_comment, refuse_commit_lines as _refuse_commit_lines,
+                  refuse_command as _refuse_command, refuse_control_characters as _refuse_control_characters,
+                  refuse_credentials as _refuse_credentials)
 
 AVAILABLE = True  # Raw sockets, always available
 
@@ -127,7 +129,12 @@ def _connect_and_login(host: str, user: Optional[str], passwd: Optional[str],
                        port: int, session_timeout: int, dialect: Dialect) -> Cli:
     """Open the socket, negotiate telnet, log in: a CLI session at a prompt.
     Raises NotAppliedError when the device rejects the credentials or shows no
-    prompt within session_timeout, even after an Enter."""
+    prompt within session_timeout, even after an Enter. The login dialogue
+    types the username and the password as they are: one with a control
+    character in it (a line break would run the rest as commands once the
+    login succeeds) is a ValueError before the socket is opened, for every
+    function here."""
+    _refuse_credentials(user, passwd)
     channel = TelnetChannel.connect(host, port, session_timeout)
     session = Cli(channel, dialect, session_timeout, initial=channel.initial)
     session.login(user, passwd)
@@ -141,10 +148,13 @@ def confirm(host: str, user: str, passwd: str,
     """Confirm a pending commit-confirmed on a telnet-junos device: configure
     exclusive, a bare `commit` (`commit comment "…"` with a comment), exit.
     Without this the runner handed the word `commit` to the edit path, which
-    committed twice and reported someone else's diff."""
+    committed twice and reported someone else's diff. A comment with a
+    control character, a Tab or a double quote in it is refused before
+    connecting (cli.refuse_comment)."""
     d = _dialect(vendor_hint)
     if d.commit_pending is None or not d.cli.has_candidate:
         raise ValueError(f"confirm is only for telnet-junos, not {vendor_hint}; nothing was sent")
+    _refuse_comment(comment)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23, session_timeout, d)
     try:
         return session.confirm(command_timeout, comment)
@@ -155,7 +165,10 @@ def confirm(host: str, user: str, passwd: str,
 def show(host: str, user: str, passwd: str, cmd: str,
          session_timeout: int, command_timeout: int,
          port: int = None, vendor_hint: str = "telnet") -> str:
-    """Send a single show command via raw-socket telnet."""
+    """Send a single show command via raw-socket telnet. One the engine would
+    not type, a control character or a Tab in it, is a ValueError before the
+    socket is opened (cli.refuse_command)."""
+    _refuse_command(cmd)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23,
                                  session_timeout, _dialect(vendor_hint))
     try:
@@ -176,10 +189,12 @@ def edit(host: str, user: str, passwd: str, payload: str,
     back, armed with a timer, or checked against the diff a dry run showed).
     An IOS-style flavour cannot honour them, so asking is a ValueError
     before anything is sent, never a dry run that lands or a commit with no
-    timer.
+    timer. So is a line with a control character or a Tab in it, which the
+    CLI would take as a key (cli.refuse_control_characters).
     """
     d = _dialect(vendor_hint)
     edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
+    _refuse_control_characters(payload)
     if d.cli.has_candidate:
         _refuse_commit_lines(payload)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23, session_timeout, d)
@@ -195,7 +210,11 @@ def edit(host: str, user: str, passwd: str, payload: str,
 def show_batch(host: str, user: str, passwd: str, cmds: List[str],
                session_timeout: int, command_timeout: int,
                port: int = None, vendor_hint: str = "telnet") -> R.BatchResult:
-    """Execute multiple show commands on a single telnet connection."""
+    """Execute multiple show commands on a single telnet connection. A batch
+    with a command the engine would not type in it is a ValueError before the
+    socket is opened, as the CLI refuses a batch with a line it cannot send."""
+    for cmd in cmds:
+        _refuse_command(cmd)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23,
                                  session_timeout, _dialect(vendor_hint))
     try:

@@ -286,6 +286,23 @@ def test_the_shell_is_ssh_tt_on_pipes_with_the_password_through_askpass(device, 
     assert "BatchMode=yes" in keyed and "SSH_ASKPASS" not in keyed_kwargs["env"]
 
 
+def test_the_shell_ssh_has_no_escape_character(device, monkeypatch):
+    """#139: with a forced tty ssh reads a ~ at the start of a typed line as
+    a command to itself (~R rekeys, ~B sends a break) and types the rest, so
+    `~Rcommit comment x` reached the device as `commit comment x`, past the
+    commit rail, under a dry run. The shell's ssh has no escape character."""
+    seen = []
+    real = subprocess.Popen
+
+    def spy(argv, **kwargs):
+        if "-tt" in argv:
+            seen.append(argv)
+        return real(argv, **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", spy)
+    junos_edit()
+    (argv,) = seen
+    assert argv[argv.index("-e") + 1] == "none"
+
 def test_a_dry_run_shows_the_diff_and_rolls_the_candidate_back(device):
     result = junos_edit(dry_run=True)
     assert result.status == R.DRY_RUN and result.diff == "[edit system]\n+  host-name test;"
@@ -328,6 +345,23 @@ def test_a_refused_commit_is_failed_and_the_candidate_discarded(device):
 def test_a_commit_line_in_the_payload_is_refused_before_connecting(no_ssh):
     with pytest.raises(ValueError, match="'commit' is not configuration"):
         junos_edit("set system host-name test\ncommit\n")
+
+
+def test_a_payload_or_comment_the_cli_would_take_as_keys_is_refused_before_connecting(no_ssh):
+    """#139: ^C, ^U and DEL in a set line are keys to the Junos line editor
+    on the pty, and what follows them ran as a line of its own, a commit
+    for good under a dry run too; a Tab completes the word; a line break or
+    a double quote in a confirm's comment typed more than the comment.
+    Refused before ssh is started, on every dialect typed at the pty."""
+    for payload in ("set system host-name x\x03commit comment y\n", "set a\x15commit\n",
+                    "set " + "\x7f" * 4 + "commit\n", "set system\thost-name x\n"):
+        with pytest.raises(ValueError, match="which a CLI takes as a key, not as text; nothing was sent to the device"):
+            junos_edit(payload, dry_run=True)
+        with pytest.raises(ValueError, match="nothing was sent to the device"):
+            openssh.edit("10.0.0.1", "u", "p", payload, 5, 10, vendor_hint="eos@openssh")
+    for comment in ('x"\nrollback 1\ncommit', 'x"'):
+        with pytest.raises(ValueError, match="the comment .* nothing was sent to the device"):
+            openssh.confirm("10.0.0.1", "lab", "hunter2", 5, 10, vendor_hint="junos@openssh", comment=comment)
 
 
 # --- confirm ----------------------------------------------------------------------------

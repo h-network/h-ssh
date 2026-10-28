@@ -619,6 +619,62 @@ def test_a_commit_line_in_a_junos_payload_is_refused_before_connecting(no_connec
         ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\ncommit\n", 5, 10, vendor_hint="junos@ssh")
 
 
+def test_a_commit_line_ending_in_a_semicolon_is_refused_before_connecting(no_connection):
+    """#139: `commit;` went past the commit rail, which for a library
+    caller is the only one, and was typed in configure mode, a dry run
+    too."""
+    for payload in ("commit;\n", "set system host-name test\ncommit;\n"):
+        with pytest.raises(ValueError, match="'commit' is not configuration"):
+            ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="junos@ssh", dry_run=True)
+
+
+def test_an_abbreviated_commit_line_is_refused_before_connecting(no_connection):
+    """#139 review: `ssh.edit(payload='set a b\\ncom\\n', vendor_hint='junos@ssh')`
+    passed the commit rail and typed `com` in configure mode, which a Junos
+    CLI completes to `commit`, a dry run too. Refused before connecting."""
+    for payload in ("set system host-name test\ncom\n", "comm;\n", "commi confirmed 1\n"):
+        with pytest.raises(ValueError, match="is 'commit' to a Junos CLI, and 'commit' is not configuration"):
+            ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="junos@ssh", dry_run=True)
+
+
+# ^C, ^U and DEL, which the Junos line editor acts on as they arrive, a Tab, which completes the word, and
+# an ESC or a C1 CSI, which starts a key sequence (#139)
+KEYS = ["set system host-name x\x03commit comment y\n", "set a\x15commit\n", "set " + "\x7f" * 4 + "commit\n",
+        "\tset system host-name x\n", "set a\x1b[2Kcommit\n", "set a\x9b2Kcommit\n"]
+
+
+def test_a_payload_the_cli_engine_would_take_as_keys_is_refused_before_connecting(no_connection):
+    """#139: a ^C inside a set line, then `commit comment ...`: the device
+    dropped the line at the ^C and ran the rest, a commit for good, while a
+    dry run said DRY-RUN. Every dialect typed at a shell refuses it, and a
+    confirm comment that would type more than the comment, before
+    connecting; the plain ssh driver runs no shell."""
+    for payload in KEYS:
+        with pytest.raises(ValueError, match="which a CLI takes as a key, not as text; nothing was sent to the device"):
+            ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="junos@ssh", dry_run=True)
+        with pytest.raises(ValueError, match="nothing was sent to the device"):
+            ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="ios@ssh")
+    for comment in ('x"\nrollback 1\ncommit', 'x"', "x\ty"):
+        with pytest.raises(ValueError, match="the comment .* nothing was sent to the device"):
+            ssh.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh", comment=comment)
+
+
+def test_the_runner_hands_a_library_caller_the_same_refusal(no_connection, tmp_path):
+    """#139: run_for_target (and edit() called directly) has no CLI in front
+    of it to read a payload first: the transport's own refusal is the one
+    it gets, a FAIL with nothing sent, for an -eC payload and a -eB file."""
+    broadcast = tmp_path / "all.set"
+    broadcast.write_text("set system host-name a\x03commit comment via-runner\n")
+    for mode, edit_cmd in (("edit-cmd", "set system host-name a\x03commit comment via-runner"),
+                           ("edit-broadcast", None)):
+        name, ok, out, _ = runner.run_for_target(
+            t=Target("R1", "10.0.0.1", "junos@ssh"), transport="junos@ssh", mode=mode,
+            show_cmd=None, edit_cmd=edit_cmd, config_dir=None, broadcast_file=str(broadcast),
+            user="lab", passwd="p", session_timeout=5, command_timeout=30,
+            dry_run=True, commit_confirmed=None, save_dir=None, quiet=True, max_attempts=1)
+        assert ok is False and "has a control character '\\x03'" in out and "nothing was sent to the device" in out
+
+
 def test_confirm_over_ssh_commits_the_pending_commit_confirmed(shell):
     shells = shell(JUNOS_BANNER, junos_cli())
     result = ssh.confirm("10.0.0.1", "lab", "p", 5, 10, vendor_hint="junos@ssh")

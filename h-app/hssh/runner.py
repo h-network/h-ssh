@@ -81,6 +81,10 @@ _PERMANENT = (
     "malformed known_hosts line",            # the pin file cannot be parsed
     "locked by another h-ssh run",           # ssh: the pin file, past the session timeout
     "no ssh session",                        # openssh: the session never opened within --session-timeout
+    # What the CLI engine will not type (#139): a line, a comment or a
+    # credential with a control character in it is refused the same way on
+    # every attempt, before the device is contacted or before it is typed.
+    "takes as a key, not as text",
 )
 
 # Failures that happen before any session exists: nothing reached the device.

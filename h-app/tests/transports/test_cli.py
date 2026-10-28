@@ -105,6 +105,38 @@ def test_login_answers_the_dialogue_and_learns_the_devices_own_prompt():
     assert not s.prompt_re.search("other@R1> ") and not s.prompt_re.search("description noc@example.com>")
 
 
+def test_a_username_or_password_the_prompt_would_take_as_keys_is_never_typed():
+    """#139 review: the login dialogue typed the username and the password
+    as they were. A password of `pw`, CR, `configure exclusive`, CR, ...,
+    `commit comment x` logged in and ran the rest as commands, a commit for
+    good from a show. Neither is typed with a control character in it, the
+    channel is closed, and the refusal quotes neither. A Tab is text in a
+    password; a shell already at its prompt (SSH, which took the pair for
+    its own login) is asked for neither."""
+    first = "\r\nR1 (ttyp0)\r\n\r\nlogin: "
+    for user, passwd, what in (("lab\rconfigure exclusive", "secret", "the username has a carriage return"),
+                               ("lab", "pw\rcommit comment x", "the password has a carriage return"),
+                               ("lab\x03", "secret", "the username has a control character '\\x03'"),
+                               ("lab\t", "secret", "the username has a Tab"),
+                               ("lab", "pw\x15commit", "the password has a control character '\\x15'"),
+                               ("lab", "pw\x9bx", "the password has a control character '\\x9b'")):
+        ch = ScriptChannel(first, junos_device(lab="Password:"), echo=False)
+        with pytest.raises(ValueError) as refused:
+            Cli(ch, dialects.junos.DIALECT, 5).login(user, passwd)
+        assert str(refused.value) == f"{what}, which a login prompt takes as a key, not as text; it was not sent"
+        assert ch.typed == [] and ch.closed
+    ch = ScriptChannel("\r\nPassword: ", junos_device(), echo=False)
+    with pytest.raises(ValueError, match="^the password has a line break, which a login prompt takes as a key"):
+        Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\ncommit")
+    assert ch.typed == []
+    ch = ScriptChannel(first, junos_device(lab="Password:", **{"pw\tx": "\r\n" + OP}), echo=False)
+    Cli(ch, dialects.junos.DIALECT, 5).login("lab", "pw\tx")
+    assert ch.typed == ["lab", "pw\tx"]
+    ch = ScriptChannel("\r\n" + OP, junos_device())
+    Cli(ch, dialects.junos.DIALECT, 5).login("lab\r", "pw\n")
+    assert ch.typed == []
+
+
 def test_a_rejected_login_is_not_applied_and_quotes_the_device():
     ch = ScriptChannel("\r\nlogin: ", {"lab": "Password:", "<else>": "\r\nLogin incorrect\r\nlogin: "}, echo=False)
     with pytest.raises(NotAppliedError, match="login failed: Login incorrect"):
@@ -193,6 +225,20 @@ def test_no_diff_is_no_changes_and_a_changed_diff_commits_nothing():
     assert "commit" not in ch.typed and ch.typed[-2:] == ["rollback 0", "exit"]
 
 
+def test_an_empty_compare_types_no_commit():
+    """#139: with nothing in `show | compare` the engine typed `commit`, or
+    `commit confirmed 5`, and said NO CHANGES: a timer armed that the CLI's
+    reminder never mentions, and on Junos an empty commit also confirms
+    another user's pending commit confirmed. Nothing to commit is NO
+    CHANGES before any commit is typed, the candidate discarded, as over
+    NETCONF; a --show-diff preview that showed nothing is the same."""
+    for kw in ({}, {"confirmed_minutes": 5}, {"expected_diff": ""}):
+        s, ch = junos_session(**{"show | compare": CFG})
+        r = s.edit_candidate("set system host-name test\n", dry_run=False, **kw)
+        assert r.status == R.NO_CHANGES and not r.pending
+        assert ch.typed == ["configure exclusive", "set system host-name test", "show | compare", "rollback 0", "exit"]
+
+
 def test_a_refused_lock_sends_nothing_else_and_a_syntax_error_rolls_back():
     s, ch = junos_session(configure="\r\nerror: configuration database locked by: other\r\n" + OP)
     with pytest.raises(NotAppliedError, match="Failed to lock config"):
@@ -245,6 +291,103 @@ def test_a_commit_line_in_a_payload_is_refused_before_anything_is_typed():
     with pytest.raises(ValueError, match="'commit' is not configuration"):
         refuse_commit_lines("set a b\ncommit confirmed 5\n")
     refuse_commit_lines("set a b\n")
+
+
+def test_a_commit_line_is_its_first_word_whatever_ends_it():
+    """#139: the rail split a line on spaces alone, so `commit;`, which the
+    set-syntax guard itself counts as a commit, and `commit` with a Tab
+    after it went past it, and in the library's edit() and run_for_target
+    it is the only rail. The word inside a set line is still configuration."""
+    for payload in ("set a b\ncommit;\n", "commit;", "set a b\ncommit\tcomment x\n", "commit;; and-quit\n"):
+        with pytest.raises(ValueError, match="'commit' is not configuration"):
+            refuse_commit_lines(payload)
+    refuse_commit_lines("set system commit synchronize\nset a commit;\n")
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match="'commit' is not configuration"):
+        s.edit_candidate("set system host-name x\ncommit;\n", dry_run=True)
+    assert ch.typed == []
+
+
+def test_an_abbreviated_commit_is_a_commit_too():
+    """#139 review: the rail took the word `commit` whole, and a Junos CLI
+    completes a unique prefix of a command: `com`, `comm` and `commi` are
+    `commit` in configuration mode (`co` is `copy` as well). For a library
+    caller the rail is the only one. A shortening is refused as the word
+    is, with a closing ';' or more words after it, before anything is
+    typed; a word that only starts like one is configuration's business."""
+    for payload in ("com\n", "set a b\ncomm\n", "commi;\n", "set a b\ncom confirmed 1\n", "com\tcheck\n"):
+        with pytest.raises(ValueError, match="is 'commit' to a Junos CLI, and 'commit' is not configuration"):
+            refuse_commit_lines(payload)
+    refuse_commit_lines("co\nset a commit\ncopy a to b\ncommitted\nCOM\n")
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match="^'com' is 'commit' to a Junos CLI"):
+        s.edit_candidate("set system host-name x\ncom\n", dry_run=True)
+    assert ch.typed == []
+
+
+# What the Junos line editor acts on as it arrives: ^C drops the line typed so
+# far, ^U kills it, DEL rubs out a character. The rest of the line then ran as
+# a line of its own (#139). An ESC or a C1 CSI starts a key sequence, and a
+# NUL is not text.
+KEYS = ["set system host-name x\x03commit comment y\n", "set a\x15commit\n", "set " + "\x7f" * 4 + "commit\n",
+        "set system\thost-name x\n", "set a\x1b[2Kcommit\n", "set a\x9b2Kcommit\n", "set a\x00commit\n"]
+
+
+def test_a_line_with_a_control_character_or_a_tab_is_never_typed():
+    """#139: `set system host-name x`, ^C, `commit comment y` in a payload
+    committed for good with no timer, under a dry run too, and h-ssh said
+    DRY-RUN. The engine types no control character and no Tab (a CLI
+    completes the word on it): an edit is refused before configure mode, a
+    command before it is sent."""
+    for payload in KEYS:
+        s, ch = junos_session()
+        with pytest.raises(ValueError, match="which a CLI takes as a key, not as text; nothing was sent to the device$"):
+            s.edit_candidate(payload, dry_run=True)
+        assert ch.typed == []
+    replies = {"configure terminal": "\r\nRouter(config)#", "end": "\r\nRouter#", "<else>": "\r\nRouter(config)#"}
+    ch = ScriptChannel("\r\nRouter#", replies)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login("u", "p")
+    with pytest.raises(ValueError, match=r"^'interface Gi0/1\\x03reload' has a control character '\\x03'"):
+        s.edit_lines("hostname x\ninterface Gi0/1\x03reload\n")
+    assert ch.typed == []
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match=r"^'set a\\x03commit' has a control character '\\x03', which a CLI takes "
+                                         r"as a key, not as text; it was not sent$"):
+        s.run("set a\x03commit", 5)
+    with pytest.raises(ValueError, match="has a Tab"):
+        s.run("show\tversion", 5)
+    assert ch.typed == []
+
+
+def test_a_string_that_is_not_text_is_never_typed():
+    """#139: the engine encoded what it typed with errors='replace', so a
+    byte that is not UTF-8 (a lone surrogate, from an argv or a JSON \\udcXX
+    escape) went out as '?', which a Junos CLI takes as a request for help.
+    It is refused before configure mode, and nothing is ever replaced."""
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match="a byte that is not UTF-8"):
+        s.edit_candidate("set system host-name a\udcffb\n", dry_run=True)
+    with pytest.raises(ValueError, match="a byte that is not UTF-8"):
+        s.run("show \udcff", 5)
+    with pytest.raises(UnicodeEncodeError):
+        s._send("show \udcff\n")
+    assert ch.typed == []
+
+
+def test_a_confirm_comment_is_one_line_of_text_without_a_double_quote():
+    """#139: the comment went on the commit line as it was given: a line
+    break ran `rollback 1` and a second commit, and the confirm said
+    confirmed-ok; a double quote ends the quoted comment."""
+    for comment, what in (('x"\nrollback 1\ncommit', "a line break"), ('x" confirmed 1', "a double quote"),
+                          ("x\ty", "a Tab"), ("x\x03", "a control character")):
+        s, ch = junos_session()
+        with pytest.raises(ValueError, match=f"the comment .* has {what}.*nothing was sent to the device$"):
+            s.confirm(5, comment=comment)
+        assert ch.typed == []
+    s, ch = junos_session()
+    assert s.confirm(5, comment="change 42: lo0") == "COMMIT CONFIRMED OK"
+    assert 'commit comment "change 42: lo0"' in ch.typed
 
 
 def test_lines_edit_applies_each_line_in_config_mode():

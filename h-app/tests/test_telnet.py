@@ -259,6 +259,33 @@ def _received(srv):
     return srv.received
 
 
+class NoDevice:
+    """A port on 127.0.0.1 that is listened on and never answered: a client
+    that connects waits in the accept queue, so connected() can count what a
+    refusal "before the socket is opened" must leave at none."""
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+
+    def connected(self):
+        """How many connections came, each closed unanswered."""
+        self.sock.setblocking(False)
+        n = 0
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except BlockingIOError:
+                return n
+            conn.close()
+            n += 1
+
+    def close(self):
+        self.sock.close()
+
+
 OP = "lab@R1> "
 CFG = "\r\n[edit]\r\nlab@R1# "
 
@@ -744,3 +771,130 @@ def test_a_commit_line_inside_a_payload_is_refused_before_anything_is_sent(monke
                         vendor_hint="telnet-junos", dry_run=True)
     srv.stop()
     assert srv.received == []
+
+
+@pytest.mark.parametrize("hint", ["telnet-junos", "telnet-ios", "telnet"])
+def test_a_payload_or_comment_the_cli_would_take_as_keys_is_refused_before_connecting(hint):
+    """#139: ^C, ^U and DEL are keys to the line editor at the other end of
+    the socket: what followed one in a set line ran as a line of its own, a
+    `commit` too under a dry run. A Tab completes the word, and a confirm's
+    comment with a line break or a double quote typed more than the
+    comment. Refused before the socket is opened, whatever the flavour: a
+    port that is listened on and never answered sees no connection (the
+    engine's own refusals come after one)."""
+    from hssh.transports import telnet
+    dev = NoDevice()
+    kw = {"dry_run": True} if hint == "telnet-junos" else {}
+    try:
+        for payload in ("set system host-name x\x03commit comment y\n", "set a\x15commit\n",
+                        "set " + "\x7f" * 4 + "commit\n", "set system\thost-name x\n"):
+            with pytest.raises(ValueError,
+                               match="which a CLI takes as a key, not as text; nothing was sent to the device"):
+                telnet.edit("127.0.0.1", "lab", "secret", payload, 1, 1, port=dev.port, vendor_hint=hint, **kw)
+        if hint == "telnet-junos":
+            for comment in ('x"\nrollback 1\ncommit', 'x"', "x\ty"):
+                with pytest.raises(ValueError, match="the comment .* nothing was sent to the device"):
+                    telnet.confirm("127.0.0.1", "lab", "secret", 1, 1, port=dev.port, vendor_hint=hint,
+                                   comment=comment)
+        assert dev.connected() == 0
+    finally:
+        dev.close()
+
+
+def test_a_username_or_password_with_a_control_character_is_refused_before_connecting():
+    """#139 review: the login dialogue typed both as they were. A password
+    of `pw`, CR, `configure exclusive`, CR, `set ...`, CR, `commit comment x`
+    logged in and ran the rest as commands: a commit for good from a show,
+    and from a dry run before its own lock failed. Every telnet function
+    refuses one before the socket is opened, quoting neither. A Tab is text
+    in a password, which the prompt does not complete."""
+    from hssh.transports import telnet
+    dev = NoDevice()
+
+    def calls(user, passwd):
+        at = {"port": dev.port, "vendor_hint": "telnet-junos"}
+        yield lambda: telnet.show("127.0.0.1", user, passwd, "show version", 1, 1, **at)
+        yield lambda: telnet.show_batch("127.0.0.1", user, passwd, ["show version"], 1, 1, **at)
+        yield lambda: telnet.edit("127.0.0.1", user, passwd, "set system host-name x\n", 1, 1, dry_run=True, **at)
+        yield lambda: telnet.confirm("127.0.0.1", user, passwd, 1, 1, **at)
+        yield lambda: telnet.edit("127.0.0.1", user, passwd, "hostname x\n", 1, 1, port=dev.port,
+                                  vendor_hint="telnet-ios")
+    try:
+        for user, passwd, what in (
+                ("lab", "pw\rconfigure exclusive\rset system host-name x\rcommit comment x",
+                 "the password has a carriage return"),
+                ("lab\rpw\rconfigure exclusive\rcommit comment x", "pw", "the username has a carriage return"),
+                ("lab", "pw\x03", "the password has a control character '\\x03'"),
+                ("lab\x1b[2J", "pw", "the username has an ESC"),
+                ("lab\t", "pw", "the username has a Tab")):
+            for call in calls(user, passwd):
+                with pytest.raises(ValueError) as refused:
+                    call()
+                assert str(refused.value) == (f"{what}, which a login prompt takes as a key, not as text; "
+                                              "nothing was sent to the device")
+        assert dev.connected() == 0
+    finally:
+        dev.close()
+    srv = ScriptedTelnetServer(junos_cli(login=True))
+    out = telnet.show("127.0.0.1", "lab", "pass\tword", "show version", session_timeout=5, command_timeout=5,
+                      port=srv.port, vendor_hint="telnet-junos")
+    assert "Model: mx204" in out and _received(srv) == ["lab", "pass\tword", "show version"]
+
+
+def test_a_show_refused_for_its_password_is_tried_once():
+    """#139 review: a show is tried again unless the failure says it cannot
+    come out differently, and a refusal of what the engine would type said
+    nothing of the kind: three attempts, a backoff between them. A FAIL of
+    that device, tried once, nothing connected."""
+    from hssh import runner
+    from hssh.core import Target
+    dev = NoDevice()
+    t0 = time.monotonic()
+    try:
+        r = runner.run_for_target(
+            t=Target("R1", "127.0.0.1", "telnet-junos", dev.port), transport="telnet-junos", mode="show",
+            show_cmd="show version", edit_cmd=None, config_dir=None, broadcast_file=None, user="lab",
+            passwd="pw\rcommit", session_timeout=1, command_timeout=1, dry_run=False, commit_confirmed=None,
+            save_dir=None, quiet=True, max_attempts=3)
+        took = time.monotonic() - t0
+        assert r.ok is False and r.error == ("the password has a carriage return, which a login prompt takes as "
+                                             "a key, not as text; nothing was sent to the device")
+        assert took < 1 and dev.connected() == 0
+    finally:
+        dev.close()
+
+
+def test_a_show_or_batch_line_the_engine_would_not_type_is_refused_before_connecting():
+    """#139 review: `-sC 'show version<TAB>'` on telnet-junos logged in, was
+    refused by the engine before it was typed, and was tried twice more:
+    three logins for a command that can never be sent. A show, or a batch
+    with such a line in it, is refused before the socket is opened, as the
+    CLI refuses a batch with a line it cannot send, and is a FAIL of that
+    device tried once."""
+    from hssh import runner
+    from hssh.core import Target
+    from hssh.transports import telnet
+    dev = NoDevice()
+    try:
+        for cmd, what in (("show version\t", "a Tab"), ("show version\nrequest system reboot", "a line break"),
+                          ("show version\x1b[A", "an ESC")):
+            said = f"{cmd!r} has {what}, which a CLI takes as a key, not as text; nothing was sent to the device"
+            with pytest.raises(ValueError) as refused:
+                telnet.show("127.0.0.1", "lab", "pw", cmd, 1, 1, port=dev.port, vendor_hint="telnet-junos")
+            assert str(refused.value) == said
+            with pytest.raises(ValueError) as refused:
+                telnet.show_batch("127.0.0.1", "lab", "pw", ["show version", cmd], 1, 1, port=dev.port,
+                                  vendor_hint="telnet-ios")
+            assert str(refused.value) == said
+        t0 = time.monotonic()
+        r = runner.run_for_target(
+            t=Target("R1", "127.0.0.1", "telnet-junos", dev.port), transport="telnet-junos", mode="show",
+            show_cmd="show version\t", edit_cmd=None, config_dir=None, broadcast_file=None, user="lab", passwd="pw",
+            session_timeout=1, command_timeout=1, dry_run=False, commit_confirmed=None, save_dir=None, quiet=True,
+            max_attempts=3)
+        took = time.monotonic() - t0
+        assert r.ok is False and r.error == ("'show version\\t' has a Tab, which a CLI takes as a key, not as text; "
+                                             "nothing was sent to the device")
+        assert took < 1 and dev.connected() == 0
+    finally:
+        dev.close()

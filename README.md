@@ -184,14 +184,16 @@ not over `openssh`.
 
 A password means the same on every transport: it is the credential, and no `~/.ssh/id_*` key and no agent key is offered first (`openssh` passes `PubkeyAuthentication=no` and `IdentitiesOnly=yes`), so a wrong password is a failed login on `junos`, `ssh` and `openssh` alike, never an OK by way of a key. Without a password the keys and the agent are what you log in with.
 
+The username is plain text. Telnet types it at the `login:` prompt as it is, where a line break would end it and run the rest as commands once the login succeeds, so one with a control character in it (a line break, an ESC, a Tab) is refused before a run that logs in starts, on every driver: exit 2, naming where it came from (`--user`, the run file's `user`, `HSSH_USER` or the config file), without quoting it. The password is checked where it is typed: `telnet` and its flavours refuse one with a control character other than a Tab before they connect, a FAIL of that device tried once, and the other drivers hand it to the SSH login as it is (see [Transports](#transports)).
+
 ## Modes
 
 | Flag | Mode | What it does |
 |---|---|---|
 | `-sC` | Show | Run a show/display command (or a template name): one line of text, so a line break or another control character in it is refused (exit 2). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` (exit 2, nothing sent) |
-| `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL) is refused (exit 2) |
-| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped on every driver, nothing else is touched, so `community ab#12` goes as written; an edit typed at an IOS-shaped CLI (`telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) also skips a full-line `!` comment. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3). A `<NAME>.set` with nothing in it but blank lines and `#` comments ends the run the same way on every driver, `--allow-missing` or not |
-| `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`; a file with nothing else in it ends the run before anything is sent, exit 2) |
+| `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL, a ^C) is refused (exit 2). A Tab passes here; a driver that types at a CLI refuses it before it connects (see [Transports](#transports)) |
+| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped on every driver, nothing else is touched, so `community ab#12` goes as written; an edit typed at an IOS-shaped CLI (`telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) also skips a full-line `!` comment. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3). A `<NAME>.set` with nothing in it but blank lines and `#` comments ends the run the same way on every driver, `--allow-missing` or not, and so does one with a control character other than a line break in it (an ESC, a ^C, a DEL), as `-eC` does, naming the file and the line |
+| `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`; a file with nothing else in it, or with a control character other than a line break, ends the run before anything is sent, exit 2) |
 | `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
 | `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt` (or `NAME`; a name with a `/` is a path), or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused) |
@@ -442,10 +444,29 @@ Every transport runs a batch on one session per device.
 A dialect over SSH or telnet is typed at by one CLI engine (`hssh/transports/cli.py`): it logs in,
 learns the device's own prompt, answers paging, and runs the edit sequence the dialect describes (a
 candidate diffed and committed or discarded for Junos, lines applied in config mode for the IOS-shaped
-ones). Shows over SSH use an exec channel, one command per channel; only edits and confirms open a
-shell. Over the OpenSSH binary the shell is `ssh -tt`, with a password still handed over through
-`SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh` drivers (dialect `none`) never open
-a shell.
+ones). An empty `show | compare` is `NO CHANGES`: the candidate is discarded and no `commit` is typed,
+plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over nothing and no other
+user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec channel, one command per
+channel; only edits and confirms open a shell. Over the OpenSSH binary the shell is `ssh -tt -e none`
+(no escape character, so a typed line that starts with `~` goes to the device as it is), with a
+password still handed over through `SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh`
+drivers (dialect `none`) never open a shell.
+
+The engine types plain text only. A CLI acts on a control character as it arrives (^C drops the line
+typed so far, ^U kills it, DEL rubs out a character, a Tab completes the word), and what is left of the
+line runs as typed, a `commit` too, under `--dry-run` as well. So `edit()` refuses a payload with a C0
+or C1 control character, DEL, a Tab or a byte that is not UTF-8 in a line, and `confirm()` a `comment=`
+with one of those, a line break or a double quote (which would end it on the commit line): a
+`ValueError` before the device is contacted, nothing sent.
+The CLI refuses a control character in `-eC`, `-eD`, `-eB` or a job on every driver before the run starts (exit 2) and lets a Tab through: it is text to `junos`, whose `load set`
+reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at no CLI. A set file
+indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
+`telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it, or a
+batch with such a line, is refused before the socket is opened, `show()` and `show_batch()` for a library
+caller too. The login dialogue is held to the same rule: a username with a control character or
+a Tab in it, or a password with a control character (a Tab is text at a password prompt), is refused by
+the telnet drivers before they connect, a `ValueError` for a library caller too, and the engine types
+neither at a login prompt on any channel. None of these refusals is tried again.
 
 `h-ssh --list-vendors` prints the registry: every driver a target may name, its aliases, transport,
 dialect, the formats `--format` can ask it for, what it supports, and where it came from (`built-in`,
@@ -465,8 +486,11 @@ a community ending in `#` cannot be taken for the prompt and shift every later r
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
-commit-confirmed with one bare `commit` in exclusive mode; a `commit` line inside a config payload is
-refused before the device is contacted. A commit whose reply never arrives is
+commit-confirmed with one bare `commit` in exclusive mode; a line inside a config payload whose first
+word is `commit` (`commit;` too, the set-syntax guard's own spelling), or `com`, `comm` or `commi`, which
+the CLI completes to it, is refused before the device is contacted, on every Junos driver that types at
+the CLI and for a library caller too. A commit whose
+reply never arrives is
 *outcome unknown* here too; one answered with `commit complete` that then takes the session with it — a
 management address, the telnet service — is still reported as committed, the closed session releasing
 the lock.
@@ -1019,7 +1043,7 @@ mode; the opt-in ones (`--safety-file`, `--audit-log`, `--log`) apply to every m
 | Dry run | `--dry-run` | Junos over NETCONF: loads, diffs, runs `commit_check` (when there is a diff), then discards the candidate. `junos@ssh`, `junos@openssh` and `telnet-junos`: `configure exclusive`, loads, `show \| compare`, `rollback 0` — no commit check, so the diff is shown but not validated. Every other driver **refuses** `--dry-run` for edits instead of pretending (a FAIL of that device) |
 | Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
 | Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box. NETCONF `junos` only: `telnet-junos` and every other transport refuse it rather than drop it, and it needs an edit (`-eC`, `-eD`, `-eB`, `--rollback`, or a job with edits) |
-| Commit confirmed | `--commit-confirmed [N]` | Junos rolls back after N minutes (1 to 65535; 10 when N is omitted) unless confirmed (confirm with `-eC "commit"`; a run without `--json` ends by printing that command for its own targets, a `--job`'s edit entries included); `junos@ssh`, `junos@openssh` and `telnet-junos` send `commit confirmed N`. Every other driver (`ssh`, `openssh`, `telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) refuses it rather than commit with no timer (a FAIL of that device) |
+| Commit confirmed | `--commit-confirmed [N]` | Junos rolls back after N minutes (1 to 65535; 10 when N is omitted) unless confirmed (confirm with `-eC "commit"`; a run without `--json` ends by printing that command for its own targets, a `--job`'s edit entries included); `junos@ssh`, `junos@openssh` and `telnet-junos` send `commit confirmed N` (nothing at all when `show \| compare` is empty: `NO CHANGES`, no timer). Every other driver (`ssh`, `openssh`, `telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) refuses it rather than commit with no timer (a FAIL of that device) |
 | Reply verdict (`ssh`, `openssh`) | *(automatic)* | A show whose reply opens with `error: ...` (Junos) or `% ...` (IOS, EOS) is FAILED as refused, not reported as output; an `error:` or `%` line further down a show's reply is output (a log, say). An edit line the device answers with `error: ...` (Junos) or `% ...` (IOS, Arista) is FAILED with that line even when the command exits 0: a plain `ssh` or `openssh` edit stops there; a dialect's edit typed at the CLI sends the rest, then a Junos candidate is discarded, and an IOS-shaped edit fails with the other lines applied |
 | Junos syntax guard | *(automatic)* | Enforces set-style syntax — each line must start with `set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect` or `unprotect`, lowercase — with `#`-only comments, for every Junos driver, `junos`, `junos@ssh`, `junos@openssh` and `telnet-junos` (checked when any target is one). `commit` (or `commit;`) is only valid as the single, exact command in `-eC` or a `--job` edit, never inside `-eD`/`-eB` configuration files |
 | Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite. The file and its `.lock` are created and locked once before the first device; a path that cannot be created, opened or locked (a directory that cannot be made, a symlink, a FIFO; a missing directory is made) refuses the run with exit 2 |
@@ -1221,7 +1245,9 @@ character is a `ValueError` before anything runs. A file is taken as it is: a bl
 and a `#` comment is sent as a command; `fleet.batch(hssh.core.read_command_file_lines(pathlib.Path(path)))`
 reads a batch file or a profile as the CLI does. Edits keep their gates
 in the CLI (the set-syntax guard, the probe's question, the confirmation) and in the transports' own
-`edit()`/`begin()` below.
+`edit()`/`begin()` below; a transport that types at a CLI refuses a payload or a confirm comment with a
+control character or a Tab in it itself, before it connects, and a Junos one a payload line whose first
+word is `commit` (`commit;` and `com` too), the one commit rail a library caller has (see [Transports](#transports)).
 
 ### One device, one call
 
@@ -1418,7 +1444,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1272 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1297 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

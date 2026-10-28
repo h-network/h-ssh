@@ -25,7 +25,7 @@ from .core import (
     resolve_command, resolve_structured,
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, parse_jobs, resolve_target_port, check_unique,
-    check_confirm_minutes, control_character, read_failure, is_file,
+    check_confirm_minutes, control_character, control_line, read_failure, is_file,
 
     path_inside, set_file_payload,
 )
@@ -921,10 +921,46 @@ async def main() -> int:
             print(f"ERROR: {'inline targets' if args.target else args.devices}: {e}", file=sys.stderr)
             return 2
 
-        # The edit guard keys off the targets' dialects, not a global flag —
-        # a mixed inventory can have some devices that care and some that don't.
+        # The payloads, read once here and handed to the checks below, the
+        # runner and the audit log as the same string: what is checked is what
+        # is sent, but for the blank and full-line '#' lines, which the runner
+        # keeps from every driver (core.set_file_payload).
         broadcast_text = None
         edit_payloads = {}
+        if args.edit_broadcast:
+            try:
+                broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
+            except Exception as e:
+                print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
+                return 2
+        if args.edit_dir:
+            for t in targets:
+                set_file = path_inside(args.edit_dir, f"{t.name}.set")
+                if set_file.is_file():
+                    try:
+                        edit_payloads[t.name] = set_file.read_text(encoding="utf-8-sig")
+                    except Exception as e:
+                        print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
+                        return 2
+        # -eC's rule, on every driver: a payload is plain text but for its
+        # line breaks. A CLI acts on a control character as it is typed (^C,
+        # ^U and DEL leave the rest of the line to run as a line of its own,
+        # a `commit` too, --dry-run or not), so a file with one is refused
+        # before the password is asked. A Tab passes here, as NETCONF reads
+        # it as a space; the drivers that type at a CLI refuse it themselves,
+        # before they connect.
+        files = [("-eB", args.edit_broadcast, broadcast_text)] if broadcast_text is not None else []
+        files += [("-eD", path_inside(args.edit_dir, f"{name}.set"), text) for name, text in edit_payloads.items()]
+        for flag, path, text in files:
+            found = control_line(text)
+            if found:
+                n, line, what = found
+                print(f"ERROR: {flag} {path}: line {n} has {what} ({line!r}); a payload is plain text.",
+                      file=sys.stderr)
+                return 2
+
+        # The edit guard keys off the targets' dialects, not a global flag —
+        # a mixed inventory can have some devices that care and some that don't.
         guards = {}
         for t in targets:
             guard = edit_guard(t.vendor)
@@ -938,59 +974,31 @@ async def main() -> int:
                         print(f"ERROR: {guard.title} -eC only accepts 'set ...' commands: {err}", file=sys.stderr)
                         return 2
             elif args.edit_broadcast:
-                try:
-                    b_content = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
-                except Exception as e:
-                    print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
-                    return 2
                 for guard in guards.values():
-                    valid, err = guard.check_edit(b_content, allow_commit=False)
+                    valid, err = guard.check_edit(broadcast_text, allow_commit=False)
                     if not valid:
                         print(f"ERROR: {guard.title} broadcast file '{args.edit_broadcast}' only accepts 'set ...' commands: {err}", file=sys.stderr)
                         return 2
             elif args.edit_dir:
                 for t in targets:
                     guard = edit_guard(t.vendor)
-                    if guard:
-                        set_file = path_inside(args.edit_dir, f"{t.name}.set")
-                        if set_file.is_file():
-                            try:
-                                d_content = set_file.read_text(encoding="utf-8-sig")
-                            except Exception as e:
-                                print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
-                                return 2
-                            valid, err = guard.check_edit(d_content, allow_commit=False)
-                            if not valid:
-                                print(f"ERROR: {guard.title} config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
-                                return 2
+                    if guard and t.name in edit_payloads:
+                        valid, err = guard.check_edit(edit_payloads[t.name], allow_commit=False)
+                        if not valid:
+                            set_file = path_inside(args.edit_dir, f"{t.name}.set")
+                            print(f"ERROR: {guard.title} config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
+                            return 2
 
-        # The payloads, read once here and handed to the runner and the audit
-        # log as the same string: what the guard checked is what is sent, but
-        # for the blank and full-line '#' lines, which the runner keeps from
-        # every driver (core.set_file_payload). A file with nothing else in it
-        # is refused here, on every driver, before anything is written or
-        # sent: the plain ssh and openssh drivers logged in, sent nothing and
-        # said OK, where the Junos guard refuses it.
-        if args.edit_broadcast:
-            try:
-                broadcast_text = Path(args.edit_broadcast).read_text(encoding="utf-8-sig")
-            except Exception as e:
-                print(f"ERROR reading broadcast file '{args.edit_broadcast}': {e}", file=sys.stderr)
-                return 2
-            if not set_file_payload(broadcast_text):
-                print(f"ERROR: -eB {args.edit_broadcast}: nothing but blank lines and '#' comments in it. "
-                      "Nothing was sent.", file=sys.stderr)
-                return 2
+        # A file with nothing but blank lines and '#' comments is refused
+        # here, on every driver, before anything is written or sent: the
+        # plain ssh and openssh drivers logged in, sent nothing and said OK,
+        # where the Junos guard refuses it.
+        if broadcast_text is not None and not set_file_payload(broadcast_text):
+            print(f"ERROR: -eB {args.edit_broadcast}: nothing but blank lines and '#' comments in it. "
+                  "Nothing was sent.", file=sys.stderr)
+            return 2
         skipped_missing = 0
         if args.edit_dir:
-            for t in targets:
-                set_file = path_inside(args.edit_dir, f"{t.name}.set")
-                if set_file.is_file():
-                    try:
-                        edit_payloads[t.name] = set_file.read_text(encoding="utf-8-sig")
-                    except Exception as e:
-                        print(f"ERROR reading config file '{set_file}': {e}", file=sys.stderr)
-                        return 2
             empty = [f"{name}.set" for name, text in edit_payloads.items() if not set_file_payload(text)]
             if empty:
                 shown = ", ".join(empty[:20]) + (" …" if len(empty) > 20 else "")
@@ -1145,6 +1153,25 @@ async def main() -> int:
         # probe logs in nowhere and asks for no password.
         print("ERROR: HSSH_PASSWORD is set but empty; refusing to start.", file=sys.stderr)
         return 2
+    if mode != "probe":
+        # The username the run logs in with is plain text: telnet types it at
+        # the login: prompt as it is, and what followed a line break in it ran
+        # as commands once the login succeeded, a commit too, in a run that
+        # only reads. No device takes such a name, so it is refused for every
+        # driver, before anything is written. Not quoted: what follows a line
+        # break in it may well be the password.
+        if args.user:
+            named, source = args.user, (f"run file '{args.run}': 'user'" if "user" in from_run_file
+                                        else "--user")
+        elif os.environ.get("HSSH_USER"):
+            named, source = os.environ["HSSH_USER"], "HSSH_USER"
+        else:
+            named = file_config.get("user")
+            source = f"{get_config_path() if args.config is None else args.config}: 'user'"
+        what = control_character(named or "", tabs=False)
+        if what:
+            print(f"ERROR: {source} has {what}; a username is plain text. Nothing was sent.", file=sys.stderr)
+            return 2
     # An edit that changes the network needs its question answered: without
     # a terminal or -y it is refused here, before the probe touches a box.
     commits = has_edits and not args.dry_run
