@@ -279,6 +279,23 @@ def test_a_store_lets_go_of_the_directory_it_holds_when_closed_or_dropped(tmp_pa
     assert held() == []
 
 
+@pytest.mark.parametrize("first", ["close", "discard"])
+def test_a_store_closed_twice_lets_go_of_its_directory_once(tmp_path, first):
+    """#180: main() closes the store it opened when it returns, on most
+    paths after the run's own close() or discard(). The first lets the
+    directory go; by the second, its fd number may be another file's (here
+    the directory opened again, at that number), which stays open."""
+    st = Store(str(tmp_path / "s.db"))
+    fd = st._where[1]
+    getattr(st, first)()
+    other = os.open(tmp_path, os.O_RDONLY)
+    os.dup2(other, fd)                                   # the number the store let go is another file's now
+    os.close(other)
+    st.close()
+    os.fstat(fd)                                         # still open: the second close let go of nothing
+    os.close(fd)
+
+
 def test_a_store_in_a_directory_that_was_removed_is_refused_with_the_reason(tmp_path, monkeypatch, capsys):
     """A reader started in a directory that was removed met a traceback (the
     current directory asked for before the file was looked for) where it

@@ -2,6 +2,7 @@
 SQLite file, byte for byte, read back by run, device and command."""
 
 import asyncio
+import builtins
 import json
 import os
 import sqlite3
@@ -1139,6 +1140,31 @@ def test_a_run_stopped_at_the_password_prompt_leaves_no_store_file(tmp_path, mon
     assert calls == ["s3cret"] and os.listdir(work) == ["h-ssh.db"]
     assert rows(work / "h-ssh.db", "SELECT device, command, output FROM results") == [
         {"device": "R1", "command": "show version", "output": "ok"}]
+
+
+def test_main_closes_the_store_it_opened_however_it_returns(tmp_path, monkeypatch, capsys):
+    """#180: main() opened the store, and most of its return paths after
+    that (an edit stopped at `Proceed with changes?` here) returned without
+    closing it. A process exits anyway; a caller of main() in-process (a
+    script, this suite, the watch's next tick) kept the connection and the
+    fd of the store's directory until garbage collection, which Python 3.13
+    says as a ResourceWarning wherever that happens to run. The store is
+    closed when main() returns, whichever way it does."""
+    opened = []
+    real = cli.Store
+
+    def store_made(*a, **kw):
+        opened.append(real(*a, **kw))
+        return opened[-1]
+    monkeypatch.setattr(cli, "Store", store_made)
+    monkeypatch.setattr(cli, "_tty", lambda stream: True)                # by hand, at a terminal
+    monkeypatch.setattr(builtins, "input", lambda prompt="": "n")
+    rc, out, err = run_cli(monkeypatch, capsys, ["--store", str(tmp_path / "runs.db"), "--target", "R1:10.0.0.1:junos",
+                                                 "-eC", "set system host-name R1"])
+    assert rc == 0 and "Aborted by user." in out, err
+    store, = opened
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        store.conn.execute("SELECT 1")
 
 
 def test_discard_takes_away_only_a_store_this_store_made_and_nobody_kept_a_run_in(tmp_path):
