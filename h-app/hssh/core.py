@@ -29,9 +29,16 @@ def validate_device_name(name: str) -> str:
 
 
 def path_inside(base: str, filename: str) -> Path:
-    """`<base>/<filename>`, refused unless it stays inside `base` once resolved."""
-    root = Path(base).resolve()
-    target = (root / filename).resolve()
+    """`<base>/<filename>`, refused unless it stays inside `base` once resolved.
+    Raises ValueError when it does not, OSError when it cannot be resolved."""
+    try:
+        root = Path(base).resolve()
+        target = (root / filename).resolve()
+    except RuntimeError as e:
+        # A symlink loop: Python before 3.13 raises here (3.13 stops at the
+        # loop and leaves it to the open, which refuses it). An OSError, as
+        # any file that cannot be used, not a crash out of a save (#152).
+        raise OSError(f"{filename!r}: cannot be resolved inside {base} ({e})") from e
     if target.parent != root:
         raise ValueError(f"{filename!r} does not stay inside {base}")
     return Path(base) / filename

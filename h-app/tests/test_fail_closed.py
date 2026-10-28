@@ -235,7 +235,10 @@ def test_a_worker_that_raises_is_that_devices_failure_and_the_run_goes_on(monkey
     """An exception out of the per-device coroutine itself (not the runner,
     which answers for its own) used to come back out of task.result() and
     end main() with the other devices' results unreported (#152). It is
-    that device's FAIL, saved and recorded like any other."""
+    that device's FAIL, saved and recorded like any other; and when its
+    own file cannot be written either (a symlink loop, which Path.resolve
+    raised RuntimeError on before Python 3.13), that is the result's
+    `not_saved` too, not a second way out of the run."""
     real = cli.run_for_target_async
 
     async def run_for_target_async(t, **kw):
@@ -250,3 +253,12 @@ def test_a_worker_that_raises_is_that_devices_failure_and_the_run_goes_on(monkey
     results = {r["device"]: r for r in json.loads(out)}
     assert results["R2"]["ok"] and results["R1"]["error"] == "RuntimeError: boom"
     assert (save / "R1.output").read_text().endswith("\n\nERROR: RuntimeError: boom\n")
+    looped = tmp_path / "looped"
+    looped.mkdir()
+    (looped / "R1.output").symlink_to("R1.output")
+    rc, out, err, drv = run(monkeypatch, capsys, [*EDIT, "--no-probe", "--json", "--save-output", str(looped)])
+    assert rc == 4 and "Traceback" not in err, err
+    results = {r["device"]: r for r in json.loads(out)}
+    assert results["R2"]["ok"] and results["R1"]["error"] == "RuntimeError: boom"
+    assert '"not_saved": 1' in err and "R1.output" in err and (looped / "R2.output").exists()
+    assert (looped / "R1.output").is_symlink()

@@ -42,9 +42,13 @@ def _expiry(host, value) -> Optional[float]:
     and a word passed as no cooldown and was erased by the next save (#152)."""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise ValueError(f"cooldown of {host!r} is {value!r}, not a finite number")
-    return float(value)
+    try:
+        expires = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else math.nan
+    except OverflowError:       # an int too large for a float (10**400): no number h-ssh wrote
+        expires = math.nan
+    if not math.isfinite(expires):
+        raise ValueError(f"cooldown of {host!r} is {value!r:.40}, not a finite number")
+    return expires
 
 
 class SafetyGate:
@@ -365,11 +369,12 @@ class SafetyGate:
                 if path.exists() and path.stat().st_size > 0:
                     with open(path, "r", encoding="utf-8") as f:
                         disk_data = json.load(f)
-                        if isinstance(disk_data, dict):
-                            for h, exp in disk_data.items():
-                                exp = _expiry(h, exp)
-                                if exp is not None and exp > now:
-                                    merged[str(h)] = exp
+                        if not isinstance(disk_data, dict):
+                            raise ValueError("invalid non-dictionary structure")
+                        for h, exp in disk_data.items():
+                            exp = _expiry(h, exp)
+                            if exp is not None and exp > now:
+                                merged[str(h)] = exp
             except ValueError as e:
                 # Not h-ssh's writing (unparsable, or a cooldown that is no
                 # finite number): kept as .corrupt, never written over.

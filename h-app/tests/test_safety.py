@@ -526,15 +526,19 @@ def test_lock_file_that_is_a_symlink_is_not_followed(tmp_path):
 
 # --- #152: a cooldown that is not a finite number ---------------------------------
 
+HUGE_INT = pytest.param('{"h": 1' + "0" * 400 + '}', id="huge-int")   # an int no float can hold: json gives 10**400
+
 @pytest.mark.parametrize("content", ['{"h": 1e400}', '{"h": Infinity}', '{"h": NaN}', '{"h": "inf"}', '{"h": "never"}',
-                                     '{"h": {"until": 1}}', '{"h": true}'])
+                                     '{"h": {"until": 1}}', '{"h": true}', HUGE_INT])
 def test_a_cooldown_that_is_not_a_finite_number_is_a_corrupt_file(tmp_path, content):
     """1e400 and Infinity loaded as inf (json.load allows them, and float()
     takes "inf" too), and check_device and holds then raised OverflowError
     at int(expires - now); "never" and an object passed as no cooldown and
     were erased by the next save, with no .corrupt (#152). A value that is
     not a finite number or null is not h-ssh's writing: the file is kept as
-    .corrupt, the gate fails closed and writes nothing over it."""
+    .corrupt, the gate fails closed and writes nothing over it. An integer
+    too large for a float (the review's repro) is the same, not an
+    OverflowError out of the constructor."""
     path = tmp_path / "safety.json"
     path.write_text(content)
     gate = SafetyGate(safety_file=str(path))
@@ -545,6 +549,27 @@ def test_a_cooldown_that_is_not_a_finite_number_is_a_corrupt_file(tmp_path, cont
     gate.set_cooldown("other", 22)
     gate.close()
     assert not path.exists()
+
+
+@pytest.mark.parametrize("content", ['[123]', '{"h": 1e400}', '{"h": "never"}', HUGE_INT])
+def test_a_file_gone_wrong_between_the_load_and_the_save_is_corrupt_too(tmp_path, content):
+    """The save's merge read took the file as the loader did, but a value
+    that was no number, or a root that was no object, went through its
+    catch-all (or was ignored) and the file was written over with `{}`:
+    fail-open, with no .corrupt (the review's repro). What the loader calls
+    corrupt the merge calls corrupt: the bytes are kept as .corrupt, nothing
+    is written, and the gate is closed from there."""
+    path = tmp_path / "safety.json"
+    gate = SafetyGate(safety_file=str(path))
+    assert gate.check_device("a", 22) == (True, "ok")
+    gate.release_device("a", 22)
+    path.write_text(content)                    # another hand, between this run's reads
+    gate.set_cooldown("b", 22)                  # the save's merge read finds it
+    assert path.with_name("safety.json.corrupt").read_text() == content and not path.exists()
+    allowed, reason = gate.check_device("b", 22)
+    assert allowed is False and "corrupt" in reason, reason
+    gate.close()
+    assert not path.exists() and path.with_name("safety.json.corrupt").read_text() == content
 
 
 def test_the_gate_never_holds_a_cooldown_that_is_not_a_finite_number(tmp_path):

@@ -514,33 +514,40 @@ def test_a_save_output_file_that_cannot_be_written_is_the_results_loss_not_the_r
     a FIFO where R1.output goes, a full disk, a planted symlink) escaped the
     worker after the commit and ended main(): no verdict, no reminder, an
     empty audit log, a run row with no results, and the device cooled for
-    120 s (#152). The save comes after the verdict and what it could not do
-    is the result's, counted like one the store could not keep: the edit
-    ran once, its verdict, reminder, audit entry and rows are all there,
-    one WARNING, `not_saved` in the summary, exit 4, and no cooldown."""
+    120 s (#152). A symlink loop did the same by another road: before
+    Python 3.13 Path.resolve raises RuntimeError on it, out of path_inside,
+    which the save's OSError catch did not hold (the review's repro). The
+    save comes after the verdict and what it could not do is the result's,
+    counted like one the store could not keep: the edit ran once, its
+    verdict, reminder, audit entry and rows are all there, one WARNING,
+    `not_saved` in the summary, exit 4, and no cooldown."""
     save, audit, safety = tmp_path / "out", tmp_path / "audit.jsonl", tmp_path / "safety.json"
     save.mkdir()
     (save / "R1.output").mkdir()
     os.mkfifo(save / "R2.output")
+    (save / "R3.output").symlink_to("R3.output")
     driver = JobDriver()
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, [
-        "--target", "R2:10.0.0.2:junos", "-eC", "set system host-name x", "-y", "--commit-confirmed", "5",
-        "--save-output", str(save), "--audit-log", str(audit), "--safety-file", str(safety)], driver=driver)
+        "--target", "R2:10.0.0.2:junos", "--target", "R3:10.0.0.3:junos", "-eC", "set system host-name x", "-y",
+        "--commit-confirmed", "5", "--save-output", str(save), "--audit-log", str(audit),
+        "--safety-file", str(safety)], driver=driver)
     assert rc == 4 and "Traceback" not in err, err
-    assert sorted(c[:2] for c in driver.calls) == [("edit", "10.0.0.1"), ("edit", "10.0.0.2")]
+    assert sorted(c[:2] for c in driver.calls) == [("edit", "10.0.0.1"), ("edit", "10.0.0.2"), ("edit", "10.0.0.3")]
     verdicts = [ln.split()[1] for ln in out.splitlines() if ln.startswith("[") and ln.endswith(" OK")]
-    assert sorted(verdicts) == ["R1", "R2"] and "FAIL" not in out and "DON'T FORGET TO CONFIRM THE COMMIT!" in out
-    assert '\n  ./h-app/h-ssh.py -eC "commit" --user u --target R1:10.0.0.1:junos --target R2:10.0.0.2:junos\n' in out
-    assert err.count("WARNING: --save-output:") == 2 and "2 of 2 results were not saved" in err, err
-    assert "R1.output: not a plain file that can be written (Is a directory)" in err
-    assert '"not_saved": 2' in err and '"ok": 2' in err and '"fail": 0' in err
+    assert sorted(verdicts) == ["R1", "R2", "R3"] and "FAIL" not in out and "DON'T FORGET TO CONFIRM THE COMMIT!" in out
+    assert ('\n  ./h-app/h-ssh.py -eC "commit" --user u --target R1:10.0.0.1:junos --target R2:10.0.0.2:junos'
+            ' --target R3:10.0.0.3:junos\n') in out
+    assert err.count("WARNING: --save-output:") == 3 and "3 of 3 results were not saved" in err, err
+    assert "R1.output: not a plain file that can be written (Is a directory)" in err and "R3.output" in err
+    assert '"not_saved": 3' in err and '"ok": 3' in err and '"fail": 0' in err
     entries = [json.loads(ln) for ln in audit.read_text().splitlines()]
-    assert sorted((e["device"], e["ok"]) for e in entries) == [("R1", True), ("R2", True)]
-    assert sorted((r["device"], r["ok"]) for r in _store_rows("SELECT device, ok FROM results")) == [("R1", 1), ("R2", 1)]
+    assert sorted((e["device"], e["ok"]) for e in entries) == [("R1", True), ("R2", True), ("R3", True)]
+    rows = _store_rows("SELECT device, ok FROM results")
+    assert sorted((r["device"], r["ok"]) for r in rows) == [("R1", 1), ("R2", 1), ("R3", 1)]
     (run,) = _store_rows("SELECT * FROM runs")
-    assert run["finished"] is not None and (run["ok"], run["failed"]) == (2, 0)
+    assert run["finished"] is not None and (run["ok"], run["failed"]) == (3, 0)
     assert json.loads(safety.read_text()) == {}          # no cooldown: the device did nothing wrong
-    assert (save / "R1.output").is_dir() and (save / "R2.output").is_fifo()
+    assert (save / "R1.output").is_dir() and (save / "R2.output").is_fifo() and (save / "R3.output").is_symlink()
 
 
 def test_a_batch_whose_file_cannot_be_written_keeps_its_replies_and_its_verdict(monkeypatch, capsys, tmp_path):
