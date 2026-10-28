@@ -856,15 +856,21 @@ def test_the_close_all_at_interpreter_exit_closes_every_session_side_by_side(tmp
     there raised 'cannot schedule new futures after interpreter shutdown'
     and closed none of them. Closed on the exiting thread instead, they
     went one after another, a close timeout per router in a row, though
-    plain threads still start there."""
+    plain threads still start there. The closers say their line under a
+    lock: print() writes a line in pieces, and three threads' pieces
+    interleaved now and then (#182), a line of two bare floats here."""
     script = tmp_path / "leaves.py"
     script.write_text(
+        "import threading\n"
         "import time\n"
         "from hssh import pool\n"
+        "said = threading.Lock()\n"
         "def closer(dev):\n"
         "    start = time.monotonic()\n"
         "    time.sleep(0.3)\n"
-        "    print('closed', dev, start, time.monotonic(), flush=True)\n"
+        "    end = time.monotonic()\n"
+        "    with said:\n"
+        "        print('closed', dev, start, end, flush=True)\n"
         "pool.enable()\n"
         "for host in ('r1', 'r2', 'r3'):\n"
         "    with pool.POOL.get_connection((host, 830, 'u'), opener=lambda: host, closer=closer):\n"
