@@ -637,7 +637,15 @@ def _run_for_target_sync(
             if save_dir:
                 secure_write(str(path_inside(save_dir, save_name(name, seq, "json"))), result_json)
             if safety_gate is not None:
-                safety_gate.release_device(*device)
+                # A command the batch kept going after (timed out, refused by
+                # the device, its session gone) failed against the device as
+                # the same command under -sC would have: the device is cooled
+                # the same, and each command keeps its own result (#145). A
+                # batch refused before any I/O (a ValueError, below) cools nothing.
+                if batch.ok:
+                    safety_gate.release_device(*device)
+                else:
+                    safety_gate.set_cooldown(*device)
             return RunResult(name, batch.ok, result_json, duration_ms, result=batch, error=batch.first_error)
 
         else:

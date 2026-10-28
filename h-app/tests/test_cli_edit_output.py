@@ -354,6 +354,63 @@ def test_a_jobs_routers_behind_one_address_run_side_by_side(monkeypatch, capsys,
     assert sorted(e["device"] for e in json.loads(out) if e["ok"]) == ["A", "B"]
 
 
+class Times(JobDriver):
+    """A show of a command in `errors` fails with its error (raised as a
+    timeout), and a batch keeps that error in the command's own result, as
+    the transports do; every other command is fine."""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = errors
+
+    def show(self, host, user, passwd, cmd, *a, **kw):
+        self.calls.append(("show", host, cmd))
+        if cmd in self.errors:
+            raise TimeoutError(self.errors[cmd])
+        return "ok\n"
+
+    def show_batch(self, host, user, passwd, cmds, *a, **kw):
+        self.calls.append(("show_batch", host, tuple(cmds)))
+        return [{"command": c, "ok": False, "error": self.errors[c]} if c in self.errors
+                else {"command": c, "ok": True, "output": "ok"} for c in cmds]
+
+
+@pytest.mark.parametrize("error", [
+    "'show version': the device sent no exit status within 20s; channel closed",
+    "'show version' was refused by the device: error: syntax error, expecting <command>",
+], ids=["timed-out", "refused"])
+def test_a_batch_command_that_failed_cools_the_device_as_a_show_does(monkeypatch, capsys, tmp_path, error):
+    """The README promises a cooldown after a timed-out or rejected command,
+    and under -sC one was kept; a --batch keeps each command's error in its
+    own result, and the runner released the device: the safety file stayed
+    {} and the next run went straight back. A batch with a failed command
+    cools the device as -sC does (#145), each command keeping its result;
+    a batch that went through cools nothing."""
+    safety = tmp_path / "safety.json"
+    batch = tmp_path / "batch.txt"
+    batch.write_text("show version\nshow uptime\n")
+    driver = Times({"show version": error})
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", driver)
+    gated = ["--json", "--retries", "0", "--safety-file", str(safety)]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--batch", str(batch), "A:127.0.0.1:10001:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 1, err
+    [entry] = json.loads(out)
+    assert [(c["ok"], c.get("error")) for c in entry["commands"]] == [(False, error), (True, None)]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-sC", "show version", "B:127.0.0.1:10002:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 1, err
+    assert sorted(json.loads(safety.read_text())) == ["127.0.0.1|10001", "127.0.0.1|10002"]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--batch", str(batch), "A:127.0.0.1:10001:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 3 and len(driver.calls) == 2, err
+    assert json.loads(out)[0]["error"].startswith("safety gate blocked: cooldown active")
+    driver.errors.clear()
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--batch", str(batch), "C:127.0.0.1:10003:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 0 and sorted(json.loads(safety.read_text())) == ["127.0.0.1|10001", "127.0.0.1|10002"], err
+
+
 class EchoDriver(JobDriver):
     """Answers a show with the command and the host, so a saved file says
     which entry it holds; a command in `fail` is refused instead."""

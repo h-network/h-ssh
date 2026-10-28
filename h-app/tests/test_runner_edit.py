@@ -286,6 +286,32 @@ def test_device_failure_does_cool_the_device(monkeypatch):
     assert gate.events == ["check", "cooldown"]
 
 
+def test_a_batch_command_that_failed_cools_the_device(monkeypatch):
+    """A batch keeps each command's result, and the runner released the
+    device whatever they were. A command that timed out or was refused
+    failed against the device, as it would have under -sC: the device is
+    cooled the same (#145), the results still per command. A batch that
+    went through is released."""
+    def batch(*answers):
+        gate = FakeGate()
+        monkeypatch.setitem(drivers.MODULES, "none@ssh", types.SimpleNamespace(
+            show_batch=lambda host, user, passwd, cmds, *a, **kw: [{"command": c, **r} for c, r in zip(cmds, answers)]))
+        res = runner.run_for_target(
+            t=Target("R1", "10.0.0.1", "ssh"), transport="ssh", mode="show-batch", show_cmd=None, edit_cmd=None,
+            config_dir=None, broadcast_file=None, user="u", passwd="p", session_timeout=5, command_timeout=30,
+            dry_run=False, commit_confirmed=None, save_dir=None, quiet=True,
+            batch_cmds=["show version", "show uptime"], safety_gate=gate, max_attempts=1)
+        return res, gate.events
+    fine = {"ok": True, "output": "ok"}
+    for failed in ({"ok": False, "error": "'show version': the device sent no exit status within 30s; channel closed"},
+                   {"ok": False, "error": "'show version' was refused by the device: % Invalid input detected"}):
+        res, events = batch(failed, fine)
+        assert not res.ok and [r["ok"] for r in res.result] == [False, True] and res.error == failed["error"]
+        assert events == ["check", "cooldown"]
+    res, events = batch(fine, fine)
+    assert res.ok and events == ["check", "release"]
+
+
 # --- rollback mode -----------------------------------------------------------
 
 class RollbackVendor(FakeVendor):
