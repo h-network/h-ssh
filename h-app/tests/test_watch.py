@@ -1,6 +1,7 @@
 """--every SECONDS: the same reads again and again, every tick a run in the
 store, and per tick one line plus what changed since the tick before."""
 
+import contextlib
 import json
 import os
 import pty
@@ -51,9 +52,9 @@ def test_three_ticks_each_a_run_and_only_the_change_is_printed(tmp_path, monkeyp
                                                           "R1:10.0.0.1:junos", "R2:10.0.0.2:junos", "-sC", "show bgp summary"], fake)
     assert rc == 0, err
     assert calls == {"10.0.0.1": 3, "10.0.0.2": 3} and slept == [30.0, 30.0]      # 3 ticks, 2 pauses between them
-    con = sqlite3.connect(db)
-    assert con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 3
-    assert con.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 6
+    with contextlib.closing(sqlite3.connect(db)) as con:
+        assert con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 3
+        assert con.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 6
     lines = out.splitlines()
     ticks = [ln for ln in lines if ln.startswith("tick ")]
     assert len(ticks) == 3
@@ -194,8 +195,8 @@ def test_a_terminal_is_asked_for_the_password_once_for_the_whole_watch(tmp_path)
     assert rc == 0, text
     assert text.count("Password (press Enter to skip):") == 1, text
     assert len(re.findall(r"^tick \d ", text, re.M)) == 3, text
-    con = sqlite3.connect(db)
-    assert [r[0] for r in con.execute("SELECT output FROM results")] == ["passwd=s3cret"] * 3
+    with contextlib.closing(sqlite3.connect(db)) as con:
+        assert [r[0] for r in con.execute("SELECT output FROM results")] == ["passwd=s3cret"] * 3
 
 
 def test_the_exit_code_is_the_worst_tick_not_the_last(tmp_path, monkeypatch, capsys):

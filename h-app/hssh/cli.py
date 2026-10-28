@@ -604,7 +604,23 @@ def confirm_minutes_arg(text: str) -> int:
 
 
 async def main() -> int:
-    """Main CLI entry point."""
+    """Main CLI entry point: one run, or one tick of a watch. The store the
+    run opens is closed when main() returns, whichever way it returns
+    (#180). Most paths close or discard it themselves; the rest (an edit
+    stopped at its question, a run stopped after its probe) returned with
+    it open, which a process exiting never noticed, and a caller in-process
+    (a script, the suite, the watch's next tick) kept with the fd of the
+    store's directory until garbage collection."""
+    opened = []                 # the Store _main() opens, if any
+    try:
+        return await _main(opened)
+    finally:
+        for store in opened:
+            store.close()       # nothing more after the run's own close() or discard()
+
+
+async def _main(opened: list) -> int:
+    """One run; `opened` gets the Store it opens, for main() to close."""
     # Device output is whatever the device sent; a byte the terminal's
     # encoding cannot show must not end the run with a traceback.
     for stream in (sys.stdout, sys.stderr):
@@ -1401,6 +1417,7 @@ async def main() -> int:
                 return 2
         try:
             store = Store(store_path)
+            opened.append(store)
         except StoreError as e:
             print(f"ERROR: store {e}; every run is kept, so a store that cannot be written is no run: "
                   f"use --store PATH for another file, or --no-store; refusing to start.", file=sys.stderr)
