@@ -12,6 +12,7 @@ session and gives it back. A session that fails underneath a call is
 discarded, never handed to the next caller.
 """
 
+import errno
 import getpass
 import hashlib
 import os
@@ -22,11 +23,13 @@ import time
 from contextlib import contextmanager
 from typing import List, Optional
 
+from .. import limits
 from ..core import COMMENT_BYTES, check_comment, check_confirm_minutes, refused_reply
 from ..dialects.junos import (SET_PREFIX_VERBS as JUNOS_SET_PREFIX_VERBS, COMMIT_PENDING as _PENDING,
                               DIALECT as _JUNOS)
 # ConnectTimeoutError is h-ssh's (hssh.errors), not PyEZ's class of that name.
-from ..errors import AmbiguousCommitError, ConnectTimeoutError, NotAppliedError, NothingToConfirmError
+from ..errors import (AmbiguousCommitError, ConnectTimeoutError, NotAppliedError, NothingToConfirmError,
+                      OpenFileLimitError)
 from ..drivers import results as R
 from ..pool import POOL
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
@@ -183,7 +186,18 @@ if _paramiko is not None:
         left of this thread's connect phase, every address of the name
         together (ncclient gives each one the whole timeout again), and what
         the OS answered is kept: ncclient says only "Could not open socket",
-        where the reason should say refused, no route or no answer (#126)."""
+        where the reason should say refused, no route or no answer (#126).
+        So is what refused the socket itself, before any connect: EMFILE,
+        this process out of descriptors, was guessed "connection refused"
+        (#147)."""
+
+        def __init__(self, *args, **kwargs):
+            try:
+                super().__init__(*args, **kwargs)
+            except OSError as e:
+                if getattr(_DEADLINE, "connect_at", None) is not None:
+                    _DEADLINE.connect_error = e
+                raise
 
         def connect(self, address):
             at = getattr(_DEADLINE, "connect_at", None)
@@ -264,6 +278,14 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         # PyEZ validates the host itself: "only alphanumerics, dots,
         # underscores, hyphens, or bracketed IPv6 literals are permitted".
         raise NotAppliedError(f"NETCONF connect failed: PyEZ does not accept host {host!r}: {e}") from e
+    except OSError as e:
+        # PyEZ reads ~/.ssh/config here: a descriptor it cannot have is this
+        # machine's limit, said as such (#147); anything else as it was.
+        short = _out_of_descriptors(e)
+        if short is None:
+            raise
+        where = f"{host}:{params['port']}"
+        raise OpenFileLimitError(f"NETCONF connect failed: {_no_descriptor(where, short)}") from e
     started = time.monotonic()
     # One deadline for the session set-up, and a nearer one for its connect
     # phase: the TCP connect and the banner have --connect-timeout between
@@ -285,8 +307,10 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         if isinstance(e, ConnectError):
             reason = _connect_reason(e, host, _login(host, user, port, dev), params["port"], session_timeout,
                                      time.monotonic() - started, connect_timeout=connect_s, os_error=os_error)
-            # A connect phase that ran out is retried; anything else in it is not.
-            failed = ConnectTimeoutError if timed_out(reason) else NotAppliedError
+            # A connect phase that ran out is retried; anything else in it is
+            # not, and the open-file limit is this machine's, not the device's.
+            failed = (OpenFileLimitError if reason.startswith(_LOCAL_LIMIT)
+                      else ConnectTimeoutError if timed_out(reason) else NotAppliedError)
             raise failed(f"NETCONF connect failed: {reason}") from e
         raise
     finally:
@@ -339,6 +363,12 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     cause_kind = type(cause).__name__ if cause is not None else ""
     text = str(cause) if cause is not None else ""
     low = text.lower()
+    # Out of descriptors, for the socket (which ncclient swallows: its
+    # "Could not open socket" read as refused) or for ncclient's selector or
+    # paramiko's pipe after it: this machine's limit, never the device's.
+    short = _out_of_descriptors(os_error, exc, cause)
+    if short is not None:
+        return _no_descriptor(where, short)
     if kind == "ConnectAuthError" or cause_kind == "AuthenticationError":
         return f"authentication failed for {user} at {where}"
     if kind == "ConnectUnknownHostError" or isinstance(cause, socket.gaierror):
@@ -383,6 +413,33 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
     if kind == "ConnectTimeoutError":
         return tcp_timed_out(where, seconds)
     return f"{kind} for {where}" + (f": {text}" if text else "")
+
+
+# How a session this machine had no descriptor for is said (#147).
+_LOCAL_LIMIT = "local open-file limit reached"
+
+
+def _out_of_descriptors(*errors) -> Optional[OSError]:
+    """The OSError among `errors`, or what they were raised from, that says
+    this machine is out of file descriptors (EMFILE, ENFILE); None if none."""
+    for err in errors:
+        if not isinstance(err, BaseException):
+            continue                # None, or PyEZ's _orig when it is a message
+        for e in _chain(err):
+            if isinstance(e, OSError) and e.errno in (errno.EMFILE, errno.ENFILE):
+                return e
+    return None
+
+
+def _no_descriptor(where: str, err: OSError) -> str:
+    """A session to `where` this machine had no descriptor for, said as the
+    local limit it is: not the device's answer, nothing sent (#147)."""
+    if err.errno == errno.ENFILE:
+        limit = "the system's file table is full: fs.file-max, not ulimit -n"
+    else:
+        soft = limits.open_file_limit()
+        limit = "ulimit -n" + (f" {soft}" if soft is not None else "")
+    return f"{_LOCAL_LIMIT} ({limit}): this machine had no descriptor for a session to {where}; nothing was sent"
 
 
 _CLOSES: "set[threading.Thread]" = set()

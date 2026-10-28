@@ -18,6 +18,14 @@ class LocalError(RuntimeError):
     safety-gate cooldown, and the same attempt again meets the same refusal."""
 
 
+class OpenFileLimitError(LocalError, NotAppliedError):
+    """This machine had no file descriptor left to open a session with: the
+    process's open-file limit (EMFILE, ulimit -n) or the system's (ENFILE).
+    Nothing was sent (a NotAppliedError), the device earns no safety-gate
+    cooldown for it (a LocalError), and the run does not try it again: the
+    same attempt meets the same limit (#147)."""
+
+
 class NothingToConfirmError(RuntimeError):
     """A confirm was asked of a device with no commit-confirmed waiting: the
     timer expired (the change is already gone) or it was confirmed before.

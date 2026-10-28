@@ -148,6 +148,103 @@ def test_the_tcp_connect_is_said_as_the_os_answered_it(os_error, expect):
     assert netconf._connect_reason(exc, "10.0.0.1", "u", 830, 30, 0.01, connect_timeout=3, os_error=os_error) == expect
 
 
+@pytest.mark.parametrize("exc, os_error, expect", [
+    # the socket refused (ncclient swallows it and says "Could not open socket")
+    (_pyez("ConnectRefusedError", SSHError("Could not open socket to 10.0.0.1:830")),
+     OSError(errno.EMFILE, "Too many open files"), "ulimit -n 1024"),
+    (_pyez("ConnectRefusedError", SSHError("Could not open socket to 10.0.0.1:830")),
+     OSError(errno.ENFILE, "Too many open files in system"), "the system's file table is full: fs.file-max, not ulimit -n"),
+    # ncclient's selector or paramiko's pipe refused after the socket
+    (_pyez("ConnectError", orig=OSError(errno.EMFILE, "Too many open files")), None, "ulimit -n 1024"),
+])
+def test_out_of_descriptors_is_said_as_the_local_open_file_limit(monkeypatch, exc, os_error, expect):
+    """#147: ncclient swallows what the socket's creation raised, so a
+    process out of descriptors read "connection refused by HOST:PORT
+    (nothing listening, or no route)" for a port that was listening: a
+    failure tried once, and a 120 s cooldown under --safety-file. It is
+    this machine's open-file limit, and said so."""
+    monkeypatch.setattr(netconf.limits, "open_file_limit", lambda: 1024)
+    said = netconf._connect_reason(exc, "10.0.0.1", "u", 830, 30, 0.01, connect_timeout=3, os_error=os_error)
+    assert said == (f"local open-file limit reached ({expect}): this machine had no descriptor for a session to "
+                    "10.0.0.1:830; nothing was sent")
+
+
+def test_a_socket_the_open_file_limit_refuses_is_a_local_error_not_a_refused_connection(monkeypatch, tmp_path):
+    """The socket ncclient opens keeps what refused its creation, as it
+    keeps what the OS answered its connect (#126): with PyEZ and ncclient
+    as they are, EMFILE there is the local limit, a NotAppliedError and a
+    LocalError (no cooldown), and permanent (not tried again)."""
+    pytest.importorskip("jnpr.junos")
+    from hssh.errors import LocalError
+    from hssh.runner import _is_local_error
+    monkeypatch.setenv("HOME", str(tmp_path))
+    real_init = socket.socket.__init__
+
+    def no_descriptor(self, *args, **kwargs):
+        if isinstance(self, netconf._ConnectSocket):
+            raise OSError(errno.EMFILE, "Too many open files")
+        real_init(self, *args, **kwargs)
+    monkeypatch.setattr(socket.socket, "__init__", no_descriptor)
+    with pytest.raises(NotAppliedError) as failed:
+        netconf.show("127.0.0.1", "u", "p", "show version", 5, 5, port=9)
+    said = str(failed.value)
+    assert said.startswith("NETCONF connect failed: local open-file limit reached (ulimit -n"), said
+    assert said.endswith("this machine had no descriptor for a session to 127.0.0.1:9; nothing was sent")
+    assert "refused" not in said
+    assert isinstance(failed.value, LocalError) and _is_local_error(failed.value)
+    assert is_permanent_failure(failed.value) and is_connect_failure(failed.value)
+
+
+def test_out_of_descriptors_is_tried_once_and_cools_no_device(monkeypatch, tmp_path):
+    """Said as "connection refused", the device was cooled 120 s under
+    --safety-file for this machine's limit. A local error now: one attempt,
+    and the gate lets the device through again."""
+    from hssh import runner
+    from hssh.core import Target
+    from hssh.safety import SafetyGate
+    opened = []
+
+    class Dev:
+        def __init__(self, **kw):
+            self.kw = kw
+
+        def open(self):
+            opened.append(1)
+            try:
+                raise OSError(errno.EMFILE, "Too many open files")      # ncclient's selector, say
+            except OSError as e:
+                err = netconf.ConnectError("ConnectError(10.0.0.1)")
+                err._orig = e
+                raise err
+
+        def close(self):
+            pass
+    monkeypatch.setattr(netconf, "AVAILABLE", True)
+    monkeypatch.setattr(netconf, "JunosDevice", Dev)
+    gate = SafetyGate(safety_file=str(tmp_path / "safety.json"))
+    result = runner.run_for_target(t=Target("R1", "10.0.0.1", "junos"), transport="junos", mode="show",
+                                   show_cmd="show version", edit_cmd=None, config_dir=None, broadcast_file=None,
+                                   user="u", passwd="p", session_timeout=10, command_timeout=10, dry_run=False,
+                                   commit_confirmed=None, save_dir=None, quiet=True, max_attempts=3,
+                                   safety_gate=gate)
+    assert not result.ok and opened == [1]
+    assert result.error.startswith("NETCONF connect failed: local open-file limit reached (ulimit -n")
+    assert gate.check_device("10.0.0.1", 830, login=False) == (True, "ok")
+
+
+def test_open_says_a_descriptor_pyez_cannot_have_for_the_ssh_config_as_the_limit(monkeypatch):
+    from hssh.errors import LocalError
+
+    class Dev:
+        def __init__(self, **kw):
+            raise OSError(errno.EMFILE, "Too many open files", "/home/u/.ssh/config")
+    monkeypatch.setattr(netconf, "JunosDevice", Dev)
+    monkeypatch.setattr(netconf.limits, "open_file_limit", lambda: 256)
+    with pytest.raises(LocalError, match=r"^NETCONF connect failed: local open-file limit reached \(ulimit -n "
+                                         r"256\): this machine had no descriptor for a session to 10\.0\.0\.1:830"):
+        netconf._open("10.0.0.1", "u", "p", 10, 30, None)
+
+
 def test_a_banner_that_never_came_is_told_from_a_server_that_closed_first():
     """paramiko says "Error reading SSH protocol banner" for both; what it
     was handling, a timeout or an EOF, tells them apart where the clock

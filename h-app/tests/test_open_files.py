@@ -56,6 +56,18 @@ cli.main_sync()
 """
 
 
+_CROWDED = r"""
+import json, os, resource, sys
+soft, hard, ports = int(sys.argv[1]), int(sys.argv[2]), json.loads(sys.argv[3])
+resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+from hssh import Fleet
+held = [os.open(os.devnull, os.O_RDONLY) for _ in range(soft - 24)]   # what the rest of the program holds
+targets = [f"r{i}:127.0.0.1:junos:{port}" for i, port in enumerate(ports)]
+with Fleet(targets, user="u", passwd="p", workers=4, probe=False, session_timeout=20, command_timeout=20) as fleet:
+    print(json.dumps([[r.device, r.ok, r.error] for r in fleet.show("show version")]))
+"""
+
+
 @pytest.fixture
 def routers():
     """routers(n) -> n ports on 127.0.0.1, each a NETCONF router that lets
@@ -211,3 +223,19 @@ def test_a_job_lets_each_routers_session_go_after_its_last_entry(routers, tmp_pa
     assert rc == 0, err
     results = json.loads(out)
     assert len(results) == ROUTERS and [r for r in results if not r["ok"]] == []
+
+
+def test_a_router_this_machine_has_no_descriptor_for_is_said_as_the_open_file_limit(routers, tmp_path):
+    """Descriptors the rest of the program holds leave the sessions too few:
+    the routers that fail fail as this machine's limit, naming ulimit -n,
+    and not one as "connection refused" (ncclient swallowed the socket's
+    EMFILE, and the reason was guessed) or as a bare "[Errno 24]"."""
+    ports = routers(ROUTERS)
+    rc, out, err = _child(tmp_path, _CROWDED, SOFT, SOFT, ports)
+    assert rc == 0, err
+    failed = [r for r in json.loads(out) if not r[1]]
+    assert failed, "every router answered: nothing ran out"
+    for device, ok, error in failed:
+        assert error.startswith("NETCONF connect failed: local open-file limit reached (ulimit -n 80): this "
+                                "machine had no descriptor for a session to 127.0.0.1:"), error
+        assert "refused" not in error and "Errno" not in error, error
