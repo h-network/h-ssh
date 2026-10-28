@@ -956,3 +956,80 @@ def test_a_show_or_batch_line_the_engine_would_not_type_is_refused_before_connec
         assert took < 1 and dev.connected() == 0
     finally:
         dev.close()
+
+
+# --- #142: a lines edit stops at the first refused line ---------------------------
+
+def ios_without_gi09(srv):
+    """An IOS CLI on a console port, which echoes what is typed: it has no
+    Gi0/9, and a line it refuses leaves it in the mode it was in."""
+    mode = "R1#"
+    srv.send("\r\n" + mode)
+    while True:
+        line = srv.readline()
+        reply = ""
+        if line == "configure terminal":
+            mode, reply = "R1(config)#", "Enter configuration commands, one per line.  End with CNTL/Z.\r\n"
+        elif line == "interface Gi0/9":
+            reply = " " * 17 + "^\r\n% Invalid input detected at '^' marker.\r\n\r\n"
+        elif line == "spanning-tree portfast":
+            reply = ("%Warning: portfast should only be enabled on ports connected to a single\r\n"
+                     " host. Connecting hubs, concentrators, switches, bridges, etc... to this\r\n"
+                     " interface  when portfast is enabled, can cause temporary bridging loops.\r\n"
+                     " Use with CAUTION\r\n\r\n")
+        elif line.startswith("interface "):
+            mode = "R1(config-if)#"
+        elif line == "end":
+            mode = "R1#"
+        srv.send(reply + mode)
+
+
+def test_a_telnet_ios_edit_stops_at_the_first_refused_line():
+    """#142: telnet-ios typed every line of an edit, the ones after a
+    refused line too: with `interface Gi0/9` refused, the console still in
+    Gi0/1's interface mode, the `shutdown` after it shut Gi0/1. The edit
+    stops at the refused line, types `end`, and the failure names the
+    lines applied before it and the lines not sent."""
+    from hssh.transports.telnet import edit
+    srv = ScriptedTelnetServer(ios_without_gi09)
+    with pytest.raises(RuntimeError) as failed:
+        edit("127.0.0.1", "admin", "admin", "interface Gi0/1\n description uplink-ok\ninterface Gi0/9\n shutdown\n",
+             session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-ios")
+    assert str(failed.value) == ("'interface Gi0/9': % Invalid input detected at '^' marker.; applied before it: "
+                                 "'interface Gi0/1', 'description uplink-ok'; not sent: 'shutdown'")
+    assert _received(srv) == ["configure terminal", "interface Gi0/1", "description uplink-ok", "interface Gi0/9",
+                              "end"]
+
+
+def test_a_telnet_ios_line_taken_with_a_warning_is_applied_and_the_warning_comes_back():
+    """#142: `spanning-tree portfast`, answered with IOS's `%Warning:
+    portfast should only be enabled ...`, failed the edit after `end` with
+    the line applied, and with the edit stopping at a refused line it would
+    have stopped there. It is applied, the lines after it are typed, and the
+    warning comes back with the result."""
+    from hssh.transports.telnet import edit
+    srv = ScriptedTelnetServer(ios_without_gi09)
+    result = edit("127.0.0.1", "admin", "admin", "interface Gi0/1\n spanning-tree portfast\n no shutdown\n",
+                  session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-ios")
+    assert result.status == "applied" and result == ("(config applied)\n'spanning-tree portfast': %Warning: portfast "
+                                                     "should only be enabled on ports connected to a single")
+    assert _received(srv) == ["configure terminal", "interface Gi0/1", "spanning-tree portfast", "no shutdown", "end"]
+
+
+def test_a_telnet_edit_with_nothing_to_apply_is_refused_before_connecting(monkeypatch):
+    """#142: an edit of nothing but `!` lines on telnet-ios logged in, typed
+    `configure terminal` and `end` and said APPLIED. Nothing but blank lines
+    and the dialect's comments ('#', and '!' for an IOS-shaped one) is
+    refused before the socket is opened; to plain telnet a '!' line is a
+    line, typed as written."""
+    from hssh.transports import telnet
+
+    def never(*a, **k):
+        raise AssertionError("connected although the edit had nothing to apply")
+    monkeypatch.setattr(telnet, "_connect_and_login", never)
+    for hint, payload, kinds in (("telnet-ios", "! a\n\n! b\n", "'#' or '!'"), ("telnet-nxos", "# x", "'#' or '!'"),
+                                 ("telnet", " \n", "'#'")):
+        with pytest.raises(ValueError) as refused:
+            telnet.edit("127.0.0.1", "admin", "admin", payload, 5, 5, port=2323, vendor_hint=hint)
+        assert str(refused.value) == (f"the payload has nothing but blank lines and {kinds} comments in it; "
+                                      "nothing was sent to the device"), hint

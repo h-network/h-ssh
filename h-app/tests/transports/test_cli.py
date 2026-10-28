@@ -8,6 +8,7 @@ import time
 import pytest
 
 from hssh import dialects
+from hssh.dialects.base import Dialect
 from hssh.drivers import results as R
 from hssh.errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
 from hssh.transports.cli import Cli, edit_policy, pending_in, refuse_commit_lines, strip_ansi, complaint
@@ -761,6 +762,238 @@ def test_lines_edit_applies_each_line_in_config_mode():
     with pytest.raises(RuntimeError, match="'bogus': % Invalid input"):
         s.edit_lines("bogus\n")
     assert ch.typed[-1] == "end"
+
+
+# An IOS device with no Gi0/9: a line it refuses leaves it in the mode it was in.
+NO_GI09 = {"configure terminal": "\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nR1(config)#",
+           "interface Gi0/1": "\r\nR1(config-if)#",
+           "interface Gi0/9": "\r\n" + " " * 17 + "^\r\n% Invalid input detected at '^' marker.\r\n\r\nR1(config-if)#",
+           "end": "\r\nR1#", "<else>": "\r\nR1(config-if)#"}
+
+
+def test_a_lines_edit_stops_at_the_first_refused_line():
+    """#142: a lines edit typed every line, refused or not, each in the mode
+    the device was then in. With `interface Gi0/9` refused, the device
+    still in Gi0/1's interface mode, the `shutdown` after it shut Gi0/1,
+    and the failure named only the refusal. The edit stops at the first
+    refused line, types `end` and fails, naming the line and the device's
+    complaint, the lines applied before it and the lines not sent."""
+    refused = "'interface Gi0/9': % Invalid input detected at '^' marker."
+    for payload, typed, said in (
+            ("interface Gi0/1\n description uplink-ok\ninterface Gi0/9\n shutdown\n",
+             ["interface Gi0/1", "description uplink-ok", "interface Gi0/9"],
+             "applied before it: 'interface Gi0/1', 'description uplink-ok'; not sent: 'shutdown'"),
+            ("interface Gi0/9\n shutdown\n no ip address\n", ["interface Gi0/9"],
+             "applied before it: none; not sent: 'shutdown', 'no ip address'"),
+            ("interface Gi0/1\n! the last line\ninterface Gi0/9\n", ["interface Gi0/1", "interface Gi0/9"],
+             "applied before it: 'interface Gi0/1'; not sent: none")):
+        ch = ScriptChannel("\r\nR1#", NO_GI09)
+        s = Cli(ch, dialects.ios.DIALECT, 5)
+        s.login()
+        with pytest.raises(RuntimeError) as failed:
+            s.edit_lines(payload)
+        assert str(failed.value) == f"{refused}; {said}"
+        assert ch.typed == ["configure terminal", *typed, "end"] and ch.unread() == ""
+
+
+# What IOS says of a line it took: two warnings, and the note that a VRF took the interface's addresses.
+TOOK = {"vrf forwarding CUST": ("\r\n% Interface GigabitEthernet0/1 IPv4 disabled and address(es) removed due to "
+                                "enabling VRF CUST\r\nR1(config-if)#"),
+        "ip address 10.0.0.1 255.255.255.254": ("\r\n% Warning: use /31 mask on non point-to-point interface "
+                                                 "cautiously\r\nR1(config-if)#"),
+        "spanning-tree portfast": ("\r\n%Warning: portfast should only be enabled on ports connected to a single\r\n"
+                                   " host. Connecting hubs, concentrators, switches, bridges, etc... to this\r\n"
+                                   " interface  when portfast is enabled, can cause temporary bridging loops.\r\n"
+                                   " Use with CAUTION\r\n\r\n%Portfast has been configured on GigabitEthernet0/1 "
+                                   "but will only\r\n have effect when the interface is in a non-trunking mode."
+                                   "\r\nR1(config-if)#")}
+
+
+def test_a_line_the_cli_took_with_a_warning_is_applied_and_the_warning_comes_back():
+    """#142: a line of a lines edit was refused when its reply had `error`,
+    `invalid` or a `%` anywhere: IOS's `%Warning: portfast should only be
+    enabled ...` failed a `spanning-tree portfast` the device took, after
+    `end`. With the edit stopping at a refused line, `% Warning: use /31
+    mask ...` would stop it too, and the note that `vrf forwarding` took
+    the interface's addresses would leave it without the `ip address` the
+    next line puts back. A line is refused as the dialect says; one it took
+    with a warning (its `informational`) is applied, every line after it
+    typed, and the warning comes back with the result."""
+    for echoes in (False, True):
+        ch = ScriptChannel("\r\nR1#", dict(NO_GI09, **TOOK))
+        s = Cli(ch, dialects.ios.DIALECT, 5, echoes=echoes)
+        s.login()
+        r = s.edit_lines("interface Gi0/1\n vrf forwarding CUST\n ip address 10.0.0.1 255.255.255.254\n"
+                         " spanning-tree portfast\n no shutdown\n")
+        assert r.status == R.APPLIED and r == r.message == "\n".join((
+            "(config applied)",
+            "'vrf forwarding CUST': % Interface GigabitEthernet0/1 IPv4 disabled and address(es) removed due to "
+            "enabling VRF CUST",
+            "'ip address 10.0.0.1 255.255.255.254': % Warning: use /31 mask on non point-to-point interface cautiously",
+            "'spanning-tree portfast': %Warning: portfast should only be enabled on ports connected to a single",
+            "'spanning-tree portfast': %Portfast has been configured on GigabitEthernet0/1 but will only"))
+        assert ch.typed == ["configure terminal", "interface Gi0/1", "vrf forwarding CUST",
+                            "ip address 10.0.0.1 255.255.255.254", "spanning-tree portfast", "no shutdown", "end"]
+
+
+def test_a_line_is_refused_as_the_dialect_says_not_by_the_words_in_its_reply():
+    """#142: a lines edit took `error`, `invalid` or a `%` anywhere in a
+    reply for a refusal, and a dialect's own refusal without them for none.
+    A reply is judged as a candidate edit's is, by the dialect's `refused`
+    on a line of it: `Bad command` from a CLI whose dialect says so fails
+    the edit and stops it, and a line the device took is applied whatever
+    words its reply has."""
+    acme = Dialect("acme", "AcmeOS", "x", refused=re.compile(r"^\s*Bad command", re.M), cli=dialects.ios.CLI)
+    replies = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#",
+               "bogus": "\r\nBad command: 'bogus'\r\nR1(config)#"}
+    ch = ScriptChannel("\r\nR1#", replies)
+    s = Cli(ch, acme, 5)
+    s.login()
+    with pytest.raises(RuntimeError, match=r"^'bogus': Bad command: 'bogus'; applied before it: 'hostname x'; "
+                                           r"not sent: 'ip domain-name lab'$"):
+        s.edit_lines("hostname x\nbogus\nip domain-name lab\n")
+    assert ch.typed == ["configure terminal", "hostname x", "bogus", "end"]
+    replies["snmp-server"] = "\r\nInvalid community strings are logged as errors; 0% of the table in use\r\nR1(config)#"
+    ch = ScriptChannel("\r\nR1#", replies)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    assert s.edit_lines("snmp-server community lab-error RO\nhostname x\n") == "(config applied)"
+    assert ch.typed == ["configure terminal", "snmp-server community lab-error RO", "hostname x", "end"]
+
+
+# What IOS says of a line it refused without a `% ` first, and of two lines it took: its syslog note on an
+# interface come up, and its note on a default route out of an interface.
+NO_SPACE = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#",
+            "ip route 10.1.1.1 255.255.255.0 192.0.2.1": "\r\n%Inconsistent address and mask\r\nR1(config)#",
+            "username ops secret 5 notahash": (
+                "\r\nERROR: The secret you entered is not a valid encrypted secret.\r\n"
+                "To enter an UNENCRYPTED secret, do not specify type 5 encryption.\r\n"
+                "When you properly enter an UNENCRYPTED secret, it will be encrypted.\r\n\r\nR1(config)#"),
+            "no shutdown": "\r\n%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to up\r\nR1(config-if)#",
+            "ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0": (
+                "\r\n%Default route without gateway, if not a point-to-point interface, may impact performance"
+                "\r\nR1(config)#")}
+
+
+def test_a_refusal_with_no_space_after_its_percent_stops_a_lines_edit():
+    """#142: judged by `^\\s*% `, a line IOS refused with `%Inconsistent
+    address and mask`, or with `ERROR: The secret you entered is not a
+    valid encrypted secret.`, as NX-OS refuses a value, came back APPLIED,
+    and the lines after it were typed; when `error` or a `%` anywhere was a
+    refusal, it failed. The IOS-shaped dialects refuse with a `%` first,
+    a space after it or not, and with `ERROR:`: the edit stops there. A
+    syslog message the device prints meanwhile (`%LINK-3-UPDOWN: ...`) is
+    not a refusal, and IOS's note on a default route it took is applied,
+    the note coming back with the result."""
+    for d in (dialects.ios.DIALECT, dialects.nxos.DIALECT, dialects.eos.DIALECT):
+        for bad, said in (("ip route 10.1.1.1 255.255.255.0 192.0.2.1", "%Inconsistent address and mask"),
+                          ("username ops secret 5 notahash",
+                           "ERROR: The secret you entered is not a valid encrypted secret.")):
+            ch = ScriptChannel("\r\nR1#", NO_SPACE)
+            s = Cli(ch, d, 5)
+            s.login()
+            with pytest.raises(RuntimeError) as failed:
+                s.edit_lines(f"hostname before\n{bad}\nhostname after\n")
+            assert str(failed.value) == (f"'{bad}': {said}; applied before it: 'hostname before'; "
+                                         "not sent: 'hostname after'"), d.name
+            assert ch.typed == ["configure terminal", "hostname before", bad, "end"], d.name
+    ch = ScriptChannel("\r\nR1#", NO_SPACE)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    r = s.edit_lines("interface Gi0/1\n no shutdown\nip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0\nhostname after\n")
+    assert r.status == R.APPLIED and r == ("(config applied)\n'ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0': "
+                                           "%Default route without gateway, if not a point-to-point interface, "
+                                           "may impact performance")
+    assert ch.typed == ["configure terminal", "interface Gi0/1", "no shutdown",
+                        "ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0", "hostname after", "end"]
+
+
+# What IOS says of a line it took besides a warning: the RSA keys it makes, the VLAN changes it applies.
+NOTES = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#",
+         "crypto key generate rsa modulus 2048": (
+             "\r\nThe name for the keys will be: R1.lab.example\r\n\r\n% The key modulus size is 2048 bits\r\n"
+             "% Generating 2048 bit RSA keys, keys will be non-exportable...\r\n[OK] (elapsed time was 1 seconds)"
+             "\r\n%SSH-5-ENABLED: SSH 1.99 has been enabled\r\nR1(config)#"),
+         "exit": "\r\n% Applying VLAN changes may take few minutes.  Please wait...\r\n\r\nR1(config)#"}
+
+
+def test_a_line_ios_took_with_a_note_is_applied_and_the_edit_goes_on():
+    """#142: IOS says `% ` first of more than a warning on a line it took:
+    `crypto key generate rsa modulus 2048` is answered `% The key modulus
+    size is 2048 bits` and `% Generating 2048 bit RSA keys ...` as the keys
+    are made, and leaving a VLAN's mode `% Applying VLAN changes may take
+    few minutes.  Please wait...`. Taken for refusals, they stopped the
+    edit there, the line applied and the lines after it not sent. They are
+    the dialect's `informational`: the line is applied, the next one typed,
+    and the notes come back with the result."""
+    ch = ScriptChannel("\r\nR1#", NOTES)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    r = s.edit_lines("ip domain-name lab.example\ncrypto key generate rsa modulus 2048\nip ssh version 2\n"
+                     "vlan 10\n name users\nexit\ninterface Gi0/1\n switchport access vlan 10\n")
+    key = "'crypto key generate rsa modulus 2048': "
+    assert r.status == R.APPLIED and r == "\n".join((
+        "(config applied)", key + "% The key modulus size is 2048 bits",
+        key + "% Generating 2048 bit RSA keys, keys will be non-exportable...",
+        "'exit': % Applying VLAN changes may take few minutes.  Please wait..."))
+    assert ch.typed == ["configure terminal", "ip domain-name lab.example", "crypto key generate rsa modulus 2048",
+                        "ip ssh version 2", "vlan 10", "name users", "exit", "interface Gi0/1",
+                        "switchport access vlan 10", "end"]
+
+
+def test_a_line_break_before_the_echo_leaves_the_echo_out_of_the_reply():
+    """#142: the echo was the reply's first line or no echo, so a device
+    that sends a line break before it left it in the reply: over telnet
+    `description clean_error_counters` came back as its own reply, which
+    failed a lines edit on its `error`, and a show's output began with the
+    command. The echo is the reply's first line of text, and a reply that is
+    only that so far, a line ending in prompt-shaped text, is not yet the
+    reply, as without the line break."""
+    replies = dict(NO_GI09, **TOOK)
+    for echoes in (False, True):
+        ch = ScriptChannel("\r\nR1#", replies, echo=lambda line: "\r\n" + line)
+        s = Cli(ch, dialects.ios.DIALECT, 5, echoes=echoes)
+        s.login()
+        assert s.run("configure terminal", 5).strip() == "Enter configuration commands, one per line.  End with CNTL/Z."
+        assert s.run("description clean_error_counters", 5) == ""
+        out = s.run("spanning-tree portfast", 5)
+        assert out.lstrip().startswith("%Warning: portfast should only be enabled") and "tree portfast" not in out
+        assert s.edit_lines("interface Gi0/1\n description clean_error_counters\n") == "(config applied)"
+    # A prompt the dialect cannot name is not learned: the echo of a line ending in prompt-shaped text, the
+    # device pausing right after it, is still only the echo, a line break before it or not.
+    xr = "RP/0/RSP0/CPU0:R1"
+    ch = ScriptChannel(f"\r\n{xr}#", {"description": PAUSE + f"\r\n{xr}(config-if)#", "show clock": f"\r\n10:00\r\n{xr}#"},
+                       echo=lambda line: "\r\n" + line, split_at="noc@example.com>")
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    assert s.run("description noc@example.com>", 5) == "" and ch.unread() == ""
+    assert s.run("show clock", 5).strip() == "10:00"
+
+
+def test_a_comment_is_the_dialects_and_a_lines_edit_of_nothing_else_is_refused():
+    """#142: a lines edit passed over `!` and `#` lines whatever the
+    dialect, and one of nothing else typed `configure terminal` and `end`
+    and said APPLIED. A comment is the dialect's (`#`, and `!` for an
+    IOS-shaped one; to plain telnet's `none` a `!` line is a line, typed as
+    written), and an edit with nothing else in it is refused before config
+    mode: nothing is typed."""
+    replies = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#"}
+    for dialect, payload, kinds in ((dialects.eos.DIALECT, "! nothing but IOS comments\n! a second one\n", "'#' or '!'"),
+                                    (dialects.ios.DIALECT, "  \n# x\n\n   ! y\n", "'#' or '!'"),
+                                    (dialects.none.DIALECT, "# x\n\n", "'#'")):
+        ch = ScriptChannel("\r\nR1#", replies)
+        s = Cli(ch, dialect, 5)
+        s.login()
+        with pytest.raises(ValueError) as refused:
+            s.edit_lines(payload)
+        assert str(refused.value) == (f"the payload has nothing but blank lines and {kinds} comments in it; "
+                                      "nothing was sent to the device")
+        assert ch.typed == []
+    ch = ScriptChannel("\r\nR1#", replies)
+    s = Cli(ch, dialects.none.DIALECT, 5)
+    s.login()
+    assert s.edit_lines("! as written\nhostname x\n# not this\n") == "(config applied)"
+    assert ch.typed == ["configure terminal", "! as written", "hostname x", "end"]
 
 
 # --- confirm ----------------------------------------------------------------------------

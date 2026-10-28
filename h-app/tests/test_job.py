@@ -173,3 +173,20 @@ def test_a_job_show_loses_its_closing_line_break(tmp_path):
     job_file.write_text(json.dumps([{"target": "R1:10.0.0.1:junos", "show": " \n"}]))
     with pytest.raises(ValueError, match=re.escape("Job entry 0 (R1): 'show' is empty")):
         load_jobs(str(job_file))
+
+
+def test_a_job_edit_of_whitespace_is_refused(tmp_path):
+    """#142: only a show was checked for emptiness, so an edit of
+    whitespace reached the driver: on a plain ssh or openssh target it
+    logged in, sent nothing and came back ok. An edit that is empty after
+    strip is refused as a show is, in a --job file and a run file's `jobs`."""
+    from hssh.core import parse_jobs
+    job_file = tmp_path / "job.json"
+    for edit in ("", "  \n ", "\n\n"):
+        entries = [{"target": "R1:10.0.0.1:ssh", "show": "uptime"}, {"target": "R2:10.0.0.2:ssh", "edit": edit}]
+        job_file.write_text(json.dumps(entries))
+        with pytest.raises(ValueError, match=re.escape("Job entry 1 (R2): 'edit' is empty")):
+            load_jobs(str(job_file))
+        with pytest.raises(ValueError, match=re.escape("Job entry 1 (R2): 'edit' is empty")):
+            parse_jobs(entries)
+    assert parse_jobs([{"target": "R1:10.0.0.1:ssh", "edit": " hostname x\n"}])[0].command == " hostname x\n"

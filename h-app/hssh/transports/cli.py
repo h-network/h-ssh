@@ -15,7 +15,7 @@ import re
 import time
 from typing import Callable, Optional
 
-from ..core import check_confirm_minutes, control_character, control_line, refusal_line
+from ..core import check_confirm_minutes, comments_named, control_character, control_line, refusal_line
 from ..dialects.base import CliSyntax, Dialect
 from ..drivers import results as R
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
@@ -137,6 +137,37 @@ def complaint(output: str, dialect: Dialect) -> str:
         if ln.strip() and set(ln.strip()) != {"^"}:
             return ln.strip()
     return output.strip()
+
+
+def quoted(lines: list) -> str:
+    """Lines of an edit as a failure names them: each in quotes, or `none`."""
+    return ", ".join(f"'{line}'" for line in lines) or "none"
+
+
+def notices(output: str, dialect: Dialect) -> list:
+    """The lines of a reply in which the CLI took the command and warned
+    about it (the dialect's `informational`), as the device said them."""
+    if dialect.informational is None:
+        return []
+    return [line.strip() for line in output.splitlines() if dialect.informational.search(line)]
+
+
+def edit_lines_of(payload: str, dialect: Dialect) -> list:
+    """The lines an edit types: the payload's lines, stripped, but the blank
+    ones and the full-line comments of the dialect (`#`, and `!` for an
+    IOS-shaped one: comment_prefixes)."""
+    lines = [line.strip() for line in payload.strip().splitlines()]
+    return [line for line in lines if line and not line.startswith(dialect.comment_prefixes)]
+
+
+def refuse_empty_edit(payload: str, dialect: Dialect) -> None:
+    """An edit without a candidate that has nothing to type, nothing but
+    blank lines and comments in it, typed `configure terminal` and `end`,
+    or on the plain drivers logged in and sent nothing, and said APPLIED
+    (#142). Refused before the device is contacted."""
+    if not edit_lines_of(payload, dialect):
+        raise ValueError(f"the payload has nothing but blank lines and {comments_named(dialect.comment_prefixes)} "
+                         "comments in it; nothing was sent to the device")
 
 
 def refuse_control_characters(payload: str) -> None:
@@ -501,8 +532,9 @@ class Cli:
             lines = clean.splitlines()
             if not lines:
                 return False
-            if len(lines) == 1 and is_echo(lines[0], cmd):
-                return False                      # only the echo so far
+            said = [line for line in lines if line.strip()]
+            if len(said) == 1 and is_echo(said[0], cmd):
+                return False                      # only the echo so far, a line break before it or not
             if through_echo and not any(drawn_echo(line, cmd, self.cli.prompt) for line in lines[:-1]):
                 return False                      # what the banner had left, the echo still to come
             return self._at_prompt(clean, prompt_re)
@@ -529,19 +561,23 @@ class Cli:
         made an empty compare a diff, its commit confirming the timer
         (#141).
 
-        The echo is the line typed, as a rule. On a channel that echoes, a
-        reply whose one line of text is not that line is its echo as the
-        CLI drew it: Junos completes a keyword as it is typed (`set int`
-        comes back `set interfaces`), and an IOS-shaped CLI narrower than a
-        long line scrolls it. Taken for output, each such line of an edit
-        was waited on (#141)."""
+        The echo is the line typed, as a rule, and the reply's first line of
+        text: a line break the device sent before it once left it in the
+        reply, where `description clean_error_counters` failed a lines edit
+        on its `error` (#142). On a channel that echoes, a reply whose one
+        line of text is not that line is its echo as the CLI drew it: Junos
+        completes a keyword as it is typed (`set int` comes back `set
+        interfaces`), and an IOS-shaped CLI narrower than a long line
+        scrolls it. Taken for output, each such line of an edit was waited
+        on (#141)."""
         lines = clean.splitlines()
         echoed = False
+        lead = next((n for n, line in enumerate(lines) if line.strip()), 0)     # the first line of text
         if through_echo:
             echo = next((n for n, line in enumerate(lines) if drawn_echo(line, cmd, self.cli.prompt)), -1)
             lines, echoed = lines[echo + 1:], echo >= 0
-        elif lines and is_echo(lines[0], cmd):
-            lines, echoed = lines[1:], True
+        elif lines and is_echo(lines[lead], cmd):
+            lines, echoed = lines[lead + 1:], True
         elif self.echoes and cmd.strip():
             # A CLI narrower than the line redraws it as it is typed: the
             # echo is one line on the terminal, several to splitlines().
@@ -580,27 +616,47 @@ class Cli:
     # --- edits -------------------------------------------------------------------
 
     def edit_lines(self, payload: str) -> R.EditResult:
-        """Config mode without a candidate: configure terminal -> commands -> end."""
-        cli = self.cli
+        """Config mode without a candidate: configure terminal, the lines, end.
+
+        Each line is live once it is typed, and the next is typed in the mode
+        the device is then in: with `interface Gi0/9` refused, the device
+        still in Gi0/1's, a `shutdown` after it shut Gi0/1 (#142). So the
+        edit stops at the first line the CLI refuses, leaves config mode
+        (`end`) and fails, naming that line and the device's complaint, the
+        lines applied before it and the lines not sent.
+
+        A line is refused as the dialect says (`refused`, a line of the
+        reply), as a candidate edit's is: `error`, `invalid` or a `%`
+        anywhere in a reply once failed a line the device took, IOS's
+        `%Warning: portfast should only be enabled ...` too, after `end`
+        with the line applied. A line the CLI took with a warning (the
+        dialect's `informational`) is applied, and the warning comes back
+        with the result, the line it answered in quotes.
+
+        A comment line (the dialect's comment_prefixes: `#`, and `!` for an
+        IOS-shaped CLI) is not typed, and a payload of nothing else is
+        refused before config mode: it typed `configure terminal` and `end`
+        and said APPLIED (#142)."""
+        d, cli = self.dialect, self.cli
         refuse_control_characters(payload)
+        refuse_empty_edit(payload, d)
+        lines = edit_lines_of(payload, d)
         self.run(cli.config_enter, 10)
 
-        errors = []
-        for line in payload.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("!") or line.startswith("#"):
-                continue
+        warned = []
+        for n, line in enumerate(lines):
             # The reply without the echoed line, so the line's own text is not
             # mistaken for the device's complaint about it.
             output = self.run(line, 10)
-            if "invalid" in output.lower() or "error" in output.lower() or "%" in output:
-                errors.append(f"'{line}': {complaint(output, self.dialect)}")
+            said = refusal_line(output, dialect=d)
+            if said:
+                self.leave_quietly(cli.config_exit)
+                raise RuntimeError(f"'{line}': {said}; "
+                                   f"applied before it: {quoted(lines[:n])}; not sent: {quoted(lines[n + 1:])}")
+            warned += [f"'{line}': {note}" for note in notices(output, d)]
 
         self.run(cli.config_exit, 10)
-
-        if errors:
-            raise RuntimeError("; ".join(errors))
-        return R.EditResult(R.APPLIED, message="(config applied)")
+        return R.EditResult(R.APPLIED, message="\n".join(["(config applied)", *warned]))
 
     def edit_candidate(self, payload: str, dry_run: bool, confirmed_minutes: int = 0,
                        expected_diff: Optional[str] = None) -> R.EditResult:
@@ -624,10 +680,7 @@ class Cli:
             raise NotAppliedError(f"Failed to lock config: {reply.strip()}")
 
         errors = []
-        for line in payload.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        for line in edit_lines_of(payload, d):
             output = self.run(line, 10)
             if d.refused.search(output):
                 errors.append(f"'{line}': {complaint(output, d)}")

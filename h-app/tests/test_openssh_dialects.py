@@ -461,10 +461,15 @@ def test_an_ios_shaped_edit_types_the_lines_in_config_mode(device, hint):
 
 
 def test_an_ios_shaped_edit_reports_the_refused_line_and_still_leaves_config_mode(device):
+    """#142: and stops there: the lines after a refused one were typed in
+    whatever mode the device was in. They are not sent, and the failure
+    names them and the lines applied before it."""
     device.knobs(flavour="ios")
-    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.$"):
-        openssh.edit("10.0.0.1", "u", "hunter2", "hostname bogus\n", 5, 10, vendor_hint="ios@openssh")
-    assert device.typed == ["configure terminal", "hostname bogus", "end"]
+    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.; "
+                                           r"applied before it: 'interface Gi0/1'; not sent: 'shutdown'$"):
+        openssh.edit("10.0.0.1", "u", "hunter2", "interface Gi0/1\nhostname bogus\n shutdown\n", 5, 10,
+                     vendor_hint="ios@openssh")
+    assert device.typed == ["configure terminal", "interface Gi0/1", "hostname bogus", "end"]
 
 
 def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(device):
@@ -477,9 +482,24 @@ def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(device):
     pty echoes what is typed, so the first reply is read through its echo:
     the refused line fails the edit."""
     device.knobs(flavour="ios", banner="noc", lag=0.2)
-    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.$"):
+    with pytest.raises(RuntimeError, match=r"^'hostname bogus': % Invalid input detected at '\^' marker\.; "
+                                           r"applied before it: 'interface Gi0/1'; not sent: none$"):
         openssh.edit("10.0.0.1", "u", "hunter2", "interface Gi0/1\nhostname bogus\n", 5, 10, vendor_hint="ios@openssh")
     assert device.typed == ["configure terminal", "interface Gi0/1", "hostname bogus", "end"]
+
+
+def test_an_edit_with_nothing_to_apply_is_refused_before_connecting(no_ssh):
+    """#142: an edit of `!` lines on an IOS-shaped dialect typed `configure
+    terminal` and `end` at the pty and said APPLIED, and one of whitespace
+    on the plain openssh driver ran no command and said ok. Refused before
+    ssh is started: nothing but blank lines and the dialect's comments
+    ('#', and '!' for an IOS-shaped one)."""
+    for hint, payload, kinds in (("ios@openssh", "! a\n! b\n", "'#' or '!'"), ("eos@openssh", "# c\n", "'#' or '!'"),
+                                 ("openssh", "  \n\n", "'#'"), ("none@openssh", "# x", "'#'")):
+        with pytest.raises(ValueError) as refused:
+            openssh.edit("10.0.0.1", "u", "p", payload, 5, 10, vendor_hint=hint)
+        assert str(refused.value) == (f"the payload has nothing but blank lines and {kinds} comments in it; "
+                                      "nothing was sent to the device"), hint
 
 
 def test_an_ios_shaped_dialect_refuses_what_only_a_candidate_can_do_before_connecting(no_ssh):

@@ -48,9 +48,9 @@ class Target:
         validate_device_name(self.name)
 
 
-def _is_comment_or_empty(line: str) -> bool:
+def _is_comment_or_empty(line: str, comments: Tuple[str, ...] = ("#",)) -> bool:
     s = line.strip()
-    return not s or s.startswith("#")
+    return not s or s.startswith(tuple(comments))
 
 
 def check_port(value, where: str) -> int:
@@ -346,11 +346,13 @@ def parse_jobs(data, default_vendor: str = "ssh") -> List[JobEntry]:
             raise ValueError(f"Job entry {i} ({target.name}): must have exactly one of 'show' or 'edit'")
         # As for -sC and -eC: a show is one line of text (stripped, as a run
         # file's commands are, so a closing line break is not part of it),
-        # an edit plain text.
+        # an edit plain text, and neither is whitespace alone: such an edit
+        # has nothing to apply, and the plain ssh and openssh drivers logged
+        # in, sent nothing and said ok (#142).
         key = "show" if has_show else "edit"
         command = item[key].strip() if has_show else item[key]
-        if has_show and not command:
-            raise ValueError(f"Job entry {i} ({target.name}): 'show' is empty")
+        if not command.strip():
+            raise ValueError(f"Job entry {i} ({target.name}): '{key}' is empty")
         what = control_character(command, line_breaks=has_edit)
         if what:
             raise ValueError(f"Job entry {i} ({target.name}): '{key}' has {what} ({command!r}); "
@@ -364,26 +366,35 @@ def parse_jobs(data, default_vendor: str = "ssh") -> List[JobEntry]:
     return entries
 
 
-def set_file_payload(text: str) -> str:
+def set_file_payload(text: str, comments: Tuple[str, ...] = ("#",)) -> str:
     """What a -eD or -eB file sends, to every driver: its lines with blank and
-    full-line '#' comment lines dropped, nothing else touched; '' when nothing
-    is left. An inline '#' is part of the line (`set snmp community ab#12
-    ...`), the rule junos._strip_comments applies to every set payload. The
-    plain ssh and openssh drivers run each line as a command of its own, so
-    the rule is applied before any driver gets the payload, not by each."""
-    lines = [ln for ln in text.splitlines() if not _is_comment_or_empty(ln)]
+    full-line comment lines dropped, nothing else touched; '' when nothing
+    is left. A comment line starts with one of `comments`, the target
+    dialect's comment_prefixes: '#' on every driver, and '!' too on an
+    IOS-shaped one. An inline '#' is part of the line (`set snmp community
+    ab#12 ...`), the rule junos._strip_comments applies to every set
+    payload. The plain ssh and openssh drivers run each line as a command
+    of its own, so the rule is applied before any driver gets the payload,
+    not by each."""
+    lines = [ln for ln in text.splitlines() if not _is_comment_or_empty(ln, comments)]
     return "\n".join(lines) + "\n" if lines else ""
 
 
-def read_set_file_for_device(config_dir: str, dev_name: str) -> str:
+def comments_named(comments: Tuple[str, ...]) -> str:
+    """Comment prefixes as a refusal names them: `'#'`, `'#' or '!'`."""
+    return " or ".join(f"'{c}'" for c in comments)
+
+
+def read_set_file_for_device(config_dir: str, dev_name: str, comments: Tuple[str, ...] = ("#",)) -> str:
     """The -eD payload for one device: `<config_dir>/<dev_name>.set` as
-    set_file_payload() makes it, so -eD sends what the syntax guard
-    validated, and what -eB sends from the same file.
+    set_file_payload() makes it for the device's dialect (`comments`), so
+    -eD sends what the syntax guard validated, and what -eB sends from the
+    same file.
     """
     path = path_inside(config_dir, f"{validate_device_name(dev_name)}.set")
     if not path.is_file():
         raise FileNotFoundError(f"Missing config file for {dev_name}: {path}")
-    payload = set_file_payload(path.read_text(encoding="utf-8-sig"))
+    payload = set_file_payload(path.read_text(encoding="utf-8-sig"), comments)
     if not payload:
         raise ValueError(f"Empty config after filtering: {path}")
     return payload
@@ -580,12 +591,15 @@ def refusal_line(*texts: str, dialect=None):
     """The first line in which the device refused the command, or None. A CLI
     that exits 0 after refusing a line still said so; how it says so is the
     dialect's (`refused`). Without one, the `none` dialect's rule: a line
-    starting with "error:" (Junos) or "% " (IOS, EOS, NX-OS)."""
-    pattern = (dialect or drivers.NONE).refused
+    starting with "error:" (Junos) or "% " (IOS, EOS, NX-OS). A line the
+    dialect's `informational` matches as well (IOS's `% Warning: ...`) is the
+    CLI taking the command with a warning, not refusing it."""
+    dialect = dialect or drivers.NONE
     for text in texts:
-        m = pattern.search(text or "")
-        if m:
-            return (text[m.start():].strip().splitlines() or [""])[0].strip()
+        for m in dialect.refused.finditer(text or ""):
+            line = (text[m.start():].strip().splitlines() or [""])[0].strip()
+            if not (dialect.informational and dialect.informational.search(line)):
+                return line
     return None
 
 

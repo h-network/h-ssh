@@ -204,6 +204,38 @@ def test_a_set_file_with_nothing_but_comments_is_refused_before_any_driver_is_ca
             assert v.edit_calls == [], (mode, text)
 
 
+def test_an_edit_with_nothing_to_apply_is_refused_by_the_targets_dialect(monkeypatch, tmp_path):
+    """#142: what the runner dropped as a comment was '#' alone, and an -eC
+    was not checked at all: a file or an -eC of `!` lines reached an
+    IOS-shaped driver, which typed `configure terminal` and `end` and said
+    APPLIED, and an -eC of whitespace logged in on the plain ssh driver and
+    said ok. A comment is the target dialect's ('#', and '!' for an
+    IOS-shaped one), and an edit of nothing else is refused before any
+    driver is called, on every path; to the plain drivers a '!' line is a
+    line, sent as written."""
+    bangs = "! nothing but IOS comments\n\n  ! a second one\n"
+    (tmp_path / "R1.set").write_text(bangs)
+    for vendor, mode, edit_cmd, where, said in (
+            ("ios@ssh", "edit-cmd", "! x", {}, "the edit has nothing but blank lines and '#' or '!' comments in it; "
+                                               "nothing was sent to the device"),
+            ("eos@openssh", "edit-cmd", "# x\n! y", {}, "nothing but blank lines and '#' or '!' comments"),
+            ("ssh", "edit-cmd", "   \n  ", {}, "the edit has nothing but blank lines and '#' comments in it; "
+                                               "nothing was sent to the device"),
+            ("junos", "edit-cmd", "# x", {}, "nothing but blank lines and '#' comments"),
+            ("telnet-ios", "edit-broadcast", None, {"broadcast_file": str(tmp_path / "R1.set")},
+             f"Empty config after filtering: {tmp_path / 'R1.set'}"),
+            ("nxos@ssh", "edit-dir", None, {"config_dir": str(tmp_path)},
+             f"Empty config after filtering: {tmp_path / 'R1.set'}")):
+        for text in ((None, bangs) if mode != "edit-cmd" else (None,)):
+            v = FakeVendor()
+            _, ok, out, _ = run(monkeypatch, vendor, v, mode=mode, edit_cmd=edit_cmd, payload_text=text, **where)
+            assert not ok and said in out and v.edit_calls == [], (vendor, mode, text, out)
+    v = FakeVendor(["(config applied)"])
+    _, ok, out, _ = run(monkeypatch, "ssh", v, mode="edit-broadcast", edit_cmd=None, payload_text=bangs,
+                        broadcast_file=str(tmp_path / "R1.set"))
+    assert ok and [c["payload"] for c in v.edit_calls] == [bangs.replace("\n\n", "\n")]
+
+
 def test_runner_leaves_name_resolution_to_the_transport(monkeypatch):
     """The runner once called gethostbyname before every attempt: result
     unused, errors swallowed, one blocking resolver round-trip per device."""

@@ -3,7 +3,8 @@
 Two things it still knows, because the plain `ssh`, `openssh` and `telnet`
 transports always behaved this way: a refusal is a line starting with
 `error:` (Junos) or `% ` (IOS, EOS, NX-OS), and on a transport that types at
-a CLI the prompt is IOS-shaped."""
+a CLI the prompt is IOS-shaped. Its comments are h-ssh's own `#` lines: a
+`!` line is a line, sent as written, typed at that prompt too (#142)."""
 
 import re
 

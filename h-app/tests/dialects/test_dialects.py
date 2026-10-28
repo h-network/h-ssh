@@ -12,7 +12,7 @@ import pytest
 
 from hssh import cli, core, dialects, drivers, runner
 from hssh.core import Target, refusal_line, resolve_command, get_available_commands
-from hssh.dialects.base import CliSyntax, Dialect
+from hssh.dialects.base import CliSyntax, Dialect, is_read
 from hssh.transports import telnet
 from tests.test_cli_runfile import run as run_cli
 
@@ -74,6 +74,91 @@ def test_how_each_dialect_refuses_a_line():
     assert refusal_line("% Invalid input", dialect=j) is None            # not how Junos says no
     assert refusal_line("% Invalid input", dialect=dialects.eos.DIALECT) == "% Invalid input"
     assert refusal_line("commit failed: x", dialect=j) == "commit failed: x"
+
+
+def test_an_ios_warning_is_no_refusal():
+    """#142: IOS says `%` first of a line it took as well as of one it
+    refused, so a lines edit that stops at a refused line stopped at a
+    `% Warning: use /31 mask ...`, and at the note that `vrf forwarding`
+    took the interface's addresses, the next line's to put back. The
+    IOS-shaped dialects name what IOS says of a line it took
+    (`informational`), and a line it matches is no refusal; a refusal after
+    it still is. Junos and `none` have none: their rule stays."""
+    ios, nxos, eos = dialects.ios.DIALECT, dialects.nxos.DIALECT, dialects.eos.DIALECT
+    assert ios.informational is nxos.informational is eos.informational
+    assert dialects.junos.DIALECT.informational is None and dialects.none.DIALECT.informational is None
+    for line in ("%Warning: portfast should only be enabled on ports connected to a single",
+                 "% Warning: use /31 mask on non point-to-point interface cautiously", "% WARNING: low memory",
+                 "% Interface GigabitEthernet0/1 IPv4 disabled and address(es) removed due to enabling VRF CUST",
+                 "% Interface FastEthernet0/0 IP address 10.0.0.1 removed due to enabling VRF CUST",
+                 "  % Interface Gi0/2 IPv4 disabled and address(es) removed due to disabling VRF CUST"):
+        assert ios.informational.search(line), line
+        assert refusal_line(line, dialect=eos) is None, line
+    for line in ("% Invalid input detected at '^' marker.", "% Incomplete command.", '% Ambiguous command:  "sh"',
+                 "% Interface Gi0/9 not found", "% Warnings are disabled"):
+        assert not ios.informational.search(line) and refusal_line(line, dialect=ios) == line, line
+    assert refusal_line("\n% Warning: use /31 mask\n\n   ^\n% Invalid input detected\n", dialect=ios) == \
+        "% Invalid input detected"
+    assert refusal_line("% Warning: use /31 mask", dialect=dialects.none.DIALECT) == "% Warning: use /31 mask"
+
+
+def test_an_ios_shaped_refusal_is_a_percent_first_a_space_after_it_or_not():
+    """#142: a lines edit took `error`, `invalid` or a `%` anywhere in a
+    reply for a refusal; judged by the IOS-shaped dialects' `^\\s*% `
+    instead, `%Inconsistent address and mask`, `ERROR: The secret you
+    entered is not a valid encrypted secret.` and NX-OS's `ERROR: ...`
+    were the device taking the line. A `%` first is a refusal, a space
+    after it or not, and so is `ERROR:`; a syslog message the device prints
+    into the session (`%LINK-3-UPDOWN: ...`) is not, and neither is what
+    IOS says, no space after its `%`, of a line it took (`informational`).
+    A show is held to the same rule: one whose reply opens with `%Error
+    opening ...` is refused, one that opens with a syslog line is output."""
+    ios, nxos, eos = dialects.ios.DIALECT, dialects.nxos.DIALECT, dialects.eos.DIALECT
+    for line in ("%Inconsistent address and mask", "%Error opening flash:x.cfg (No such file or directory)",
+                 "ERROR: The secret you entered is not a valid encrypted secret.",
+                 "ERROR: VLAN 4095 is a reserved VLAN", "% Invalid input detected at '^' marker."):
+        for d in (ios, nxos, eos):
+            assert refusal_line(f"\n{line}\nmore", dialect=d) == line, (d.name, line)
+    for line in ("%LINK-3-UPDOWN: Interface GigabitEthernet0/1, changed state to up",
+                 "%OIR-SP-6-INSCARD: Card inserted in slot 3, interfaces are now online",
+                 "%SYS-5-CONFIG_I: Configured from console by vty0 (10.0.0.1)",
+                 "%SEC_LOGIN-5-LOGIN_SUCCESS: Login Success [user: lab]", "%ETHPORT-5-IF_UP: Interface Ethernet1/1 is up",
+                 "%Portfast has been configured on GigabitEthernet0/1 but will only",
+                 "%Portfast will be configured in 10 interfaces due to the range command",
+                 "%Default route without gateway, if not a point-to-point interface, may impact performance",
+                 "%Command accepted but obsolete, unreleased or unsupported; see documentation.",
+                 "100% of the table in use", "Errors: 0"):
+        assert refusal_line(line, dialect=ios) is None, line
+    assert core.refused_reply("", "%Error opening flash:x.cfg (No such file or directory)\n", dialect=nxos) == \
+        "%Error opening flash:x.cfg (No such file or directory)"
+    assert core.refused_reply("", "%LINK-3-UPDOWN: Interface Gi0/1, changed state to up\n", dialect=ios) is None
+
+
+def test_the_dialect_says_what_starts_a_comment():
+    """#142: `!` was a comment to every edit typed at a CLI, plain telnet's
+    too, and to no check that an edit had anything in it, so a file of `!`
+    lines passed as a payload and was then typed as nothing. A comment is
+    the dialect's: h-ssh's own `#` on every driver (#133), and the
+    IOS-shaped dialects' `!`; to Junos and `none` a `!` line is a line."""
+    for d in dialects.ALL:
+        ios_shaped = d.name in ("ios", "nxos", "eos")
+        assert d.comment_prefixes == (("#", "!") if ios_shaped else ("#",)), d.name
+        assert d.comments == (("!",) if ios_shaped else ()), d.name
+    assert core.set_file_payload("! a\n  ! b\n\n# c\n", dialects.eos.DIALECT.comment_prefixes) == ""
+    assert core.set_file_payload("! a\n  ! b\n\n# c\n", dialects.none.DIALECT.comment_prefixes) == "! a\n  ! b\n"
+    assert core.set_file_payload("! a\n# c\nset x\n") == "! a\nset x\n"        # '#' alone, as before
+
+
+def test_a_dialect_built_with_its_fields_in_order_keeps_them():
+    """#142: `informational` went in between `refused` and `cli`, so every
+    field after it moved one place along: a package's `Dialect("acme",
+    "AcmeOS", "x", None, None, is_read, REFUSED, CLI)` got no CLI, its
+    edits refused for want of one, and a CliSyntax for its
+    `informational`. The fields #142 adds come after the ones it had."""
+    refused, pending = re.compile(r"^\s*% ", re.M), re.compile(r"rollback in (\d+)mins")
+    d = Dialect("acme", "AcmeOS", "x", None, None, is_read, refused, dialects.ios.CLI, pending)
+    assert d.refused is refused and d.cli is dialects.ios.CLI and d.commit_pending is pending
+    assert d.informational is None and d.comments == () and d.comment_prefixes == ("#",)
 
 
 def test_a_cli_that_commits_needs_compare_and_discard():

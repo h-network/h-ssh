@@ -3,6 +3,7 @@ the former commands/arista.json). Structured reads via `| json` come with
 the eos@ssh driver (#83)."""
 
 from .base import Dialect
-from .ios import CLI, REFUSED
+from .ios import CLI, COMMENTS, INFORMATIONAL, REFUSED
 
-DIALECT = Dialect("eos", "EOS", "Arista EOS", shortcuts="eos", refused=REFUSED, cli=CLI)
+DIALECT = Dialect("eos", "EOS", "Arista EOS", shortcuts="eos", refused=REFUSED, informational=INFORMATIONAL, cli=CLI,
+                  comments=COMMENTS)
