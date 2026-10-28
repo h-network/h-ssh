@@ -68,6 +68,19 @@ def test_a_job_opens_one_session_per_device_not_per_entry(monkeypatch, capsys, t
     assert all(d.closed for d in FakeDevice.instances) and pool.live() == 0 and not pool.POOL.enabled
 
 
+def test_eleven_entries_for_one_device_are_one_login_to_the_safety_gate(monkeypatch, capsys, tmp_path):
+    """The --safety-file gate lets a device have 10 logins in 60 s, and it
+    counted every job entry as one: the 11th entry for one router was
+    turned away (`rate limited 10/10`, exit 3), though the job ran them
+    all on the one NETCONF session it keeps open. It counts logins now
+    (#145): all eleven run, on one login."""
+    entries = [{"target": "R1:10.0.0.1:junos", "show": f"show version {i}"} for i in range(11)]
+    rc, out, err = _run(monkeypatch, capsys, tmp_path, entries, "--safety-file", str(tmp_path / "safety.json"))
+    assert rc == 0, err
+    assert [e["output"] for e in json.loads(out)] == [f"output of show version {i}" for i in range(11)]
+    assert len(FakeDevice.instances) == 1 and '"skipped": 0' in err
+
+
 def test_an_edit_entry_and_the_show_after_it_share_the_session(monkeypatch, capsys, tmp_path):
     FakeDevice.cli_outputs = {"show configuration | compare rollback 1": "+ host-name r1"}
     rc, out, err = _run(monkeypatch, capsys, tmp_path, [

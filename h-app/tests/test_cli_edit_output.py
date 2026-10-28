@@ -8,6 +8,7 @@ import os
 import sqlite3
 import stat
 import sys
+import threading
 import time
 import types
 
@@ -210,6 +211,204 @@ def test_job_entries_for_one_host_take_turns_at_the_safety_gate(monkeypatch, cap
     assert rc == 0
     assert [c[2] for c in driver.calls] == ["show version", "show chassis hardware"]
     assert all(e["ok"] for e in json.loads(out)) and '"skipped": 0' in err
+
+
+def test_a_job_the_gates_rate_limit_would_stop_part_way_is_refused_before_anything_is_sent(monkeypatch, capsys,
+                                                                                            tmp_path):
+    """The gate lets a device have 10 logins in 60 s, and on the ssh
+    transport each job entry logs in again: eleven entries for one device
+    ran ten and turned the 11th away (`rate limited 10/10`, exit 3), a job
+    applied in part. The run's logins are counted before the first device
+    now (#145): eleven are refused whole (exit 2, nothing sent), ten all
+    run, and a dry run of the eleven, which logs in nowhere, answers all."""
+    safety = str(tmp_path / "safety.json")
+    driver = JobDriver()
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", driver)
+
+    def job(n):
+        return [{"target": "R1:10.0.0.1:ssh", "show": f"show version {i}"} for i in range(n)]
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(11), "--safety-file", safety, driver=driver)
+    assert rc == 2 and driver.calls == [], err
+    assert ("the safety gate lets a device have 10 logins in 60 s, and this run would log in more often: "
+            "R1 (10.0.0.1:22) 11 times" in err and err.rstrip().endswith("Nothing was sent."))
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(10), "--json", "--safety-file", safety, driver=driver)
+    assert rc == 0 and len(driver.calls) == 10 and all(e["ok"] for e in json.loads(out)), err
+    driver.calls.clear()
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(11), "--json", "--dry-run", "--safety-file", safety,
+                              driver=driver)
+    assert rc == 0 and driver.calls == [] and len(json.loads(out)) == 11, err
+
+
+def test_a_show_diff_preview_is_one_login_more_counted_before_it(monkeypatch, capsys, tmp_path):
+    """A --show-diff preview opens a session of its own, before the run.
+    One edit and nine shows for a junos@ssh device are eleven logins: the
+    preview and nine entries ran, and the last show was turned away after
+    the commit. Refused before the preview now (#145), nothing sent; with
+    eight shows the preview and all nine entries run."""
+    safety = str(tmp_path / "safety.json")
+    driver = JobDriver()
+    monkeypatch.setitem(drivers.MODULES, "junos@ssh", driver)
+
+    def job(shows):
+        return ([{"target": "R1:10.0.0.1:junos@ssh", "edit": "set system location building b1"}] +
+                [{"target": "R1:10.0.0.1:junos@ssh", "show": f"show version {i}"} for i in range(shows)])
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(9), "--show-diff", "-y", "--safety-file", safety,
+                              driver=driver)
+    assert rc == 2 and driver.calls == [] and "R1 (10.0.0.1:22) 11 times" in err, err
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, job(8), "--show-diff", "-y", "--json",
+                              "--safety-file", safety, driver=driver)
+    assert rc == 0, err
+    assert [c[0] for c in driver.calls] == ["edit", "edit"] + ["show"] * 8     # the preview, then the job in order
+    assert all(e["ok"] for e in json.loads(out))
+
+
+class Meet(JobDriver):
+    """A show waits until `n` shows are in at the same time (5 s at most,
+    then it fails): a run that keeps them apart fails them."""
+
+    def __init__(self, n):
+        super().__init__()
+        self.meet = threading.Barrier(n, timeout=5)
+
+    def show(self, host, user, passwd, cmd, *a, port=None, **kw):
+        self.calls.append(("show", host, port))
+        self.meet.wait()
+        return "ok\n"
+
+
+class FailsOn(JobDriver):
+    """A show fails on `port` (the connection reset), and is fine elsewhere."""
+
+    def __init__(self, port):
+        super().__init__()
+        self.port = port
+
+    def show(self, host, user, passwd, cmd, *a, port=None, **kw):
+        self.calls.append(("show", host, port))
+        if port == self.port:
+            raise RuntimeError("Connection reset by peer")
+        return "ok\n"
+
+
+def test_two_devices_behind_one_address_are_two_to_the_safety_gate(monkeypatch, capsys, tmp_path):
+    """The gate keyed on the host: 127.0.0.1 on NETCONF (830) and on ssh (22)
+    were one device to it, and the second was turned away as an "active
+    connection" while the first ran (exit 3). A device is its host and the
+    port its transport uses (#145): both run, at the same time."""
+    driver = Meet(2)
+    monkeypatch.setitem(drivers.MODULES, "junos@ssh", driver)
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path,
+                           ["--target", "R2:127.0.0.1:junos@ssh", "-sC", "show version", "--workers", "2", "--json",
+                            "--safety-file", str(tmp_path / "safety.json")], driver=driver, target="R1:127.0.0.1:830:junos")
+    assert rc == 0, err
+    assert sorted(e["device"] for e in json.loads(out) if e["ok"]) == ["R1", "R2"]
+
+
+def test_eleven_routers_behind_one_address_all_run(monkeypatch, capsys, tmp_path):
+    """Eleven port-forwarded routers behind one address were the address's
+    eleven attempts to the gate: the 11th was `rate limited 10/10`. Each
+    is a device of its own (#145), one login each: all eleven run."""
+    driver = JobDriver()
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", driver)
+    targets = [arg for p in range(8300, 8311) for arg in ("--target", f"R{p}:127.0.0.1:{p}:ssh")]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, [*targets, "-sC", "show version", "--workers", "1", "--json",
+                                                           "--safety-file", str(tmp_path / "safety.json")],
+                           driver=driver, target=None)
+    assert rc == 0, err
+    assert len(driver.calls) == 11 and all(e["ok"] for e in json.loads(out))
+
+
+def test_a_cooldown_is_the_failed_devices_own(monkeypatch, capsys, tmp_path):
+    """A failure on 127.0.0.1:8301 cooled the whole address: :8302, after it
+    in the same run and alone in the next, was turned away. The cooldown is
+    the device's own (#145), kept as `127.0.0.1|8301`; an entry an older
+    h-ssh kept under the address alone still holds every port of it."""
+    safety = tmp_path / "safety.json"
+    driver = FailsOn(8301)
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", driver)
+    a, b = ["--target", "A:127.0.0.1:8301:ssh"], ["--target", "B:127.0.0.1:8302:ssh"]
+    show = ["-sC", "show version", "--workers", "1", "--retries", "0", "--json", "--safety-file", str(safety)]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, [*a, *b, *show], driver=driver, target=None)
+    assert rc == 1 and [c[2] for c in driver.calls] == [8301, 8302], err
+    assert {e["device"]: e["ok"] for e in json.loads(out)} == {"A": False, "B": True}
+    assert list(json.loads(safety.read_text())) == ["127.0.0.1|8301"]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, [*b, *show], driver=driver, target=None)
+    assert rc == 0 and [c[2] for c in driver.calls] == [8301, 8302, 8302], err
+    safety.write_text(json.dumps({"127.0.0.1": time.time() + 300}))
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, [*a, *b, *show], driver=driver, target=None)
+    assert rc == 3 and len(driver.calls) == 3, err
+    assert all(e["error"].startswith("safety gate blocked: cooldown active") for e in json.loads(out))
+
+
+def test_a_jobs_routers_behind_one_address_run_side_by_side(monkeypatch, capsys, tmp_path):
+    """A job ran a host's entries one at a time, so two routers behind one
+    address on two ports waited for each other. The job keeps a device's
+    entries in turn (#145): those two run at the same time."""
+    driver = Meet(2)
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", driver)
+    rc, out, err, _ = run_job(monkeypatch, capsys, tmp_path, [
+        {"target": "A:127.0.0.1:8301:ssh", "show": "show version"},
+        {"target": "B:127.0.0.1:8302:ssh", "show": "show version"},
+    ], "--json", "--safety-file", str(tmp_path / "safety.json"), driver=driver)
+    assert rc == 0, err
+    assert sorted(e["device"] for e in json.loads(out) if e["ok"]) == ["A", "B"]
+
+
+class Times(JobDriver):
+    """A show of a command in `errors` fails with its error (raised as a
+    timeout), and a batch keeps that error in the command's own result, as
+    the transports do; every other command is fine."""
+
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = errors
+
+    def show(self, host, user, passwd, cmd, *a, **kw):
+        self.calls.append(("show", host, cmd))
+        if cmd in self.errors:
+            raise TimeoutError(self.errors[cmd])
+        return "ok\n"
+
+    def show_batch(self, host, user, passwd, cmds, *a, **kw):
+        self.calls.append(("show_batch", host, tuple(cmds)))
+        return [{"command": c, "ok": False, "error": self.errors[c]} if c in self.errors
+                else {"command": c, "ok": True, "output": "ok"} for c in cmds]
+
+
+@pytest.mark.parametrize("error", [
+    "'show version': the device sent no exit status within 20s; channel closed",
+    "'show version' was refused by the device: error: syntax error, expecting <command>",
+], ids=["timed-out", "refused"])
+def test_a_batch_command_that_failed_cools_the_device_as_a_show_does(monkeypatch, capsys, tmp_path, error):
+    """The README promises a cooldown after a timed-out or rejected command,
+    and under -sC one was kept; a --batch keeps each command's error in its
+    own result, and the runner released the device: the safety file stayed
+    {} and the next run went straight back. A batch with a failed command
+    cools the device as -sC does (#145), each command keeping its result;
+    a batch that went through cools nothing."""
+    safety = tmp_path / "safety.json"
+    batch = tmp_path / "batch.txt"
+    batch.write_text("show version\nshow uptime\n")
+    driver = Times({"show version": error})
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", driver)
+    gated = ["--json", "--retries", "0", "--safety-file", str(safety)]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--batch", str(batch), "A:127.0.0.1:10001:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 1, err
+    [entry] = json.loads(out)
+    assert [(c["ok"], c.get("error")) for c in entry["commands"]] == [(False, error), (True, None)]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-sC", "show version", "B:127.0.0.1:10002:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 1, err
+    assert sorted(json.loads(safety.read_text())) == ["127.0.0.1|10001", "127.0.0.1|10002"]
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--batch", str(batch), "A:127.0.0.1:10001:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 3 and len(driver.calls) == 2, err
+    assert json.loads(out)[0]["error"].startswith("safety gate blocked: cooldown active")
+    driver.errors.clear()
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["--batch", str(batch), "C:127.0.0.1:10003:ssh", *gated],
+                           driver=driver, target=None)
+    assert rc == 0 and sorted(json.loads(safety.read_text())) == ["127.0.0.1|10001", "127.0.0.1|10002"], err
 
 
 class EchoDriver(JobDriver):

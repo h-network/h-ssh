@@ -55,6 +55,62 @@ def test_rate_limit():
     assert "rate limited 10/10" in reason
 
 
+def test_the_rate_limit_counts_logins_only():
+    """An attempt that opens no session of its own (a job's later entry on
+    the pooled NETCONF session, a dry run of a read) is not a login (#145):
+    past the limit it still goes, and it is not counted; a cooldown and an
+    active mark turn it away as before."""
+    gate = SafetyGate(rate_limit=2)
+    for _ in range(2):
+        assert gate.check_device("10.0.1.1") == (True, "ok")
+        gate.release_device("10.0.1.1")
+    assert gate.check_device("10.0.1.1") == (False, "rate limited 2/2")
+    assert gate.check_device("10.0.1.1", login=False) == (True, "ok")
+    assert gate.check_device("10.0.1.1", login=False) == (False, "active connection")
+    gate.release_device("10.0.1.1")
+    assert len(gate._attempt_timestamps["10.0.1.1"]) == 2
+    gate.set_cooldown("10.0.1.1")
+    allowed, reason = gate.check_device("10.0.1.1", login=False)
+    assert not allowed and reason.startswith("cooldown active")
+
+
+def test_a_device_is_its_host_and_its_port(tmp_path):
+    """Two routers behind one address are two devices (#145): each is
+    marked active, counted and cooled on its own, and the file keeps a
+    cooldown as `host|port`. An entry kept under the host alone (a caller
+    that names no port, a file an older h-ssh wrote) holds every port, and
+    such a caller asks for the host as a whole, held while any port of it
+    is cooling: a script on the old API, sharing the file with h-ssh runs,
+    sees their cooldowns."""
+    path = str(tmp_path / "safety.json")
+    gate = SafetyGate(safety_file=path, rate_limit=1)
+    assert gate.check_device("10.0.0.1", 8301) == (True, "ok")
+    assert gate.check_device("10.0.0.1", 8302) == (True, "ok")          # not an "active connection"
+    gate.release_device("10.0.0.1", 8302)
+    assert gate.check_device("10.0.0.1", 8302) == (False, "rate limited 1/1")
+    gate.set_cooldown("10.0.0.1", 8301)
+    with open(path) as f:
+        assert list(json.load(f)) == ["10.0.0.1|8301"]
+    assert gate.check_device("10.0.0.1", 8301)[1].startswith("cooldown active")
+    assert list(gate.holds([("10.0.0.1", 8301), ("10.0.0.1", 8302)])) == [("10.0.0.1", 8301)]
+    gate.set_cooldown("10.0.0.20", 22)
+    script = SafetyGate(safety_file=path)                                 # the old API, on the same file
+    allowed, reason = script.check_device("10.0.0.1")                     # no port: the host as a whole
+    assert not allowed and reason.startswith("cooldown active")
+    assert list(script.holds(["10.0.0.1", "10.0.0.2"])) == ["10.0.0.1"]  # 10.0.0.20 is not 10.0.0.2
+    assert script.check_device("10.0.0.1", 8302) == (True, "ok")         # the other port still goes
+    gate.set_cooldown("10.0.0.1")                                         # the host alone: every port of it
+    assert sorted(gate.holds([("10.0.0.1", 8302), ("10.0.0.1", 22), ("10.0.0.2", 22)])) == [
+        ("10.0.0.1", 22), ("10.0.0.1", 8302)]
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"10.0.0.9": time.time() + 300}))           # as an h-ssh before #145 kept it
+    gate = SafetyGate(safety_file=str(old))
+    allowed, reason = gate.check_device("10.0.0.9", 830)
+    assert not allowed and reason.startswith("cooldown active")
+    assert list(gate.holds([("10.0.0.9", 22)])) == [("10.0.0.9", 22)]
+    assert gate.check_device("10.0.0.8", 830) == (True, "ok")
+
+
 # T5: Cooldown set
 def test_cooldown_set():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -132,7 +188,8 @@ def test_an_unwritable_safety_file_refuses_the_gate(tmp_path):
     assert allowed is False and "cooldown active" in reason
 
 
-# T9: Concurrent invocations (fcntl.flock prevents corruption)
+# T9: two gates on one file, one after the other: the second's save merges
+# the first's cooldown from the file (two at once: the two-process test below)
 def test_concurrent_file_access():
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         tmp = f.name
@@ -158,6 +215,56 @@ def test_concurrent_file_access():
     finally:
         Path(tmp).unlink(missing_ok=True)
         Path(f"{tmp}.lock").unlink(missing_ok=True)
+
+
+def _save_a_cooldown(path, host, start, inside, wait):
+    """One run's set_cooldown(host) on the shared file, in a process of its
+    own. The two runs start together (`start`); each then stops inside its
+    save, after reading the file and just before its os.replace, until the
+    other is there too or `wait` seconds pass (`inside`)."""
+    import threading
+    from hssh import safety
+    gate = SafetyGate(safety_file=path, cooldown_seconds=300)
+    real_replace = safety.os.replace
+
+    def replace(src, dst):
+        try:
+            inside.wait(wait)
+        except threading.BrokenBarrierError:
+            pass                    # the other run is not in here: it waits for the lock
+        return real_replace(src, dst)
+    safety.os.replace = replace
+    start.wait(60)
+    gate.set_cooldown(host)
+
+
+def test_two_runs_saving_at_the_same_moment_keep_both_cooldowns(tmp_path):
+    """The flock around a save is all that keeps two runs from losing each
+    other's cooldowns (#145): a save reads the file, merges its own hosts
+    and replaces the file. Here two processes save at once. Under the lock
+    only one is inside at a time: the first writes after its wait, the
+    second then reads that file, and both hosts are kept. Without it both
+    read the file before either wrote it, and the second os.replace drops
+    the first one's host: with every fcntl.flock in safety.py stubbed out
+    this fails, where T9, whose two gates take turns, passed."""
+    import multiprocessing
+    path = str(tmp_path / "safety.json")
+    ctx = multiprocessing.get_context("spawn")          # no fork of a process with threads in it
+    start, inside = ctx.Barrier(2), ctx.Barrier(2)
+    runs = [ctx.Process(target=_save_a_cooldown, args=(path, host, start, inside, 1.0))
+            for host in ("10.0.0.1", "10.0.0.2")]
+    try:
+        for p in runs:
+            p.start()
+        for p in runs:
+            p.join(60)
+        assert [p.exitcode for p in runs] == [0, 0]
+    finally:
+        for p in runs:
+            if p.is_alive():
+                p.terminate()
+    with open(path) as f:
+        assert sorted(json.load(f)) == ["10.0.0.1", "10.0.0.2"]
 
 
 def test_fail_closed_on_corrupt_file():
