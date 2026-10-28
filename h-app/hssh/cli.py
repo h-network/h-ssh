@@ -150,6 +150,17 @@ def _ms_arg(text: str) -> float:
     return value
 
 
+def _not_empty(text: str) -> str:
+    """An argparse type for a flag that names a file, a directory, a user or
+    a profile (and --comment): an empty value is refused, not taken for the
+    flag left out (#140). `--audit-log "$AUDIT"` with the variable unset
+    turned the HSSH_AUDIT_LOG audit trail off, `--config ''` read the
+    default config, `--user ''` logged in as HSSH_USER."""
+    if text == "":
+        raise argparse.ArgumentTypeError("empty (an unset variable?); give it a value or leave the flag out")
+    return text
+
+
 def _ranged_int(low: int, high: Optional[int], what: str):
     """An argparse type: an integer within [low, high], or one line naming the
     range. The value a flag accepts is the value a config file accepts, so
@@ -539,16 +550,16 @@ async def main() -> int:
                "when a pipeline runs h-ssh; there is no --password flag, and the config file never "
                "carries one.")
 
-    parser.add_argument("--devices", default=get_default_devices_path(),
+    parser.add_argument("--devices", type=_not_empty, default=get_default_devices_path(),
                         help="Devices CSV (default: ~/.h-ssh/devices.csv or ./devices.csv)")
     parser.add_argument("--transport", choices=TRANSPORT_CHOICES, default=None,
                         help="Transport for targets that don't declare one (default: ssh)")
     parser.add_argument("--structured", action="store_true",
                         help="Return structured data where the vendor supports it "
                              "(junos NETCONF); falls back to text elsewhere")
-    parser.add_argument("--user", type=str,
+    parser.add_argument("--user", type=_not_empty,
                         help="Username (or HSSH_USER, or 'user' in ~/.h-ssh/config; default: the name you are logged in as)")
-    parser.add_argument("--config", type=str,
+    parser.add_argument("--config", type=_not_empty,
                         help="Config file with defaults (default: ~/.h-ssh/config)")
 
     # Modes
@@ -556,28 +567,28 @@ async def main() -> int:
                         help="Show command to run on all targets")
     parser.add_argument("-eC", "--edit-command", type=str,
                         help="Single config command (Junos expects 'set ...')")
-    parser.add_argument("-eD", "--edit-dir", type=str,
+    parser.add_argument("-eD", "--edit-dir", type=_not_empty,
                         help="Directory containing <NAME>.set files")
-    parser.add_argument("-eB", "--edit-broadcast", type=str,
+    parser.add_argument("-eB", "--edit-broadcast", type=_not_empty,
                         help="Multi-line config file for all devices (e.g., configs/all.set)")
     parser.add_argument("--allow-missing", action="store_true",
                         help="-eD: skip devices that have no <NAME>.set instead of refusing the run "
                              "(they count as skipped: exit 3)")
-    parser.add_argument("--batch", type=str,
+    parser.add_argument("--batch", type=_not_empty,
                         help="File containing show commands to run in batch (one per line, # comments)")
-    parser.add_argument("--profile", type=str, metavar="NAME",
+    parser.add_argument("--profile", type=_not_empty, metavar="NAME",
                         help="A named command set, run like --batch: ~/.h-ssh/profiles/NAME.txt, else one that "
                              "ships with h-ssh (--list-profiles shows both)")
-    parser.add_argument("--job", type=str,
+    parser.add_argument("--job", type=_not_empty,
                         help="JSON job file with per-device commands (use - for stdin)")
-    parser.add_argument("--run", type=str, metavar="FILE",
+    parser.add_argument("--run", type=_not_empty, metavar="FILE",
                         help="YAML or JSON run file: every key is a flag name (devices, show, commands, "
                              "edit, jobs, workers, ...); a flag on the command line wins over the file")
     parser.add_argument("--rollback", type=_ranged_int(0, 49, "--rollback"), metavar="N",
                         help="Return every target to rollback N (0-49), with the same gates as an edit (Junos only)")
     parser.add_argument("--commit-status", action="store_true",
                         help="Show the commit history as data: sequence, time, user, comment, pending commit-confirmed timer (Junos only)")
-    parser.add_argument("--comment", type=str, metavar="TEXT",
+    parser.add_argument("--comment", type=_not_empty, metavar="TEXT",
                         help="Log this comment with the commit; it shows in 'show system commit' (Junos only)")
     parser.add_argument("--show-diff", action="store_true",
                         help="Edits: run a dry-run on every target, print the diffs, then ask once before "
@@ -661,23 +672,25 @@ async def main() -> int:
     parser.add_argument("--format", choices=["text", "json", "xml"], default="text",
                         help="Show output as the router's own JSON or XML reply, through its RPC "
                              "translation of the command (junos only; default: text)")
-    parser.add_argument("--save-output", type=str,
+    parser.add_argument("--save-output", type=_not_empty,
                         help="Create dir (0700) and save each device's raw output in it (0600 files, not redacted): "
                              "NAME.output, or NAME.json for a batch; a job's later entries for one device go to "
                              "NAME.2.output, NAME.3.output, ... in file order")
-    parser.add_argument("--log", type=str,
+    parser.add_argument("--log", type=_not_empty,
                         help="Append per-device JSONL results to file (0600, secrets redacted as in the audit log)")
-    parser.add_argument("--store", type=str,
+    parser.add_argument("--store", type=_not_empty,
                         help=f"The SQLite file every run is kept in: one row per command per device, the reply as "
                              f"the device gave it, 0600 (default ${STORE_ENV}, else `store` in the config file, "
                              f"else ./{STORE_DEFAULT}; read it with h-ssh-store)")
     parser.add_argument("--no-store", action="store_true",
                         help="Keep nothing of this run")
-    parser.add_argument("--audit-log", type=str,
-                        default=os.environ.get("HSSH_AUDIT_LOG"),
+    # An empty value is refused (_not_empty); an empty variable is no audit
+    # log or safety file, as it always was, and argparse never sees it.
+    parser.add_argument("--audit-log", type=_not_empty,
+                        default=os.environ.get("HSSH_AUDIT_LOG") or None,
                         help="Edit audit log path for JSONL audit trail (or set HSSH_AUDIT_LOG env var)")
-    parser.add_argument("--safety-file", type=str,
-                        default=os.environ.get("HSSH_SAFETY_FILE"),
+    parser.add_argument("--safety-file", type=_not_empty,
+                        default=os.environ.get("HSSH_SAFETY_FILE") or None,
                         help="Safety gate JSON file for per-device rate limiting and cooldown")
 
     args = parser.parse_intermixed_args()
@@ -1088,6 +1101,18 @@ async def main() -> int:
     if args.comment is not None and not has_edits:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
         return 2
+    # So do the timer and the probe's go-ahead, and --allow-missing goes with
+    # -eD: on a show they were accepted and did nothing (#140), typed or from
+    # a run file alike.
+    for flag, given in (("--commit-confirmed", args.commit_confirmed is not None),
+                        ("--skip-unreachable", args.skip_unreachable)):
+        if given and not has_edits:
+            print(f"ERROR: {flag} goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).",
+                  file=sys.stderr)
+            return 2
+    if args.allow_missing and mode != "edit-dir":
+        print("ERROR: --allow-missing goes with -eD: it skips the devices that have no <NAME>.set.", file=sys.stderr)
+        return 2
     # Nobody watches a pipeline: a run file that commits must arm a timer, or
     # say it is a dry run. A flag on the command line may supply either, and
     # an edit given there (-eC, -eD, -eB, --rollback, a --job file) is held to
@@ -1273,7 +1298,7 @@ async def main() -> int:
         if store is not None:
             store.discard()
 
-    safety_file = args.safety_file or os.environ.get("HSSH_SAFETY_FILE")
+    safety_file = args.safety_file       # the flag, the run file's, or HSSH_SAFETY_FILE
     try:
         safety_gate = SafetyGate(safety_file=safety_file) if safety_file else None
     except OSError as e:

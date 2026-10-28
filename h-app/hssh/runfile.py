@@ -76,6 +76,10 @@ CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 PATH_KEYS = ("devices", "batch", "edit_dir", "edit_broadcast", "save_output",
              "log", "audit_log", "safety_file")
 
+# An empty path, user or comment is refused, as the flag's is (#140): it is
+# not the key left out. `audit_log: ''` turned the HSSH_AUDIT_LOG trail off.
+NOT_EMPTY_KEYS = PATH_KEYS + ("user", "comment")
+
 FORMAT_CHOICES = ("text", "json", "xml")
 
 
@@ -180,6 +184,8 @@ def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, 
     for key, value in data.items():
         dest, expected = RUN_KEYS[key]
         _check_type(path, key, value, expected)
+        if key in NOT_EMPTY_KEYS and value == "":
+            raise ValueError(f"run file '{path}': '{key}' is empty; give it a value or leave the key out")
         if key in floors and value < floors[key]:
             raise ValueError(f"run file '{path}': '{key}' must be at least {floors[key]}, not {value}")
         if ceilings and key in ceilings and value > ceilings[key]:

@@ -552,3 +552,17 @@ def test_targets_typed_beside_a_job_are_refused(monkeypatch, capsys, tmp_path):
     f = write(tmp_path, "run.yaml", f"devices: [lab1:10.0.9.1:junos]\nuser: u\ncommit-confirmed: 5\nyes: true\n{jobs}")
     rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
     assert rc == 0 and drv.edits == [("10.0.0.1", "set system location building A", 5, False)], err
+
+
+def test_an_empty_path_user_or_comment_in_the_file_is_refused(monkeypatch, capsys, tmp_path):
+    """#140: a run file's empty value was the key left out: `audit_log: ''`
+    turned the HSSH_AUDIT_LOG trail off, `user: ''` fell back to HSSH_USER,
+    `save_output: ''` saved nothing. Every path, `user` and `comment` that
+    is empty is refused naming the key, exit 2, nothing sent."""
+    for key in ("devices", "user", "batch", "edit_dir", "edit_broadcast", "comment", "save_output", "log",
+                "audit_log", "safety_file"):
+        f = write(tmp_path, "run.json", json.dumps({"devices": ["R1:10.0.0.1:junos"], "user": "u",
+                                                    "show": "show version", key: ""}))
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
+        assert rc == 2 and drv.shows == drv.batches == drv.edits == [], (key, err)
+        assert f"ERROR: run file '{f}': '{key}' is empty; give it a value or leave the key out\n" in err, key

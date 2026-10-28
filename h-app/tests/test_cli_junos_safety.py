@@ -266,3 +266,34 @@ def test_diff_goes_with_a_show(monkeypatch, capsys, tmp_path):
     for argv in (["-sC", "show version", "--diff", *two], ["--batch", str(batch), "--diff", *two]):
         rc, err, sent = _main(monkeypatch, capsys, *argv)
         assert rc == 0 and sorted(name for name, _, _ in sent) == ["R1", "R2"], (argv, err)
+
+
+def test_the_options_of_an_edit_need_an_edit(monkeypatch, capsys, tmp_path):
+    """#140: on a show, --commit-confirmed, --skip-unreachable and
+    --allow-missing were accepted and did nothing, while --comment was
+    refused. Each is refused now, as --comment is, typed or from a run
+    file, nothing sent; --allow-missing goes with -eD, the edit it is for.
+    With an edit the timer and --skip-unreachable go on as before."""
+    edit_only = "goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits)."
+    missing = "ERROR: --allow-missing goes with -eD: it skips the devices that have no <NAME>.set."
+    batch = tmp_path / "cmds.txt"
+    batch.write_text("show version\n")
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "R1:192.0.2.1:junos", "show": "show version"}]))
+    run_file = tmp_path / "run.yaml"
+    run_file.write_text("devices: [R1:192.0.2.1:junos]\nshow: show version\ncommit-confirmed: 5\n")
+    r1 = ["--target", "R1:192.0.2.1:junos"]
+    for argv, said in ((["-sC", "show version", "--commit-confirmed", "5", *r1], f"--commit-confirmed {edit_only}"),
+                       (["-sC", "show version", "--commit-confirmed", *r1], f"--commit-confirmed {edit_only}"),
+                       (["--commit-status", "--commit-confirmed", "5", *r1], f"--commit-confirmed {edit_only}"),
+                       (["--job", str(job), "--commit-confirmed", "5"], f"--commit-confirmed {edit_only}"),
+                       (["--run", str(run_file)], f"--commit-confirmed {edit_only}"),
+                       (["--batch", str(batch), "--skip-unreachable", *r1], f"--skip-unreachable {edit_only}"),
+                       (["-sC", "show version", "--allow-missing", *r1], missing),
+                       (["-eC", "set system location x", "--allow-missing", *r1], missing)):
+        rc, err, sent = _main(monkeypatch, capsys, *argv)
+        assert rc == 2 and sent == [], (argv, err)
+        assert said in err, (argv, err)
+    rc, err, sent = _main(monkeypatch, capsys, "-eC", "set system location x", "--commit-confirmed", "5",
+                          "--skip-unreachable", *r1)
+    assert rc == 0 and sent == [("R1", "junos", "set system location x")], err
