@@ -14,6 +14,11 @@ CLI = CliSyntax(
     config_exit="end",
 )
 
+# A line that starts with `!` is a comment to an IOS-shaped CLI (a `show
+# running-config` is full of them): never typed, and a payload of nothing
+# else has nothing to apply.
+COMMENTS = ("!",)
+
 REFUSED = re.compile(r"^\s*% ", re.M)
 
 # What IOS says, a `%` first, of a line it took: a warning (`%Warning:
@@ -26,4 +31,5 @@ REFUSED = re.compile(r"^\s*% ", re.M)
 INFORMATIONAL = re.compile(r"^\s*%\s*(warning\b|interface \S+ .*\bremoved due to (en|dis)abling vrf\b)",
                            re.M | re.I)
 
-DIALECT = Dialect("ios", "IOS", "Cisco IOS and IOS-XE", refused=REFUSED, informational=INFORMATIONAL, cli=CLI)
+DIALECT = Dialect("ios", "IOS", "Cisco IOS and IOS-XE", refused=REFUSED, informational=INFORMATIONAL, cli=CLI,
+                  comments=COMMENTS)

@@ -12,8 +12,8 @@ from typing import Any, List, NamedTuple, Optional, Tuple
 
 from .errors import ConnectTimeoutError, LocalError, NotAppliedError
 from .audit import secure_write
-from .core import (Target, check_confirm_minutes, path_inside, read_set_file_for_device, read_command_file_lines,
-                   set_file_payload)
+from .core import (Target, check_confirm_minutes, comments_named, path_inside, read_set_file_for_device,
+                   read_command_file_lines, set_file_payload)
 from .safety import SafetyGate
 from . import drivers
 from .drivers import results as R
@@ -503,6 +503,15 @@ def _run_for_target_sync(
             if not edit_cmd:
                 raise ValueError("No edit command provided.")
             payload = edit_cmd.strip() + "\n"
+            # Nothing but blank lines and comments, for this target's dialect,
+            # is nothing to apply: refused before the device is contacted, as
+            # a file with nothing else is. A `! x` to an IOS-shaped driver
+            # typed `configure terminal` and `end` and said APPLIED, and
+            # whitespace logged in on the plain ssh driver and said ok (#142).
+            comments = b.dialect.comment_prefixes
+            if not set_file_payload(payload, comments):
+                raise ValueError(f"the edit has nothing but blank lines and {comments_named(comments)} comments "
+                                 "in it; nothing was sent to the device")
             if payload.strip() in ("commit", "commit;") and "confirm" in b.caps:
                 # Only a literal -eC "commit" confirms a pending commit-confirmed;
                 # the same word inside an -eD/-eB file is just (invalid) config.
@@ -529,10 +538,12 @@ def _run_for_target_sync(
                 raise ValueError("No config directory provided for -eD.")
             # The CLI hands over the text it validated; a file re-read here
             # could differ from what the guard saw. Either way no driver gets
-            # its blank and full-line '#' lines, and a file with nothing else
-            # is refused before the device is contacted.
-            payload = (set_file_payload(payload_text) if payload_text is not None
-                       else read_set_file_for_device(config_dir, name))
+            # its blank lines and full-line comments ('#', and '!' for an
+            # IOS-shaped dialect), and a file with nothing else is refused
+            # before the device is contacted.
+            comments = b.dialect.comment_prefixes
+            payload = (set_file_payload(payload_text, comments) if payload_text is not None
+                       else read_set_file_for_device(config_dir, name, comments))
             if not payload:
                 raise ValueError(f"Empty config after filtering: {path_inside(config_dir, name + '.set')}")
             result = _apply_edit(b, name, quiet, max_attempts,
@@ -546,7 +557,7 @@ def _run_for_target_sync(
             if not broadcast_file:
                 raise ValueError("No broadcast file provided for -eB.")
             payload = set_file_payload(payload_text if payload_text is not None
-                                       else _read_broadcast_file(broadcast_file))
+                                       else _read_broadcast_file(broadcast_file), b.dialect.comment_prefixes)
             if not payload:
                 raise ValueError(f"Empty config after filtering: {broadcast_file}")
             result = _apply_edit(b, name, quiet, max_attempts,

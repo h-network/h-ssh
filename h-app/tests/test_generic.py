@@ -722,6 +722,20 @@ def test_an_ios_shaped_edit_over_ssh_stops_at_the_first_refused_line(shell, hint
     assert shells[0].typed == ["configure terminal", "interface Gi0/1", "interface Gi0/9", "end"] and shells[0].closed
 
 
+def test_an_edit_with_nothing_to_apply_is_refused_before_connecting(no_connection):
+    """#142: an edit of `!` lines on ios@ssh logged in, typed `configure
+    terminal` and `end` and said APPLIED, and one of whitespace on the plain
+    ssh driver logged in, sent nothing and said ok. Nothing but blank lines
+    and comments (the dialect's: '#', and '!' for an IOS-shaped one) is
+    refused before connecting, on every dialect without a candidate."""
+    for hint, payload, kinds in (("ios@ssh", "! a\n\n  ! b\n# c\n", "'#' or '!'"), ("nxos@ssh", "! x", "'#' or '!'"),
+                                 ("eos@ssh", "\n", "'#' or '!'"), ("ssh", "  \n ", "'#'"), (None, "# x\n", "'#'")):
+        with pytest.raises(ValueError) as refused:
+            ssh.edit("10.0.0.1", "u", "p", payload, 5, 10, vendor_hint=hint)
+        assert str(refused.value) == (f"the payload has nothing but blank lines and {kinds} comments in it; "
+                                      "nothing was sent to the device"), hint
+
+
 def test_an_ios_shaped_dialect_refuses_a_dry_run_before_connecting(no_connection):
     with pytest.raises(ValueError, match="not supported by ios@ssh; nothing was sent"):
         ssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ios@ssh", dry_run=True)

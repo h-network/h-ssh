@@ -18,7 +18,7 @@ from ..drivers import results as R
 from .cli import (Cli, LOGIN_RE, PASSWORD_RE, MORE_PATTERNS, strip_ansi as _strip_ansi,  # noqa: F401
                   edit_policy, refuse_comment as _refuse_comment, refuse_commit_lines as _refuse_commit_lines,
                   refuse_command as _refuse_command, refuse_control_characters as _refuse_control_characters,
-                  refuse_credentials as _refuse_credentials)
+                  refuse_credentials as _refuse_credentials, refuse_empty_edit as _refuse_empty_edit)
 
 AVAILABLE = True  # Raw sockets, always available
 
@@ -192,13 +192,17 @@ def edit(host: str, user: str, passwd: str, payload: str,
     An IOS-style flavour cannot honour them, so asking is a ValueError
     before anything is sent, never a dry run that lands or a commit with no
     timer. So is a line with a control character or a Tab in it, which the
-    CLI would take as a key (cli.refuse_control_characters).
+    CLI would take as a key (cli.refuse_control_characters), and, but for a
+    candidate, a payload with nothing to apply: nothing but blank lines and
+    comments (`#`, and `!` for an IOS-shaped dialect; cli.refuse_empty_edit).
     """
     d = _dialect(vendor_hint)
     edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
     _refuse_control_characters(payload)
     if d.cli.has_candidate:
         _refuse_commit_lines(payload)
+    else:
+        _refuse_empty_edit(payload, d)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23, session_timeout, d)
     try:
         if d.cli.has_candidate:

@@ -889,6 +889,32 @@ def test_a_line_break_before_the_echo_leaves_the_echo_out_of_the_reply():
     assert s.run("show clock", 5).strip() == "10:00"
 
 
+def test_a_comment_is_the_dialects_and_a_lines_edit_of_nothing_else_is_refused():
+    """#142: a lines edit passed over `!` and `#` lines whatever the
+    dialect, and one of nothing else typed `configure terminal` and `end`
+    and said APPLIED. A comment is the dialect's (`#`, and `!` for an
+    IOS-shaped one; to plain telnet's `none` a `!` line is a line, typed as
+    written), and an edit with nothing else in it is refused before config
+    mode: nothing is typed."""
+    replies = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#"}
+    for dialect, payload, kinds in ((dialects.eos.DIALECT, "! nothing but IOS comments\n! a second one\n", "'#' or '!'"),
+                                    (dialects.ios.DIALECT, "  \n# x\n\n   ! y\n", "'#' or '!'"),
+                                    (dialects.none.DIALECT, "# x\n\n", "'#'")):
+        ch = ScriptChannel("\r\nR1#", replies)
+        s = Cli(ch, dialect, 5)
+        s.login()
+        with pytest.raises(ValueError) as refused:
+            s.edit_lines(payload)
+        assert str(refused.value) == (f"the payload has nothing but blank lines and {kinds} comments in it; "
+                                      "nothing was sent to the device")
+        assert ch.typed == []
+    ch = ScriptChannel("\r\nR1#", replies)
+    s = Cli(ch, dialects.none.DIALECT, 5)
+    s.login()
+    assert s.edit_lines("! as written\nhostname x\n# not this\n") == "(config applied)"
+    assert ch.typed == ["configure terminal", "! as written", "hostname x", "end"]
+
+
 # --- confirm ----------------------------------------------------------------------------
 
 def test_confirm_is_one_bare_commit_in_exclusive_mode():

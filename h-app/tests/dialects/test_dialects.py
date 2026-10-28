@@ -102,6 +102,21 @@ def test_an_ios_warning_is_no_refusal():
     assert refusal_line("% Warning: use /31 mask", dialect=dialects.none.DIALECT) == "% Warning: use /31 mask"
 
 
+def test_the_dialect_says_what_starts_a_comment():
+    """#142: `!` was a comment to every edit typed at a CLI, plain telnet's
+    too, and to no check that an edit had anything in it, so a file of `!`
+    lines passed as a payload and was then typed as nothing. A comment is
+    the dialect's: h-ssh's own `#` on every driver (#133), and the
+    IOS-shaped dialects' `!`; to Junos and `none` a `!` line is a line."""
+    for d in dialects.ALL:
+        ios_shaped = d.name in ("ios", "nxos", "eos")
+        assert d.comment_prefixes == (("#", "!") if ios_shaped else ("#",)), d.name
+        assert d.comments == (("!",) if ios_shaped else ()), d.name
+    assert core.set_file_payload("! a\n  ! b\n\n# c\n", dialects.eos.DIALECT.comment_prefixes) == ""
+    assert core.set_file_payload("! a\n  ! b\n\n# c\n", dialects.none.DIALECT.comment_prefixes) == "! a\n  ! b\n"
+    assert core.set_file_payload("! a\n# c\nset x\n") == "! a\nset x\n"        # '#' alone, as before
+
+
 def test_a_cli_that_commits_needs_compare_and_discard():
     with pytest.raises(ValueError, match="compare and discard"):
         CliSyntax(prompt=re.compile("x"), prompt_name=re.compile("(x)"), prompt_tail="", config_enter="c",

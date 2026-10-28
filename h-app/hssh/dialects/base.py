@@ -79,3 +79,14 @@ class Dialect:
     informational: Optional[re.Pattern] = None
     cli: Optional[CliSyntax] = None
     commit_pending: Optional[re.Pattern] = None   # group 1: minutes left on a pending commit-confirmed
+    # What starts a full-line comment in an edit payload besides h-ssh's own
+    # `#`, which is one on every driver (#133): IOS's `!`. See comment_prefixes.
+    comments: Tuple[str, ...] = ()
+
+    @property
+    def comment_prefixes(self) -> Tuple[str, ...]:
+        """What starts a full-line comment in an edit payload for this
+        dialect: `#`, and its own `comments`. Such a line is never sent, and
+        a payload of nothing but those and blank lines is refused before the
+        device is contacted: it has nothing to apply (#142)."""
+        return ("#",) + tuple(self.comments)

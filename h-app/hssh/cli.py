@@ -27,7 +27,7 @@ from .core import (
     load_jobs, parse_jobs, resolve_target_port, check_unique,
     check_confirm_minutes, control_character, control_line, read_failure, is_file,
 
-    path_inside, set_file_payload,
+    path_inside, set_file_payload, comments_named,
 )
 from .runner import (run_for_target_async, is_connect_failure, RunResult, error_line, is_read, reads_only, save_name,
                      DEFAULT_CONNECT_TIMEOUT)
@@ -368,6 +368,31 @@ def edit_guard(vendor: str):
     except ValueError:
         return None
     return dialect if dialect.check_edit else None
+
+
+def comment_prefixes(vendor: str) -> tuple:
+    """What starts a full-line comment in an edit payload for this vendor's
+    dialect: `#`, and `!` for an IOS-shaped one. `#` alone for a vendor name
+    the check further down reports as unknown."""
+    try:
+        return drivers.get(vendor).dialect.comment_prefixes
+    except ValueError:
+        return ("#",)
+
+
+def nothing_to_apply(text: str, targets) -> str:
+    """Where `text`, an edit payload, has nothing but blank lines and
+    comments for some target's dialect: the comments named, and the targets
+    when not all of them (` for SW1, SW2`); '' when every target gets a
+    line. A `! x` is nothing to an IOS-shaped dialect and a line to the
+    plain drivers, so it depends on the target."""
+    empty = [t for t in targets if not set_file_payload(text, comment_prefixes(t.vendor))]
+    if not empty:
+        return ""
+    kinds = comments_named(tuple(dict.fromkeys(c for t in empty for c in comment_prefixes(t.vendor))))
+    names = [t.name for t in empty]
+    whom = "" if len(empty) == len(targets) else " for " + ", ".join(names[:20]) + (" …" if len(names) > 20 else "")
+    return f"nothing but blank lines and {kinds} comments in it{whom}"
 
 
 def probe_lines(results) -> list:
@@ -891,6 +916,14 @@ async def main() -> int:
                 if not valid:
                     print(f"ERROR: {guard.title} job command for '{je.target.name}' only accepts set-style commands: {err}", file=sys.stderr)
                     return 2
+        # As for -eC: an edit of nothing but blank lines and the comments of
+        # its target's dialect has nothing to apply (#142).
+        for n, je in enumerate(job_entries):
+            empty = nothing_to_apply(je.command, [je.target]) if je.mode.startswith("edit") else ""
+            if empty:
+                print(f"ERROR: Invalid job file: Job entry {n} ({je.target.name}): 'edit' has {empty}. "
+                      "Nothing was sent.", file=sys.stderr)
+                return 2
     else:
         # Determine mode
         modes = [
@@ -980,8 +1013,9 @@ async def main() -> int:
 
         # The payloads, read once here and handed to the checks below, the
         # runner and the audit log as the same string: what is checked is what
-        # is sent, but for the blank and full-line '#' lines, which the runner
-        # keeps from every driver (core.set_file_payload).
+        # is sent, but for the blank lines and full-line comments ('#', and '!'
+        # for an IOS-shaped dialect), which the runner keeps from every driver
+        # (core.set_file_payload).
         broadcast_text = None
         edit_payloads = {}
         if args.edit_broadcast:
@@ -1046,20 +1080,30 @@ async def main() -> int:
                             print(f"ERROR: {guard.title} config file '{set_file}' only accepts 'set ...' commands: {err}", file=sys.stderr)
                             return 2
 
-        # A file with nothing but blank lines and '#' comments is refused
+        # A payload with nothing but blank lines and comments is refused
         # here, on every driver, before anything is written or sent: the
         # plain ssh and openssh drivers logged in, sent nothing and said OK,
-        # where the Junos guard refuses it.
-        if broadcast_text is not None and not set_file_payload(broadcast_text):
-            print(f"ERROR: -eB {args.edit_broadcast}: nothing but blank lines and '#' comments in it. "
-                  "Nothing was sent.", file=sys.stderr)
+        # where the Junos guard refuses it. What is a comment is the target
+        # dialect's: '#', and '!' for an IOS-shaped one, whose edit typed
+        # `configure terminal` and `end` for a file of '!' lines, or an -eC
+        # '! x', and said OK (#142).
+        empty = nothing_to_apply(args.edit_command, targets) if args.edit_command is not None else ""
+        if empty:
+            # Said as the run file's key when it is the file's, as its other refusals are.
+            what = f"run file '{args.run}': 'edit'" if "edit" in from_run_file else f"-eC {args.edit_command!r}"
+            print(f"ERROR: {what} has {empty}. Nothing was sent.", file=sys.stderr)
+            return 2
+        empty = nothing_to_apply(broadcast_text, targets) if broadcast_text is not None else ""
+        if empty:
+            print(f"ERROR: -eB {args.edit_broadcast}: {empty}. Nothing was sent.", file=sys.stderr)
             return 2
         skipped_missing = 0
         if args.edit_dir:
-            empty = [f"{name}.set" for name, text in edit_payloads.items() if not set_file_payload(text)]
+            empty = [t for t in targets if t.name in edit_payloads and nothing_to_apply(edit_payloads[t.name], [t])]
             if empty:
-                shown = ", ".join(empty[:20]) + (" …" if len(empty) > 20 else "")
-                print(f"ERROR: -eD {args.edit_dir}: nothing but blank lines and '#' comments in {shown}. "
+                shown = ", ".join(f"{t.name}.set" for t in empty[:20]) + (" …" if len(empty) > 20 else "")
+                kinds = comments_named(tuple(dict.fromkeys(c for t in empty for c in comment_prefixes(t.vendor))))
+                print(f"ERROR: -eD {args.edit_dir}: nothing but blank lines and {kinds} comments in {shown}. "
                       "Nothing was sent.", file=sys.stderr)
                 return 2
             # A device without a set file is known before the first lock. The

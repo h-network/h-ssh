@@ -291,3 +291,93 @@ def test_a_tab_is_text_to_netconf_and_a_key_to_a_cli_typed_at(monkeypatch, capsy
     assert by_name["R2"]["ok"] is False and by_name["R2"]["error"] == (
         "'\\tset system host-name x' has a Tab, which a CLI takes as a key, not as text; "
         "nothing was sent to the device")
+
+
+# --- #142: an edit with nothing to apply, by the target's dialect -------------------
+
+class RecordingEdit:
+    """A driver's module that records every edit it is asked for."""
+    AVAILABLE = True
+
+    def __init__(self):
+        self.sent = []
+
+    def edit(self, host, user, passwd, payload, *a, **kw):
+        self.sent.append(payload)
+        return "(config applied)"
+
+
+def _main(monkeypatch, capsys, *argv, ask=None):
+    """cli.main() as typed at a terminal with no HSSH_PASSWORD: the password
+    would be asked, and `ask` lists every question."""
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER", "HSSH_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(cli, "_tty", lambda stream: True)
+    monkeypatch.setattr(cli, "_ask", lambda prompt, secret=False: ask.append(prompt) or "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-y", *argv])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    return rc, err
+
+
+def test_an_edit_of_nothing_but_the_dialects_comments_is_refused_before_anything_is_sent(monkeypatch, capsys,
+                                                                                        tmp_path, probed):
+    """#142: a -eB or -eD file of `!` lines passed the check for blank and
+    '#' lines, and ios@ssh typed `configure terminal` and `end` and said OK,
+    exit 0; so did -eC '! x' and -eC '# x', which had no such check, a run
+    file's `edit` and a job's edit of `!` lines. A comment is the target
+    dialect's ('#', and '!' for an IOS-shaped one): a payload of nothing
+    else is refused per target, exit 2, before anything is probed, asked,
+    written or sent, a run file's said as its key. Where only some targets
+    would get nothing, they are named; to the plain ssh driver a '!' line
+    is a line, sent as written."""
+    ios, plain = RecordingEdit(), RecordingEdit()
+    monkeypatch.setitem(drivers.MODULES, "ios@ssh", ios)
+    monkeypatch.setitem(drivers.MODULES, "none@ssh", plain)
+    bangs = tmp_path / "bang.cfg"
+    bangs.write_text("! nothing but IOS comments\n\n  ! a second one\n")
+    sets = tmp_path / "sets"
+    sets.mkdir()
+    (sets / "SW1.set").write_text(bangs.read_text())
+    job = tmp_path / "job.json"
+    job.write_text(json.dumps([{"target": "SW1:10.0.0.1:ios@ssh", "edit": "! x\n# y"}]))
+    kinds = "nothing but blank lines and '#' or '!' comments"
+    for argv, said in (
+            (["-eB", str(bangs)], f"ERROR: -eB {bangs}: {kinds} in it. Nothing was sent."),
+            (["-eD", str(sets)], f"ERROR: -eD {sets}: {kinds} in SW1.set. Nothing was sent."),
+            (["-eC", "! x"], f"ERROR: -eC '! x' has {kinds} in it. Nothing was sent."),
+            (["-eC", "# x"], f"ERROR: -eC '# x' has {kinds} in it. Nothing was sent."),
+            (["-eB", str(bangs), "R2:10.0.0.2:ssh"], f"ERROR: -eB {bangs}: {kinds} in it for SW1. Nothing was sent.")):
+        asked = []
+        rc, err = _main(monkeypatch, capsys, *argv, "SW1:10.0.0.1:ios@ssh", ask=asked)
+        assert rc == 2 and said in err, (argv, err)
+        assert asked == [] and ios.sent == plain.sent == [] and probed == [], argv
+    asked = []
+    rc, err = _main(monkeypatch, capsys, "--job", str(job), ask=asked)
+    assert rc == 2 and (f"ERROR: Invalid job file: Job entry 0 (SW1): 'edit' has {kinds} in it. "
+                        "Nothing was sent.") in err, err
+    run = tmp_path / "run.json"
+    run.write_text(json.dumps({"devices": ["SW1:10.0.0.1:ios@ssh"], "edit": "! x\n! y"}))
+    rc, err = _main(monkeypatch, capsys, "--run", str(run), ask=asked)
+    assert rc == 2 and f"ERROR: run file '{run}': 'edit' has {kinds} in it. Nothing was sent." in err, err
+    assert asked == [] and ios.sent == [] and probed == [] and not os.path.exists(os.environ["HSSH_STORE"])
+    rc, err = _main(monkeypatch, capsys, "-eB", str(bangs), "R2:10.0.0.2:ssh", ask=asked)
+    assert rc == 0 and plain.sent == ["! nothing but IOS comments\n  ! a second one\n"], err
+
+
+def test_a_job_edit_of_whitespace_is_refused_before_anything_is_sent(monkeypatch, capsys, tmp_path, probed):
+    """#142: a --job edit of whitespace on a plain ssh target logged in,
+    sent nothing and came back `ok: true`, exit 0: only a show was checked
+    for emptiness. Refused with the job file's other mistakes, exit 2,
+    before the password prompt and the probe; no driver is called."""
+    from hssh.transports import ssh
+    calls = []
+    monkeypatch.setattr(ssh, "_run_commands", lambda *a, **kw: calls.append(a) or "")
+    job = tmp_path / "job.json"
+    for edit in ("", "  \n "):
+        job.write_text(json.dumps([{"target": "R1:10.0.0.1:ssh", "show": "uptime"},
+                                   {"target": "R2:10.0.0.2:ssh", "edit": edit}]))
+        asked = []
+        rc, err = _main(monkeypatch, capsys, "--job", str(job), "--json", ask=asked)
+        assert rc == 2 and "ERROR: Invalid job file: Job entry 1 (R2): 'edit' is empty" in err, err
+        assert calls == [] and asked == [] and probed == []

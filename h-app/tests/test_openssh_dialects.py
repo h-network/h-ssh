@@ -488,6 +488,20 @@ def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(device):
     assert device.typed == ["configure terminal", "interface Gi0/1", "hostname bogus", "end"]
 
 
+def test_an_edit_with_nothing_to_apply_is_refused_before_connecting(no_ssh):
+    """#142: an edit of `!` lines on an IOS-shaped dialect typed `configure
+    terminal` and `end` at the pty and said APPLIED, and one of whitespace
+    on the plain openssh driver ran no command and said ok. Refused before
+    ssh is started: nothing but blank lines and the dialect's comments
+    ('#', and '!' for an IOS-shaped one)."""
+    for hint, payload, kinds in (("ios@openssh", "! a\n! b\n", "'#' or '!'"), ("eos@openssh", "# c\n", "'#' or '!'"),
+                                 ("openssh", "  \n\n", "'#'"), ("none@openssh", "# x", "'#'")):
+        with pytest.raises(ValueError) as refused:
+            openssh.edit("10.0.0.1", "u", "p", payload, 5, 10, vendor_hint=hint)
+        assert str(refused.value) == (f"the payload has nothing but blank lines and {kinds} comments in it; "
+                                      "nothing was sent to the device"), hint
+
+
 def test_an_ios_shaped_dialect_refuses_what_only_a_candidate_can_do_before_connecting(no_ssh):
     with pytest.raises(ValueError, match="not supported by ios@openssh; nothing was sent"):
         openssh.edit("10.0.0.1", "u", "p", "hostname x\n", 5, 10, vendor_hint="ios@openssh", dry_run=True)

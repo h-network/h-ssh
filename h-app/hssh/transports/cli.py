@@ -15,7 +15,7 @@ import re
 import time
 from typing import Callable, Optional
 
-from ..core import check_confirm_minutes, control_character, control_line, refusal_line
+from ..core import check_confirm_minutes, comments_named, control_character, control_line, refusal_line
 from ..dialects.base import CliSyntax, Dialect
 from ..drivers import results as R
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
@@ -150,6 +150,24 @@ def notices(output: str, dialect: Dialect) -> list:
     if dialect.informational is None:
         return []
     return [line.strip() for line in output.splitlines() if dialect.informational.search(line)]
+
+
+def edit_lines_of(payload: str, dialect: Dialect) -> list:
+    """The lines an edit types: the payload's lines, stripped, but the blank
+    ones and the full-line comments of the dialect (`#`, and `!` for an
+    IOS-shaped one: comment_prefixes)."""
+    lines = [line.strip() for line in payload.strip().splitlines()]
+    return [line for line in lines if line and not line.startswith(dialect.comment_prefixes)]
+
+
+def refuse_empty_edit(payload: str, dialect: Dialect) -> None:
+    """An edit without a candidate that has nothing to type, nothing but
+    blank lines and comments in it, typed `configure terminal` and `end`,
+    or on the plain drivers logged in and sent nothing, and said APPLIED
+    (#142). Refused before the device is contacted."""
+    if not edit_lines_of(payload, dialect):
+        raise ValueError(f"the payload has nothing but blank lines and {comments_named(dialect.comment_prefixes)} "
+                         "comments in it; nothing was sent to the device")
 
 
 def refuse_control_characters(payload: str) -> None:
@@ -613,11 +631,16 @@ class Cli:
         `%Warning: portfast should only be enabled ...` too, after `end`
         with the line applied. A line the CLI took with a warning (the
         dialect's `informational`) is applied, and the warning comes back
-        with the result, the line it answered in quotes."""
+        with the result, the line it answered in quotes.
+
+        A comment line (the dialect's comment_prefixes: `#`, and `!` for an
+        IOS-shaped CLI) is not typed, and a payload of nothing else is
+        refused before config mode: it typed `configure terminal` and `end`
+        and said APPLIED (#142)."""
         d, cli = self.dialect, self.cli
         refuse_control_characters(payload)
-        lines = [ln.strip() for ln in payload.strip().splitlines()]
-        lines = [ln for ln in lines if ln and not ln.startswith(("!", "#"))]
+        refuse_empty_edit(payload, d)
+        lines = edit_lines_of(payload, d)
         self.run(cli.config_enter, 10)
 
         warned = []
@@ -657,10 +680,7 @@ class Cli:
             raise NotAppliedError(f"Failed to lock config: {reply.strip()}")
 
         errors = []
-        for line in payload.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        for line in edit_lines_of(payload, d):
             output = self.run(line, 10)
             if d.refused.search(output):
                 errors.append(f"'{line}': {complaint(output, d)}")

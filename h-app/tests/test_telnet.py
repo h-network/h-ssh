@@ -1014,3 +1014,22 @@ def test_a_telnet_ios_line_taken_with_a_warning_is_applied_and_the_warning_comes
     assert result.status == "applied" and result == ("(config applied)\n'spanning-tree portfast': %Warning: portfast "
                                                      "should only be enabled on ports connected to a single")
     assert _received(srv) == ["configure terminal", "interface Gi0/1", "spanning-tree portfast", "no shutdown", "end"]
+
+
+def test_a_telnet_edit_with_nothing_to_apply_is_refused_before_connecting(monkeypatch):
+    """#142: an edit of nothing but `!` lines on telnet-ios logged in, typed
+    `configure terminal` and `end` and said APPLIED. Nothing but blank lines
+    and the dialect's comments ('#', and '!' for an IOS-shaped one) is
+    refused before the socket is opened; to plain telnet a '!' line is a
+    line, typed as written."""
+    from hssh.transports import telnet
+
+    def never(*a, **k):
+        raise AssertionError("connected although the edit had nothing to apply")
+    monkeypatch.setattr(telnet, "_connect_and_login", never)
+    for hint, payload, kinds in (("telnet-ios", "! a\n\n! b\n", "'#' or '!'"), ("telnet-nxos", "# x", "'#' or '!'"),
+                                 ("telnet", " \n", "'#'")):
+        with pytest.raises(ValueError) as refused:
+            telnet.edit("127.0.0.1", "admin", "admin", payload, 5, 5, port=2323, vendor_hint=hint)
+        assert str(refused.value) == (f"the payload has nothing but blank lines and {kinds} comments in it; "
+                                      "nothing was sent to the device"), hint

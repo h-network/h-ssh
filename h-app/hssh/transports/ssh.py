@@ -38,7 +38,8 @@ from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
 from ..errors import ConnectTimeoutError, LocalError, NotAppliedError
-from .cli import Cli, edit_policy, refuse_comment, refuse_commit_lines, refuse_control_characters
+from .cli import (Cli, edit_policy, refuse_comment, refuse_commit_lines, refuse_control_characters,
+                  refuse_empty_edit)
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
                       tcp_timed_out, where)
 
@@ -714,7 +715,10 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
     configure terminal, the lines, end, and refuses dry_run, commit_confirmed
     and expected_diff before anything is sent. A payload the CLI engine would
     type with a control character or a Tab in it is refused before connecting:
-    the CLI takes either as a key (cli.refuse_control_characters).
+    the CLI takes either as a key (cli.refuse_control_characters). So is one
+    with nothing to apply, nothing but blank lines and comments (`#`, and
+    `!` for an IOS-shaped dialect), but for Junos's candidate, where it is
+    NO CHANGES (cli.refuse_empty_edit).
     """
     d = _dialect(vendor_hint)
     if d is drivers.NONE:
@@ -722,6 +726,7 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
             raise ValueError("commit_confirmed is not supported by the 'ssh' transport; "
                              "nothing was sent to the device")
         edit_policy(d, vendor_hint or "ssh", dry_run, None, expected_diff)
+        refuse_empty_edit(payload, d)
         commands = [ln.strip() for ln in payload.strip().splitlines() if ln.strip()]
         return _run_commands(host, user, passwd, commands, session_timeout, command_timeout, port=port,
                              edit=True, dialect=d, connect_timeout=connect_timeout)
@@ -732,6 +737,8 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
     refuse_control_characters(payload)
     if d.cli.has_candidate:
         refuse_commit_lines(payload)
+    else:
+        refuse_empty_edit(payload, d)
     client, session = _shell_session(host, user, passwd, session_timeout, port, d, connect_timeout)
     try:
         if d.cli.has_candidate:
