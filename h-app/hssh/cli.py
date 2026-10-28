@@ -1187,6 +1187,26 @@ async def main() -> int:
     if args.show_diff and (not has_edits or args.dry_run):
         print("ERROR: --show-diff goes with an edit that is not already a --dry-run.", file=sys.stderr)
         return 2
+    # A preview is a dry run of one entry on the device as it is now, and a
+    # job runs a device's entries one after another, each on the device as
+    # the one before left it. A device's second edit was previewed without
+    # its first (a delete of what the first sets: NO CHANGES), and after the
+    # y the first committed and the second failed `diff changed since
+    # preview`: the job half applied (#144). Refused, before anything is
+    # written or sent, until a device's edits are previewed as one candidate.
+    if args.show_diff and job_entries:
+        edits = {}
+        for je in job_entries:
+            if je.mode.startswith("edit"):
+                edits[je.target.name] = edits.get(je.target.name, 0) + 1
+        several = [name for name, n in edits.items() if n > 1]
+        if several:
+            shown = ", ".join(several[:20]) + (" …" if len(several) > 20 else "")
+            print(f"ERROR: --show-diff: the job has more than one edit entry for {shown}; its edits would be "
+                  "previewed one by one, each on the device as it is now, so a later one's preview would not "
+                  "see the ones before it. Put a device's edits in one entry, or drop --show-diff. "
+                  "Nothing was sent.", file=sys.stderr)
+            return 2
     # --format shapes a show's reply. An edit, --rollback or --commit-status
     # has none to shape, so it is refused rather than quietly ignored; a job
     # keeps it for its show entries.
