@@ -486,8 +486,9 @@ a community ending in `#` cannot be taken for the prompt and shift every later r
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
 commit-confirmed with one bare `commit` in exclusive mode; a line inside a config payload whose first
-word is `commit` (`commit;` too, the set-syntax guard's own spelling) is refused before the device is
-contacted, on every Junos driver that types at the CLI and for a library caller too. A commit whose
+word is `commit` (`commit;` too, the set-syntax guard's own spelling), or `com`, `comm` or `commi`, which
+the CLI completes to it, is refused before the device is contacted, on every Junos driver that types at
+the CLI and for a library caller too. A commit whose
 reply never arrives is
 *outcome unknown* here too; one answered with `commit complete` that then takes the session with it — a
 management address, the telnet service — is still reported as committed, the closed session releasing
@@ -1245,7 +1246,7 @@ reads a batch file or a profile as the CLI does. Edits keep their gates
 in the CLI (the set-syntax guard, the probe's question, the confirmation) and in the transports' own
 `edit()`/`begin()` below; a transport that types at a CLI refuses a payload or a confirm comment with a
 control character or a Tab in it itself, before it connects, and a Junos one a payload line whose first
-word is `commit` (`commit;` too), the one commit rail a library caller has (see [Transports](#transports)).
+word is `commit` (`commit;` and `com` too), the one commit rail a library caller has (see [Transports](#transports)).
 
 ### One device, one call
 
@@ -1442,7 +1443,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1292 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1294 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

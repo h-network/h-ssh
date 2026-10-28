@@ -308,6 +308,23 @@ def test_a_commit_line_is_its_first_word_whatever_ends_it():
     assert ch.typed == []
 
 
+def test_an_abbreviated_commit_is_a_commit_too():
+    """#139 review: the rail took the word `commit` whole, and a Junos CLI
+    completes a unique prefix of a command: `com`, `comm` and `commi` are
+    `commit` in configuration mode (`co` is `copy` as well). For a library
+    caller the rail is the only one. A shortening is refused as the word
+    is, with a closing ';' or more words after it, before anything is
+    typed; a word that only starts like one is configuration's business."""
+    for payload in ("com\n", "set a b\ncomm\n", "commi;\n", "set a b\ncom confirmed 1\n", "com\tcheck\n"):
+        with pytest.raises(ValueError, match="is 'commit' to a Junos CLI, and 'commit' is not configuration"):
+            refuse_commit_lines(payload)
+    refuse_commit_lines("co\nset a commit\ncopy a to b\ncommitted\nCOM\n")
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match="^'com' is 'commit' to a Junos CLI"):
+        s.edit_candidate("set system host-name x\ncom\n", dry_run=True)
+    assert ch.typed == []
+
+
 # What the Junos line editor acts on as it arrives: ^C drops the line typed so
 # far, ^U kills it, DEL rubs out a character. The rest of the line then ran as
 # a line of its own (#139). An ESC or a C1 CSI starts a key sequence, and a

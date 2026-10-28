@@ -628,6 +628,15 @@ def test_a_commit_line_ending_in_a_semicolon_is_refused_before_connecting(no_con
             ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="junos@ssh", dry_run=True)
 
 
+def test_an_abbreviated_commit_line_is_refused_before_connecting(no_connection):
+    """#139 review: `ssh.edit(payload='set a b\\ncom\\n', vendor_hint='junos@ssh')`
+    passed the commit rail and typed `com` in configure mode, which a Junos
+    CLI completes to `commit`, a dry run too. Refused before connecting."""
+    for payload in ("set system host-name test\ncom\n", "comm;\n", "commi confirmed 1\n"):
+        with pytest.raises(ValueError, match="is 'commit' to a Junos CLI, and 'commit' is not configuration"):
+            ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="junos@ssh", dry_run=True)
+
+
 # ^C, ^U and DEL, which the Junos line editor acts on as they arrive, a Tab, which completes the word, and
 # an ESC or a C1 CSI, which starts a key sequence (#139)
 KEYS = ["set system host-name x\x03commit comment y\n", "set a\x15commit\n", "set " + "\x7f" * 4 + "commit\n",

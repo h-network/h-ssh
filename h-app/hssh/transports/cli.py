@@ -138,6 +138,11 @@ def refuse_credentials(user: Optional[str], passwd: Optional[str]) -> None:
                          "nothing was sent to the device")
 
 
+# The shortest word a Junos CLI completes to `commit` in configuration mode:
+# it takes a unique prefix of a command, and `co` is `copy` as well.
+_COMMIT_SHORTEST = 3
+
+
 def refuse_commit_lines(payload: str) -> None:
     """`commit` typed inside configure mode would commit (and confirm any
     pending timer) halfway through a payload. A confirm is `-eC "commit"`
@@ -145,11 +150,14 @@ def refuse_commit_lines(payload: str) -> None:
     device is contacted. The word is the line's first, whatever whitespace
     follows it, with a closing ';' taken off: `commit;` is a commit to the
     set-syntax guard too (dialects.junos.check_edit), and for a library
-    caller this is the only rail."""
+    caller this is the only rail. The CLI completes `com`, `comm` and
+    `commi` to `commit` as it does `sh` to `show`, so they are refused too."""
     for line in payload.strip().splitlines():
         words = line.split()
-        if words and words[0].rstrip(";") == "commit":
-            raise ValueError("'commit' is not configuration; a pending commit-confirmed is confirmed "
+        word = words[0].rstrip(";") if words else ""
+        if len(word) >= _COMMIT_SHORTEST and "commit".startswith(word):
+            said = "'commit'" if word == "commit" else f"{word!r} is 'commit' to a Junos CLI, and 'commit'"
+            raise ValueError(f"{said} is not configuration; a pending commit-confirmed is confirmed "
                              "with -eC \"commit\" alone. Nothing was sent to the device")
 
 
