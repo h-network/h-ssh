@@ -1026,11 +1026,15 @@ def test_a_close_with_a_grace_skips_the_queued_devices_instead_of_failing_them(m
     hold, release, started = threading.Event(), threading.Event(), threading.Event()
 
     def show(host, user, passwd, cmd, *a, **kw):
+        # Held until the test lets go (the finally below), 60 s at most: well
+        # past the test's own 10 s waits, so a stalled runner fails one of
+        # those and not this. Held 10 s, a fake timed out first, its worker
+        # ran the queued device, and the close found nothing to cancel (#180).
         if host == "10.0.0.1":
-            hold.wait(10)
+            hold.wait(60)
         elif host == "10.0.0.2":
             started.set()
-            release.wait(10)
+            release.wait(60)
         return f"{cmd} on {host}"
 
     install(monkeypatch, show=show)
