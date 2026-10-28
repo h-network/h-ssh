@@ -247,6 +247,55 @@ def test_a_commit_line_in_a_payload_is_refused_before_anything_is_typed():
     refuse_commit_lines("set a b\n")
 
 
+# What the Junos line editor acts on as it arrives: ^C drops the line typed so
+# far, ^U kills it, DEL rubs out a character. The rest of the line then ran as
+# a line of its own (#139).
+KEYS = ["set system host-name x\x03commit comment y\n", "set a\x15commit\n", "set " + "\x7f" * 4 + "commit\n",
+        "set system\thost-name x\n"]
+
+
+def test_a_line_with_a_control_character_or_a_tab_is_never_typed():
+    """#139: `set system host-name x`, ^C, `commit comment y` in a payload
+    committed for good with no timer, under a dry run too, and h-ssh said
+    DRY-RUN. The engine types no control character and no Tab (a CLI
+    completes the word on it): an edit is refused before configure mode, a
+    command before it is sent."""
+    for payload in KEYS:
+        s, ch = junos_session()
+        with pytest.raises(ValueError, match="which a CLI takes as a key, not as text; nothing was sent to the device$"):
+            s.edit_candidate(payload, dry_run=True)
+        assert ch.typed == []
+    replies = {"configure terminal": "\r\nRouter(config)#", "end": "\r\nRouter#", "<else>": "\r\nRouter(config)#"}
+    ch = ScriptChannel("\r\nRouter#", replies)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login("u", "p")
+    with pytest.raises(ValueError, match=r"^'interface Gi0/1\\x03reload' has a control character '\\x03'"):
+        s.edit_lines("hostname x\ninterface Gi0/1\x03reload\n")
+    assert ch.typed == []
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match=r"^'set a\\x03commit' has a control character '\\x03', which a CLI takes "
+                                         r"as a key, not as text; it was not sent$"):
+        s.run("set a\x03commit", 5)
+    with pytest.raises(ValueError, match="has a Tab"):
+        s.run("show\tversion", 5)
+    assert ch.typed == []
+
+
+def test_a_confirm_comment_is_one_line_of_text_without_a_double_quote():
+    """#139: the comment went on the commit line as it was given: a line
+    break ran `rollback 1` and a second commit, and the confirm said
+    confirmed-ok; a double quote ends the quoted comment."""
+    for comment, what in (('x"\nrollback 1\ncommit', "a line break"), ('x" confirmed 1', "a double quote"),
+                          ("x\ty", "a Tab"), ("x\x03", "a control character")):
+        s, ch = junos_session()
+        with pytest.raises(ValueError, match=f"the comment .* has {what}.*nothing was sent to the device$"):
+            s.confirm(5, comment=comment)
+        assert ch.typed == []
+    s, ch = junos_session()
+    assert s.confirm(5, comment="change 42: lo0") == "COMMIT CONFIRMED OK"
+    assert 'commit comment "change 42: lo0"' in ch.typed
+
+
 def test_lines_edit_applies_each_line_in_config_mode():
     replies = {"configure terminal": "\r\nRouter(config)#", "end": "\r\nRouter#", "<else>": "\r\nRouter(config)#"}
     ch = ScriptChannel("\r\nRouter#", replies)

@@ -15,7 +15,7 @@ import re
 import time
 from typing import Callable, Optional
 
-from ..core import check_confirm_minutes, refusal_line
+from ..core import check_confirm_minutes, control_character, control_line, refusal_line
 from ..dialects.base import CliSyntax, Dialect
 from ..drivers import results as R
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
@@ -67,6 +67,38 @@ def complaint(output: str, dialect: Dialect) -> str:
         if ln.strip() and set(ln.strip()) != {"^"}:
             return ln.strip()
     return output.strip()
+
+
+def refuse_control_characters(payload: str) -> None:
+    """A CLI acts on a control character as it is typed: ^C drops the line
+    typed so far, ^U kills it, DEL rubs out the character before it, a Tab
+    completes the word. What is left of the line then runs as typed: `set
+    system host-name x`, ^C, `commit comment y` commits for good, dry run or
+    not. Every line the engine types is plain text, line breaks only between
+    lines; a C0 or C1 control character, DEL or a Tab is refused before the
+    device is contacted."""
+    found = control_line(payload, tabs=False)
+    if found:
+        _, line, what = found
+        raise ValueError(f"{line!r} has {what}, which a CLI takes as a key, not as text; "
+                         "nothing was sent to the device")
+
+
+def refuse_comment(comment: Optional[str]) -> None:
+    """confirm()'s comment goes on the commit line in double quotes: a line
+    break in it runs what follows as commands of their own (`rollback 1`, a
+    second commit), another control character or a Tab is a key to the CLI,
+    and a double quote ends the comment, the rest read as more of the
+    commit. Refused before the device is contacted."""
+    if not comment:
+        return
+    what = control_character(comment, tabs=False)
+    if what:
+        raise ValueError(f"the comment {comment!r} has {what}, which a CLI takes as a key, not as text; "
+                         "nothing was sent to the device")
+    if '"' in comment:
+        raise ValueError(f"the comment {comment!r} has a double quote, which would end it on the commit line; "
+                         "nothing was sent to the device")
 
 
 def refuse_commit_lines(payload: str) -> None:
@@ -248,7 +280,13 @@ class Cli:
         a config line that itself ends in prompt-shaped text (`description
         noc@example.com>`) once satisfied the match on its echo, left the real
         reply in the socket, and shifted every later read by one reply, so a
-        commit the device refused was reported as COMMIT OK."""
+        commit the device refused was reported as COMMIT OK.
+
+        A command with a control character or a Tab in it is not typed: the
+        CLI would take it as a key (refuse_control_characters)."""
+        what = control_character(cmd, tabs=False)
+        if what:
+            raise ValueError(f"{cmd!r} has {what}, which a CLI takes as a key, not as text; it was not sent")
         self._send(cmd + "\n")
         prompt_re = self.prompt_re
 
@@ -299,6 +337,7 @@ class Cli:
     def edit_lines(self, payload: str) -> R.EditResult:
         """Config mode without a candidate: configure terminal -> commands -> end."""
         cli = self.cli
+        refuse_control_characters(payload)
         self.run(cli.config_enter, 10)
 
         errors = []
@@ -330,6 +369,7 @@ class Cli:
         `show | compare` says the same again.
         """
         d, cli = self.dialect, self.cli
+        refuse_control_characters(payload)
         refuse_commit_lines(payload)
         reply = self.run(cli.config_enter, 10)
         if d.refused.search(reply):
@@ -388,6 +428,7 @@ class Cli:
         means the timer expired or it was confirmed already; a commit now
         would hide that from the operator."""
         d, cli = self.dialect, self.cli
+        refuse_comment(comment)
         history = self.run("show system commit", command_timeout)
         if not pending_in(history, d):
             raise NothingToConfirmError(

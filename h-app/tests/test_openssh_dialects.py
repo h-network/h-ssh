@@ -330,6 +330,23 @@ def test_a_commit_line_in_the_payload_is_refused_before_connecting(no_ssh):
         junos_edit("set system host-name test\ncommit\n")
 
 
+def test_a_payload_or_comment_the_cli_would_take_as_keys_is_refused_before_connecting(no_ssh):
+    """#139: ^C, ^U and DEL in a set line are keys to the Junos line editor
+    on the pty, and what follows them ran as a line of its own, a commit
+    for good under a dry run too; a Tab completes the word; a line break or
+    a double quote in a confirm's comment typed more than the comment.
+    Refused before ssh is started, on every dialect typed at the pty."""
+    for payload in ("set system host-name x\x03commit comment y\n", "set a\x15commit\n",
+                    "set " + "\x7f" * 4 + "commit\n", "set system\thost-name x\n"):
+        with pytest.raises(ValueError, match="which a CLI takes as a key, not as text; nothing was sent to the device"):
+            junos_edit(payload, dry_run=True)
+        with pytest.raises(ValueError, match="nothing was sent to the device"):
+            openssh.edit("10.0.0.1", "u", "p", payload, 5, 10, vendor_hint="eos@openssh")
+    for comment in ('x"\nrollback 1\ncommit', 'x"'):
+        with pytest.raises(ValueError, match="the comment .* nothing was sent to the device"):
+            openssh.confirm("10.0.0.1", "lab", "hunter2", 5, 10, vendor_hint="junos@openssh", comment=comment)
+
+
 # --- confirm ----------------------------------------------------------------------------
 
 def test_confirm_commits_the_pending_commit_confirmed(device):

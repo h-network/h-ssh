@@ -38,7 +38,7 @@ from ..core import refusal_line, refused_reply
 from ..dialects.base import Dialect
 from ..drivers import results as R
 from ..errors import ConnectTimeoutError, LocalError, NotAppliedError
-from .cli import Cli, edit_policy, refuse_commit_lines
+from .cli import Cli, edit_policy, refuse_comment, refuse_commit_lines, refuse_control_characters
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
                       tcp_timed_out, where)
 
@@ -707,7 +707,9 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
     commit (confirmed with a timer, or rollback 0 for a dry run, or only if
     the diff is still what the dry run showed); an IOS-shaped dialect gets
     configure terminal, the lines, end, and refuses dry_run, commit_confirmed
-    and expected_diff before anything is sent.
+    and expected_diff before anything is sent. A payload the CLI engine would
+    type with a control character or a Tab in it is refused before connecting:
+    the CLI takes either as a key (cli.refuse_control_characters).
     """
     d = _dialect(vendor_hint)
     if d is drivers.NONE:
@@ -722,6 +724,7 @@ def edit(host: str, user: str, passwd: str, payload: str, session_timeout: int,
         raise ValueError(f"{vendor_hint}: the {d.title} dialect has no CLI to type at; "
                          "nothing was sent to the device")
     edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
+    refuse_control_characters(payload)
     if d.cli.has_candidate:
         refuse_commit_lines(payload)
     client, session = _shell_session(host, user, passwd, session_timeout, port, d, connect_timeout)
@@ -741,10 +744,13 @@ def confirm(host: str, user: str, passwd: str, session_timeout: int, command_tim
     """Confirm a pending commit-confirmed on a Junos device over SSH: `show
     system commit` must show one waiting, then configure exclusive, a bare
     `commit` (`commit comment "…"` with a comment), exit. Only a dialect with
-    a candidate and a commit history has anything to confirm."""
+    a candidate and a commit history has anything to confirm. A comment with
+    a control character, a Tab or a double quote in it is refused before
+    connecting (cli.refuse_comment)."""
     d = _dialect(vendor_hint)
     if d.cli is None or not d.cli.has_candidate or d.commit_pending is None:
         raise ValueError(f"confirm is only for a Junos dialect, not {vendor_hint}; nothing was sent")
+    refuse_comment(comment)
     client, session = _shell_session(host, user, passwd, session_timeout, port, d, connect_timeout)
     try:
         return session.confirm(command_timeout, comment)

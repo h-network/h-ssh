@@ -1,8 +1,11 @@
 """#67: the transports agree on what a password means, an edit's verdict
 comes from the reply as well as the exit status, a delete of what is not
 there is not a failure, and the open-file limit is checked before it bites;
-#133: and none sends a set file's comment line as a command."""
+#133: and none sends a set file's comment line as a command; #139: nor a
+set file with a control character in it, and a Tab only where no CLI is
+typed at."""
 import asyncio
+import json
 import os
 import stat
 import sys
@@ -210,3 +213,81 @@ def test_a_set_file_with_nothing_but_comments_is_refused_before_anything_is_sent
     assert rc == 2 and "nothing but blank lines and '#' comments" in err and "Nothing was sent." in err, err
     assert ("R1.set" if flag == "-eD" else str(tmp_path / "R1.set")) in err
     assert sent == [] and probed == [] and not os.path.exists(os.environ["HSSH_STORE"])
+
+
+@pytest.mark.parametrize("line, what", [("set system host-name x\x03commit comment y", "a control character '\\x03'"),
+                                        ("set a\x15commit", "a control character '\\x15'"),
+                                        ("set " + "\x7f" * 4 + "commit", "a DEL")])
+def test_a_set_file_with_a_control_character_is_refused_before_anything_is_sent(monkeypatch, capsys, tmp_path,
+                                                                                line, what, probed):
+    """#139: -eB and -eD files (and a run file's edit-broadcast and
+    edit-dir, which name them) were never held to -eC's rule. The Junos line
+    editor acts on ^C, ^U and DEL as they arrive and ran the rest of the line
+    on its own: `commit comment y` committed for good while --dry-run said
+    DRY-RUN, exit 0. Refused on every driver now, exit 2 naming the file and
+    the line, before anything is probed, written or sent."""
+    sent = []
+
+    async def fake_run(t, transport, mode, *a, **kw):
+        sent.append(t.name)
+        return t.name, True, "ok\n", 1
+    monkeypatch.setattr(cli, "run_for_target_async", fake_run)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True))
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    sets = tmp_path / "sets"
+    sets.mkdir()
+    (sets / "R1.set").write_text("set system domain-name lab\n" + line + "\n")
+    for vendor in ("junos@ssh", "junos", "ssh"):
+        target = f"R1:10.0.0.1:{vendor}"
+        for i, how in enumerate((["-eB", str(sets / "R1.set")], ["-eD", str(sets)],
+                                 {"edit-broadcast": "sets/R1.set"}, {"edit-dir": "sets"})):
+            if isinstance(how, dict):
+                run = tmp_path / f"run{i}.json"
+                run.write_text(json.dumps({"devices": [target], "dry-run": True, **how}))
+                argv = ["--run", str(run)]
+            else:
+                argv = [*how, "--dry-run", target]
+            monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-y", *argv])
+            rc = asyncio.run(cli.main())
+            out, err = capsys.readouterr()
+            flag = "-eB" if "-eB" in argv or "edit-broadcast" in how else "-eD"
+            assert rc == 2 and f"ERROR: {flag} {sets / 'R1.set'}: line 2 has {what} ({line!r}); " \
+                                f"a payload is plain text." in err, (vendor, how, err)
+    assert sent == [] and probed == [] and not os.path.exists(os.environ["HSSH_STORE"])
+
+
+def test_a_tab_is_text_to_netconf_and_a_key_to_a_cli_typed_at(monkeypatch, capsys, tmp_path):
+    """#139: NETCONF's `load set` reads a Tab as a space, so a Tab-indented
+    set file works on junos as it always did. Typed at a CLI, a Tab
+    completes the word: junos@ssh and every driver that types at a CLI
+    refuse the file themselves, before they connect, a FAIL of that device
+    with nothing sent, beside the junos device that got the file as written."""
+    from hssh.transports import ssh
+    got = []
+
+    def netconf_edit(host, user, passwd, payload, *a, **kw):
+        got.append(payload)
+        return "DRY-RUN\n\nDIFF:\n[edit system]\n+   host-name x;"
+
+    class NeverConnects:
+        def __init__(self, *a, **kw):
+            raise AssertionError("connected although the payload was refused before any device I/O")
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", types.SimpleNamespace(AVAILABLE=True, edit=netconf_edit))
+    monkeypatch.setattr(ssh.paramiko, "SSHClient", NeverConnects)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    broadcast = tmp_path / "all.set"
+    broadcast.write_text("\tset system host-name x\n")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", "-eB", str(broadcast),
+                                      "--dry-run", "-y", "--json", "R1:10.0.0.1:junos", "R2:10.0.0.2:junos@ssh"])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    by_name = {r["device"]: r for r in json.loads(out)}
+    assert rc == 1, err
+    assert got == ["\tset system host-name x\n"] and by_name["R1"]["ok"] is True
+    assert by_name["R2"]["ok"] is False and by_name["R2"]["error"] == (
+        "'\\tset system host-name x' has a Tab, which a CLI takes as a key, not as text; "
+        "nothing was sent to the device")

@@ -189,9 +189,9 @@ A password means the same on every transport: it is the credential, and no `~/.s
 | Flag | Mode | What it does |
 |---|---|---|
 | `-sC` | Show | Run a show/display command (or a template name): one line of text, so a line break or another control character in it is refused (exit 2). A command that acts on the device (`request …`, `clear …`) is sent once and never retried, and refused under `--format` (exit 2, nothing sent) |
-| `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL) is refused (exit 2) |
-| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped on every driver, nothing else is touched, so `community ab#12` goes as written; an edit typed at an IOS-shaped CLI (`telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) also skips a full-line `!` comment. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3). A `<NAME>.set` with nothing in it but blank lines and `#` comments ends the run the same way on every driver, `--allow-missing` or not |
-| `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`; a file with nothing else in it ends the run before anything is sent, exit 2) |
+| `-eC` | Edit command | Apply one config line to every target; a control character other than a line break (an ESC, a NUL, a ^C) is refused (exit 2). A Tab passes here; a driver that types at a CLI refuses it before it connects (see [Transports](#transports)) |
+| `-eD` | Edit directory | Per-device config from `<NAME>.set` files: blank and full-line `#` comments are skipped on every driver, nothing else is touched, so `community ab#12` goes as written; an edit typed at an IOS-shaped CLI (`telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) also skips a full-line `!` comment. A device without its `<NAME>.set` ends the run before anything is sent (exit 2, naming it); `--allow-missing` skips those devices instead and reports them as skipped (exit 3). A `<NAME>.set` with nothing in it but blank lines and `#` comments ends the run the same way on every driver, `--allow-missing` or not, and so does one with a control character other than a line break in it (an ESC, a ^C, a DEL), as `-eC` does, naming the file and the line |
+| `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`; a file with nothing else in it, or with a control character other than a line break, ends the run before anything is sent, exit 2) |
 | `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
 | `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt` (or `NAME`; a name with a `/` is a path), or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
 | `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused) |
@@ -446,6 +446,18 @@ ones). Shows over SSH use an exec channel, one command per channel; only edits a
 shell. Over the OpenSSH binary the shell is `ssh -tt`, with a password still handed over through
 `SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh` drivers (dialect `none`) never open
 a shell.
+
+The engine types plain text only. A CLI acts on a control character as it arrives (^C drops the line
+typed so far, ^U kills it, DEL rubs out a character, a Tab completes the word), and what is left of the
+line runs as typed, a `commit` too, under `--dry-run` as well. So `edit()` refuses a payload with a C0
+or C1 control character, DEL or a Tab in a line, and `confirm()` a `comment=` with one of those, a line
+break or a double quote (which would end it on the commit line): a `ValueError` before the device is
+contacted, nothing sent. The CLI refuses a control character in `-eC`, `-eD`, `-eB` or a job on every
+driver before the run starts (exit 2) and lets a Tab through: it is text to `junos`, whose `load set`
+reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at no CLI. A set file
+indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
+`telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it fails
+without being typed.
 
 `h-ssh --list-vendors` prints the registry: every driver a target may name, its aliases, transport,
 dialect, the formats `--format` can ask it for, what it supports, and where it came from (`built-in`,
@@ -1221,7 +1233,8 @@ character is a `ValueError` before anything runs. A file is taken as it is: a bl
 and a `#` comment is sent as a command; `fleet.batch(hssh.core.read_command_file_lines(pathlib.Path(path)))`
 reads a batch file or a profile as the CLI does. Edits keep their gates
 in the CLI (the set-syntax guard, the probe's question, the confirmation) and in the transports' own
-`edit()`/`begin()` below.
+`edit()`/`begin()` below; a transport that types at a CLI refuses a payload or a confirm comment with a
+control character or a Tab in it itself, before it connects (see [Transports](#transports)).
 
 ### One device, one call
 

@@ -16,7 +16,8 @@ from .. import drivers
 from ..dialects.base import Dialect
 from ..drivers import results as R
 from .cli import (Cli, LOGIN_RE, PASSWORD_RE, MORE_PATTERNS, strip_ansi as _strip_ansi,  # noqa: F401
-                  edit_policy, refuse_commit_lines as _refuse_commit_lines)
+                  edit_policy, refuse_comment as _refuse_comment, refuse_commit_lines as _refuse_commit_lines,
+                  refuse_control_characters as _refuse_control_characters)
 
 AVAILABLE = True  # Raw sockets, always available
 
@@ -141,10 +142,13 @@ def confirm(host: str, user: str, passwd: str,
     """Confirm a pending commit-confirmed on a telnet-junos device: configure
     exclusive, a bare `commit` (`commit comment "…"` with a comment), exit.
     Without this the runner handed the word `commit` to the edit path, which
-    committed twice and reported someone else's diff."""
+    committed twice and reported someone else's diff. A comment with a
+    control character, a Tab or a double quote in it is refused before
+    connecting (cli.refuse_comment)."""
     d = _dialect(vendor_hint)
     if d.commit_pending is None or not d.cli.has_candidate:
         raise ValueError(f"confirm is only for telnet-junos, not {vendor_hint}; nothing was sent")
+    _refuse_comment(comment)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23, session_timeout, d)
     try:
         return session.confirm(command_timeout, comment)
@@ -176,10 +180,12 @@ def edit(host: str, user: str, passwd: str, payload: str,
     back, armed with a timer, or checked against the diff a dry run showed).
     An IOS-style flavour cannot honour them, so asking is a ValueError
     before anything is sent, never a dry run that lands or a commit with no
-    timer.
+    timer. So is a line with a control character or a Tab in it, which the
+    CLI would take as a key (cli.refuse_control_characters).
     """
     d = _dialect(vendor_hint)
     edit_policy(d, vendor_hint, dry_run, commit_confirmed, expected_diff)
+    _refuse_control_characters(payload)
     if d.cli.has_candidate:
         _refuse_commit_lines(payload)
     session = _connect_and_login(host, user, passwd, port if port is not None else 23, session_timeout, d)

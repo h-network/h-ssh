@@ -419,23 +419,38 @@ def read_failure(e: Exception) -> str:
 
 
 # What a command may not carry: the C0 and C1 control characters and DEL,
-# the line breaks among them. A tab is text.
+# the line breaks among them. A tab is text, except to the CLI engine.
 _CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
+_CONTROL_OR_TAB = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _CONTROL_NAMES = {"\n": "a line break", "\r": "a carriage return", "\x00": "a NUL", "\x1b": "an ESC",
-                  "\x7f": "a DEL"}
+                  "\x7f": "a DEL", "\t": "a Tab"}
 
 
-def control_character(text: str, line_breaks: bool = False) -> Optional[str]:
+def control_character(text: str, line_breaks: bool = False, tabs: bool = True) -> Optional[str]:
     """The first control character in `text`, named ('a line break', 'a NUL',
     'an ESC', else 'a control character' and its repr), or None. A command
     is one line of text: a line break in it runs two commands (and a retry
     both again), a NUL or an ESC is not text. An edit payload is lines, so
-    `line_breaks` lets the line breaks through."""
-    for m in _CONTROL.finditer(text):
+    `line_breaks` lets the line breaks through. A Tab is text (NETCONF's
+    `load set` reads it as a space) unless `tabs` is False: the CLI engine
+    types none, since a CLI completes the word on it."""
+    for m in (_CONTROL if tabs else _CONTROL_OR_TAB).finditer(text):
         ch = m.group()
         if line_breaks and ch in "\r\n":
             continue
         return _CONTROL_NAMES.get(ch, f"a control character {ch!r}")
+    return None
+
+
+def control_line(text: str, tabs: bool = True) -> Optional[Tuple[int, str, str]]:
+    """What control_character() finds in a payload, its line breaks let
+    through, with where it is: (line number, the line, what), for a refusal
+    that names the line; None when the payload is plain text."""
+    for n, line in enumerate(text.split("\n"), 1):
+        line = line.rstrip("\r")
+        what = control_character(line, line_breaks=True, tabs=tabs)
+        if what:
+            return n, line, what
     return None
 
 
