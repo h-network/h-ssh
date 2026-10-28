@@ -833,6 +833,14 @@ async def main() -> int:
             jobs = "--job" if args.job else "a run file's 'jobs'"
             print(f"ERROR: {', '.join(beside)} beside {jobs}: a job's targets are its entries.", file=sys.stderr)
             return 2
+        # So are a run file's `devices` beside a --job typed next to the
+        # file: the job ran and committed on its own entries, the file's
+        # devices dropped without a word (#140). Beside the file's own
+        # `jobs` they are not used, as the README says.
+        if args.job and "devices" in from_run_file:
+            print(f"ERROR: run file '{args.run}': 'devices' beside --job: a job's targets are its entries.",
+                  file=sys.stderr)
+            return 2
         try:
             if args.job:
                 job_entries = load_jobs(args.job, default_vendor=args.transport)
@@ -2168,7 +2176,8 @@ async def main() -> int:
         if args.commit_confirmed and not args.dry_run and has_edits and armed:
             # A job's timers are armed on its edit entries' targets, not on
             # the inventory file or a run file's `devices` beside its jobs (a
-            # target typed beside a job is refused).
+            # target typed beside a job is refused, and so are a run file's
+            # `devices` beside a typed --job).
             specs = args.target
             if job_entries:
                 specs = list(dict.fromkeys(target_spec(je.target) for je in job_entries

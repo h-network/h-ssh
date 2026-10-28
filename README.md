@@ -196,11 +196,11 @@ The username is plain text. Telnet types it at the `login:` prompt as it is, whe
 | `-eB` | Edit broadcast | One config file applied to all targets (comments as for `-eD`; a file with nothing else in it, or with a control character other than a line break, ends the run before anything is sent, exit 2) |
 | `--batch` | Batch | Several show commands from a file, one connection per device. Every line is held to `-sC`'s rules: one line of text, and a line that acts on the device makes the batch a single attempt and is refused under `--format` (exit 2, nothing sent). A file that cannot be read (not UTF-8, no permission) is exit 2 saying why |
 | `--profile` | Batch | The same, by name: a command set of yours in `~/.h-ssh/profiles/NAME.txt` (or `NAME`; a name with a `/` is a path), or one that ships (`junos-health`, `junos-snapshot`); `--list-profiles` shows both. A profile is a batch file, one command per line, `#` comments, the first comment its description; one that cannot be read is listed as unreadable, with the reason |
-| `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused). A job's targets are its entries: a target typed beside it (a bare host, `--target`) or a `--devices` is refused (exit 2, nothing sent) |
+| `--job` | Job | Per-device commands *and* modes from JSON — file or `-` for stdin; each entry's `target` is `NAME:HOST[:VENDOR][:PORT]`, as for `--target` (a bare host is refused). A job's targets are its entries: a target typed beside it (a bare host, `--target`), a `--devices`, or the `devices` of a run file it is typed beside is refused (exit 2, nothing sent) |
 | `--rollback N` | Rollback | Return every target to rollback N (0–49): the same lock → diff → commit check → commit → unlock as an edit, so `--dry-run` shows the diff of going back and `--commit-confirmed` arms the timer (NETCONF `junos` only) |
 | `--commit-status` | Commit status | `show system commit` as data per target: sequence, time, user, comment, and the pending commit-confirmed timer (NETCONF `junos` only) |
 | `--probe` | Probe | Alone, with no command: every box checked without logging in, one line each with its result and times, a summary, kept in the store; exit 0 when every box is live, 1 when one is dead, 3 when none is but one was not probed, 4 when the store could not keep it. See [The probe](#the-probe) |
-| `--run FILE` | Run file | Any of the above but `--profile` and `--probe` alone, described in one YAML or JSON file: devices, commands, options, outputs (a profile's file can go in as `batch:`; `--profile` or `--probe` typed next to `--run` still work). A flag typed next to it wins over the file whatever its value, and a target or a `--devices` typed next to it replaces the file's `devices`. See [Run files](#run-files) |
+| `--run FILE` | Run file | Any of the above but `--profile` and `--probe` alone, described in one YAML or JSON file: devices, commands, options, outputs (a profile's file can go in as `batch:`; `--profile` or `--probe` typed next to `--run` still work). A flag typed next to it wins over the file whatever its value, and a target or a `--devices` typed next to it replaces the file's `devices`; a `--job` typed next to a file that holds `devices` is refused (exit 2). See [Run files](#run-files) |
 
 `-sC`, `-eC`, `-eD` and `-eB` are also `--show-command`, `--edit-command`, `--edit-dir` and
 `--edit-broadcast`; `-y` and `-v` are `--yes` and `--verbose`.
@@ -798,7 +798,10 @@ devices.csv` beside `devices: prod.csv` reads `devices.csv`, and an `--audit-log
 `$HSSH_AUDIT_LOG` beside `audit-log:` writes where the flag says. A target typed on the command line
 (bare or `--target`) or a typed `--devices` replaces the file's `devices`, an inline list or a path
 alike, and one line on stderr says so: `Run file 'fleet-bgp.yaml': 'devices' is ignored; --devices on
-the command line wins.` Relative paths in the file (`devices`, `batch`,
+the command line wins.` A `--job` typed beside a file that holds `devices` does not replace them: a
+job's targets are its entries, so the run is refused (exit 2, nothing sent) rather than run on the
+job's devices with the file's `yes` and timer: `ERROR: run file 'fleet-bgp.yaml': 'devices' beside
+--job: a job's targets are its entries.` Relative paths in the file (`devices`, `batch`,
 `edit-dir`, `edit-broadcast`, `log`, `audit-log`, `save-output`, `safety-file`) resolve against the
 file's own directory, so a run directory with its inventory and set files moves as one.
 
@@ -1463,7 +1466,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1321 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1322 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

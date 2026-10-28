@@ -554,6 +554,29 @@ def test_targets_typed_beside_a_job_are_refused(monkeypatch, capsys, tmp_path):
     assert rc == 0 and drv.edits == [("10.0.0.1", "set system location building A", 5, False)], err
 
 
+def test_a_run_files_devices_beside_a_typed_job_are_refused(monkeypatch, capsys, tmp_path):
+    """#140 review: a run file's `devices` (a list or a path) beside a --job
+    typed next to the file was dropped without a word: the job ran on its
+    own entries and, with the file's timer and `yes`, committed on prod1
+    with no prompt, the confirm hint naming it. Refused as a typed target
+    beside a job is, nothing sent; a file without `devices` still lends a
+    typed job its options."""
+    job = write(tmp_path, "job.json", json.dumps([
+        {"target": "prod1:10.0.0.1:junos", "edit": "set system location building A"},
+        {"target": "prod2:10.0.0.2:junos", "show": "show version"}]))
+    write(tmp_path, "lab.csv", "lab1,10.0.9.1,junos\n")
+    options = {"user": "u", "commit-confirmed": 5, "yes": True}
+    for devices in (["lab1:10.0.9.1:junos"], "lab.csv"):
+        f = write(tmp_path, "run.json", json.dumps({"devices": devices, **options}))
+        rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", job])
+        assert rc == 2 and drv.edits == drv.shows == [] and out == "", (devices, err)
+        assert err == f"ERROR: run file '{f}': 'devices' beside --job: a job's targets are its entries.\n", devices
+    f = write(tmp_path, "run.json", json.dumps(options))
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--job", job])
+    assert rc == 0 and drv.edits == [("10.0.0.1", "set system location building A", 5, False)], err
+    assert drv.shows == [("10.0.0.2", "show version", None)]
+
+
 def test_an_empty_path_user_or_comment_in_the_file_is_refused(monkeypatch, capsys, tmp_path):
     """#140: a run file's empty value was the key left out: `audit_log: ''`
     turned the HSSH_AUDIT_LOG trail off, `user: ''` fell back to HSSH_USER,
