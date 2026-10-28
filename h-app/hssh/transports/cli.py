@@ -456,7 +456,11 @@ class Cli:
     def _reply_lines(self, clean: str, cmd: str, prompt_re: re.Pattern, through_echo: bool = False) -> list:
         """The lines of a reply that are its own: not the echo of `cmd` (with
         `through_echo`, nor anything before it), the prompt that ends it, or
-        the context banner the CLI prints with that prompt."""
+        the context lines the CLI prints with that prompt: Junos's `[edit]`,
+        and above it, while a commit confirmed waits, `# commit confirmed
+        will be rolled back in 4 minutes`, which as a reply's own line once
+        made an empty compare a diff, its commit confirming the timer
+        (#141)."""
         lines = clean.splitlines()
         if through_echo:
             echo = next((n for n, line in enumerate(lines) if is_echo(line, cmd)), -1)
@@ -465,7 +469,7 @@ class Cli:
             lines = lines[1:]
         if lines and self._is_prompt(lines[-1], prompt_re):
             lines = lines[:-1]
-        if self.cli.context and lines and self.cli.context.match(lines[-1].strip()):
+        while self.cli.context and lines and self.cli.context.match(lines[-1].strip()):
             lines = lines[:-1]            # the context banner is the prompt's, not the reply's
         return lines
 

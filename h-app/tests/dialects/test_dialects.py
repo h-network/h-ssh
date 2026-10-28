@@ -199,8 +199,9 @@ def test_telnet_maps_its_hints_to_dialects():
 def test_the_cli_engine_learns_the_prompt_from_the_dialects_shape():
     """The prompt learned is the whole line from its start (#141): a reply
     line that only ends in it, `uplink to BackupRouter#`, is not `Router#`.
-    Junos's `[edit]` banner, `{master}[edit]` with two routing engines, is
-    the prompt's."""
+    Junos's `[edit]` banner, `{master}[edit]` with two routing engines, and
+    the note above it while a commit confirmed waits, are the prompt's; the
+    commit's own word on its timer is the reply's."""
     from hssh.transports.cli import Cli
     learned = Cli(None, dialects.junos.DIALECT, 5)._learn_prompt("welcome\nlab@r1.example> ")
     assert learned.search("lab@r1.example# ") and not learned.search("other@r1.example# ")
@@ -210,5 +211,10 @@ def test_the_cli_engine_learns_the_prompt_from_the_dialects_shape():
     assert not learned.search("uplink to BackupRouter#") and not learned.search("uplink to BackupRouter(config)#")
     context = dialects.junos.CLI.context
     assert all(context.match(line) for line in ("[edit]", "[edit system]", "{master}[edit]",
-                                                 "{master:0}[edit interfaces ge-0/0/0]", "{primary:node0}[edit]"))
-    assert not any(context.match(line) for line in ("", "{master}", "[edit] x", "x [edit]"))
+                                                 "{master:0}[edit interfaces ge-0/0/0]", "{primary:node0}[edit]",
+                                                 "# commit confirmed will be rolled back in 4 minutes",
+                                                 "# commit confirmed will be rolled back in 1 minute"))
+    assert not any(context.match(line) for line in (
+        "", "{master}", "[edit] x", "x [edit]",
+        "commit confirmed will be automatically rolled back in 5 minutes unless confirmed",
+        "+  # commit confirmed will be rolled back in 4 minutes"))

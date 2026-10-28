@@ -37,8 +37,11 @@ class CliSyntax:
     `commit`; one without applies each line as typed. `context` matches a
     line the CLI prints with its prompt rather than as part of a reply
     (Junos's `[edit system]` banner in configuration mode, `{master}[edit]`
-    with two routing engines): a reply of nothing but the echo, that line
-    and the prompt (a line of an edit) is not waited on for more."""
+    with two routing engines, and the `# commit confirmed will be rolled
+    back in 4 minutes` above it while a timer runs): every such line at the
+    end of a reply is the prompt's, and a reply of nothing but the echo,
+    those lines and the prompt (a line of an edit) is not waited on for
+    more."""
     prompt: re.Pattern
     prompt_name: re.Pattern
     prompt_tail: str

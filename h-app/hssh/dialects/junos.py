@@ -86,9 +86,12 @@ CLI = CliSyntax(
     # "[edit]" / "[edit system]" before the configuration-mode prompt belongs
     # to the prompt: without this, an empty `show | compare` read as a diff.
     # A router with two routing engines (a virtual chassis, a cluster) puts
-    # the engine's role in front, "{master}[edit]": the engine waits after a
-    # reply with output of its own, and this is none (#141).
-    context=re.compile(r"^(\{[^{}]*\})?\[edit[^\]]*\]\s*$"),
+    # the engine's role in front, "{master}[edit]", and while a commit
+    # confirmed waits the CLI says so above it, "# commit confirmed will be
+    # rolled back in 4 minutes": the engine waits after a reply with output
+    # of its own, and neither is one (#141). Read as a diff, the note made an
+    # empty compare commit, which confirms the pending timer.
+    context=re.compile(r"^((\{[^{}]*\})?\[edit[^\]]*\]|# commit confirmed will be rolled back\b.*?)\s*$"),
 )
 
 DIALECT = Dialect("junos", "Junos", "Junos: set syntax, candidate configuration, commit confirmed",

@@ -371,14 +371,19 @@ def test_a_line_that_only_ends_in_the_prompt_never_ends_a_read():
         s.run("show uplinks", 1)
 
 
-@pytest.mark.parametrize("banner", ["[edit]", "{master}[edit]"])
+# Above the [edit] banner while a commit confirmed waits.
+TIMER = "# commit confirmed will be rolled back in 4 minutes"
+
+
+@pytest.mark.parametrize("banner", ["[edit]", "{master}[edit]", TIMER + "\r\n[edit]"])
 def test_a_line_of_an_edit_is_not_waited_on(banner):
     """#141: a reply with output of its own is read on for SETTLE after its
     prompt. One that is only the echo, the context banner and the prompt,
     each set line of an edit (`{master}[edit]` on a router with two routing
-    engines), is not waited on at all, so a 1000-line edit costs what it
-    did: a few ms a line at most. The channel's reads block as a socket's
-    do, so a wait would cost its time; one after a set line ends the test."""
+    engines, the note of a pending commit confirmed above `[edit]`), is not
+    waited on at all, so a 1000-line edit costs what it did: a few ms a
+    line at most. The channel's reads block as a socket's do, so a wait
+    would cost its time; one after a set line ends the test."""
     cfg = f"\r\n\r\n{banner}\r\nlab@R1# "
     stamps = []
 
@@ -397,6 +402,35 @@ def test_a_line_of_an_edit_is_not_waited_on(banner):
     assert r.status == R.DRY_RUN and r.diff == "[edit system]\n+  host-name test;"
     assert ch.waits == [None, "configure exclusive", "show | compare", "rollback 0", "exit"]
     assert len(stamps) == 1000 and (stamps[-1] - stamps[0]) / 999 < 0.003
+
+
+def test_the_note_of_a_pending_commit_confirmed_is_the_prompts_not_the_replys():
+    """#141 review: while a commit confirmed waits, Junos says so above the
+    `[edit]` of every configuration-mode prompt. The engine took one line
+    there for the prompt's, so the note was the reply's own: an empty `show
+    | compare` read as a diff, and an edit that changed nothing typed
+    `commit`, which confirms the pending timer; a preview made at 4 minutes
+    was another diff at 3. Every such line at the end of a reply is the
+    prompt's: nothing to commit is NO CHANGES with no commit typed, and the
+    diff is the same whatever the minutes."""
+    def cfg(minutes):
+        return f"\r\n\r\n# commit confirmed will be rolled back in {minutes} minutes\r\n[edit]\r\n" + OP.replace(">", "#")
+
+    def device(minutes, diff):
+        return {"configure": "\r\nEntering configuration mode" + cfg(minutes), "set": cfg(minutes),
+                "show | compare": diff + cfg(minutes), "rollback": "\r\nload complete" + cfg(minutes),
+                "commit": "\r\ncommit complete" + cfg(minutes)}
+    s, ch = junos_session(**device(4, ""))
+    r = s.edit_candidate("set system host-name R1\n", dry_run=False, confirmed_minutes=5)
+    assert r.status == R.NO_CHANGES and not r.pending
+    assert ch.typed == ["configure exclusive", "set system host-name R1", "show | compare", "rollback 0", "exit"]
+    diff = "\r\n[edit system]\r\n+  host-name test;"
+    s, ch = junos_session(**device(4, diff))
+    preview = s.edit_candidate("set system host-name test\n", dry_run=True).diff
+    assert preview == "[edit system]\n+  host-name test;"
+    s, ch = junos_session(**device(3, diff))
+    r = s.edit_candidate("set system host-name test\n", dry_run=False, expected_diff=preview)
+    assert r.status == R.COMMITTED and r.diff == preview and ch.typed[-2:] == ["commit", "exit"]
 
 
 def test_paging_is_answered_and_the_marker_removed():
