@@ -910,7 +910,12 @@ def show_structured(host: str, user: str, passwd: str, cmd: str,
 
 def ssh_command_line(host: str, user: str, cmd: str, session_timeout: int = 8,
                      port: int = None, connect_timeout: int = DEFAULT_CONNECT_TIMEOUT) -> str:
-    """The exact command line this module would run, for logs and bug reports."""
+    """The ssh this module runs for `cmd`, for logs and bug reports: the
+    command's half, its options without the -v log (`-E`) and the
+    ControlMaster ones. Each call first logs in on a ControlMaster, an
+    `ssh -N` with the same options, and the command runs through it; this
+    line run alone logs in by itself, and the server's login banner lands
+    in its stderr, where h-ssh keeps it out of the command's."""
     argv = (["ssh", "-n"] + _base_opts(budget(connect_timeout, session_timeout), port, None, False)
             + ["--", "%s@%s" % (user, host) if user else host, cmd])
     return " ".join(shlex.quote(part) for part in argv)
