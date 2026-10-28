@@ -506,13 +506,18 @@ description ending in `>`, a community ending in `#` or a reply line `uplink to 
 taken for the prompt and shift every later reply. A reply with output of its own is read on until the
 device has said nothing more for 0.15 s after its prompt (0.3 s after a refusal: a CLI on a pty refuses
 the Enter again after redrawing the line), so a reply line that is the prompt itself (`Router>`) does
-not end it when the reply goes on within that time. A reply that is only the echo and the prompt, with
-its `[edit]` banner (`{master}[edit]` on a router with two routing engines, and the note of a pending
-commit confirmed above it), as each line of an edit is, is not waited on, and a long edit costs no more.
-On an SSH shell the echo is also the line as the CLI drew it, when that is the reply's one line of text
-(a keyword Junos completed as it was typed, a long line an IOS-shaped CLI scrolled); over telnet, where
-the device need not echo, only the line typed is, and a line echoed otherwise is waited on for the
-0.15 s. No wait runs past the command's timeout.
+not end it when the reply goes on within that time; output that comes within that time with no prompt
+after it (a console's syslog line without `logging synchronous`) leaves the reply with none, and it
+fails on the command's timeout. A prompt the dialect cannot name (`RP/0/RSP0/CPU0:R1#` is no IOS prompt
+name) is not learned: the dialect's own pattern stays, which only has to end the line, so on such a
+device a reply line `uplink to BackupR1#` with a longer pause after it still ends the reply, the rest of
+it read as the next command's. A reply that is only the echo and the prompt, with its `[edit]` banner
+(`{master}[edit]` on a router with two routing engines, and the note of a pending commit confirmed above
+it), as each line of an edit is, is not waited on, and a long edit costs no more. On an SSH shell the
+echo is also the line as the CLI drew it, when that is the reply's one line of text (a keyword Junos
+completed as it was typed, a long line an IOS-shaped CLI scrolled); over telnet, where the device need
+not echo, only the line typed is, and a line echoed otherwise is waited on for the 0.15 s. No wait runs
+past the command's timeout.
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
@@ -622,7 +627,7 @@ and nothing about connections; `hssh/dialects/ios.py` is the smallest that defin
 | `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. On an exec channel (`ssh`, `openssh`) every reply is read with it: a show whose reply opens with such a line is a failure, not output, and the plain drivers' line-by-line edit stops at the line that got one. Typed at a CLI (a shell on `ssh` or `openssh`, `telnet`), a candidate edit checks each line's reply with it and discards the candidate after the last line; a lines edit looks for `error`, `invalid` or `%` instead and fails after `end`, the other lines applied; a telnet show is not checked. A dialect on `ssh`, `openssh` or `telnet` must have one |
 | `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*`; a command with a line break in it is never a read, whatever the dialect says |
 | `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
-| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, a line Junos prints with its prompt: `[edit]`, `{master}[edit]` with two routing engines, and the `# commit confirmed will be rolled back in 4 minutes` above it while a timer runs; every such line at the end of a reply is the prompt's, and a reply of the echo, those lines and the prompt is not waited on for more). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
+| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`: `prompt_name`'s group 1 is the name the device's prompt line starts with, and the prompt learned from it is that name at the start of a line, then `prompt_tail`, the whole line; a prompt it cannot name leaves `prompt`, which need only end the line), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, a line Junos prints with its prompt: `[edit]`, `{master}[edit]` with two routing engines, and the `# commit confirmed will be rolled back in 4 minutes` above it while a timer runs; every such line at the end of a reply is the prompt's, and a reply of the echo, those lines and the prompt is not waited on for more). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
 | `commit_pending` | a regex whose group 1 is the minutes left on a pending commit-confirmed, as `show system commit` prints them; `-eC commit` confirms only when it finds one |
 | `shortcuts` | the stem of a shipped library, `hssh/dialects/<stem>.json` — built-in dialects only, see below |
 

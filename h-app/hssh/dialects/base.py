@@ -30,8 +30,10 @@ class CliSyntax:
 
     `prompt` matches a line that is the device waiting for input; after login
     the transport narrows it to this device's own prompt: `prompt_name` finds
-    the name in the first prompt seen (group 1), `prompt_tail` is what may
-    follow it, and the narrowed prompt is the whole line from its start.
+    the name in the first prompt seen (group 1, where the prompt line
+    starts), `prompt_tail` is what may follow it, and the narrowed prompt is
+    the whole line from its start. A prompt `prompt_name` cannot name leaves
+    `prompt`, which need only end the line.
     `config_enter`/`config_exit` bracket an edit. A dialect with a
     candidate configuration also has `compare` (the diff), `discard` and
     `commit`; one without applies each line as typed. `context` matches a
