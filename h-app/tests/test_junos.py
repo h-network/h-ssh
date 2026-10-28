@@ -465,31 +465,53 @@ def test_transaction_commit_verdicts_match_edit():
     assert "rollback" not in cfg().names and "unlock" not in cfg().names and not tx.open
 
 
-# commit_status() as guarded_commit() reads it: the entry its commit confirmed
-# made, the commit before it, and what another user's commit looks like
-OURS = {"seq": 0, "user": "u", "client": "netconf", "time": "2026-10-20 19:19:11 CEST", "epoch": 1792516751.0,
-        "comment": "C1", "note": "commit confirmed, rollback in 5mins", "pending_rollback_minutes": 5}
-PRE = {"seq": 1, "user": "u", "client": "cli", "time": "2026-10-19 02:33:16 CEST", "epoch": 1792369996.0,
+# The router's commit history as guarded_commit() reads it, kept by a Router:
+# every commit made in a test is logged there as the device logs it.
+PRE = {"seq": 0, "user": "u", "client": "cli", "time": "2026-10-19 02:33:16 CEST", "epoch": 1792369996.0,
        "comment": None, "note": None, "pending_rollback_minutes": None}
-THEIRS = {"seq": 0, "user": "other", "client": "cli", "time": "2026-10-20 19:21:40 CEST", "epoch": 1792516900.0,
-          "comment": "theirs", "note": None, "pending_rollback_minutes": None}
 
 
-def history(monkeypatch, *reads):
-    """Canned commit_status() replies, one per read, the last one repeating;
-    returns the list that grows by one per read made."""
-    reads, made = list(reads), []
+class Router:
+    """A router's commit history, newest first, as commit_status() and a
+    read on an open session (_history_on, _pending_on) give it. A commit
+    FakeConfig makes is logged as the device logs one: under the name its
+    session logged in as (the device's `user`), with the comment as the
+    device keeps it (`keep`); a later commit ends the wait of the commit
+    confirmed before it. `after_commit`, once set, runs right after the
+    next commit, before anything reads the history: what lands on the
+    device behind it."""
 
-    def commit_status(host, user, passwd, st, ct, port=None, vendor_hint=None, connect_timeout=None):
-        made.append(host)
-        return reads.pop(0) if len(reads) > 1 else reads[0]
+    def __init__(self, monkeypatch, keep=lambda comment: comment):
+        self.entries = [dict(PRE)]
+        self.keep = keep
+        self.after_commit = None
+        FakeConfig.on_commit = self._committed
+        monkeypatch.setattr(netconf, "commit_status", lambda *a, **kw: self.read())
+        monkeypatch.setattr(netconf, "_history_on", lambda dev, t: self.read())
+        monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: netconf.pending_commit(self.read()))
 
-    monkeypatch.setattr(netconf, "commit_status", commit_status)
-    return made
+    def read(self):
+        return [dict(e) for e in self.entries]
+
+    def _committed(self, cfg, confirm, comment):
+        self.log(cfg.dev.user, comment, confirm)
+        after, self.after_commit = self.after_commit, None
+        if after:
+            after()
+
+    def log(self, user, comment=None, confirm=None, client="netconf"):
+        for e in self.entries:
+            e["seq"] += 1
+            e["pending_rollback_minutes"] = None
+        at = 1792516751 + 60 * len(self.entries)
+        self.entries.insert(0, {"seq": 0, "user": user, "client": client, "time": f"@{at}", "epoch": float(at),
+                                "comment": self.keep(comment) if comment else None,
+                                "note": f"commit confirmed, rollback in {confirm}mins" if confirm else None,
+                                "pending_rollback_minutes": confirm})
 
 
-def guarded(check):
-    return netconf.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5, check=check, comment="C1")
+def guarded(check, comment="C1"):
+    return netconf.guarded_commit("10.0.0.1", "u", "p", "set a b\n", 5, 30, minutes=5, check=check, comment=comment)
 
 
 def failing_check():
@@ -500,69 +522,88 @@ def all_names():
     return [c[0] for i in FakeConfig.instances for c in i.calls]
 
 
+def committed():
+    """Every commit sent, in order: (its timer, its comment)."""
+    return [(c[2]["confirm"], c[2]["comment"]) for i in FakeConfig.instances for c in i.calls if c[0] == "commit"]
+
+
+EDIT = ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+
+
 def test_guarded_commit_confirms_or_rolls_back(monkeypatch):
-    reads = history(monkeypatch, [OURS, PRE])
+    router = Router(monkeypatch)
     calls = []
     res = guarded(lambda: calls.append("checked") or True)
-    assert res["final"] == "confirmed" and calls == ["checked"] and len(reads) == 2
-    commits = [c[2] for i in FakeConfig.instances for c in i.calls if c[0] == "commit"]
-    assert commits == [{"confirm": 5, "comment": "C1"}, {"confirm": None, "comment": "C1 (confirmed)"}]
+    assert res["final"] == "confirmed" and calls == ["checked"]
+    assert committed() == [(5, "C1"), (None, "C1 (confirmed)")]
     FakeConfig.instances.clear()
     res = guarded(failing_check)
     assert res["final"] == "rolled back" and "bgp down" in res["reason"]
-    assert all_names() == ["lock", "load", "diff", "commit_check", "commit", "unlock",
-                           "lock", "rollback", "diff", "commit_check", "commit", "unlock"]
+    assert all_names() == EDIT + ["lock", "rollback", "diff", "commit_check", "commit", "unlock"]
     assert FakeConfig.instances[1].calls[1][1] == (1,)       # rollback 1
+    assert router.entries[0]["comment"] == "C1 (rolled back: checks failed)"
 
 
 def test_guarded_commit_takes_the_timer_as_a_countdown_not_an_identity(monkeypatch):
-    later = dict(OURS, note="commit confirmed, rollback in 3mins", pending_rollback_minutes=3)
-    history(monkeypatch, [OURS, PRE], [later, PRE])
-    assert guarded(lambda: True)["final"] == "confirmed"
+    router = Router(monkeypatch)
+
+    def check():
+        router.entries[0].update(note="commit confirmed, rollback in 3mins", pending_rollback_minutes=3)
+        return True
+    assert guarded(check)["final"] == "confirmed"
 
 
 def test_guarded_commit_sends_nothing_once_another_commit_landed(monkeypatch):
     """Their commit confirmed ours and is rollback 0 now: `rollback 1` would
     put back the change that just failed its checks."""
-    entries = [THEIRS, dict(OURS, seq=1, note=None, pending_rollback_minutes=None), PRE]
-    history(monkeypatch, [OURS, PRE], entries)
-    res = guarded(failing_check)
+    router = Router(monkeypatch)
+
+    def theirs_then(verdict):
+        router.log("other", "theirs", client="cli")
+        return verdict()
+    res = guarded(lambda: theirs_then(failing_check))
     assert res["final"] == "not rolled back" and res["checks"] is False
     assert "history changed" in res["reason"] and "bgp down" in res["check_error"]
-    assert res["status"] == entries
-    assert all_names() == ["lock", "load", "diff", "commit_check", "commit", "unlock"]   # the edit, nothing after
+    assert res["status"] == router.entries and res["status"][0]["user"] == "other"
+    assert all_names() == EDIT                                 # the edit, nothing after
     FakeConfig.instances.clear()
-    history(monkeypatch, [OURS, PRE], entries)
-    res = guarded(lambda: True)
-    assert res["final"] == "not confirmed" and res["checks"] is True and res["status"] == entries
-    assert [c[2] for c in cfg().calls if c[0] == "commit"] == [{"confirm": 5, "comment": "C1"}]
+    res = guarded(lambda: theirs_then(lambda: True))
+    assert res["final"] == "not confirmed" and res["checks"] is True and res["status"] == router.entries
+    assert committed() == [(5, "C1")]
     assert len(FakeConfig.instances) == 1
 
 
 def test_guarded_commit_does_not_roll_back_after_the_timer_ran_out(monkeypatch):
     """Checks that outlast the timer: the device's own rollback is a commit of
     its own and rollback 0 now, so there is nothing left to undo."""
-    expired = [{"seq": 0, "user": "u", "client": "other", "time": "2026-10-20 19:24:11 CEST",
-                "epoch": 1792517051.0, "comment": None, "note": None, "pending_rollback_minutes": None},
-               dict(OURS, seq=1, note=None, pending_rollback_minutes=None), PRE]
-    history(monkeypatch, [OURS, PRE], expired)
-    res = guarded(lambda: False)
+    router = Router(monkeypatch)
+
+    def expired():
+        router.log("u", client="other")
+        return False
+    res = guarded(expired)
     assert res["final"] == "not rolled back" and res["check_error"] is None
-    assert res["status"] == expired and all_names() == ["lock", "load", "diff", "commit_check", "commit", "unlock"]
+    assert res["status"] == router.entries and all_names() == EDIT
 
 
 def test_guarded_commit_needs_its_own_commit_in_the_history(monkeypatch):
-    history(monkeypatch, [dict(OURS, note=None, pending_rollback_minutes=None), PRE])
+    router = Router(monkeypatch)
+    router.after_commit = lambda: router.entries[0].update(note=None, pending_rollback_minutes=None)
     res = guarded(lambda: True)
     assert res["final"] == "not confirmed" and "no pending commit" in res["reason"]
     assert len(FakeConfig.instances) == 1
 
 
-def test_guarded_commit_does_not_adopt_someone_elses_commit_confirmed(monkeypatch):
-    # Another user's commit confirmed is the pending one right after our edit:
-    # it is not ours, so neither their change nor ours is touched.
-    foreign = dict(THEIRS, note="commit confirmed, rollback in 10mins", pending_rollback_minutes=10)
-    history(monkeypatch, [foreign, dict(OURS, seq=1, note=None, pending_rollback_minutes=None), PRE])
+@pytest.mark.parametrize("who", ["other", "u"])
+def test_guarded_commit_does_not_adopt_someone_elses_commit_confirmed(monkeypatch, who):
+    """Another commit confirmed is the pending one right after our edit: it
+    is not ours, so neither that change nor ours is touched. Nor is one made
+    under our own login with our comment (#146), which only the comment told
+    apart, and only where it differed: ours is the commit logged right after
+    the latest one the history had under our lock, and here that is
+    sequence 1."""
+    router = Router(monkeypatch)
+    router.after_commit = lambda: router.log(who, "C1", 10, client="cli")
     res = guarded(failing_check)
     assert res["final"] == "not rolled back" and "no pending commit" in res["reason"]
     assert "bgp down" in res["check_error"] and len(FakeConfig.instances) == 1
@@ -571,8 +612,13 @@ def test_guarded_commit_does_not_adopt_someone_elses_commit_confirmed(monkeypatc
 def test_guarded_commit_only_trusts_the_latest_commit(monkeypatch):
     # Our entry still carries the device's "rollback in" note but a later
     # commit sits at sequence 0: not ours to roll back any more.
-    history(monkeypatch, [OURS, PRE], [THEIRS, dict(OURS, seq=1), PRE])
-    res = guarded(failing_check)
+    router = Router(monkeypatch)
+
+    def later():
+        router.log("other", "theirs", client="cli")
+        router.entries[1].update(note="commit confirmed, rollback in 5mins", pending_rollback_minutes=5)
+        raise RuntimeError("bgp down")
+    res = guarded(later)
     assert res["final"] == "not rolled back" and "history changed" in res["reason"]
     assert len(FakeConfig.instances) == 1
 
@@ -588,31 +634,6 @@ class PyezUserDevice(FakeDevice):
         super().__init__(**params)
         from jnpr.junos import Device
         self.user = Device(host=params["host"], user=params.get("user"), gather_facts=False).user
-
-
-class Router:
-    """A router's commit history, newest first, as commit_status() reads it.
-    A commit FakeConfig makes is logged as the device logs one: under the
-    name its session logged in as (the device's `user`), with the comment
-    as the device keeps it (`keep`); a later commit ends the wait of the
-    commit confirmed before it."""
-
-    def __init__(self, monkeypatch, keep=lambda comment: comment):
-        self.entries = [dict(PRE, seq=0)]
-        self.keep = keep
-        FakeConfig.on_commit = lambda cfg, confirm, comment: self.log(cfg.dev.user, comment, confirm)
-        monkeypatch.setattr(netconf, "commit_status", lambda *a, **kw: [dict(e) for e in self.entries])
-        monkeypatch.setattr(netconf, "_pending_on", lambda dev, t: netconf.pending_commit(self.entries))
-
-    def log(self, user, comment=None, confirm=None, client="netconf"):
-        for e in self.entries:
-            e["seq"] += 1
-            e["pending_rollback_minutes"] = None
-        at = 1792516751 + 60 * len(self.entries)
-        self.entries.insert(0, {"seq": 0, "user": user, "client": client, "time": f"@{at}", "epoch": float(at),
-                                "comment": self.keep(comment) if comment else None,
-                                "note": f"commit confirmed, rollback in {confirm}mins" if confirm else None,
-                                "pending_rollback_minutes": confirm})
 
 
 @pytest.fixture
@@ -672,6 +693,114 @@ def test_a_refused_login_without_a_user_names_the_login_pyez_used(pyez_login):
         netconf.show("10.0.0.1", None, None, "show version", 5, 30)
     with pytest.raises(NotAppliedError, match=r"authentication failed for named at 10\.0\.0\.1:830$"):
         netconf.show("10.0.0.1", "named", None, "show version", 5, 30)
+
+
+# --- #146: a commit comment Junos logs as given, and never the way to our commit ---
+
+@pytest.mark.parametrize("keep", [lambda comment: None, lambda comment: comment.split()[-1]],
+                         ids=["none of it", "part of it"])
+def test_guarded_commit_finds_its_commit_whatever_the_device_kept_of_the_comment(monkeypatch, keep):
+    """#146: the commit was found by the comment's text, and the device keeps
+    a comment as it keeps it (live, of one with a line break only the last
+    line): a passing check ended `not confirmed`, the good change reverted
+    at the timer, a failing one `not rolled back`. The commit is found by
+    its place in the history and its login."""
+    Router(monkeypatch, keep=keep)
+    res = guarded(lambda: True, comment="C1 cutover")
+    assert res["final"] == "confirmed", res.get("reason")
+    assert committed() == [(5, "C1 cutover"), (None, "C1 cutover (confirmed)")]
+
+
+BAD_COMMENTS = [("line one\nline two", "has a line break"), ("cutover \x1b[1m", "has an ESC"),
+                ("   ", "has no text"), ("", "has no text"), ("é" * 257, "is 514 bytes"),
+                ("C1\ufffe", "has a character XML cannot carry")]
+
+
+@pytest.mark.parametrize("comment, fault", BAD_COMMENTS,
+                         ids=["line break", "ESC", "blanks", "empty", "514 bytes", "U+FFFE"])
+def test_a_comment_junos_would_not_log_as_given_is_refused_before_any_session(comment, fault):
+    """#146: the comment went to the device as given: over 512 bytes, or only
+    blanks, it went through lock, load, diff and commit check and then
+    failed the commit; with a line break the device logged its last line
+    alone; '' was dropped without a word; an ESC failed in PyEZ as `commit
+    outcome unknown`. edit(), rollback(), confirm() and guarded_commit()
+    refuse it before a session is opened."""
+    for call in (lambda: edit(comment=comment), lambda: rollback(1, comment=comment),
+                 lambda: netconf.confirm("10.0.0.1", "u", "p", 5, 30, comment=comment),
+                 lambda: guarded(lambda: True, comment=comment)):
+        with pytest.raises(ValueError, match=f"^the comment .* {fault}.*; nothing was sent to the device$"):
+            call()
+    assert FakeDevice.instances == [] and FakeConfig.instances == []
+
+
+def test_a_comment_is_sent_stripped_and_512_bytes_go_through():
+    edit(comment="  C1 cutover\n")                      # the line break a YAML block ends with
+    assert commit_call()["comment"] == "C1 cutover"
+    FakeConfig.instances.clear()
+    rollback(1, comment="A" * 512)
+    assert commit_call()["comment"] == "A" * 512
+
+
+def test_guarded_commit_needs_room_for_the_comments_it_adds(monkeypatch):
+    """#146: guarded_commit() logs its rollback as the comment and ` (rolled
+    back: checks failed)`: a comment of 500 bytes committed, then failed
+    the rollback at its commit check, the change that failed its checks
+    left live. Refused before anything is sent; 483 bytes go through."""
+    with pytest.raises(ValueError, match="is 484 bytes: .* which leaves 483 for the comment; nothing was sent"):
+        guarded(failing_check, comment="A" * 484)
+    assert FakeDevice.instances == [] and FakeConfig.instances == []
+    router = Router(monkeypatch)
+    assert guarded(failing_check, comment="A" * 483)["final"] == "rolled back"
+    assert len(router.entries[0]["comment"].encode()) == 512
+
+
+def test_a_transaction_refusing_its_comment_rolls_back_and_unlocks():
+    """#146: an ESC reached PyEZ, which refused it before the commit RPC was
+    built, and the except around the commit took that for a commit in
+    flight: `commit outcome unknown`, the session dropped with the candidate
+    loaded and the lock held. Nothing was committed: the candidate is
+    discarded and the lock released, and the error says what was wrong."""
+    tx = begin()
+    with pytest.raises(ValueError, match=r"^the comment 'cutover \\x1b\[1m' has an ESC; .*nothing was sent"):
+        tx.commit(confirmed=5, comment="cutover \x1b[1m")
+    assert cfg().names == ["lock", "load", "diff", "commit_check", "rollback", "unlock"] and not tx.open
+    assert FakeDevice.instances[0].closed                # given back, not dropped as in doubt
+
+
+def test_a_transaction_on_pyez_sends_no_commit_for_a_refused_comment(monkeypatch):
+    """#146, as found: PyEZ's own Config on a device that answers every RPC.
+    An ESC in the comment sent no commit RPC and ended `commit outcome
+    unknown` with neither rollback nor unlock; now the candidate's rollback
+    and the unlock are what goes out after the commit check."""
+    pytest.importorskip("jnpr.junos")
+    from lxml import etree
+    from jnpr.junos.rpcmeta import _RpcMetaExec
+    from jnpr.junos.utils.config import Config
+    sent = []
+
+    class Dev(FakeDevice):
+        def __init__(self, **params):
+            super().__init__(**params)
+            self.connected = True
+            self.rpc = _RpcMetaExec(self)
+
+        def execute(self, rpc, **kw):
+            sent.append(etree.tostring(rpc).decode())
+            if rpc.tag == "get-configuration":
+                return etree.fromstring("<configuration-information><configuration-output>"
+                                        "[edit system]\n+  location x;</configuration-output>"
+                                        "</configuration-information>")
+            return etree.fromstring("<ok/>")
+
+    monkeypatch.setattr(netconf, "JunosDevice", Dev)
+    monkeypatch.setattr(netconf, "JunosConfig", Config)
+    tx = netconf.begin("10.0.0.1", "u", "p", "set system location x\n", 5, 30)
+    with pytest.raises(ValueError, match="has an ESC"):
+        tx.commit(confirmed=5, comment="cutover \x1b[1m")
+    tags = [etree.fromstring(r).tag for r in sent]
+    assert tags == ["lock-configuration", "load-configuration", "get-configuration", "commit-configuration",
+                    "load-configuration", "unlock-configuration"], sent
+    assert "<check/>" in sent[3] and 'rollback="0"' in sent[4]      # the commit check; rollback 0
 
 
 # --- #40: no timer means no commit, never a plain one ---------------------------

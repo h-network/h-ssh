@@ -15,7 +15,8 @@ import re
 import time
 from typing import Callable, Optional
 
-from ..core import check_confirm_minutes, comments_named, control_character, control_line, refusal_line
+from ..core import (check_comment, check_confirm_minutes, comments_named, control_character, control_line,
+                    refusal_line)
 from ..dialects.base import CliSyntax, Dialect
 from ..drivers import results as R
 from ..errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
@@ -195,21 +196,26 @@ def refuse_command(cmd: str) -> None:
                          "nothing was sent to the device")
 
 
-def refuse_comment(comment: Optional[str]) -> None:
-    """confirm()'s comment goes on the commit line in double quotes: a line
-    break in it runs what follows as commands of their own (`rollback 1`, a
-    second commit), another control character or a Tab is a key to the CLI,
-    and a double quote ends the comment, the rest read as more of the
-    commit. Refused before the device is contacted."""
-    if not comment:
-        return
-    what = control_character(comment, tabs=False)
-    if what:
-        raise ValueError(f"the comment {comment!r} has {what}, which a CLI takes as a key, not as text; "
-                         "nothing was sent to the device")
-    if '"' in comment:
-        raise ValueError(f"the comment {comment!r} has a double quote, which would end it on the commit line; "
-                         "nothing was sent to the device")
+def refuse_comment(comment: Optional[str]) -> Optional[str]:
+    """The comment confirm() types, stripped, or None for none. It goes on
+    the commit line in double quotes: a line break in it runs what follows
+    as commands of their own (`rollback 1`, a second commit), another
+    control character or a Tab is a key to the CLI, and a double quote ends
+    the comment, the rest read as more of the commit. Like every commit
+    comment it has text and at most 512 bytes (core.check_comment), which
+    Junos fails at the commit otherwise (#146). Refused before the device
+    is contacted."""
+    if comment is None:
+        return None
+    if isinstance(comment, str):
+        what = control_character(comment.strip(), tabs=False)
+        if what:
+            raise ValueError(f"the comment {comment!r} has {what}, which a CLI takes as a key, not as text; "
+                             "nothing was sent to the device")
+        if '"' in comment:
+            raise ValueError(f"the comment {comment!r} has a double quote, which would end it on the commit line; "
+                             "nothing was sent to the device")
+    return check_comment(comment)
 
 
 def credential_fault(user: Optional[str], passwd: Optional[str]) -> Optional[str]:
@@ -727,7 +733,7 @@ class Cli:
         means the timer expired or it was confirmed already; a commit now
         would hide that from the operator."""
         d, cli = self.dialect, self.cli
-        refuse_comment(comment)
+        comment = refuse_comment(comment)
         history = self.run("show system commit", command_timeout)
         if not pending_in(history, d):
             raise NothingToConfirmError(

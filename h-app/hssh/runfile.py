@@ -19,7 +19,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .core import check_port, control_character
+from .core import COMMENT_RULE, check_port, comment_fault, control_character
 
 try:  # PyYAML comes along with junos-eznc; a JSON run file needs nothing
     import yaml
@@ -218,6 +218,14 @@ def validate_run(data: Dict[str, Any], path: str, transports, floors: Dict[str, 
             if what:
                 raise ValueError(f"run file '{path}': '{key}' has {what} ({value!r}); "
                                  f"{'a command is one line of text' if key == 'show' else 'a payload is plain text'}")
+        if key == "comment":
+            # --comment's rule, said as the file's (#146): stripped, so the
+            # line break a YAML block ends with is not part of it, then one
+            # line of text Junos logs as it is, at most 512 bytes.
+            fault = comment_fault(value.strip())
+            if fault:
+                raise ValueError(f"run file '{path}': 'comment' {fault} ({value!r}); {COMMENT_RULE}")
+            value = value.strip()
         if key == "jobs":
             if not value or not all(isinstance(j, dict) for j in value):
                 raise ValueError(f"run file '{path}': 'jobs' must be a non-empty list of job entries")

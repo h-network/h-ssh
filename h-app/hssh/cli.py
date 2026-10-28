@@ -26,6 +26,7 @@ from .core import (
     get_available_commands, read_command_file_lines, parse_inline_target,
     load_jobs, parse_jobs, resolve_target_port, check_unique,
     check_confirm_minutes, control_character, control_line, read_failure, is_file,
+    comment_fault, COMMENT_RULE,
 
     path_inside, set_file_payload, comments_named,
 )
@@ -159,6 +160,19 @@ def _not_empty(text: str) -> str:
     if text == "":
         raise argparse.ArgumentTypeError("empty (an unset variable?); give it a value or leave the flag out")
     return text
+
+
+def _comment_arg(text: str) -> str:
+    """--comment TEXT, stripped: an empty one is refused as every flag's is
+    (#140), and so is one Junos would not log as given (#146), here before
+    the probe touches a box: only blanks, a line break (Junos keeps the last
+    line alone), another control character, or more than 512 bytes (failed
+    at every router's commit check, after its lock, load and diff)."""
+    _not_empty(text)
+    fault = comment_fault(text.strip())
+    if fault:
+        raise argparse.ArgumentTypeError(f"{text!r} {fault}; {COMMENT_RULE}")
+    return text.strip()
 
 
 def _ranged_int(low: int, high: Optional[int], what: str):
@@ -642,8 +656,9 @@ async def main() -> int:
                         help="Return every target to rollback N (0-49), with the same gates as an edit (Junos only)")
     parser.add_argument("--commit-status", action="store_true",
                         help="Show the commit history as data: sequence, time, user, comment, pending commit-confirmed timer (Junos only)")
-    parser.add_argument("--comment", type=_not_empty, metavar="TEXT",
-                        help="Log this comment with the commit; it shows in 'show system commit' (Junos only)")
+    parser.add_argument("--comment", type=_comment_arg, metavar="TEXT",
+                        help="Log this comment with the commit; it shows in 'show system commit' (Junos only): "
+                             "one line of text, at most 512 bytes")
     parser.add_argument("--show-diff", action="store_true",
                         help="Edits: run a dry-run on every target, print the diffs, then ask once before "
                              "committing; a diff that changed by then is not committed")

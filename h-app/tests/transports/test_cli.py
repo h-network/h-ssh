@@ -748,6 +748,21 @@ def test_a_confirm_comment_is_one_line_of_text_without_a_double_quote():
     assert 'commit comment "change 42: lo0"' in ch.typed
 
 
+def test_a_confirm_comment_is_held_to_the_commit_comments_rule():
+    """#146: like every commit comment it has text and at most 512 bytes,
+    which Junos fails at the commit otherwise: refused before anything is
+    typed, '' too, where it went as no comment. The blanks around it,
+    the line break a YAML block ends with among them, are not typed."""
+    for comment, what in (("   ", "has no text"), ("", "has no text"), ("é" * 257, "is 514 bytes")):
+        s, ch = junos_session()
+        with pytest.raises(ValueError, match=f"^the comment .* {what}; .*nothing was sent to the device$"):
+            s.confirm(5, comment=comment)
+        assert ch.typed == []
+    s, ch = junos_session()
+    assert s.confirm(5, comment="  change 42: lo0\n") == "COMMIT CONFIRMED OK"
+    assert 'commit comment "change 42: lo0"' in ch.typed
+
+
 def test_lines_edit_applies_each_line_in_config_mode():
     replies = {"configure terminal": "\r\nRouter(config)#", "end": "\r\nRouter#", "<else>": "\r\nRouter(config)#"}
     ch = ScriptChannel("\r\nRouter#", replies)

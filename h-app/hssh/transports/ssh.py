@@ -791,8 +791,8 @@ def confirm(host: str, user: str, passwd: str, session_timeout: int, command_tim
     system commit` must show one waiting, then configure exclusive, a bare
     `commit` (`commit comment "…"` with a comment), exit. Only a dialect with
     a candidate and a commit history has anything to confirm. A comment with
-    a control character, a Tab or a double quote in it is refused before
-    connecting (cli.refuse_comment)."""
+    a control character, a Tab or a double quote in it, or with no text or
+    over 512 bytes, is refused before connecting (cli.refuse_comment)."""
     d = _dialect(vendor_hint)
     if d.cli is None or not d.cli.has_candidate or d.commit_pending is None:
         raise ValueError(f"confirm is only for a Junos dialect, not {vendor_hint}; nothing was sent")
