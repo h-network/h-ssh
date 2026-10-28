@@ -484,17 +484,29 @@ class Cli:
         and above it, while a commit confirmed waits, `# commit confirmed
         will be rolled back in 4 minutes`, which as a reply's own line once
         made an empty compare a diff, its commit confirming the timer
-        (#141)."""
+        (#141).
+
+        The echo is the line typed, as a rule. On a channel that echoes, a
+        reply whose one line of text is not that line is its echo as the
+        CLI drew it: Junos completes a keyword as it is typed (`set int`
+        comes back `set interfaces`), and an IOS-shaped CLI narrower than a
+        long line scrolls it. Taken for output, each such line of an edit
+        was waited on (#141)."""
         lines = clean.splitlines()
+        echoed = False
         if through_echo:
             echo = next((n for n, line in enumerate(lines) if is_echo(line, cmd)), -1)
-            lines = lines[echo + 1:]
+            lines, echoed = lines[echo + 1:], echo >= 0
         elif lines and is_echo(lines[0], cmd):
-            lines = lines[1:]
+            lines, echoed = lines[1:], True
         if lines and self._is_prompt(lines[-1], prompt_re):
             lines = lines[:-1]
         while self.cli.context and lines and self.cli.context.match(lines[-1].strip()):
             lines = lines[:-1]            # the context banner is the prompt's, not the reply's
+        if self.echoes and not echoed and cmd.strip():
+            said = [n for n, line in enumerate(lines) if line.strip()]
+            if len(said) == 1:
+                del lines[said[0]]        # the echo, as the CLI drew it
         return lines
 
     def leave_quietly(self, *cmds: str) -> None:

@@ -509,7 +509,10 @@ the Enter again after redrawing the line), so a reply line that is the prompt it
 not end it when the reply goes on within that time. A reply that is only the echo and the prompt, with
 its `[edit]` banner (`{master}[edit]` on a router with two routing engines, and the note of a pending
 commit confirmed above it), as each line of an edit is, is not waited on, and a long edit costs no more.
-No wait runs past the command's timeout.
+On an SSH shell the echo is also the line as the CLI drew it, when that is the reply's one line of text
+(a keyword Junos completed as it was typed, a long line an IOS-shaped CLI scrolled); over telnet, where
+the device need not echo, only the line typed is, and a line echoed otherwise is waited on for the
+0.15 s. No wait runs past the command's timeout.
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
@@ -1493,7 +1496,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1341 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1342 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

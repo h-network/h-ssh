@@ -32,7 +32,8 @@ _PAUSES = re.compile(rb"<pause(?: ([0-9.]+))?>")
 
 class ScriptChannel:
     """A device played from a dict: what it says first, then a reply per
-    command (a callable gets the line). Typed lines are echoed as a tty does.
+    command (a callable gets the line). Typed lines are echoed as a tty does,
+    or as `echo` draws them when it is a callable.
     `hang_on` names a command left unanswered, `close_on` one answered by
     hanging up. `split_at` makes the first read that holds that text end
     right after it, as a device pausing there would; a PAUSE in what it
@@ -103,7 +104,7 @@ class ScriptChannel:
         if self.lag:
             self.queue += later(self.lag).encode()
         if self.echo:
-            self.queue += (line + "\r\n").encode()
+            self.queue += ((self.echo(line) if callable(self.echo) else line) + "\r\n").encode()
         reply = self.replies.get(line, self.replies.get(word, self.replies.get("<else>", "")))
         self.queue += (reply(line) if callable(reply) else reply).encode()
 
@@ -402,6 +403,57 @@ def test_a_line_of_an_edit_is_not_waited_on(banner):
     assert r.status == R.DRY_RUN and r.diff == "[edit system]\n+  host-name test;"
     assert ch.waits == [None, "configure exclusive", "show | compare", "rollback 0", "exit"]
     assert len(stamps) == 1000 and (stamps[-1] - stamps[0]) / 999 < 0.003
+
+
+def test_a_line_whose_echo_the_cli_redraws_is_not_waited_on():
+    """#141 review: a reply that is only the echo and the prompt is not
+    waited on, and the echo was known only as the line typed. A Junos CLI
+    completes a keyword as it is typed (`set int ge-0/0/0 desc x0` comes
+    back `set interfaces ge-0/0/0 description x0`), and an IOS-shaped CLI
+    narrower than a long line scrolls it (a `$`, then its end): that echo
+    was taken for output, and each such line of an edit waited SETTLE, 150 s
+    more for 1000 lines. On a channel that echoes, a reply whose one line
+    of text is not the line typed is its echo as the CLI drew it; a reply
+    with more than that is output, and a refusal still fails the edit. A
+    telnet device need not echo: there a reply of one line is that line."""
+    full = {"int": "interfaces", "desc": "description"}
+
+    def line_of_an_edit(line):
+        assert not (ch.waits and (ch.waits[-1] or "").startswith(("set ", "snmp"))), "a line's reply was waited on"
+        stamps.append(time.monotonic())
+        return ("\r\n" + " " * 20 + "^\r\nsyntax error." if "bogus" in line else "") + cfg
+
+    stamps, cfg = [], "\r\n\r\n[edit]\r\nlab@R1# "
+    junos = junos_device(**{"configure": "\r\nEntering configuration mode" + cfg, "set": line_of_an_edit,
+                            "show | compare": "\r\n[edit system]\r\n+  host-name test;" + cfg,
+                            "rollback": "\r\nload complete" + cfg})
+    ch = ScriptChannel("\r\n" + OP, junos, blocking=True,
+                       echo=lambda line: " ".join(full.get(word, word) for word in line.split(" ")))
+    s = Cli(ch, dialects.junos.DIALECT, 5, echoes=True)
+    s.login()
+    r = s.edit_candidate("".join(f"set int ge-0/0/{n} desc x{n}\n" for n in range(1000)), dry_run=True)
+    assert r.status == R.DRY_RUN and ch.waits == [None, "configure exclusive", "show | compare", "rollback 0", "exit"]
+    assert len(stamps) == 1000 and (stamps[-1] - stamps[0]) / 999 < 0.003
+    ch = ScriptChannel("\r\n" + OP, junos, echo=lambda line: " ".join(full.get(word, word) for word in line.split(" ")))
+    s = Cli(ch, dialects.junos.DIALECT, 5, echoes=True)
+    s.login()
+    with pytest.raises(RuntimeError, match=r"^'set int ge-0/0/1 bogus-knob 1': syntax error\.$"):
+        s.edit_candidate("set int ge-0/0/1 desc y\nset int ge-0/0/1 bogus-knob 1\n", dry_run=True)
+
+    stamps, cfg = [], "\r\nR1(config)#"
+    ios = {"configure terminal": "\r\nEnter configuration commands, one per line.  End with CNTL/Z." + cfg,
+           "snmp-server": line_of_an_edit, "end": "\r\nR1#"}
+    ch = ScriptChannel("\r\nR1#", ios, blocking=True, echo=lambda line: line if len(line) < 60 else "$" + line[-58:])
+    s = Cli(ch, dialects.ios.DIALECT, 5, echoes=True)
+    s.login()
+    lines = "".join(f"snmp-server location building {n}, floor 2, rack 17, managed by the noc desk\n"
+                    for n in range(1000))
+    assert s.edit_lines(lines) == "(config applied)"
+    assert ch.waits == [None, "configure terminal"] and len(stamps) == 1000
+    ch = ScriptChannel("\r\nR1#", {"show clock": "\r\n*10:00:00.000 UTC Wed Oct 28 2026\r\nR1#"}, echo=False)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    assert s.run("show clock", 5).strip() == "*10:00:00.000 UTC Wed Oct 28 2026"
 
 
 def test_the_note_of_a_pending_commit_confirmed_is_the_prompts_not_the_replys():
