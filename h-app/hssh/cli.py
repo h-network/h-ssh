@@ -1109,16 +1109,18 @@ async def main() -> int:
     if args.comment is not None and not has_edits:
         print("ERROR: --comment goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).", file=sys.stderr)
         return 2
-    # So do the timer and the probe's go-ahead, and --allow-missing goes with
-    # -eD: on a show they were accepted and did nothing (#140), typed or from
-    # a run file alike.
+    # So do the timer, the probe's go-ahead and --allow-missing: on a run
+    # with no edit they were accepted and did nothing (#140), typed or from
+    # a run file alike. --allow-missing is for -eD; beside another edit it
+    # changes nothing and is let be, so a run file that sets it for every
+    # edit still runs.
     for flag, given in (("--commit-confirmed", args.commit_confirmed is not None),
                         ("--skip-unreachable", args.skip_unreachable)):
         if given and not has_edits:
             print(f"ERROR: {flag} goes with an edit (-eC, -eD, -eB, --rollback, or a job with edits).",
                   file=sys.stderr)
             return 2
-    if args.allow_missing and mode != "edit-dir":
+    if args.allow_missing and not has_edits:
         print("ERROR: --allow-missing goes with -eD: it skips the devices that have no <NAME>.set.", file=sys.stderr)
         return 2
     # Nobody watches a pipeline: a run file that commits must arm a timer, or
