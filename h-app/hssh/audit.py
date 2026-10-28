@@ -79,24 +79,17 @@ _REDACT_PATTERNS = [
 ]
 
 
-# What a description says is no secret, whatever words it uses
-# (`description "customer password reset portal"`): its value, quoted or
-# one word, and a <description> element's text are kept out of the
-# patterns' reach; redact_values() keeps a JSON "description" as it is.
-_DESCRIPTION = re.compile(r'(\bdescription[ \t]+|<description>)'
-                          r'((?<=>)[^<]*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s;<"\']+)', re.IGNORECASE)
-_KEPT_KEY = re.compile(r'(?:^|[-_])description$')
-
-
 def redact_secrets(text: Optional[str]) -> Optional[str]:
-    """Redact passwords and secrets from text."""
+    """Redact passwords and secrets from text. A keyword's value goes
+    wherever the keyword is: a description with "password" in it loses the
+    word after it too, and a log that says too little beats one that says
+    a secret (#151)."""
     if not text:
         return text
-    parts = _DESCRIPTION.split(text)      # text, a description's keyword, its value, text, …
-    for i in range(0, len(parts), 3):
-        for pattern, repl in _REDACT_PATTERNS:
-            parts[i] = pattern.sub(repl, parts[i])
-    return "".join(parts)
+    result = text
+    for pattern, repl in _REDACT_PATTERNS:
+        result = pattern.sub(repl, result)
+    return result
 
 
 # A JSON key whose whole value is a secret, known by its last word. A reply
@@ -116,8 +109,7 @@ def redact_values(data):
     if isinstance(data, list):
         return [redact_values(v) for v in data]
     if isinstance(data, dict):
-        return {k: ("[REDACTED]" if _SECRET_KEY.search(str(k).lower()) else
-                    v if _KEPT_KEY.search(str(k).lower()) else redact_values(v))
+        return {k: ("[REDACTED]" if _SECRET_KEY.search(str(k).lower()) else redact_values(v))
                 for k, v in data.items()}
     return data
 

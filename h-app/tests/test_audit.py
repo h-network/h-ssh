@@ -381,43 +381,53 @@ def test_xml_and_json_names_ending_in_a_secret_word_are_redacted():
 def test_what_is_not_a_secret_stays():
     """Over-redaction the review found: a `key N` line took the next line's
     first word for its value (a key-string keyword, a cryptographic-algorithm),
-    a BGP community's name went, a description with the word password in it
-    lost its next word, and a quoted command lost its closing quote. SNMP
-    communities still go, in every form they are written."""
+    a BGP community's name went, and a quoted command lost its closing
+    quote. SNMP communities still go, in every form they are written. A
+    description with the word password in it still loses the word after
+    it: sparing it opened leaks (a secret whose value has the word
+    description in it), and a log that says too little beats one that
+    says a secret."""
     chain = ("key chain K\n key 1\n  key-string 7 0822455D0A16\n  cryptographic-algorithm hmac-sha-256\n"
              " key 2\n  key-string 7 0822455D0A17")
     assert redact_secrets(chain) == ("key chain K\n key 1\n  key-string 7 [REDACTED]\n  cryptographic-algorithm hmac-sha-256\n"
                                      " key 2\n  key-string 7 [REDACTED]")
     for line in ("set policy-options community CUST members 65000:100",
-                 "    community CUST members [ 65000:100 65000:200 ];",
-                 'set interfaces ge-0/0/0 description "password reset portal"'):
+                 "    community CUST members [ 65000:100 65000:200 ];"):
         assert redact_secrets(line) == line
     assert redact_secrets("'show password X'") == "'show password [REDACTED]'"
+    assert redact_secrets('set interfaces ge-0/0/0 description "password reset portal"') == \
+        'set interfaces ge-0/0/0 description "password [REDACTED] portal"'
     assert redact_secrets("set snmp community public authorization read-only") == \
         "set snmp community [REDACTED] authorization read-only"
     assert redact_secrets("    community public {") == "    community [REDACTED] {"
     assert redact_secrets("snmp-server community C0MM RO") == "snmp-server community [REDACTED] RO"
 
 
-def test_a_quoted_credential_command_is_redacted_and_a_description_is_kept_whole():
+def test_a_quoted_credential_command_is_redacted_and_a_description_spares_no_secret():
     """#151 review: the openssh transport repeats a refused command in
     quotes in its error, and a credential in it must still go, the closing
-    quote kept; a description keeps every word, wherever a keyword sits in
-    it, in text, XML and JSON alike."""
+    quote kept. Sparing a description's words opened leaks (a secret whose
+    value has the word description in it), so none is spared: the keyword
+    patterns apply wherever the keyword is, a description included."""
     assert redact_secrets("'password hunter2' was refused by the device: bad command") == \
         "'password [REDACTED]' was refused by the device: bad command"
     assert redact_secrets('"set system login user bob authentication plain-text-password-value hunter2" was refused') == \
         '"set system login user bob authentication plain-text-password-value [REDACTED]" was refused'
-    for line in ('set interfaces ge-0/0/0 description "customer password reset portal"',
-                 '    description "customer password reset portal";',
-                 "description 'secret sauce'",
-                 'description password-reset-portal',
-                 '<interface><description>customer password reset portal</description></interface>'):
-        assert redact_secrets(line) == line
     assert redact_secrets('    description "customer password reset portal";\n    encrypted-password "$9$x";') == \
-        '    description "customer password reset portal";\n    encrypted-password [REDACTED];'
+        '    description "customer password [REDACTED] portal";\n    encrypted-password [REDACTED];'
     assert redact_values({"description": "customer password reset portal", "password": "x"}) == \
-        {"description": "customer password reset portal", "password": "[REDACTED]"}
+        {"description": "customer password [REDACTED] portal", "password": "[REDACTED]"}
+    assert redact_secrets('password "description hunter2"') == 'password [REDACTED]'
+    assert redact_secrets('encrypted-password "has description words";') == 'encrypted-password [REDACTED];'
+    assert redact_secrets('<password>description hunter2</password>') == '<password>[REDACTED]</password>'
+    assert redact_secrets('snmp-server user admin netops v3 auth sha description priv aes 128 PRIVPASS') == \
+        'snmp-server user admin netops v3 auth sha [REDACTED] priv aes 128 [REDACTED]'
+    assert redact_secrets('    secret "description hunter2"; ## SECRET-DATA') == '    secret [REDACTED]; ## SECRET-DATA'
+    assert redact_secrets('encrypted-password "has description words";') == 'encrypted-password [REDACTED];'
+    assert redact_secrets('<password>description hunter2</password>') == '<password>[REDACTED]</password>'
+    assert redact_secrets('snmp-server user admin netops v3 auth sha description priv aes 128 PRIVPASS') == \
+        'snmp-server user admin netops v3 auth sha [REDACTED] priv aes 128 [REDACTED]'
+    assert redact_secrets('    secret "description hunter2"; ## SECRET-DATA') == '    secret [REDACTED]; ## SECRET-DATA'
 
 
 def test_the_comment_is_redacted_too(tmp_path):
