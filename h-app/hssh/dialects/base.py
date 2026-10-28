@@ -72,5 +72,10 @@ class Dialect:
     check_edit: Optional[Callable[[str, bool], Tuple[bool, str]]] = None
     is_read: Callable[[str], bool] = is_read
     refused: Optional[re.Pattern] = None   # a line in which the CLI refused the command (MULTILINE)
+    # A line in which the CLI took the command and warned about it, though
+    # `refused` may match it (MULTILINE): no refusal, and a lines edit goes
+    # on and reports it with its result. None: every line `refused` matches
+    # is one.
+    informational: Optional[re.Pattern] = None
     cli: Optional[CliSyntax] = None
     commit_pending: Optional[re.Pattern] = None   # group 1: minutes left on a pending commit-confirmed

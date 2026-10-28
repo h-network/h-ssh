@@ -520,8 +520,9 @@ echo is also the line as the CLI drew it, when that is the reply's one line of t
 completed as it was typed, a long line an IOS-shaped CLI scrolled), or the line as the terminal shows
 it after Junos redrew it (a line longer than the 80-column pty of `junos@openssh`, scrolled to
 `...` and its end); over telnet, where the device need
-not echo, only the line typed is, and a line echoed otherwise is waited on for the 0.15 s. No wait runs
-past the command's timeout.
+not echo, only the line typed is, and a line echoed otherwise is waited on for the 0.15 s. The echo is
+the reply's first line of text: a line break the device sends before it leaves it out of the reply all
+the same. No wait runs past the command's timeout.
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
@@ -609,11 +610,16 @@ ignored, as it is on every driver but the four Junos ones (`junos`, `junos@ssh`,
 than refusing.
 
 On `eos@openssh` (and `eos@ssh`, `telnet-arista`) an edit is typed in config mode, as for IOS:
-`configure terminal`, the lines, `end`. Each line is live once it is typed; there is no session diff
-and nothing to roll back. A refused line stops the edit there, since the next line would be typed in
+`configure terminal`, the lines, `end`. Each line is live once it is typed; there is no session diff and
+nothing to roll back. A refused line stops the edit there, since the next line would be typed in
 whatever mode the device is left in (a `shutdown` after a refused `interface Gi0/9` shut the interface
 before it): `end` is typed and the edit fails, naming the line and the device's complaint, the lines
-applied before it, which stay applied, and the lines not sent. A clean edit prints `(config applied)`.
+applied before it, which stay applied, and the lines not sent. A line is refused as the dialect's
+`refused` says, a line of the reply that starts with `% ` for these, not by an `error` or a `%` anywhere
+in it; a line the device took with a warning (`%Warning: portfast should only be enabled …`,
+`% Warning: use /31 mask …`, or the note that `vrf forwarding` removed the interface's addresses) is
+applied and the edit goes on. A clean edit prints `(config applied)`, and each warning under it, after
+the line it answered.
 
 ## Adding a vendor
 
@@ -630,7 +636,8 @@ and nothing about connections; `hssh/dialects/ios.py` is the smallest that defin
 |---|---|
 | `name` | the half of a driver name before the `@` (`ios` in `ios@ssh`), and the stem of the operator's shortcut file |
 | `title`, `description` | the name as printed to the operator, and one line on the dialect |
-| `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. On an exec channel (`ssh`, `openssh`) every reply is read with it: a show whose reply opens with such a line is a failure, not output, and the plain drivers' line-by-line edit stops at the line that got one. Typed at a CLI (a shell on `ssh` or `openssh`, `telnet`), a candidate edit checks each line's reply with it and discards the candidate after the last line; a lines edit looks for `error`, `invalid` or `%` instead, stops at the first line with one and types `end`, and fails naming that line, the lines applied before it and the lines not sent; a telnet show is not checked. A dialect on `ssh`, `openssh` or `telnet` must have one |
+| `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. On an exec channel (`ssh`, `openssh`) every reply is read with it: a show whose reply opens with such a line is a failure, not output, and the plain drivers' line-by-line edit stops at the line that got one. Typed at a CLI (a shell on `ssh` or `openssh`, `telnet`), a candidate edit checks each line's reply with it and discards the candidate after the last line; a lines edit checks each line's reply with it too, stops at the first refused line and types `end`, and fails naming that line, the lines applied before it and the lines not sent; a telnet show is not checked. A dialect on `ssh`, `openssh` or `telnet` must have one |
+| `informational` | a compiled regex (`re.MULTILINE`) for a line in which the CLI took a command and warned about it, though `refused` matches it too: for the IOS-shaped dialects IOS's `%Warning: …` and `% Warning: …`, and its note that a VRF enabled or disabled on an interface removed the interface's addresses (the line after it puts them back). Such a line is no refusal: a lines edit goes on, and prints it under `(config applied)` after the line it answered, in quotes. `None`, the default and Junos's and `none`'s: every line `refused` matches is a refusal |
 | `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*`; a command with a line break in it is never a read, whatever the dialect says |
 | `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
 | `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`: `prompt_name`'s group 1 is the name the device's prompt line starts with, and the prompt learned from it is that name at the start of a line, then `prompt_tail`, the whole line; a prompt it cannot name leaves `prompt`, which need only end the line), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, a line Junos prints with its prompt: `[edit]`, `{master}[edit]` with two routing engines, and the `# commit confirmed will be rolled back in 4 minutes` above it while a timer runs; every such line at the end of a reply is the prompt's, and a reply of the echo, those lines and the prompt is not waited on for more). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
@@ -1107,7 +1114,7 @@ mode; the opt-in ones (`--safety-file`, `--audit-log`, `--log`) apply to every m
 | Show diff, then ask | `--show-diff` | Edits: dry-run on every target, every diff printed, one `y/N` (a TTY, or `-y`) before anything is committed; a preview that fails on any device ends the run (exit 1) with nothing committed. Each commit is then checked against the diff it showed: a device (or a config file) that changed in between is refused with `diff changed since preview; nothing committed` |
 | Commit comment | `--comment TEXT` | Logged with the commit (`show system commit`, the audit log), so a change can be found again on the box. NETCONF `junos` only: `telnet-junos` and every other transport refuse it rather than drop it, and it needs an edit (`-eC`, `-eD`, `-eB`, `--rollback`, or a job with edits); an empty one is refused (exit 2) |
 | Commit confirmed | `--commit-confirmed [N]` | Junos rolls back after N minutes (1 to 65535; 10 when N is omitted) unless confirmed (confirm with `-eC "commit"`; a run without `--json` ends by printing that command for its own targets, a `--job`'s edit entries included); `junos@ssh`, `junos@openssh` and `telnet-junos` send `commit confirmed N` (nothing at all when `show \| compare` is empty: `NO CHANGES`, no timer). Every other driver (`ssh`, `openssh`, `telnet`, `ios@…`, `nxos@…` and `eos@…`, so `telnet-ios`, `telnet-nxos` and `telnet-arista` as well) refuses it rather than commit with no timer (a FAIL of that device). It needs an edit, as `--comment` does: with a show, a batch, `--commit-status`, `--probe` alone or a job without edits it is refused (exit 2), from a run file too |
-| Reply verdict (`ssh`, `openssh`) | *(automatic)* | A show whose reply opens with `error: ...` (Junos) or `% ...` (IOS, EOS) is FAILED as refused, not reported as output; an `error:` or `%` line further down a show's reply is output (a log, say). An edit line the device answers with `error: ...` (Junos) or `% ...` (IOS, Arista) is FAILED with that line even when the command exits 0: a plain `ssh` or `openssh` edit stops there; a Junos edit typed at the CLI sends the rest, then discards the candidate; an IOS-shaped edit typed at the CLI stops there and types `end`, and fails naming the lines applied before it and the lines not sent |
+| Reply verdict (`ssh`, `openssh`) | *(automatic)* | A show whose reply opens with `error: ...` (Junos) or `% ...` (IOS, EOS) is FAILED as refused, not reported as output; an `error:` or `%` line further down a show's reply is output (a log, say). An edit line the device answers with `error: ...` (Junos) or `% ...` (IOS, Arista) is FAILED with that line even when the command exits 0 (on an IOS-shaped dialect, a `% Warning: ...` or the note that a VRF removed an interface's addresses is the device taking the line, and is printed with the result): a plain `ssh` or `openssh` edit stops there; a Junos edit typed at the CLI sends the rest, then discards the candidate; an IOS-shaped edit typed at the CLI stops there and types `end`, and fails naming the lines applied before it and the lines not sent |
 | Junos syntax guard | *(automatic)* | Enforces set-style syntax — each line must start with `set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect` or `unprotect`, lowercase — with `#`-only comments, for every Junos driver, `junos`, `junos@ssh`, `junos@openssh` and `telnet-junos` (checked when any target is one). `commit` (or `commit;`) is only valid as the single, exact command in `-eC` or a `--job` edit, never inside `-eD`/`-eB` configuration files |
 | Safety gate | `--safety-file PATH` (or `HSSH_SAFETY_FILE`) | Opt-in. Sliding-window rate limit (10 attempts / host / 60 s, counted within one run) and a 120 s cooldown after any failure against the device — connect, auth, a timed-out or rejected command, a failed commit — held in a `flock`'d 0600 JSON file so the cooldown persists across processes. Fails closed and preserves corrupt files as `.corrupt` without silent overwrite. The file and its `.lock` are created and locked once before the first device; a path that cannot be created, opened or locked (a directory that cannot be made, a symlink, a FIFO; a missing directory is made) refuses the run with exit 2, and so does an empty `--safety-file ''` |
 | Audit trail | `--audit-log PATH` (or `HSSH_AUDIT_LOG`) | Appended as 0600 JSONL with secret redaction (`encrypted-password`, `secret`, `password`/`passwd`, `authentication-key`, `md5-key`, `community`, `pre-shared-key`, `ascii-text`, hex keys, API tokens). One entry per device for every mode — shows and `--probe` included, without their output — plus the edits the probe stopped (`preflight probe failed: … (aborted)`) and user cancellations; records diffs for edits. The file is opened once before the first device, so an unwritable path refuses the run before anything is sent (exit 2); in edit modes, audit write failures during the run fail it. `--audit-log ''` and a run file's `audit-log: ''` are refused (exit 2): an unset variable never turns the trail off |
@@ -1472,7 +1479,7 @@ h-ssh/
 │   │   ├── dialects/        # what each device speaks, with its shortcut library next to it
 │   │   │   ├── base.py      # Dialect, CliSyntax, the default read rule
 │   │   │   ├── junos.py     # set-syntax guard, refusal regex, candidate CLI, commit-pending note  + junos.json
-│   │   │   ├── ios.py       # IOS-shaped CLI and `% ` refusals; nxos.py, eos.py (+ eos.json) build on it
+│   │   │   ├── ios.py       # IOS-shaped CLI, `% ` refusals and `%Warning`s; nxos.py, eos.py (+ eos.json) build on it
 │   │   │   └── none.py      # no vendor knowledge: error:/% refusals, IOS-shaped prompt  + none.json
 │   │   ├── transports/      # how a device is reached: each module does one transport's work for every dialect on it
 │   │   │   ├── netconf.py   # PyEZ NETCONF: show, structured, rpc, config transactions, commit-confirmed, commit status
@@ -1507,7 +1514,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1350 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1355 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

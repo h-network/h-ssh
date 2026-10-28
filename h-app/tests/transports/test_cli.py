@@ -8,6 +8,7 @@ import time
 import pytest
 
 from hssh import dialects
+from hssh.dialects.base import Dialect
 from hssh.drivers import results as R
 from hssh.errors import AmbiguousCommitError, NotAppliedError, NothingToConfirmError
 from hssh.transports.cli import Cli, edit_policy, pending_in, refuse_commit_lines, strip_ansi, complaint
@@ -793,6 +794,99 @@ def test_a_lines_edit_stops_at_the_first_refused_line():
             s.edit_lines(payload)
         assert str(failed.value) == f"{refused}; {said}"
         assert ch.typed == ["configure terminal", *typed, "end"] and ch.unread() == ""
+
+
+# What IOS says of a line it took: two warnings, and the note that a VRF took the interface's addresses.
+TOOK = {"vrf forwarding CUST": ("\r\n% Interface GigabitEthernet0/1 IPv4 disabled and address(es) removed due to "
+                                "enabling VRF CUST\r\nR1(config-if)#"),
+        "ip address 10.0.0.1 255.255.255.254": ("\r\n% Warning: use /31 mask on non point-to-point interface "
+                                                 "cautiously\r\nR1(config-if)#"),
+        "spanning-tree portfast": ("\r\n%Warning: portfast should only be enabled on ports connected to a single\r\n"
+                                   " host. Connecting hubs, concentrators, switches, bridges, etc... to this\r\n"
+                                   " interface  when portfast is enabled, can cause temporary bridging loops.\r\n"
+                                   " Use with CAUTION\r\n\r\n%Portfast has been configured on GigabitEthernet0/1 "
+                                   "but will only\r\n have effect when the interface is in a non-trunking mode."
+                                   "\r\nR1(config-if)#")}
+
+
+def test_a_line_the_cli_took_with_a_warning_is_applied_and_the_warning_comes_back():
+    """#142: a line of a lines edit was refused when its reply had `error`,
+    `invalid` or a `%` anywhere: IOS's `%Warning: portfast should only be
+    enabled ...` failed a `spanning-tree portfast` the device took, after
+    `end`. With the edit stopping at a refused line, `% Warning: use /31
+    mask ...` would stop it too, and the note that `vrf forwarding` took
+    the interface's addresses would leave it without the `ip address` the
+    next line puts back. A line is refused as the dialect says; one it took
+    with a warning (its `informational`) is applied, every line after it
+    typed, and the warning comes back with the result."""
+    for echoes in (False, True):
+        ch = ScriptChannel("\r\nR1#", dict(NO_GI09, **TOOK))
+        s = Cli(ch, dialects.ios.DIALECT, 5, echoes=echoes)
+        s.login()
+        r = s.edit_lines("interface Gi0/1\n vrf forwarding CUST\n ip address 10.0.0.1 255.255.255.254\n"
+                         " spanning-tree portfast\n no shutdown\n")
+        assert r.status == R.APPLIED and r == r.message == "\n".join((
+            "(config applied)",
+            "'vrf forwarding CUST': % Interface GigabitEthernet0/1 IPv4 disabled and address(es) removed due to "
+            "enabling VRF CUST",
+            "'ip address 10.0.0.1 255.255.255.254': % Warning: use /31 mask on non point-to-point interface cautiously",
+            "'spanning-tree portfast': %Warning: portfast should only be enabled on ports connected to a single"))
+        assert ch.typed == ["configure terminal", "interface Gi0/1", "vrf forwarding CUST",
+                            "ip address 10.0.0.1 255.255.255.254", "spanning-tree portfast", "no shutdown", "end"]
+
+
+def test_a_line_is_refused_as_the_dialect_says_not_by_the_words_in_its_reply():
+    """#142: a lines edit took `error`, `invalid` or a `%` anywhere in a
+    reply for a refusal, and a dialect's own refusal without them for none.
+    A reply is judged as a candidate edit's is, by the dialect's `refused`
+    on a line of it: `Bad command` from a CLI whose dialect says so fails
+    the edit and stops it, and a line the device took is applied whatever
+    words its reply has."""
+    acme = Dialect("acme", "AcmeOS", "x", refused=re.compile(r"^\s*Bad command", re.M), cli=dialects.ios.CLI)
+    replies = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#",
+               "bogus": "\r\nBad command: 'bogus'\r\nR1(config)#"}
+    ch = ScriptChannel("\r\nR1#", replies)
+    s = Cli(ch, acme, 5)
+    s.login()
+    with pytest.raises(RuntimeError, match=r"^'bogus': Bad command: 'bogus'; applied before it: 'hostname x'; "
+                                           r"not sent: 'ip domain-name lab'$"):
+        s.edit_lines("hostname x\nbogus\nip domain-name lab\n")
+    assert ch.typed == ["configure terminal", "hostname x", "bogus", "end"]
+    replies["snmp-server"] = "\r\nInvalid community strings are logged as errors; 0% of the table in use\r\nR1(config)#"
+    ch = ScriptChannel("\r\nR1#", replies)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    assert s.edit_lines("snmp-server community lab-error RO\nhostname x\n") == "(config applied)"
+    assert ch.typed == ["configure terminal", "snmp-server community lab-error RO", "hostname x", "end"]
+
+
+def test_a_line_break_before_the_echo_leaves_the_echo_out_of_the_reply():
+    """#142: the echo was the reply's first line or no echo, so a device
+    that sends a line break before it left it in the reply: over telnet
+    `description clean_error_counters` came back as its own reply, which
+    failed a lines edit on its `error`, and a show's output began with the
+    command. The echo is the reply's first line of text, and a reply that is
+    only that so far, a line ending in prompt-shaped text, is not yet the
+    reply, as without the line break."""
+    replies = dict(NO_GI09, **TOOK)
+    for echoes in (False, True):
+        ch = ScriptChannel("\r\nR1#", replies, echo=lambda line: "\r\n" + line)
+        s = Cli(ch, dialects.ios.DIALECT, 5, echoes=echoes)
+        s.login()
+        assert s.run("configure terminal", 5).strip() == "Enter configuration commands, one per line.  End with CNTL/Z."
+        assert s.run("description clean_error_counters", 5) == ""
+        out = s.run("spanning-tree portfast", 5)
+        assert out.lstrip().startswith("%Warning: portfast should only be enabled") and "tree portfast" not in out
+        assert s.edit_lines("interface Gi0/1\n description clean_error_counters\n") == "(config applied)"
+    # A prompt the dialect cannot name is not learned: the echo of a line ending in prompt-shaped text, the
+    # device pausing right after it, is still only the echo, a line break before it or not.
+    xr = "RP/0/RSP0/CPU0:R1"
+    ch = ScriptChannel(f"\r\n{xr}#", {"description": PAUSE + f"\r\n{xr}(config-if)#", "show clock": f"\r\n10:00\r\n{xr}#"},
+                       echo=lambda line: "\r\n" + line, split_at="noc@example.com>")
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    assert s.run("description noc@example.com>", 5) == "" and ch.unread() == ""
+    assert s.run("show clock", 5).strip() == "10:00"
 
 
 # --- confirm ----------------------------------------------------------------------------

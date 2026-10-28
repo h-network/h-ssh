@@ -144,6 +144,14 @@ def quoted(lines: list) -> str:
     return ", ".join(f"'{line}'" for line in lines) or "none"
 
 
+def notices(output: str, dialect: Dialect) -> list:
+    """The lines of a reply in which the CLI took the command and warned
+    about it (the dialect's `informational`), as the device said them."""
+    if dialect.informational is None:
+        return []
+    return [line.strip() for line in output.splitlines() if dialect.informational.search(line)]
+
+
 def refuse_control_characters(payload: str) -> None:
     """A CLI acts on a control character as it is typed: ^C drops the line
     typed so far, ^U kills it, DEL rubs out the character before it, a Tab
@@ -506,8 +514,9 @@ class Cli:
             lines = clean.splitlines()
             if not lines:
                 return False
-            if len(lines) == 1 and is_echo(lines[0], cmd):
-                return False                      # only the echo so far
+            said = [line for line in lines if line.strip()]
+            if len(said) == 1 and is_echo(said[0], cmd):
+                return False                      # only the echo so far, a line break before it or not
             if through_echo and not any(drawn_echo(line, cmd, self.cli.prompt) for line in lines[:-1]):
                 return False                      # what the banner had left, the echo still to come
             return self._at_prompt(clean, prompt_re)
@@ -534,19 +543,23 @@ class Cli:
         made an empty compare a diff, its commit confirming the timer
         (#141).
 
-        The echo is the line typed, as a rule. On a channel that echoes, a
-        reply whose one line of text is not that line is its echo as the
-        CLI drew it: Junos completes a keyword as it is typed (`set int`
-        comes back `set interfaces`), and an IOS-shaped CLI narrower than a
-        long line scrolls it. Taken for output, each such line of an edit
-        was waited on (#141)."""
+        The echo is the line typed, as a rule, and the reply's first line of
+        text: a line break the device sent before it once left it in the
+        reply, where `description clean_error_counters` failed a lines edit
+        on its `error` (#142). On a channel that echoes, a reply whose one
+        line of text is not that line is its echo as the CLI drew it: Junos
+        completes a keyword as it is typed (`set int` comes back `set
+        interfaces`), and an IOS-shaped CLI narrower than a long line
+        scrolls it. Taken for output, each such line of an edit was waited
+        on (#141)."""
         lines = clean.splitlines()
         echoed = False
+        lead = next((n for n, line in enumerate(lines) if line.strip()), 0)     # the first line of text
         if through_echo:
             echo = next((n for n, line in enumerate(lines) if drawn_echo(line, cmd, self.cli.prompt)), -1)
             lines, echoed = lines[echo + 1:], echo >= 0
-        elif lines and is_echo(lines[0], cmd):
-            lines, echoed = lines[1:], True
+        elif lines and is_echo(lines[lead], cmd):
+            lines, echoed = lines[lead + 1:], True
         elif self.echoes and cmd.strip():
             # A CLI narrower than the line redraws it as it is typed: the
             # echo is one line on the terminal, several to splitlines().
@@ -592,24 +605,35 @@ class Cli:
         still in Gi0/1's, a `shutdown` after it shut Gi0/1 (#142). So the
         edit stops at the first line the CLI refuses, leaves config mode
         (`end`) and fails, naming that line and the device's complaint, the
-        lines applied before it and the lines not sent."""
-        cli = self.cli
+        lines applied before it and the lines not sent.
+
+        A line is refused as the dialect says (`refused`, a line of the
+        reply), as a candidate edit's is: `error`, `invalid` or a `%`
+        anywhere in a reply once failed a line the device took, IOS's
+        `%Warning: portfast should only be enabled ...` too, after `end`
+        with the line applied. A line the CLI took with a warning (the
+        dialect's `informational`) is applied, and the warning comes back
+        with the result, the line it answered in quotes."""
+        d, cli = self.dialect, self.cli
         refuse_control_characters(payload)
         lines = [ln.strip() for ln in payload.strip().splitlines()]
         lines = [ln for ln in lines if ln and not ln.startswith(("!", "#"))]
         self.run(cli.config_enter, 10)
 
+        warned = []
         for n, line in enumerate(lines):
             # The reply without the echoed line, so the line's own text is not
             # mistaken for the device's complaint about it.
             output = self.run(line, 10)
-            if "invalid" in output.lower() or "error" in output.lower() or "%" in output:
+            said = refusal_line(output, dialect=d)
+            if said:
                 self.leave_quietly(cli.config_exit)
-                raise RuntimeError(f"'{line}': {complaint(output, self.dialect)}; "
+                raise RuntimeError(f"'{line}': {said}; "
                                    f"applied before it: {quoted(lines[:n])}; not sent: {quoted(lines[n + 1:])}")
+            warned += [f"'{line}': {note}" for note in notices(output, d)]
 
         self.run(cli.config_exit, 10)
-        return R.EditResult(R.APPLIED, message="(config applied)")
+        return R.EditResult(R.APPLIED, message="\n".join(["(config applied)", *warned]))
 
     def edit_candidate(self, payload: str, dry_run: bool, confirmed_minutes: int = 0,
                        expected_diff: Optional[str] = None) -> R.EditResult:

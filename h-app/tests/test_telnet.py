@@ -972,6 +972,11 @@ def ios_without_gi09(srv):
             mode, reply = "R1(config)#", "Enter configuration commands, one per line.  End with CNTL/Z.\r\n"
         elif line == "interface Gi0/9":
             reply = " " * 17 + "^\r\n% Invalid input detected at '^' marker.\r\n\r\n"
+        elif line == "spanning-tree portfast":
+            reply = ("%Warning: portfast should only be enabled on ports connected to a single\r\n"
+                     " host. Connecting hubs, concentrators, switches, bridges, etc... to this\r\n"
+                     " interface  when portfast is enabled, can cause temporary bridging loops.\r\n"
+                     " Use with CAUTION\r\n\r\n")
         elif line.startswith("interface "):
             mode = "R1(config-if)#"
         elif line == "end":
@@ -994,3 +999,18 @@ def test_a_telnet_ios_edit_stops_at_the_first_refused_line():
                                  "'interface Gi0/1', 'description uplink-ok'; not sent: 'shutdown'")
     assert _received(srv) == ["configure terminal", "interface Gi0/1", "description uplink-ok", "interface Gi0/9",
                               "end"]
+
+
+def test_a_telnet_ios_line_taken_with_a_warning_is_applied_and_the_warning_comes_back():
+    """#142: `spanning-tree portfast`, answered with IOS's `%Warning:
+    portfast should only be enabled ...`, failed the edit after `end` with
+    the line applied, and with the edit stopping at a refused line it would
+    have stopped there. It is applied, the lines after it are typed, and the
+    warning comes back with the result."""
+    from hssh.transports.telnet import edit
+    srv = ScriptedTelnetServer(ios_without_gi09)
+    result = edit("127.0.0.1", "admin", "admin", "interface Gi0/1\n spanning-tree portfast\n no shutdown\n",
+                  session_timeout=5, command_timeout=5, port=srv.port, vendor_hint="telnet-ios")
+    assert result.status == "applied" and result == ("(config applied)\n'spanning-tree portfast': %Warning: portfast "
+                                                     "should only be enabled on ports connected to a single")
+    assert _received(srv) == ["configure terminal", "interface Gi0/1", "spanning-tree portfast", "no shutdown", "end"]

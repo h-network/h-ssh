@@ -580,12 +580,15 @@ def refusal_line(*texts: str, dialect=None):
     """The first line in which the device refused the command, or None. A CLI
     that exits 0 after refusing a line still said so; how it says so is the
     dialect's (`refused`). Without one, the `none` dialect's rule: a line
-    starting with "error:" (Junos) or "% " (IOS, EOS, NX-OS)."""
-    pattern = (dialect or drivers.NONE).refused
+    starting with "error:" (Junos) or "% " (IOS, EOS, NX-OS). A line the
+    dialect's `informational` matches as well (IOS's `% Warning: ...`) is the
+    CLI taking the command with a warning, not refusing it."""
+    dialect = dialect or drivers.NONE
     for text in texts:
-        m = pattern.search(text or "")
-        if m:
-            return (text[m.start():].strip().splitlines() or [""])[0].strip()
+        for m in dialect.refused.finditer(text or ""):
+            line = (text[m.start():].strip().splitlines() or [""])[0].strip()
+            if not (dialect.informational and dialect.informational.search(line)):
+                return line
     return None
 
 

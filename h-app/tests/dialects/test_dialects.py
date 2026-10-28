@@ -76,6 +76,32 @@ def test_how_each_dialect_refuses_a_line():
     assert refusal_line("commit failed: x", dialect=j) == "commit failed: x"
 
 
+def test_an_ios_warning_is_no_refusal():
+    """#142: IOS says `%` first of a line it took as well as of one it
+    refused, so a lines edit that stops at a refused line stopped at a
+    `% Warning: use /31 mask ...`, and at the note that `vrf forwarding`
+    took the interface's addresses, the next line's to put back. The
+    IOS-shaped dialects name what IOS says of a line it took
+    (`informational`), and a line it matches is no refusal; a refusal after
+    it still is. Junos and `none` have none: their rule stays."""
+    ios, nxos, eos = dialects.ios.DIALECT, dialects.nxos.DIALECT, dialects.eos.DIALECT
+    assert ios.informational is nxos.informational is eos.informational
+    assert dialects.junos.DIALECT.informational is None and dialects.none.DIALECT.informational is None
+    for line in ("%Warning: portfast should only be enabled on ports connected to a single",
+                 "% Warning: use /31 mask on non point-to-point interface cautiously", "% WARNING: low memory",
+                 "% Interface GigabitEthernet0/1 IPv4 disabled and address(es) removed due to enabling VRF CUST",
+                 "% Interface FastEthernet0/0 IP address 10.0.0.1 removed due to enabling VRF CUST",
+                 "  % Interface Gi0/2 IPv4 disabled and address(es) removed due to disabling VRF CUST"):
+        assert ios.informational.search(line), line
+        assert refusal_line(line, dialect=eos) is None, line
+    for line in ("% Invalid input detected at '^' marker.", "% Incomplete command.", '% Ambiguous command:  "sh"',
+                 "% Interface Gi0/9 not found", "% Warnings are disabled"):
+        assert not ios.informational.search(line) and refusal_line(line, dialect=ios) == line, line
+    assert refusal_line("\n% Warning: use /31 mask\n\n   ^\n% Invalid input detected\n", dialect=ios) == \
+        "% Invalid input detected"
+    assert refusal_line("% Warning: use /31 mask", dialect=dialects.none.DIALECT) == "% Warning: use /31 mask"
+
+
 def test_a_cli_that_commits_needs_compare_and_discard():
     with pytest.raises(ValueError, match="compare and discard"):
         CliSyntax(prompt=re.compile("x"), prompt_name=re.compile("(x)"), prompt_tail="", config_enter="c",
