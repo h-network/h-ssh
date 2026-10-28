@@ -477,8 +477,10 @@ a community ending in `#` cannot be taken for the prompt and shift every later r
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
-commit-confirmed with one bare `commit` in exclusive mode; a `commit` line inside a config payload is
-refused before the device is contacted. A commit whose reply never arrives is
+commit-confirmed with one bare `commit` in exclusive mode; a line inside a config payload whose first
+word is `commit` (`commit;` too, the set-syntax guard's own spelling) is refused before the device is
+contacted, on every Junos driver that types at the CLI and for a library caller too. A commit whose
+reply never arrives is
 *outcome unknown* here too; one answered with `commit complete` that then takes the session with it — a
 management address, the telnet service — is still reported as committed, the closed session releasing
 the lock.
@@ -1234,7 +1236,8 @@ and a `#` comment is sent as a command; `fleet.batch(hssh.core.read_command_file
 reads a batch file or a profile as the CLI does. Edits keep their gates
 in the CLI (the set-syntax guard, the probe's question, the confirmation) and in the transports' own
 `edit()`/`begin()` below; a transport that types at a CLI refuses a payload or a confirm comment with a
-control character or a Tab in it itself, before it connects (see [Transports](#transports)).
+control character or a Tab in it itself, before it connects, and a Junos one a payload line whose first
+word is `commit` (`commit;` too), the one commit rail a library caller has (see [Transports](#transports)).
 
 ### One device, one call
 

@@ -247,6 +247,21 @@ def test_a_commit_line_in_a_payload_is_refused_before_anything_is_typed():
     refuse_commit_lines("set a b\n")
 
 
+def test_a_commit_line_is_its_first_word_whatever_ends_it():
+    """#139: the rail split a line on spaces alone, so `commit;`, which the
+    set-syntax guard itself counts as a commit, and `commit` with a Tab
+    after it went past it, and in the library's edit() and run_for_target
+    it is the only rail. The word inside a set line is still configuration."""
+    for payload in ("set a b\ncommit;\n", "commit;", "set a b\ncommit\tcomment x\n", "commit;; and-quit\n"):
+        with pytest.raises(ValueError, match="'commit' is not configuration"):
+            refuse_commit_lines(payload)
+    refuse_commit_lines("set system commit synchronize\nset a commit;\n")
+    s, ch = junos_session()
+    with pytest.raises(ValueError, match="'commit' is not configuration"):
+        s.edit_candidate("set system host-name x\ncommit;\n", dry_run=True)
+    assert ch.typed == []
+
+
 # What the Junos line editor acts on as it arrives: ^C drops the line typed so
 # far, ^U kills it, DEL rubs out a character. The rest of the line then ran as
 # a line of its own (#139).

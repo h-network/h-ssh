@@ -105,9 +105,13 @@ def refuse_commit_lines(payload: str) -> None:
     """`commit` typed inside configure mode would commit (and confirm any
     pending timer) halfway through a payload. A confirm is `-eC "commit"`
     on its own, which confirm() handles; here it is refused before the
-    device is contacted."""
+    device is contacted. The word is the line's first, whatever whitespace
+    follows it, with a closing ';' taken off: `commit;` is a commit to the
+    set-syntax guard too (dialects.junos.check_edit), and for a library
+    caller this is the only rail."""
     for line in payload.strip().splitlines():
-        if line.strip().split(" ")[0] == "commit":
+        words = line.split()
+        if words and words[0].rstrip(";") == "commit":
             raise ValueError("'commit' is not configuration; a pending commit-confirmed is confirmed "
                              "with -eC \"commit\" alone. Nothing was sent to the device")
 

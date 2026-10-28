@@ -619,6 +619,15 @@ def test_a_commit_line_in_a_junos_payload_is_refused_before_connecting(no_connec
         ssh.edit("10.0.0.1", "lab", "p", "set system host-name test\ncommit\n", 5, 10, vendor_hint="junos@ssh")
 
 
+def test_a_commit_line_ending_in_a_semicolon_is_refused_before_connecting(no_connection):
+    """#139: `commit;` went past the commit rail, which for a library
+    caller is the only one, and was typed in configure mode, a dry run
+    too."""
+    for payload in ("commit;\n", "set system host-name test\ncommit;\n"):
+        with pytest.raises(ValueError, match="'commit' is not configuration"):
+            ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="junos@ssh", dry_run=True)
+
+
 # ^C, ^U and DEL, which the Junos line editor acts on as they arrive, and a Tab, which completes the word (#139)
 KEYS = ["set system host-name x\x03commit comment y\n", "set a\x15commit\n", "set " + "\x7f" * 4 + "commit\n",
         "\tset system host-name x\n"]
