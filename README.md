@@ -449,12 +449,16 @@ has logged in before the shell opens, so the engine reads the banner to the prom
 username nor the password, whatever the banner ends with: a banner ending in `Password: ` gets nothing,
 and the password cannot come back in a reply, to the screen, `--log`, the audit log or the store. A
 shell that asks for credentials after SSH has logged in (a console server's port) gets none and fails as
-a login that shows no prompt. An empty `show | compare` is `NO CHANGES`: the candidate is discarded and
-no `commit` is typed, plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over
-nothing and no other user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec
-channel, one command per channel; only edits and confirms open a shell. Over the OpenSSH binary the
-shell is `ssh -tt -e none` (no escape character, so a typed line that starts with `~` goes to the device
-as it is), with a password still handed over through `SSH_ASKPASS`, never typed at a prompt. The plain
+a login that shows no prompt. A login ends at a prompt that is the last line, with nothing after it,
+once the device has said nothing more for 0.15 s. A banner line that ends in `NOC-DESK>` is not the
+device's prompt once its line break has come, however long the pause after it, and a read that stops
+right after such a line (or one that is all `NOC-DESK>`) is read past when the banner goes on within
+that time. An empty `show | compare` is `NO CHANGES`: the candidate is discarded and no `commit` is
+typed, plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over nothing and no
+other user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec channel, one
+command per channel; only edits and confirms open a shell. Over the OpenSSH binary the shell is
+`ssh -tt -e none` (no escape character, so a typed line that starts with `~` goes to the device as it
+is), with a password still handed over through `SSH_ASKPASS`, never typed at a prompt. The plain
 `ssh`/`openssh` drivers (dialect `none`) never open a shell.
 
 The engine types plain text only. A CLI acts on a control character as it arrives (^C drops the line
@@ -1471,7 +1475,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1328 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1329 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

@@ -75,6 +75,10 @@ class ScriptChannel:
     def close(self):
         self.closed = True
 
+    def unread(self):
+        """What the device said that nothing read, the pauses left out."""
+        return bytes(self.queue).replace(PAUSE.encode(), b"").decode()
+
 
 def junos_device(**over):
     replies = {
@@ -187,6 +191,42 @@ def test_without_the_dialogue_a_banner_that_asks_for_a_password_gets_nothing_typ
     ch = ScriptChannel(asks, junos_device(secret="\r\n" + OP), echo=False)
     Cli(ch, dialects.junos.DIALECT, 5).login("lab", "secret", dialogue=True)
     assert ch.typed == ["secret"]
+
+
+IOS_LINES = {"configure terminal": "\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nR1(config)#",
+             "interface": "\r\nR1(config-if)#",
+             "ip": "\r\n               ^\r\n% Invalid input detected at '^' marker.\r\nR1(config-if)#",
+             "end": "\r\nR1#"}
+
+
+def test_a_banner_line_shaped_like_a_prompt_does_not_end_the_login():
+    """#141: login() took the dialect's prompt at the end of a read, a line
+    break after it or not, and waited no longer. A banner whose last line
+    ends in a word and `>` (`... report misuse to NOC-DESK>`), the real
+    prompt in a later read, ended the login on the banner: the prompt
+    learned was the wrong one and every reply after it the one before, so
+    the `% Invalid input` for a refused line was read as the reply to `end`
+    and the edit said APPLIED. A prompt is the last line with nothing after
+    it, and a login waits SETTLE after one for the device to say more: the
+    edit fails on its refused line, every reply read by the command it
+    answers. Telnet's dialogue reads past a `Password: ` in a banner the
+    same way."""
+    replies = {said: reply + PAUSE for said, reply in IOS_LINES.items()}
+    for banner in ("\r\nAuthorized users only - report misuse to NOC-DESK>\r\n" + PAUSE + "\r\nR1>",
+                   "\r\nAuthorized users only - report misuse to NOC-DESK>" + PAUSE + "\r\n\r\nR1>",
+                   "\r\nAuthorized users only. Report misuse to:\r\nNOC-DESK>" + PAUSE + "\r\n\r\nR1>"):
+        ch = ScriptChannel(banner + PAUSE, replies)
+        s = Cli(ch, dialects.ios.DIALECT, 5)
+        s.login()
+        assert s.prompt_re.search("R1(config-if)#") and not s.prompt_re.search("NOC-DESK>")
+        with pytest.raises(RuntimeError, match=r"^'ip addres 10\.0\.0\.1 255\.255\.255\.0': % Invalid input detected"):
+            s.edit_lines("interface Gi0/1\nip addres 10.0.0.1 255.255.255.0\n")
+        assert ch.typed == ["configure terminal", "interface Gi0/1", "ip addres 10.0.0.1 255.255.255.0", "end"]
+        assert ch.unread() == ""
+    ch = ScriptChannel("\r\nAsk the NOC for the Password: " + PAUSE + "\r\nR1>" + PAUSE, replies)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login("u", "pw", dialogue=True)
+    assert ch.typed == [] and s.prompt_re.search("R1#")
 
 
 def test_the_initial_bytes_from_negotiation_count_as_the_banner():

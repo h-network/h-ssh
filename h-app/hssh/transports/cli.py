@@ -40,10 +40,23 @@ PASSWORD_RE = re.compile(r'(Password|password)\s*:\s*$', re.IGNORECASE)
 _LOGIN_REJECTED = ("login incorrect", "bad password", "login invalid",
                    "authentication failed", "access denied", "permission denied")
 
+# How long a login waits, after a prompt, for the device to say more: a
+# banner line shaped like a prompt, at a read boundary, is not the end of the
+# banner (#141). Seconds; never past the login's own timeout.
+SETTLE = 0.15
+
 
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from output."""
     return _ANSI_RE.sub('', text)
+
+
+def last_line(text: str) -> str:
+    """What follows the last line break in `text`: the line a prompt waits
+    on, empty when the text ends with a line break, as a prompt never does.
+    (The character added keeps splitlines() from dropping an empty last
+    line.)"""
+    return (text + "\0").splitlines()[-1][:-1]
 
 
 def is_echo(line: str, cmd: str) -> bool:
@@ -192,28 +205,45 @@ class Cli:
         # '?', which a Junos CLI takes as a request for help (#139).
         self.channel.send(data.encode("utf-8"))
 
-    def _read_until(self, done: Callable[[str], bool], timeout: int, buffer: str = "") -> str:
+    def _read_until(self, done: Callable[[str], bool], timeout: float, buffer: str = "",
+                    settle: Optional[Callable[[str], float]] = None) -> str:
         """Read until done(text) matches the cleaned buffer.
 
-        What has arrived when the deadline passes is not an answer: that
-        raises TimeoutError, and the peer closing or the channel failing
-        raises ConnectionError. A caller never gets a partial read back as
-        the reply."""
+        With `settle`, a match is the end only once the device has sent
+        nothing more for settle(text) seconds after it (none at all for 0):
+        what comes meanwhile is read on, paging answered, and done() must
+        match again at its end. The wait never runs past the deadline; a
+        match that stands when it passes, or when the device hangs up
+        during the wait, is the reply.
+
+        What has arrived when the deadline passes without a match is not an
+        answer: that raises TimeoutError, and the peer closing or the
+        channel failing raises ConnectionError. A caller never gets a
+        partial read back as the reply."""
         buf = buffer
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
             clean = strip_ansi(buf)
-            if done(clean):
-                return clean
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                chunk = self.channel.recv(4096, min(remaining, 2.0)).decode("utf-8", errors="replace")
-            except TimeoutError:
-                continue
-            if not chunk:
-                raise ConnectionError("connection closed by the device")
+            if done(clean):
+                quiet = min(settle(clean), remaining) if settle else 0
+                if quiet <= 0:
+                    return clean
+                try:
+                    chunk = self.channel.recv(4096, quiet).decode("utf-8", errors="replace")
+                except OSError:                  # nothing more (a TimeoutError), or gone after its prompt
+                    return clean
+                if not chunk:
+                    return clean
+            else:
+                if remaining <= 0:
+                    break
+                try:
+                    chunk = self.channel.recv(4096, min(remaining, 2.0)).decode("utf-8", errors="replace")
+                except TimeoutError:
+                    continue
+                if not chunk:
+                    raise ConnectionError("connection closed by the device")
             buf += chunk
             clean = strip_ansi(buf)
             # Handle --More-- pagination: the marker goes, what followed it in
@@ -223,10 +253,7 @@ class Cli:
                 if m:
                     self._send(" ")
                     buf = clean[:m.start()] + clean[m.end():]
-                    clean = strip_ansi(buf)
                     break
-            if done(clean):
-                return clean
         seen = [l.strip() for l in strip_ansi(buf).splitlines() if l.strip()]
         tail = f"; last line: {seen[-1][:80]!r}" if seen else ""
         raise TimeoutError(f"no prompt within {timeout}s{tail}")
@@ -249,13 +276,28 @@ class Cli:
                 return buf
             buf += chunk
 
-    def read_until_prompt(self, timeout: int, buffer: str = "") -> str:
-        return self._read_until(self.prompt_re.search, timeout, buffer)
+    @staticmethod
+    def _at_prompt(clean: str, prompt_re: re.Pattern) -> bool:
+        """`clean` ends with a prompt: its last line, with nothing after it,
+        is one. A prompt waits on its line for what is typed; a line break
+        after prompt-shaped text is the device going on."""
+        line = last_line(clean).strip()
+        return bool(line) and prompt_re.search(line) is not None
 
-    def _read_until_prompt_or_login(self, timeout: int, buffer: str = "") -> str:
-        return self._read_until(
-            lambda clean: LOGIN_RE.search(clean) or PASSWORD_RE.search(clean) or self.prompt_re.search(clean),
-            timeout, buffer)
+    def read_until_prompt(self, timeout: int, buffer: str = "") -> str:
+        return self._read_until(lambda clean: self._at_prompt(clean, self.prompt_re), timeout, buffer)
+
+    def _read_login(self, timeout: int, dialogue: bool, buffer: str = "") -> str:
+        """The login's next read: up to a prompt as the last line (with the
+        dialogue, a `login:` or `Password:` too) and SETTLE of quiet after
+        it. A banner line shaped like a prompt, at a read boundary, once
+        ended the login there: the prompt learned was the wrong one, and
+        every reply after it the one before (#141)."""
+        def done(clean: str) -> bool:
+            if dialogue and (LOGIN_RE.search(clean) or PASSWORD_RE.search(clean)):
+                return True
+            return self._at_prompt(clean, self.prompt_re)
+        return self._read_until(done, timeout, buffer, settle=lambda clean: SETTLE)
 
     # --- login ----------------------------------------------------------------
 
@@ -299,31 +341,30 @@ class Cli:
         a ValueError before either is typed. The channel is closed on any
         failure."""
         timeout = self.session_timeout
-        read = self._read_until_prompt_or_login if dialogue else self.read_until_prompt
         try:
             try:
-                initial = read(timeout, buffer=self._initial)
+                initial = self._read_login(timeout, dialogue, buffer=self._initial)
             except TimeoutError:
                 # A console-server line left at a prompt, or at "Press RETURN to
                 # get started.", prints nothing until Enter. One Enter, only once
                 # the wait is up: typed ahead of a slow login prompt it would be
                 # taken as an empty username.
                 self._send("\n")
-                initial = read(timeout)
+                initial = self._read_login(timeout, dialogue)
 
             last = initial
             if dialogue and LOGIN_RE.search(initial):
                 self._refuse_typing(user, passwd)
                 self._send((user or "") + "\n")
-                last = self._read_until_prompt_or_login(timeout)
+                last = self._read_login(timeout, dialogue)
                 if PASSWORD_RE.search(last):
                     self._send((passwd or "") + "\n")
-                    last = self._read_until_prompt_or_login(timeout)
+                    last = self._read_login(timeout, dialogue)
                 self._check_login(last)
             elif dialogue and PASSWORD_RE.search(initial):
                 self._refuse_typing(None, passwd)
                 self._send((passwd or "") + "\n")
-                last = self._read_until_prompt_or_login(timeout)
+                last = self._read_login(timeout, dialogue)
                 self._check_login(last)
             self.prompt_re = self._learn_prompt(last)
         except Exception as e:
