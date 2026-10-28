@@ -908,6 +908,39 @@ def test_a_refusal_with_no_space_after_its_percent_stops_a_lines_edit():
                         "ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0", "hostname after", "end"]
 
 
+# What IOS says of a line it took besides a warning: the RSA keys it makes, the VLAN changes it applies.
+NOTES = {"configure terminal": "\r\nR1(config)#", "end": "\r\nR1#", "<else>": "\r\nR1(config)#",
+         "crypto key generate rsa modulus 2048": (
+             "\r\nThe name for the keys will be: R1.lab.example\r\n\r\n% The key modulus size is 2048 bits\r\n"
+             "% Generating 2048 bit RSA keys, keys will be non-exportable...\r\n[OK] (elapsed time was 1 seconds)"
+             "\r\n%SSH-5-ENABLED: SSH 1.99 has been enabled\r\nR1(config)#"),
+         "exit": "\r\n% Applying VLAN changes may take few minutes.  Please wait...\r\n\r\nR1(config)#"}
+
+
+def test_a_line_ios_took_with_a_note_is_applied_and_the_edit_goes_on():
+    """#142: IOS says `% ` first of more than a warning on a line it took:
+    `crypto key generate rsa modulus 2048` is answered `% The key modulus
+    size is 2048 bits` and `% Generating 2048 bit RSA keys ...` as the keys
+    are made, and leaving a VLAN's mode `% Applying VLAN changes may take
+    few minutes.  Please wait...`. Taken for refusals, they stopped the
+    edit there, the line applied and the lines after it not sent. They are
+    the dialect's `informational`: the line is applied, the next one typed,
+    and the notes come back with the result."""
+    ch = ScriptChannel("\r\nR1#", NOTES)
+    s = Cli(ch, dialects.ios.DIALECT, 5)
+    s.login()
+    r = s.edit_lines("ip domain-name lab.example\ncrypto key generate rsa modulus 2048\nip ssh version 2\n"
+                     "vlan 10\n name users\nexit\ninterface Gi0/1\n switchport access vlan 10\n")
+    key = "'crypto key generate rsa modulus 2048': "
+    assert r.status == R.APPLIED and r == "\n".join((
+        "(config applied)", key + "% The key modulus size is 2048 bits",
+        key + "% Generating 2048 bit RSA keys, keys will be non-exportable...",
+        "'exit': % Applying VLAN changes may take few minutes.  Please wait..."))
+    assert ch.typed == ["configure terminal", "ip domain-name lab.example", "crypto key generate rsa modulus 2048",
+                        "ip ssh version 2", "vlan 10", "name users", "exit", "interface Gi0/1",
+                        "switchport access vlan 10", "end"]
+
+
 def test_a_line_break_before_the_echo_leaves_the_echo_out_of_the_reply():
     """#142: the echo was the reply's first line or no echo, so a device
     that sends a line break before it left it in the reply: over telnet

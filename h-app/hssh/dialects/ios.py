@@ -37,12 +37,19 @@ REFUSED = re.compile(r"^\s*(% |%(?![A-Z0-9_]+-\d+-[A-Z0-9_]+:)\S|ERROR:)", re.M)
 # (`%Default route without gateway, if not a point-to-point interface,
 # may impact performance`) or on a command it took and calls obsolete
 # (`%Command accepted but obsolete, unreleased or unsupported; see
-# documentation.`), or the note that a VRF enabled on an interface removed
-# its addresses (`% Interface Gi0/1 IPv4 disabled and address(es) removed
-# due to enabling VRF CUST`), which the payload's next line puts back. None
-# is a refusal: a lines edit goes on past it and reports it (#142).
+# documentation.`), what it says as it makes the RSA keys of `crypto key
+# generate rsa modulus 2048` (`% The key modulus size is 2048 bits`,
+# `% Generating 2048 bit RSA keys, keys will be non-exportable...`) and as
+# a switch leaves a VLAN's mode (`% Applying VLAN changes may take few
+# minutes.  Please wait...`), or the note that a VRF enabled on an
+# interface removed its addresses (`% Interface Gi0/1 IPv4 disabled and
+# address(es) removed due to enabling VRF CUST`), which the payload's next
+# line puts back. None is a refusal: a lines edit goes on past it and
+# reports it (#142).
 INFORMATIONAL = re.compile(r"^\s*%\s*(warning\b|portfast (has been|will be) configured\b"
                            r"|default route without gateway\b|command accepted but obsolete\b"
+                           r"|the key modulus size is \d+ bits|generating \d+ bit rsa keys\b"
+                           r"|applying vlan changes\b"
                            r"|interface \S+ .*\bremoved due to (en|dis)abling vrf\b)",
                            re.M | re.I)
 
