@@ -30,6 +30,8 @@ def pin_file(home):
 
 
 class FakeChannel:
+    eof_received = True          # its streams are files that end: the device's EOF
+
     def __init__(self, rc):
         self.rc = rc
 
@@ -1765,3 +1767,121 @@ def test_the_ssh_password_never_reaches_the_runs_records(shell_sshd, tmp_path, m
     for where, text in (("stdout", out), ("stderr", err), ("--log", log.read_text()),
                         ("the audit log", audit.read_text()), ("the store", kept)):
         assert text and secret not in text, where
+
+
+# --- #143: a session lost before the reply ended is not a reply ----------------
+
+class _ExecSshd(_Sshd):
+    """_Sshd that answers an exec: `reply(channel, command)` is the device,
+    in a thread of its own; `sent` keeps every command it was given."""
+
+    def __init__(self, logins, reply, sent):
+        super().__init__(logins)
+        self.reply, self.sent = reply, sent
+
+    def check_channel_request(self, kind, chanid):
+        return paramiko.OPEN_SUCCEEDED
+
+    def check_channel_exec_request(self, channel, command):
+        self.sent.append(command.decode())
+        threading.Thread(target=self.reply, args=(channel, command.decode()), daemon=True).start()
+        return True
+
+
+@pytest.fixture
+def exec_sshd():
+    """exec_sshd(reply) -> (port, sent): a paramiko SSH server on 127.0.0.1
+    that lets anyone in with a password and answers every exec with
+    `reply(channel, command)`; `sent` is the commands it got, in order."""
+    key = paramiko.ECDSAKey.generate()
+    opened = []
+
+    def make(reply):
+        sent = []
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        opened.append(srv)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                t = paramiko.Transport(conn)
+                t.add_server_key(key)
+                opened.append(t)
+                try:
+                    t.start_server(server=_ExecSshd([], reply, sent))
+                except (paramiko.SSHException, EOFError, OSError):
+                    pass
+        threading.Thread(target=serve, daemon=True).start()
+        return srv.getsockname()[1], sent
+    yield make
+    for each in opened:
+        each.close()
+
+
+def lost_after(*lines):
+    """A device that says `lines`, then loses the session: the connection
+    closes with no exit status, no EOF and no channel close before it."""
+    def reply(channel, command):
+        for line in lines:
+            channel.sendall(line.encode() + b"\n")
+        _time.sleep(0.2)
+        channel.get_transport().close()
+    return reply
+
+
+def no_status(channel, command):
+    """A device that ends its output (EOF), closes the channel and never sends an exit status."""
+    channel.sendall(b"output-for: " + command.encode() + b"\n")
+    channel.shutdown_write()
+    _time.sleep(0.1)
+    channel.close()
+
+
+def test_a_session_lost_before_the_command_finished_is_not_its_reply(exec_sshd):
+    """paramiko's -1 after the transport died was read as "no status":
+    a session lost 0.2 s after the exec was an OK show with empty output,
+    and one lost after two lines returned them as the whole reply. The EOF
+    is what tells it from a device that ends its output and never sends a
+    status (some network OSes): that one gave its whole reply."""
+    lost = "connection to 127.0.0.1 lost before 'show interfaces terse' finished"
+    for lines in ((), ("xe-0/0/0 up up", "xe-0/0/1 up up")):
+        port, sent = exec_sshd(lost_after(*lines))
+        with pytest.raises(ConnectionError) as failed:
+            ssh.show("127.0.0.1", "u", "p", "show interfaces terse", 5, 5, port=port)
+        assert str(failed.value) == lost and not runner.is_permanent_failure(failed.value)
+        (entry,) = ssh.show_batch("127.0.0.1", "u", "p", ["show interfaces terse"], 5, 5, port=port)
+        assert entry == {"command": "show interfaces terse", "ok": False, "error": lost}
+        assert sent == ["show interfaces terse"] * 2
+    port, _ = exec_sshd(no_status)
+    assert ssh.show("127.0.0.1", "u", "p", "show version", 5, 5, port=port) == (
+        "$ show version\noutput-for: show version\n")
+
+
+def test_a_lost_session_is_tried_again_for_a_read_and_fails_an_edit_once(exec_sshd, monkeypatch):
+    """A reset after connecting is retried for a read (README, Failure
+    handling); a none-dialect edit line whose session was lost came back
+    APPLIED. Its outcome is unknown: FAILED, and never sent again."""
+    monkeypatch.setattr(runner, "_backoff", lambda attempt, steps=None: 0)
+    port, sent = exec_sshd(lost_after("partial"))
+
+    def run(**kw):
+        args = dict(t=Target("R1", "127.0.0.1", "ssh", port), transport="ssh", mode="show",
+                    show_cmd=None, edit_cmd=None, config_dir=None, broadcast_file=None, user="u", passwd="p",
+                    session_timeout=5, command_timeout=5, dry_run=False, commit_confirmed=None, save_dir=None,
+                    quiet=True, max_attempts=3)
+        args.update(kw)
+        return runner.run_for_target(**args)
+    read = run(show_cmd="show version")
+    assert not read.ok and read.error == "connection to 127.0.0.1 lost before 'show version' finished"
+    assert sent == ["show version"] * 3
+    del sent[:]
+    edit = run(mode="edit-cmd", edit_cmd="set system host-name r1")
+    assert not edit.ok and edit.error == "connection to 127.0.0.1 lost before 'set system host-name r1' finished"
+    assert edit.result is None and "APPLIED" not in edit.text
+    assert sent == ["set system host-name r1"]
+

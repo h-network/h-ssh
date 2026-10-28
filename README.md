@@ -540,6 +540,11 @@ the lock.
 The default transport runs each line as its own `exec_command`. A command that exits non-zero is a
 failure, not output: an edit stops at that line and reports it, a batch marks the entry `ok: false`
 with the first line the device said about it (stderr, or stdout where the device puts its errors).
+So is a session lost before the command finished — the connection closed with no exit status and no
+end of output from the device — whatever the device had sent by then: `connection to HOST lost before
+'CMD' finished`. A read is tried again, an edit line is FAILED with its outcome unknown and never sent
+again, a batch marks that entry `ok: false`. A device that ends its output and closes without an exit
+status, as some network OSes do, has answered.
 
 Host keys are pinned on first contact in `~/.h-ssh/known_hosts` (created 0600), and
 `~/.ssh/known_hosts` is honoured too. The policy is the same `HSSH_HOST_KEY_POLICY` the `openssh`
@@ -1064,7 +1069,7 @@ once a run is under way, with the probe skipped or after it, is classified befor
 | A device that drops the session before login (`HOST dropped the session before login after Ns (…)`, an sshd at its connection limit) | on `ssh` a read is retried after 1 s and then 3 s, an edit is not; on `junos` it fails at once |
 | Authentication, host key, rejected command | fail immediately |
 | The request itself is wrong — `--structured` on a command without a binding, no password and no key to offer (`ssh`), a user or host name OpenSSH refuses, a `known_hosts` line that cannot be parsed, a pin file another h-ssh run keeps locked (`ssh`: `/home/you/.h-ssh/known_hosts is locked by another h-ssh run …`), a host PyEZ does not accept | fail immediately: the same call cannot come out differently |
-| Failures *after* connecting — command timeout, reset, broken pipe | retried, `--retries` times (default 2), after 1 s and then 3 s |
+| Failures *after* connecting — command timeout, reset, broken pipe, a session lost before the command finished (`ssh`: `connection to HOST lost before 'CMD' finished`) | retried, `--retries` times (default 2), after 1 s and then 3 s |
 
 The split is whether the device answered. A box that does not answer at all — a dead or blackholed
 address, or a port that accepts TCP and never sends the SSH banner (a load balancer or NAT answering
@@ -1525,7 +1530,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1368 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1370 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
