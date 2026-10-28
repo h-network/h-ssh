@@ -72,7 +72,7 @@ COMMIT_PENDING = re.compile(r"rollback in (\d+)\s*min", re.I)
 
 CLI = CliSyntax(
     prompt=re.compile(r'[\w\-\.]+@[\w\-\.]+[>%#]\s*$'),
-    prompt_name=re.compile(r'([\w\-\.]+@[\w\-\.]+)[>%#]\s*$'),
+    prompt_name=re.compile(r'^([\w\-\.]+@[\w\-\.]+)[>%#]\s*$'),
     prompt_tail=r'[>%#]\s*$',
     # Exclusive mode keeps the candidate to this session, as the NETCONF
     # driver's lock does: commit and rollback 0 never touch another user's

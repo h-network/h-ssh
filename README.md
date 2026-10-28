@@ -507,7 +507,8 @@ description ending in `>`, a community ending in `#` or a reply line `uplink to 
 taken for the prompt and shift every later reply. A reply with output of its own is read on until the
 device has said nothing more for 0.15 s after its prompt (0.3 s after a refusal: a CLI on a pty refuses
 the Enter again after redrawing the line), so a reply line that is the prompt itself (`Router>`) does
-not end it when the reply goes on within that time; output that comes within that time with no prompt
+not end it when the reply goes on within that time (unless it is the reply's first line: a reply that is
+only the echo and a prompt so far is not waited on, as each set line's is not); output that comes within that time with no prompt
 after it (a console's syslog line without `logging synchronous`) leaves the reply with none, and it
 fails on the command's timeout. A prompt the dialect cannot name (`RP/0/RSP0/CPU0:R1#` is no IOS prompt
 name) is not learned: the dialect's own pattern stays, which only has to end the line, so on such a
@@ -1502,7 +1503,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1342 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1344 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

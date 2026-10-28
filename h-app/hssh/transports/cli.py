@@ -82,6 +82,16 @@ def is_echo(line: str, cmd: str) -> bool:
     return line.strip().endswith(cmd.strip())
 
 
+def drawn_echo(line: str, cmd: str, prompt: re.Pattern) -> bool:
+    """The echo as a pty draws it: the command, after nothing or after a
+    prompt. A banner line that merely ends in the command (`Edits: always
+    enter with configure terminal`) is not it."""
+    if not is_echo(line, cmd):
+        return False
+    before = line.rstrip()[:len(line.rstrip()) - len(cmd.strip())]
+    return not before.strip() or bool(prompt.search(before))
+
+
 def complaint(output: str, dialect: Dialect) -> str:
     """The line in which the device refused what was typed: the dialect's
     own refusal where the reply has one, else the first line that is neither
@@ -463,7 +473,7 @@ class Cli:
                 return False
             if len(lines) == 1 and is_echo(lines[0], cmd):
                 return False                      # only the echo so far
-            if through_echo and not any(is_echo(line, cmd) for line in lines[:-1]):
+            if through_echo and not any(drawn_echo(line, cmd, self.cli.prompt) for line in lines[:-1]):
                 return False                      # what the banner had left, the echo still to come
             return self._at_prompt(clean, prompt_re)
 
@@ -498,7 +508,7 @@ class Cli:
         lines = clean.splitlines()
         echoed = False
         if through_echo:
-            echo = next((n for n, line in enumerate(lines) if is_echo(line, cmd)), -1)
+            echo = next((n for n, line in enumerate(lines) if drawn_echo(line, cmd, self.cli.prompt)), -1)
             lines, echoed = lines[echo + 1:], echo >= 0
         elif lines and is_echo(lines[0], cmd):
             lines, echoed = lines[1:], True

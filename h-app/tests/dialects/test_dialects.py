@@ -196,6 +196,20 @@ def test_telnet_maps_its_hints_to_dialects():
     assert telnet.PROMPT_PATTERNS["junos"] is dialects.junos.CLI.prompt
 
 
+def test_a_prompt_name_starts_the_line():
+    """#141 review: a prompt's name is where its line starts. Junos's was
+    not anchored, and named `noc@example.net` in a banner line `Contact
+    NOC <noc@example.net>`; IOS's already was."""
+    from hssh import dialects
+    junos = dialects.junos.DIALECT.cli.prompt_name
+    assert junos.search("lab@r1> ").group(1) == "lab@r1" and junos.search("lab@r1# ").group(1) == "lab@r1"
+    for banner in ("Unauthorized access prohibited. Contact NOC <noc@example.net>", "mail noc@example.net>",
+                   "\x1b[?2004hlab@r1> "):
+        assert junos.search(banner) is None
+    ios = dialects.ios.DIALECT.cli.prompt_name
+    assert ios.search("R1>").group(1) == "R1" and ios.search("report misuse to NOC-DESK>") is None
+
+
 def test_the_cli_engine_learns_the_prompt_from_the_dialects_shape():
     """The prompt learned is the whole line from its start (#141): a reply
     line that only ends in it, `uplink to BackupRouter#`, is not `Router#`.
