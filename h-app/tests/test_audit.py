@@ -332,6 +332,140 @@ def test_json_replies_lose_the_keys_that_carry_secrets():
     assert out["configuration"]["interfaces"]["description"] == "key customer uplink"
 
 
+# --- #151: what the review's corpus found ---------------------------------------------
+
+LEAKED_TOO = [
+    # IOS SNMPv3 user: the auth and the priv passwords
+    ('snmp-server user admin netops v3 auth sha AUTHPASS priv aes 128 PRIVPASS', ["AUTHPASS", "PRIVPASS"]),
+    ('snmp-server user admin netops v3 auth md5 AUTHPASS', ["AUTHPASS"]),
+    # IOS trap and inform hosts: the community after the version words
+    ('snmp-server host 10.0.0.1 version 2c C0MMUNITY', ["C0MMUNITY"]),
+    ('snmp-server host 10.0.0.1 traps version 2c C0MMUNITY udp-port 1162', ["C0MMUNITY"]),
+    ('snmp-server host 10.0.0.1 C0MMUNITY', ["C0MMUNITY"]),
+    # IOS wireless pre-shared key
+    ('wpa-psk ascii 7 0822455D0A16', ["0822455D0A16"]),
+    ('wpa-psk ascii 0 plainpsk', ["plainpsk"]),
+    # Junos: a trap group's name is its community
+    ('set snmp trap-group TRAPGRP targets 10.0.0.1', ["TRAPGRP"]),
+    ('    trap-group TRAPGRP {', ["TRAPGRP"]),
+    # an escaped quote inside the value: the tail after it leaked
+    ('password "abc\\"def"', ["abc", "def"]),
+    ('    secret "ab\\"cd"; ## SECRET-DATA', ["ab", "cd"]),
+]
+
+
+@pytest.mark.parametrize("line, secrets", LEAKED_TOO, ids=[line[:40] for line, _ in LEAKED_TOO])
+def test_the_forms_the_review_found_are_redacted(line, secrets):
+    out = redact_secrets(line)
+    assert "[REDACTED]" in out and not any(s in out for s in secrets), out
+
+
+def test_xml_and_json_names_ending_in_a_secret_word_are_redacted():
+    """--format xml and json replies of `show configuration` kept the type 9
+    values of hello-authentication-key, simple-password and chap-secret: the
+    XML and JSON patterns matched exact names, while the text form of the
+    same config was redacted. A tag or a key is known by its last word."""
+    xml = ("<interface><hello-authentication-key>$9$OSPF</hello-authentication-key></interface>"
+           "<rip><simple-password>$9$RIP</simple-password></rip><ppp><chap-secret>$9$CHAP</chap-secret></ppp>"
+           "<description>key customer uplink</description><keyboard>qwerty</keyboard>")
+    out = redact_secrets(xml)
+    assert out.count("[REDACTED]") == 3 and "$9$" not in out, out
+    assert "<description>key customer uplink</description>" in out and "<keyboard>qwerty</keyboard>" in out
+    data = {"hello-authentication-key": "$9$OSPF", "simple-password": "$9$RIP", "chap-secret": "$9$CHAP",
+            "keyboard": "qwerty", "description": "key customer uplink"}
+    assert redact_values(data) == {"hello-authentication-key": "[REDACTED]", "simple-password": "[REDACTED]",
+                                   "chap-secret": "[REDACTED]", "keyboard": "qwerty",
+                                   "description": "key customer uplink"}
+
+
+def test_a_json_reply_carried_as_text_is_redacted_like_parsed_data():
+    """`show configuration | display json` on junos@ssh and openssh comes
+    back as JSON text, not data, and --log kept the five secrets the tester
+    planted on a cRPD: the key's closing quote put `"encrypted-password" :
+    "$6$…"` out of the `password:` pattern's reach, and redact_values only
+    sees parsed data. A quoted key is known by the last-word rule
+    redact_values uses and its scalar goes, so the text reads as the parsed
+    reply would; the names and key-ids beside the secrets stay."""
+    text = json.dumps({"configuration": {
+        "system": {"login": {"user": [{"name": "t151", "authentication": {"encrypted-password": "$6$ROOT"}}]}},
+        "protocols": {
+            "bgp": {"group": [{"name": "peers", "authentication-key": "$9$BGP"}]},
+            "ospf": {"area": [{"name": "0.0.0.0", "interface": [{"name": "ge-0/0/0.0", "authentication": {
+                "md5": [{"name": 1, "key": "$9$MD5"}], "simple-password": "$9$OSPF"}}]}]},
+            "isis": {"interface": [{"name": "ge-0/0/0.0", "hello-authentication-key": "$9$ISIS"}]}}}},
+        indent=4, separators=(",", " : "))
+    out = redact_secrets(text)
+    for secret in ("$6$ROOT", "$9$BGP", "$9$MD5", "$9$OSPF", "$9$ISIS"):
+        assert secret not in out, out
+    assert json.loads(out) == redact_values(json.loads(text))
+    assert '"name" : "t151"' in out and '"name" : 1' in out and out.count('"[REDACTED]"') == 5
+    compact = '{"password":"x","api_token":123,"keyboard":"qwerty","key":null,"key-chain":"K"}'
+    assert redact_secrets(compact) == ('{"password":"[REDACTED]","api_token":"[REDACTED]","keyboard":"qwerty",'
+                                       '"key":"[REDACTED]","key-chain":"K"}')
+
+
+def test_what_is_not_a_secret_stays():
+    """Over-redaction the review found: a `key N` line took the next line's
+    first word for its value (a key-string keyword, a cryptographic-algorithm),
+    a BGP community's name went, and a quoted command lost its closing
+    quote. SNMP communities still go, in every form they are written. A
+    description with the word password in it still loses the word after
+    it: sparing it opened leaks (a secret whose value has the word
+    description in it), and a log that says too little beats one that
+    says a secret."""
+    chain = ("key chain K\n key 1\n  key-string 7 0822455D0A16\n  cryptographic-algorithm hmac-sha-256\n"
+             " key 2\n  key-string 7 0822455D0A17")
+    assert redact_secrets(chain) == ("key chain K\n key 1\n  key-string 7 [REDACTED]\n  cryptographic-algorithm hmac-sha-256\n"
+                                     " key 2\n  key-string 7 [REDACTED]")
+    for line in ("set policy-options community CUST members 65000:100",
+                 "    community CUST members [ 65000:100 65000:200 ];"):
+        assert redact_secrets(line) == line
+    assert redact_secrets("'show password X'") == "'show password [REDACTED]'"
+    assert redact_secrets('set interfaces ge-0/0/0 description "password reset portal"') == \
+        'set interfaces ge-0/0/0 description "password [REDACTED] portal"'
+    assert redact_secrets("set snmp community public authorization read-only") == \
+        "set snmp community [REDACTED] authorization read-only"
+    assert redact_secrets("    community public {") == "    community [REDACTED] {"
+    assert redact_secrets("snmp-server community C0MM RO") == "snmp-server community [REDACTED] RO"
+
+
+def test_a_quoted_credential_command_is_redacted_and_a_description_spares_no_secret():
+    """#151 review: the openssh transport repeats a refused command in
+    quotes in its error, and a credential in it must still go, the closing
+    quote kept. Sparing a description's words opened leaks (a secret whose
+    value has the word description in it), so none is spared: the keyword
+    patterns apply wherever the keyword is, a description included."""
+    assert redact_secrets("'password hunter2' was refused by the device: bad command") == \
+        "'password [REDACTED]' was refused by the device: bad command"
+    assert redact_secrets('"set system login user bob authentication plain-text-password-value hunter2" was refused') == \
+        '"set system login user bob authentication plain-text-password-value [REDACTED]" was refused'
+    assert redact_secrets('    description "customer password reset portal";\n    encrypted-password "$9$x";') == \
+        '    description "customer password [REDACTED] portal";\n    encrypted-password [REDACTED];'
+    assert redact_values({"description": "customer password reset portal", "password": "x"}) == \
+        {"description": "customer password [REDACTED] portal", "password": "[REDACTED]"}
+    assert redact_secrets('password "description hunter2"') == 'password [REDACTED]'
+    assert redact_secrets('encrypted-password "has description words";') == 'encrypted-password [REDACTED];'
+    assert redact_secrets('<password>description hunter2</password>') == '<password>[REDACTED]</password>'
+    assert redact_secrets('snmp-server user admin netops v3 auth sha description priv aes 128 PRIVPASS') == \
+        'snmp-server user admin netops v3 auth sha [REDACTED] priv aes 128 [REDACTED]'
+    assert redact_secrets('    secret "description hunter2"; ## SECRET-DATA') == '    secret [REDACTED]; ## SECRET-DATA'
+    assert redact_secrets('encrypted-password "has description words";') == 'encrypted-password [REDACTED];'
+    assert redact_secrets('<password>description hunter2</password>') == '<password>[REDACTED]</password>'
+    assert redact_secrets('snmp-server user admin netops v3 auth sha description priv aes 128 PRIVPASS') == \
+        'snmp-server user admin netops v3 auth sha [REDACTED] priv aes 128 [REDACTED]'
+    assert redact_secrets('    secret "description hunter2"; ## SECRET-DATA') == '    secret [REDACTED]; ## SECRET-DATA'
+
+
+def test_the_comment_is_redacted_too(tmp_path):
+    """An entry's `comment` was written as given, where every other text of
+    the entry is redacted; a comment can quote the secret it rotated."""
+    path = tmp_path / "audit.jsonl"
+    write_audit_entry(path=str(path), device="R1", host="10.0.1.1", vendor="junos", mode="edit-cmd",
+                      payload="set system host-name R1", ok=True, comment="rotated: password hunter2")
+    record = json.loads(path.read_text())
+    assert record["comment"] == "rotated: password [REDACTED]" and "hunter2" not in path.read_text()
+
+
 def test_secure_write_is_0600_and_refuses_a_symlink(tmp_path):
     from hssh.audit import secure_write
     os.umask(0o022)

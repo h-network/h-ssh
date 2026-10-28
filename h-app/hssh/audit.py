@@ -12,48 +12,90 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# A value as a config line writes it: quoted, with escaped quotes inside it
+# ("abc\"def" is one value), or one word; never a quote on its own, and
+# never the next line's first word (blanks between the words, not `\s`).
+_VALUE = r'("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s;"\']+)'
+
+# The last word of a JSON key whose whole value is a secret (see _SECRET_KEY
+# and redact_values below): "encrypted-password", "hello-authentication-key",
+# "chap-secret", "api_token".
+_SECRET_WORDS = (r'password(?:-value)?|passwd|secret|key|key-string|key-hex|hexadecimal|'
+                 r'ascii-text|token|community')
+
 # Patterns for redaction of sensitive credentials/tokens. Order matters: the
 # Junos "## SECRET-DATA" rule goes first, it knows the value is the last token
 # whatever the keyword.
 _REDACT_PATTERNS = [
     # Junos marks every secret line in text/display-set output: the last token
     # before the marker is the secret, whatever stanza it sits in.
-    (re.compile(r'^([^\n]*?)("[^"\n]*"|[^\s\n;]+)(;?\s*## SECRET-DATA)', re.MULTILINE),
+    (re.compile(r'^([^\n]*?)' + _VALUE + r'(;?[ \t]*## SECRET-DATA)', re.MULTILINE),
      r'\1[REDACTED]\3'),
     # keyword [type words] value — Junos set/text, EOS and IOS alike:
     # `plain-text-password-value hunter2`, `authentication md5 1 key X`,
     # `ntp authentication-key 1 value "$9$.."`, `secret sha512 $6$..`,
-    # `tacacs-server key 7 X`, `key-string 7 X`, `privacy-key "$9$.."`.
+    # `tacacs-server key 7 X`, `key-string 7 X`, `privacy-key "$9$.."`,
+    # and a quoted command an error repeats (`'password X' was refused`).
     (re.compile(r'((?:encrypted-password|plain-text-password(?:-value)?|password(?:-value)?|secret|'
-                r'authentication-key|message-digest-key|md5-key|privacy-key|key-string)\s+'
-                r'(?:(?:\d+|md5|sha512|sha256|sha1|sha|value|type\s+\S+|hmac-\S+)\s+)*)'
-                r'(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+                r'authentication-key|message-digest-key|md5-key|privacy-key|key-string)[ \t]+'
+                r'(?:(?:\d+|md5|sha512|sha256|sha1|sha|value|type[ \t]+\S+|hmac-\S+)[ \t]+)*)' + _VALUE,
+                re.IGNORECASE),
      r'\1[REDACTED]'),
     # A bare `key` only where a protocol puts a secret after it, so a
     # description with the word "key" in it is left alone: `md5 1 key X`
     # (OSPF/IS-IS/BGP), `key 7 X` (IOS type 7), `tacacs-server … key X`,
-    # `radius-server … key X`, `crypto isakmp key X`.
-    (re.compile(r'((?:(?<![\w-])(?:md5|sha\d*|hmac-\S+)\s+\d+\s+key\s+|(?<![\w-])key\s+\d+\s+|\bisakmp\s+key\s+|'
-                r'\b(?:tacacs-server|radius-server)\b[^\n]*?\bkey\s+(?:\d+\s+)?))'
-                r'(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+    # `radius-server … key X`, `crypto isakmp key X`. A key chain's `key 1`
+    # line ends there: the key-string below it is not its value.
+    (re.compile(r'((?:(?<![\w-])(?:md5|sha\d*|hmac-\S+)[ \t]+\d+[ \t]+key[ \t]+|(?<![\w-])key[ \t]+\d+[ \t]+|'
+                r'\bisakmp[ \t]+key[ \t]+|'
+                r'\b(?:tacacs-server|radius-server)\b[^\n]*?\bkey[ \t]+(?:\d+[ \t]+)?))' + _VALUE, re.IGNORECASE),
      r'\1[REDACTED]'),
-    # XML, as --format xml returns it: <encrypted-password>$6$..</encrypted-password>
-    (re.compile(r'(<(?:[\w.-]+:)?(?:encrypted-password|plain-text-password-value|secret|password|passwd|'
-                r'authentication-key|md5-key|key|key-string|privacy-key|pre-shared-key|ascii-text|'
-                r'hexadecimal|hex-key|key-hex|token|api-key)>)[^<]*(?=</)', re.IGNORECASE),
+    # XML, as --format xml returns it, the tag known by its last word:
+    # <encrypted-password>, <hello-authentication-key>, <chap-secret>, <key>.
+    (re.compile(r'(<(?:[\w.-]+:)?(?:[\w.-]+-)?(?:password(?:-value)?|passwd|secret|key|key-string|'
+                r'ascii-text|hexadecimal|key-hex|token|api_key)>)[^<]*(?=</)', re.IGNORECASE),
      r'\1[REDACTED]'),
     (re.compile(r'(<community>\s*<name>)[^<]*(?=</name>)', re.IGNORECASE), r'\1[REDACTED]'),
-    (re.compile(r'((?:password|secret|token|api[_-]?key|passwd)\s*[:=]\s*)(?:("[^"]*"|\'[^\']*\'|[^\s,;]+))', re.IGNORECASE),
+    # JSON carried as text (`show configuration | display json` on junos@ssh
+    # or openssh): the quoted key known by the last-word rule redact_values
+    # uses for parsed data, its scalar replaced as the parsed reply would read.
+    (re.compile(r'("(?:[^"\\\n]*[-_])?(?:' + _SECRET_WORDS + r')"[ \t]*:[ \t]*)'
+                r'(?:"(?:\\.|[^"\\\n])*"|[^\s,{}\[\]"]+)', re.IGNORECASE),
+     r'\1"[REDACTED]"'),
+    (re.compile(r'((?:password|secret|token|api[_-]?key|passwd)[ \t]*[:=][ \t]*)'
+                r'(?:("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s,;"\']+))', re.IGNORECASE),
      r'\1[REDACTED]'),
-    (re.compile(r'(\bcommunity\s+)(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+    # A `community` is SNMP's wherever it is written (`set snmp community
+    # public …`, `snmp-server community C0MM RO`, a stanza's or a diff's own
+    # `community public {` line, an error's `community public rejected`),
+    # but for a BGP community's definition: `policy-options community CUST
+    # members …` names no secret.
+    (re.compile(r'(\bcommunity[ \t]+)' + _VALUE + r'(?=[\s;{}]|$)(?![ \t]+members\b)', re.IGNORECASE),
      r'\1[REDACTED]'),
-    (re.compile(r'(\b(?:pre-shared-key|ascii-text|hexadecimal|hex-key|key-hex)\s+(?:(?:ascii-text|hexadecimal|hex-key|key-hex)\s+)?)(?:("[^"]*"|\'[^\']*\'|[^\s\n;]+))', re.IGNORECASE),
+    # IOS: the community a trap or inform host is told, an SNMPv3 user's auth
+    # and priv passwords, a wireless pre-shared key; Junos: a trap group's
+    # name is its community.
+    (re.compile(r'(\bsnmp-server[ \t]+host[ \t]+\S+(?:[ \t]+(?:informs|traps|vrf[ \t]+\S+|'
+                r'version[ \t]+(?:1|2c|3(?:[ \t]+(?:auth|noauth|priv))?)))*[ \t]+)' + _VALUE, re.IGNORECASE),
+     r'\1[REDACTED]'),
+    (re.compile(r'(\bsnmp-server[ \t]+user\b[^\n]*?\bauth[ \t]+(?:md5|sha)[ \t]+)' + _VALUE, re.IGNORECASE),
+     r'\1[REDACTED]'),
+    (re.compile(r'(\bsnmp-server[ \t]+user\b[^\n]*?\bpriv[ \t]+(?:des|3des|aes[ \t]+\d+)[ \t]+)' + _VALUE,
+                re.IGNORECASE),
+     r'\1[REDACTED]'),
+    (re.compile(r'(\bwpa-psk[ \t]+(?:ascii|hex)[ \t]+(?:\d+[ \t]+)?)' + _VALUE, re.IGNORECASE), r'\1[REDACTED]'),
+    (re.compile(r'(\btrap-group[ \t]+)' + _VALUE, re.IGNORECASE), r'\1[REDACTED]'),
+    (re.compile(r'(\b(?:pre-shared-key|ascii-text|hexadecimal|hex-key|key-hex)[ \t]+'
+                r'(?:(?:ascii-text|hexadecimal|hex-key|key-hex)[ \t]+)?)' + _VALUE, re.IGNORECASE),
      r'\1[REDACTED]'),
 ]
 
 
 def redact_secrets(text: Optional[str]) -> Optional[str]:
-    """Redact passwords and secrets from text."""
+    """Redact passwords and secrets from text. A keyword's value goes
+    wherever the keyword is: a description with "password" in it loses the
+    word after it too, and a log that says too little beats one that says
+    a secret (#151)."""
     if not text:
         return text
     result = text
@@ -62,15 +104,11 @@ def redact_secrets(text: Optional[str]) -> Optional[str]:
     return result
 
 
-# JSON keys whose whole value is a secret. A reply carried as data (--format
-# json) puts "encrypted-password" in the key and the hash in the value, out
-# of reach of the text patterns above.
-_SECRET_KEYS = frozenset({
-    "encrypted-password", "plain-text-password-value", "secret", "password", "passwd",
-    "authentication-key", "md5-key", "key", "key-string", "privacy-key", "community",
-    "pre-shared-key", "ascii-text", "hexadecimal", "hex-key", "key-hex", "token",
-    "api-key", "api_key",
-})
+# A JSON key whose whole value is a secret, known by its last word. A reply
+# carried as data (--format json) puts "encrypted-password" (or
+# "hello-authentication-key", "chap-secret") in the key and the hash in the
+# value, out of reach of the text patterns above.
+_SECRET_KEY = re.compile(r'(?:^|[-_])(?:' + _SECRET_WORDS + r')$')
 
 
 def redact_values(data):
@@ -82,7 +120,7 @@ def redact_values(data):
     if isinstance(data, list):
         return [redact_values(v) for v in data]
     if isinstance(data, dict):
-        return {k: ("[REDACTED]" if str(k).lower() in _SECRET_KEYS else redact_values(v))
+        return {k: ("[REDACTED]" if _SECRET_KEY.search(str(k).lower()) else redact_values(v))
                 for k, v in data.items()}
     return data
 
@@ -206,7 +244,7 @@ def write_audit_entry(
         if commit_confirmed:
             entry["commit_confirmed"] = commit_confirmed
         if comment:
-            entry["comment"] = comment
+            entry["comment"] = redact_secrets(comment)
         if diff:
             entry["diff"] = redact_secrets(diff)
         if error:

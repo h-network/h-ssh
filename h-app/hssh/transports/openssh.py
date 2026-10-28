@@ -71,18 +71,27 @@ _HOST_KEY_POLICY = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
 # and fall back to prompting on the terminal, so refuse rather than guess.
 _MIN_OPENSSH = (8, 4)
 
-# The helper carries no secret. OpenSSH passes its own environment to it, so
-# the password travels in the environment of the ssh process, readable only by
-# this user. Nothing is written to disk except this three-line script.
+# The helper carries no secret: it prints the 0600 file beside it, which
+# holds the password in the helper's 0700 directory for the call alone (the
+# login and the commands on its session; a `-tt` session until its prompt)
+# and goes with it. The password used to ride in the ssh process's environment,
+# which any process of this user reads from /proc/<pid>/environ and a
+# ProxyCommand inherits (#151).
 _ASKPASS_HELPER = """#!/bin/sh
-printf '%s\\n' "$HSSH_ASKPASS_SECRET"
+cat "${0%/*}/secret"
 """
+
+
+def _without_password() -> dict:
+    """The environment for an ssh that needs no credential (`-V`, `-O check`,
+    `-O exit`): HSSH_PASSWORD is the operator's, not its to inherit (#151)."""
+    return {k: v for k, v in os.environ.items() if k != "HSSH_PASSWORD"}
 
 
 def _openssh_version() -> tuple:
     """(major, minor) of the ssh on PATH, or () if it cannot be determined."""
     try:
-        proc = subprocess.run(["ssh", "-V"], capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(["ssh", "-V"], capture_output=True, text=True, timeout=10, env=_without_password())
     except (OSError, subprocess.SubprocessError):
         return ()
     banner = (proc.stderr or "") + (proc.stdout or "")
@@ -104,14 +113,16 @@ def _dialect(vendor_hint: Optional[str]) -> Dialect:
 class _AskPass:
     """A short-lived SSH_ASKPASS helper, and the environment that points ssh at it.
 
-    The password reaches OpenSSH through the helper's environment, never through
-    the session, so no amount of device output can be mistaken for a prompt.
+    The password reaches OpenSSH through the helper, which reads it from the
+    file beside it, never through the session, so no amount of device output
+    can be mistaken for a prompt.
     """
 
     def __init__(self, passwd: Optional[str]):
         self.passwd = passwd
         self.dir = None
         self.path = None
+        self.secret = None
 
     def __enter__(self):
         if not self.passwd:
@@ -123,11 +134,21 @@ class _AskPass:
                 "SSH_ASKPASS_REQUIRE (found %d.%d); use key authentication"
                 % (_MIN_OPENSSH + version))
         self.dir = tempfile.mkdtemp(prefix="hssh-ap-")
-        os.chmod(self.dir, stat.S_IRWXU)
-        self.path = os.path.join(self.dir, "askpass")
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(_ASKPASS_HELPER)
+        try:
+            os.chmod(self.dir, stat.S_IRWXU)
+            self.path = os.path.join(self.dir, "askpass")
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(_ASKPASS_HELPER)
+            self.secret = os.path.join(self.dir, "secret")
+            fd = os.open(self.secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(self.passwd + "\n")
+        except BaseException:
+            # A `with` that failed to enter is never exited: what was made
+            # (the directory, the helper, part of the secret) goes here.
+            self.__exit__(None, None, None)
+            raise
         return self
 
     @property
@@ -135,24 +156,25 @@ class _AskPass:
         env = os.environ.copy()
         # The password reaches ssh through the askpass channel only; the
         # variable the operator set is not for ssh, the ControlMaster daemon
-        # (which outlives the run) or any ProxyCommand helper to inherit.
+        # (which outlives the run) or any ProxyCommand helper to inherit, and
+        # neither is the password itself: the helper reads it from its file.
         env.pop("HSSH_PASSWORD", None)
         if not self.passwd:
             return env
         env["SSH_ASKPASS"] = self.path
         env["SSH_ASKPASS_REQUIRE"] = "force"
-        env["HSSH_ASKPASS_SECRET"] = self.passwd
         # DISPLAY is irrelevant under REQUIRE=force and only invites an X11
         # askpass dialog on a desktop, which would hang a batch run.
         env.pop("DISPLAY", None)
         return env
 
     def __exit__(self, *_exc):
-        if self.path:
-            try:
-                os.unlink(self.path)
-            except OSError:
-                pass
+        for made in (self.secret, self.path):
+            if made:
+                try:
+                    os.unlink(made)
+                except OSError:
+                    pass
         if self.dir:
             try:
                 os.rmdir(self.dir)
@@ -388,7 +410,7 @@ def _master_running(host: str, user: str, control_path: str, port: Optional[int]
             ["ssh", "-O", "check", "-o", "ControlPath=%s" % control_path]
             + (["-p", str(port)] if port else [])
             + ["--", "%s@%s" % (user, host) if user else host],
-            capture_output=True, timeout=float(timeout)).returncode == 0
+            capture_output=True, timeout=float(timeout), env=_without_password()).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -715,7 +737,7 @@ def _close_master(host: str, user: str, control_path: Optional[str],
                 ["ssh", "-O", "exit", "-o", "ControlPath=%s" % control_path]
                 + (["-p", str(port)] if port else [])
                 + ["--", "%s@%s" % (user, host) if user else host],
-                capture_output=True, text=True, timeout=float(session_timeout))
+                capture_output=True, text=True, timeout=float(session_timeout), env=_without_password())
     except (OSError, subprocess.SubprocessError):
         pass
     try:

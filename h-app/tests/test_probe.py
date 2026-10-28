@@ -1389,3 +1389,20 @@ def test_a_box_this_machine_has_no_descriptor_for_is_not_probed_not_dead(real_pr
     monkeypatch.setattr(probe.socket, "socket", no_descriptor)
     answer = asyncio.run(probe.attempt("127.0.0.1", 830, b"SSH-", 1.0))
     assert answer.result == probe.NOT_PROBED and limit in answer.reason, answer
+
+
+
+def test_ssh_g_runs_without_the_operators_password_in_its_environment(monkeypatch, tmp_path):
+    """#151: the probe's `ssh -G` ran with the environment as it is,
+    HSSH_PASSWORD in it, where the openssh transport keeps the variable
+    from every ssh it runs."""
+    fake = tmp_path / "ssh"
+    fake.write_text("#!/bin/sh\nenv > \"$FAKE_SSH_ENV\"\nprintf 'hostname 127.0.0.1\\nport 22\\n'\n")
+    fake.chmod(0o700)
+    monkeypatch.setenv("FAKE_SSH_ENV", str(tmp_path / "env"))
+    monkeypatch.setenv("HSSH_PASSWORD", "hunter2")
+    monkeypatch.setattr(probe, "SSH_G", (str(fake), "-G"))
+    route = probe._ssh_g("r1.invalid", None, 22, "u", 5)
+    assert (route.host, route.port, route.via) == ("127.0.0.1", 22, None)
+    seen = (tmp_path / "env").read_text()
+    assert "hunter2" not in seen and "HSSH_PASSWORD" not in seen and "FAKE_SSH_ENV" in seen
