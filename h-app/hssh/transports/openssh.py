@@ -72,8 +72,9 @@ _HOST_KEY_POLICY = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
 _MIN_OPENSSH = (8, 4)
 
 # The helper carries no secret: it prints the 0600 file beside it, which
-# holds the password in the helper's 0700 directory for the login alone and
-# goes with it. The password used to ride in the ssh process's environment,
+# holds the password in the helper's 0700 directory for the call alone (the
+# login and the commands on its session; a `-tt` session until its prompt)
+# and goes with it. The password used to ride in the ssh process's environment,
 # which any process of this user reads from /proc/<pid>/environ and a
 # ProxyCommand inherits (#151).
 _ASKPASS_HELPER = """#!/bin/sh
@@ -133,15 +134,21 @@ class _AskPass:
                 "SSH_ASKPASS_REQUIRE (found %d.%d); use key authentication"
                 % (_MIN_OPENSSH + version))
         self.dir = tempfile.mkdtemp(prefix="hssh-ap-")
-        os.chmod(self.dir, stat.S_IRWXU)
-        self.path = os.path.join(self.dir, "askpass")
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(_ASKPASS_HELPER)
-        self.secret = os.path.join(self.dir, "secret")
-        fd = os.open(self.secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(self.passwd + "\n")
+        try:
+            os.chmod(self.dir, stat.S_IRWXU)
+            self.path = os.path.join(self.dir, "askpass")
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(_ASKPASS_HELPER)
+            self.secret = os.path.join(self.dir, "secret")
+            fd = os.open(self.secret, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(self.passwd + "\n")
+        except BaseException:
+            # A `with` that failed to enter is never exited: what was made
+            # (the directory, the helper, part of the secret) goes here.
+            self.__exit__(None, None, None)
+            raise
         return self
 
     @property

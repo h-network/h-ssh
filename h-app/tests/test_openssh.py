@@ -1,4 +1,5 @@
 """OpenSSH transport tests — a fake `ssh` binary on PATH, no live devices needed."""
+import errno
 import json
 import os
 import stat
@@ -238,7 +239,7 @@ def test_device_output_is_never_rewritten(askpass_ssh):
 
 def test_the_helper_holds_no_secret_and_the_secret_file_beside_it_is_0600(askpass_ssh, tmp_path):
     """The helper is a script; the password is a 0600 file beside it in the
-    helper's 0700 directory, for the login alone (#151: it travelled in the
+    helper's 0700 directory, for the call alone (#151: it travelled in the
     ssh process's environment before)."""
     captured = {}
     real = openssh._AskPass.__enter__
@@ -282,6 +283,44 @@ def test_askpass_helper_is_removed_afterwards(askpass_ssh):
     assert not os.path.exists(seen["path"])
     assert not os.path.exists(seen["secret"])
     assert not os.path.exists(seen["dir"])
+
+
+def test_a_secret_that_cannot_be_written_leaves_nothing_behind(monkeypatch):
+    """#151 review: an error writing the secret (ENOSPC after its first bytes)
+    raised out of __enter__, which no __exit__ follows: the helper, the
+    directory and the partial secret stayed. Nothing of a login that never
+    started is left behind, and the error is the caller's."""
+    real_fdopen = os.fdopen
+
+    class ShortDisk:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+
+        def write(self, text):
+            self.fh.write(text[:8])
+            self.fh.flush()
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    opened = []
+
+    def fdopen(fd, *a, **kw):
+        fh = real_fdopen(fd, *a, **kw)
+        opened.append(fd)
+        return ShortDisk(fh) if len(opened) == 2 else fh         # the second file made is the secret
+    monkeypatch.setattr(os, "fdopen", fdopen)
+    monkeypatch.setattr(openssh, "_openssh_version", lambda: (9, 6))
+    ap = openssh._AskPass("hunter2")
+    with pytest.raises(OSError, match="No space left"):
+        with ap:
+            pass
+    assert ap.dir and ap.secret and len(opened) == 2
+    assert not os.path.exists(ap.secret) and not os.path.exists(ap.path) and not os.path.exists(ap.dir)
 
 
 def test_no_askpass_configured_without_a_password(fake_ssh):
