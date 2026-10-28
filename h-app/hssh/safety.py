@@ -9,7 +9,8 @@ A device is its host and the port its transport uses, as everywhere in
 h-ssh (#145): two routers behind one address on two ports are two devices.
 Both tiers key on it, `host|port` in the file; a caller that names no port
 keys on the host alone, as every key was before, and such an entry in the
-file holds every port of that host.
+file holds every port of that host. Asked about the host alone, the gate
+answers for the host as a whole: held while any port of it is cooling.
 """
 
 from contextlib import contextmanager
@@ -84,6 +85,8 @@ class SafetyGate:
 
     def check_device(self, host: str, port: Optional[int] = None, *, login: bool = True) -> tuple[bool, str]:
         """Check whether a device, `host` and `port`, is safe to contact.
+        Without a port it is the host as a whole, which a cooldown on any
+        port of it turns away.
 
         Returns (allowed, reason). The device is added to _active BEFORE
         returning True — crash before release_device() keeps it blocked
@@ -135,10 +138,10 @@ class SafetyGate:
 
     def holds(self, devices) -> dict:
         """{device: why} for each of `devices`, (host, port) pairs (or a
-        host alone), that check_device() would turn away now for a reason
-        that outlasts this run: a cooldown, a corrupt safety file. Nothing
-        is recorded; the probe asks before it connects, so a box in
-        cooldown gets no connection from it either."""
+        host alone, the host as a whole), that check_device() would turn
+        away now for a reason that outlasts this run: a cooldown, a corrupt
+        safety file. Nothing is recorded; the probe asks before it
+        connects, so a box in cooldown gets no connection from it either."""
         with self._lock:
             if self._safety_file:
                 self._load_cooldowns()
@@ -174,8 +177,14 @@ class SafetyGate:
         """When the device's cooldown ends; None when none is running. Its
         own entry counts, and one kept under the host alone (by a caller
         that names no port, or an h-ssh before #145), which holds every
-        port of the host; the later of the two."""
-        ends = [self._cooldowns[k] for k in {_key(host, port), host} if now < self._cooldowns.get(k, now)]
+        port of the host. Without a port the device is the host as a
+        whole, held while any port of it is cooling, so a caller that names
+        none still sees the cooldowns h-ssh keeps as `host|port`. The
+        latest of them."""
+        keys = {_key(host, port), host}
+        if port is None:
+            keys.update(k for k in self._cooldowns if k.startswith(f"{host}|"))
+        ends = [self._cooldowns[k] for k in keys if now < self._cooldowns.get(k, now)]
         return max(ends) if ends else None
 
     def close(self) -> None:

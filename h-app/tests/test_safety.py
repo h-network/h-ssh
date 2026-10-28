@@ -78,7 +78,10 @@ def test_a_device_is_its_host_and_its_port(tmp_path):
     """Two routers behind one address are two devices (#145): each is
     marked active, counted and cooled on its own, and the file keeps a
     cooldown as `host|port`. An entry kept under the host alone (a caller
-    that names no port, a file an older h-ssh wrote) holds every port."""
+    that names no port, a file an older h-ssh wrote) holds every port, and
+    such a caller asks for the host as a whole, held while any port of it
+    is cooling: a script on the old API, sharing the file with h-ssh runs,
+    sees their cooldowns."""
     path = str(tmp_path / "safety.json")
     gate = SafetyGate(safety_file=path, rate_limit=1)
     assert gate.check_device("10.0.0.1", 8301) == (True, "ok")
@@ -90,6 +93,12 @@ def test_a_device_is_its_host_and_its_port(tmp_path):
         assert list(json.load(f)) == ["10.0.0.1|8301"]
     assert gate.check_device("10.0.0.1", 8301)[1].startswith("cooldown active")
     assert list(gate.holds([("10.0.0.1", 8301), ("10.0.0.1", 8302)])) == [("10.0.0.1", 8301)]
+    gate.set_cooldown("10.0.0.20", 22)
+    script = SafetyGate(safety_file=path)                                 # the old API, on the same file
+    allowed, reason = script.check_device("10.0.0.1")                     # no port: the host as a whole
+    assert not allowed and reason.startswith("cooldown active")
+    assert list(script.holds(["10.0.0.1", "10.0.0.2"])) == ["10.0.0.1"]  # 10.0.0.20 is not 10.0.0.2
+    assert script.check_device("10.0.0.1", 8302) == (True, "ok")         # the other port still goes
     gate.set_cooldown("10.0.0.1")                                         # the host alone: every port of it
     assert sorted(gate.holds([("10.0.0.1", 8302), ("10.0.0.1", 22), ("10.0.0.2", 22)])) == [
         ("10.0.0.1", 22), ("10.0.0.1", 8302)]
