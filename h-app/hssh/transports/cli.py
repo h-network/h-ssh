@@ -445,7 +445,8 @@ class Cli:
         that ended on a banner line shaped like a prompt, the device then
         pausing longer than SETTLE, once had the rest of the banner read as
         the first reply and each later reply as the one before: a refused
-        line came back APPLIED (#141).
+        line came back APPLIED (#141). Such a login could not name the
+        device's prompt, which is learned from this reply's instead.
 
         A command with a control character or a Tab in it is not typed: the
         CLI would take it as a key (refuse_control_characters)."""
@@ -475,6 +476,8 @@ class Cli:
         output = self._read_until(done, command_timeout, settle=settle)
         if through_echo:
             self._in_step = True
+            if self.prompt_re is self.cli.prompt:      # the login named none
+                self.prompt_re = self._learn_prompt(output)
         return "\n".join(self._reply_lines(output, cmd, prompt_re, through_echo))
 
     def _reply_lines(self, clean: str, cmd: str, prompt_re: re.Pattern, through_echo: bool = False) -> list:

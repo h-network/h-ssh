@@ -457,17 +457,18 @@ that time. When the device pauses longer right after it, before the line break, 
 line that is all `NOC-DESK>` is then learned as the prompt, and every command fails on its timeout,
 nothing applied. One that only ends in it costs an SSH shell nothing: the shell echoes every line typed,
 so the first command after the login, always one of the engine's own (`configure exclusive`,
-`configure terminal`, `show system commit`), is read through its echo and then its prompt, and the rest
-of the banner is never taken for its reply. Over telnet, where the device need not echo, the rest of the
-banner is read as the first reply and each later reply as the one before, so a refused line can come
-back APPLIED. An empty `show | compare` is `NO CHANGES` (the note Junos prints above `[edit]` while a
-commit confirmed waits, `# commit confirmed will be rolled back in 4 minutes`, is the prompt's, not a
-diff): the candidate is discarded and no `commit` is typed, plain or confirmed, as NETCONF aborts on an
-empty diff, so no timer is armed over nothing and no other user's pending commit-confirmed is confirmed
-by it. Shows over SSH use an exec channel, one command per channel; only edits and confirms open a
-shell. Over the OpenSSH binary the shell is `ssh -tt -e none` (no escape character, so a typed line that
-starts with `~` goes to the device as it is), with a password still handed over through `SSH_ASKPASS`,
-never typed at a prompt. The plain `ssh`/`openssh` drivers (dialect `none`) never open a shell.
+`configure terminal`, `show system commit`), is read through its echo and then its prompt, the device's
+prompt is learned from it, and the rest of the banner is never taken for its reply. Over telnet, where
+the device need not echo, the rest of the banner is read as the first reply and each later reply as the
+one before, so a refused line can come back APPLIED. An empty `show | compare` is `NO CHANGES` (the note
+Junos prints above `[edit]` while a commit confirmed waits,
+`# commit confirmed will be rolled back in 4 minutes`, is the prompt's, not a diff): the candidate is
+discarded and no `commit` is typed, plain or confirmed, as NETCONF aborts on an empty diff, so no timer
+is armed over nothing and no other user's pending commit-confirmed is confirmed by it. Shows over SSH
+use an exec channel, one command per channel; only edits and confirms open a shell. Over the OpenSSH
+binary the shell is `ssh -tt -e none` (no escape character, so a typed line that starts with `~` goes to
+the device as it is), with a password still handed over through `SSH_ASKPASS`, never typed at a prompt.
+The plain `ssh`/`openssh` drivers (dialect `none`) never open a shell.
 
 The engine types plain text only. A CLI acts on a control character as it arrives (^C drops the line
 typed so far, ^U kills it, DEL rubs out a character, a Tab completes the word), and what is left of the

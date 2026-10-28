@@ -276,7 +276,8 @@ def test_on_a_channel_that_echoes_the_first_reply_is_read_through_its_echo():
     APPLIED. A pty echoes each line typed, and the ssh and openssh shells
     say so: the first reply is read until the echo of its command and then
     its prompt, what came before the echo is not part of it, and each reply
-    after it is the command's own."""
+    after it is the command's own. The login could not name the device's
+    prompt, which is learned from the first reply."""
     banner = "\r\nAuthorized users only - report misuse to NOC-DESK>" + later(0.3)
     for tail in ("\r\n\r\nR1>", "\r\nChange window 22:00-02:00 only\r\n\r\nR1>"):
         ch = ScriptChannel(banner + tail, IOS_LINES, lag=0.2)
@@ -288,7 +289,9 @@ def test_on_a_channel_that_echoes_the_first_reply_is_read_through_its_echo():
         assert ch.unread() == ""
     s = Cli(ScriptChannel(banner + tail, IOS_LINES, lag=0.2), dialects.ios.DIALECT, 5, echoes=True)
     s.login()
+    assert s.prompt_re.search("uplink to BackupR1#")         # no prompt name in the banner line
     assert s.run("configure terminal", 5).strip() == "Enter configuration commands, one per line.  End with CNTL/Z."
+    assert s.prompt_re.search("R1(config-if)#") and not s.prompt_re.search("uplink to BackupR1#")
 
 
 def test_the_initial_bytes_from_negotiation_count_as_the_banner():
