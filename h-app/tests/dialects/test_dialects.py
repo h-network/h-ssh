@@ -196,9 +196,39 @@ def test_telnet_maps_its_hints_to_dialects():
     assert telnet.PROMPT_PATTERNS["junos"] is dialects.junos.CLI.prompt
 
 
+def test_a_prompt_name_starts_the_line():
+    """#141 review: a prompt's name is where its line starts. Junos's was
+    not anchored, and named `noc@example.net` in a banner line `Contact
+    NOC <noc@example.net>`; IOS's already was."""
+    from hssh import dialects
+    junos = dialects.junos.DIALECT.cli.prompt_name
+    assert junos.search("lab@r1> ").group(1) == "lab@r1" and junos.search("lab@r1# ").group(1) == "lab@r1"
+    for banner in ("Unauthorized access prohibited. Contact NOC <noc@example.net>", "mail noc@example.net>",
+                   "\x1b[?2004hlab@r1> "):
+        assert junos.search(banner) is None
+    ios = dialects.ios.DIALECT.cli.prompt_name
+    assert ios.search("R1>").group(1) == "R1" and ios.search("report misuse to NOC-DESK>") is None
+
+
 def test_the_cli_engine_learns_the_prompt_from_the_dialects_shape():
+    """The prompt learned is the whole line from its start (#141): a reply
+    line that only ends in it, `uplink to BackupRouter#`, is not `Router#`.
+    Junos's `[edit]` banner, `{master}[edit]` with two routing engines, and
+    the note above it while a commit confirmed waits, are the prompt's; the
+    commit's own word on its timer is the reply's."""
     from hssh.transports.cli import Cli
     learned = Cli(None, dialects.junos.DIALECT, 5)._learn_prompt("welcome\nlab@r1.example> ")
     assert learned.search("lab@r1.example# ") and not learned.search("other@r1.example# ")
+    assert not learned.search("description lab@r1.example>")
     learned = Cli(None, dialects.ios.DIALECT, 5)._learn_prompt("Router#")
     assert learned.search("Router(config-if)#") and not learned.search("Switch#")
+    assert not learned.search("uplink to BackupRouter#") and not learned.search("uplink to BackupRouter(config)#")
+    context = dialects.junos.CLI.context
+    assert all(context.match(line) for line in ("[edit]", "[edit system]", "{master}[edit]",
+                                                 "{master:0}[edit interfaces ge-0/0/0]", "{primary:node0}[edit]",
+                                                 "# commit confirmed will be rolled back in 4 minutes",
+                                                 "# commit confirmed will be rolled back in 1 minute"))
+    assert not any(context.match(line) for line in (
+        "", "{master}", "[edit] x", "x [edit]",
+        "commit confirmed will be automatically rolled back in 5 minutes unless confirmed",
+        "+  # commit confirmed will be rolled back in 4 minutes"))

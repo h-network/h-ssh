@@ -444,13 +444,31 @@ Every transport runs a batch on one session per device.
 A dialect over SSH or telnet is typed at by one CLI engine (`hssh/transports/cli.py`): it logs in,
 learns the device's own prompt, answers paging, and runs the edit sequence the dialect describes (a
 candidate diffed and committed or discarded for Junos, lines applied in config mode for the IOS-shaped
-ones). An empty `show | compare` is `NO CHANGES`: the candidate is discarded and no `commit` is typed,
-plain or confirmed, as NETCONF aborts on an empty diff, so no timer is armed over nothing and no other
-user's pending commit-confirmed is confirmed by it. Shows over SSH use an exec channel, one command per
-channel; only edits and confirms open a shell. Over the OpenSSH binary the shell is `ssh -tt -e none`
-(no escape character, so a typed line that starts with `~` goes to the device as it is), with a
-password still handed over through `SSH_ASKPASS`, never typed at a prompt. The plain `ssh`/`openssh`
-drivers (dialect `none`) never open a shell.
+ones). Only telnet has a login dialogue for it to answer (`login:`, `Password:`). Over SSH the session
+has logged in before the shell opens, so the engine reads the banner to the prompt and types neither the
+username nor the password, whatever the banner ends with: a banner ending in `Password: ` gets nothing,
+and the password cannot come back in a reply, to the screen, `--log`, the audit log or the store. A
+shell that asks for credentials after SSH has logged in (a console server's port) gets none and fails as
+a login that shows no prompt. A login ends at a prompt that is the last line, with nothing after it,
+once the device has said nothing more for 0.15 s. A banner line that ends in `NOC-DESK>` is not the
+device's prompt once its line break has come, however long the pause after it, and a read that stops
+right after such a line (or one that is all `NOC-DESK>`) is read past when the banner goes on within
+that time. When the device pauses longer right after it, before the line break, the login ends there. A
+line that is all `NOC-DESK>` is then learned as the prompt, and every command fails on its timeout,
+nothing applied. One that only ends in it costs an SSH shell nothing: the shell echoes every line typed,
+so the first command after the login, always one of the engine's own (`configure exclusive`,
+`configure terminal`, `show system commit`), is read through its echo and then its prompt, the device's
+prompt is learned from it, and the rest of the banner is never taken for its reply. Over telnet, where
+the device need not echo, the rest of the banner is read as the first reply and each later reply as the
+one before, so a refused line can come back APPLIED. An empty `show | compare` is `NO CHANGES` (the note
+Junos prints above `[edit]` while a commit confirmed waits,
+`# commit confirmed will be rolled back in 4 minutes`, is the prompt's, not a diff): the candidate is
+discarded and no `commit` is typed, plain or confirmed, as NETCONF aborts on an empty diff, so no timer
+is armed over nothing and no other user's pending commit-confirmed is confirmed by it. Shows over SSH
+use an exec channel, one command per channel; only edits and confirms open a shell. Over the OpenSSH
+binary the shell is `ssh -tt -e none` (no escape character, so a typed line that starts with `~` goes to
+the device as it is), with a password still handed over through `SSH_ASKPASS`, never typed at a prompt.
+The plain `ssh`/`openssh` drivers (dialect `none`) never open a shell.
 
 The engine types plain text only. A CLI acts on a control character as it arrives (^C drops the line
 typed so far, ^U kills it, DEL rubs out a character, a Tab completes the word), and what is left of the
@@ -463,10 +481,10 @@ reads it as a space, and to the plain `ssh` and `openssh` drivers, which type at
 indented with Tabs works there and is a FAIL, nothing sent, on `junos@ssh`, `junos@openssh`,
 `telnet-junos` and every other driver that types at a CLI. A show over telnet with a Tab in it, or a
 batch with such a line, is refused before the socket is opened, `show()` and `show_batch()` for a library
-caller too. The login dialogue is held to the same rule: a username with a control character or
+caller too. The telnet login dialogue is held to the same rule: a username with a control character or
 a Tab in it, or a password with a control character (a Tab is text at a password prompt), is refused by
 the telnet drivers before they connect, a `ValueError` for a library caller too, and the engine types
-neither at a login prompt on any channel. None of these refusals is tried again.
+neither at a login prompt. None of these refusals is tried again.
 
 `h-ssh --list-vendors` prints the registry: every driver a target may name, its aliases, transport,
 dialect, the formats `--format` can ask it for, what it supports, and where it came from (`built-in`,
@@ -480,9 +498,30 @@ its timeout or loses the connection is an error, never a partial reply passed of
 and a `login:`/`Password:` prompt back after the password is a failed login, reported once — not the
 command typed in as a username. A port that prints nothing until Enter — a console-server line left at
 a prompt — gets one Enter once the session timeout is up, before silence counts as a failed login.
-The prompt is learned at login (`lab@R1` or `Router`, with its config-mode suffix) and looked for on
-the last line of a reply only, never on the echo of what was typed, so a description ending in `>` or
-a community ending in `#` cannot be taken for the prompt and shift every later reply.
+A telnet command the device sends once the session is open (`IAC WILL ECHO` after `Password: `, say)
+is negotiation, not text: it is left out of what is read, so the prompt before it is still the last
+line, and a reply holds none of it.
+The prompt is learned at login (`lab@R1` or `Router`, with its config-mode suffix) and ends a reply only
+as its whole last line, from the start with nothing after it, never as the echo of what was typed: a
+description ending in `>`, a community ending in `#` or a reply line `uplink to BackupRouter>` cannot be
+taken for the prompt and shift every later reply. A reply with output of its own is read on until the
+device has said nothing more for 0.15 s after its prompt (0.3 s after a refusal: a CLI on a pty refuses
+the Enter again after redrawing the line), so a reply line that is the prompt itself (`Router>`) does
+not end it when the reply goes on within that time (unless it is the reply's first line: a reply that is
+only the echo and a prompt so far is not waited on, as each set line's is not); output that comes within that time with no prompt
+after it (a console's syslog line without `logging synchronous`) leaves the reply with none, and it
+fails on the command's timeout. A prompt the dialect cannot name (`RP/0/RSP0/CPU0:R1#` is no IOS prompt
+name) is not learned: the dialect's own pattern stays, which only has to end the line, so on such a
+device a reply line `uplink to BackupR1#` with a longer pause after it still ends the reply, the rest of
+it read as the next command's. A reply that is only the echo and the prompt, with its `[edit]` banner
+(`{master}[edit]` on a router with two routing engines, and the note of a pending commit confirmed above
+it), as each line of an edit is, is not waited on, and a long edit costs no more. On an SSH shell the
+echo is also the line as the CLI drew it, when that is the reply's one line of text (a keyword Junos
+completed as it was typed, a long line an IOS-shaped CLI scrolled), or the line as the terminal shows
+it after Junos redrew it (a line longer than the 80-column pty of `junos@openssh`, scrolled to
+`...` and its end); over telnet, where the device need
+not echo, only the line typed is, and a line echoed otherwise is waited on for the 0.15 s. No wait runs
+past the command's timeout.
 `telnet-junos` edits enter `configure exclusive`, as the NETCONF driver's lock does: a refused lock is
 reported before any `set` line is sent, and `commit` and the dry run's `rollback 0` only ever touch
 this session's candidate, never another user's pending changes. `-eC "commit"` confirms a pending
@@ -592,7 +631,7 @@ and nothing about connections; `hssh/dialects/ios.py` is the smallest that defin
 | `refused` | a compiled regex (`re.MULTILINE`) for a line in which the CLI refused a command, `^\s*% ` for IOS. On an exec channel (`ssh`, `openssh`) every reply is read with it: a show whose reply opens with such a line is a failure, not output, and the plain drivers' line-by-line edit stops at the line that got one. Typed at a CLI (a shell on `ssh` or `openssh`, `telnet`), a candidate edit checks each line's reply with it and discards the candidate after the last line; a lines edit looks for `error`, `invalid` or `%` instead and fails after `end`, the other lines applied; a telnet show is not checked. A dialect on `ssh`, `openssh` or `telnet` must have one |
 | `is_read` | `command -> bool`: a read is retried and allowed under `--format`, anything else is sent once. The default takes `show …` and `get-*`; a command with a line break in it is never a read, whatever the dialect says |
 | `check_edit` | `(payload, allow_commit) -> (ok, why_not)`: the guard an edit payload must pass before any device is contacted (Junos's set-syntax rule; `allow_commit` is False for `-eD`/`-eB` files). `None` means no guard |
-| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, the `[edit]` line Junos prints with its prompt). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
+| `cli` | a `CliSyntax`, for edits over a transport that types at the device (a shell on `ssh` or `openssh`, `telnet`): the prompt regexes (`prompt`, `prompt_name`, `prompt_tail`: `prompt_name`'s group 1 is the name the device's prompt line starts with, and the prompt learned from it is that name at the start of a line, then `prompt_tail`, the whole line; a prompt it cannot name leaves `prompt`, which need only end the line), `config_enter`/`config_exit`, and for a dialect with a candidate configuration `compare`, `discard` and `commit` (plus `context`, a line Junos prints with its prompt: `[edit]`, `{master}[edit]` with two routing engines, and the `# commit confirmed will be rolled back in 4 minutes` above it while a timer runs; every such line at the end of a reply is the prompt's, and a reply of the echo, those lines and the prompt is not waited on for more). `None`: the dialect shows over `ssh` and `openssh` (an exec channel) but cannot edit, and cannot be used on `telnet`, where a show is typed at the CLI too |
 | `commit_pending` | a regex whose group 1 is the minutes left on a pending commit-confirmed, as `show system commit` prints them; `-eC commit` confirms only when it finds one |
 | `shortcuts` | the stem of a shipped library, `hssh/dialects/<stem>.json` — built-in dialects only, see below |
 
@@ -1466,7 +1505,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1323 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1345 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

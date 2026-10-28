@@ -72,7 +72,7 @@ COMMIT_PENDING = re.compile(r"rollback in (\d+)\s*min", re.I)
 
 CLI = CliSyntax(
     prompt=re.compile(r'[\w\-\.]+@[\w\-\.]+[>%#]\s*$'),
-    prompt_name=re.compile(r'([\w\-\.]+@[\w\-\.]+)[>%#]\s*$'),
+    prompt_name=re.compile(r'^([\w\-\.]+@[\w\-\.]+)[>%#]\s*$'),
     prompt_tail=r'[>%#]\s*$',
     # Exclusive mode keeps the candidate to this session, as the NETCONF
     # driver's lock does: commit and rollback 0 never touch another user's
@@ -85,7 +85,13 @@ CLI = CliSyntax(
     commit="commit",
     # "[edit]" / "[edit system]" before the configuration-mode prompt belongs
     # to the prompt: without this, an empty `show | compare` read as a diff.
-    context=re.compile(r"^\[edit[^\]]*\]\s*$"),
+    # A router with two routing engines (a virtual chassis, a cluster) puts
+    # the engine's role in front, "{master}[edit]", and while a commit
+    # confirmed waits the CLI says so above it, "# commit confirmed will be
+    # rolled back in 4 minutes": the engine waits after a reply with output
+    # of its own, and neither is one (#141). Read as a diff, the note made an
+    # empty compare commit, which confirms the pending timer.
+    context=re.compile(r"^((\{[^{}]*\})?\[edit[^\]]*\]|# commit confirmed will be rolled back\b.*?)\s*$"),
 )
 
 DIALECT = Dialect("junos", "Junos", "Junos: set syntax, candidate configuration, commit confirmed",

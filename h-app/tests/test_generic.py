@@ -1522,3 +1522,216 @@ def test_the_key_exchange_has_the_session_timeout_too_not_paramikos_fixed_15_s(m
     finally:
         a.close()
         b.close()
+
+
+# --- #141: the shell's login types no credentials, whatever the banner says ---
+
+import asyncio
+import json
+import sqlite3
+
+from hssh import cli
+
+
+class _ShellSshd(_Sshd):
+    """_Sshd with a shell on a pty: `play(channel)` is the device."""
+
+    def __init__(self, logins, play):
+        super().__init__(logins)
+        self.play = play
+
+    def check_channel_request(self, kind, chanid):
+        return paramiko.OPEN_SUCCEEDED
+
+    def check_channel_pty_request(self, channel, term, width, height, pixelwidth, pixelheight, modes):
+        return True
+
+    def check_channel_shell_request(self, channel):
+        threading.Thread(target=self.play, args=(channel,), daemon=True).start()
+        return True
+
+
+@pytest.fixture
+def shell_sshd():
+    """shell_sshd(play) -> the port of a paramiko SSH server on 127.0.0.1
+    that lets anyone in with a password and plays `play(channel)` on the
+    shell it opens."""
+    key = paramiko.ECDSAKey.generate()
+    opened = []
+
+    def make(play):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        opened.append(srv)
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                t = paramiko.Transport(conn)
+                t.add_server_key(key)
+                opened.append(t)
+                try:
+                    t.start_server(server=_ShellSshd([], play))
+                except (paramiko.SSHException, EOFError, OSError):
+                    pass
+        threading.Thread(target=serve, daemon=True).start()
+        return srv.getsockname()[1]
+    yield make
+    for each in opened:
+        each.close()
+
+
+PASSWORD_BANNER = "\r\n--- JUNOS 23.2R1.13 built 2023-06-21\r\nAsk the NOC for the Password: "
+
+
+def junos_pty(received, banner=PASSWORD_BANNER, pause=0.7):
+    """A Junos CLI behind an SSH shell: the banner, `pause` seconds of
+    nothing, then its prompt, and what was typed ahead is read once the
+    prompt is out. Each line typed is kept in `received`, echoed as a pty
+    does and answered; a line the CLI does not know gets `unknown
+    command`."""
+    def play(channel):
+        cfg, candidate = [False], []
+
+        def prompt():
+            return "\r\n\r\n[edit]\r\nlab@r1# " if cfg[0] else "\r\n\r\nlab@r1> "
+
+        def answer(line):
+            if line == "configure exclusive" and not cfg[0]:
+                cfg[0] = True
+                return "\r\nEntering configuration mode" + prompt()
+            if cfg[0] and line.startswith("set "):
+                candidate.append(" ".join(line.split()[2:]))
+                return prompt()
+            if cfg[0] and line == "show | compare":
+                return "".join(f"\r\n[edit system]\r\n+  {stmt};" for stmt in candidate) + prompt()
+            if cfg[0] and line == "rollback 0":
+                candidate.clear()
+                return "\r\nload complete" + prompt()
+            if cfg[0] and line == "exit":
+                cfg[0] = False
+                return "\r\nExiting configuration mode" + prompt()
+            return "\r\n          ^\r\nunknown command." + prompt()
+        try:
+            channel.sendall(banner.encode())
+            _time.sleep(pause)
+            channel.sendall(prompt().encode())
+            _time.sleep(0.1)
+            pending = b""
+            while True:
+                data = channel.recv(4096)
+                if not data:
+                    return
+                pending += data
+                while b"\n" in pending:
+                    raw, pending = pending.split(b"\n", 1)
+                    line = raw.decode(errors="replace").rstrip("\r")
+                    received.append(line)
+                    channel.sendall((line + answer(line)).encode())
+        except (OSError, EOFError):
+            pass
+    return play
+
+
+def ios_pty(received, tail, lag=0.2):
+    """An IOS CLI behind an SSH shell: a banner whose last line ends in
+    `NOC-DESK>`, half a second of nothing, then `tail`, the rest of it and
+    the prompt. What was typed ahead is read once that is out; each line
+    is kept in `received`, and echoed and answered `lag` seconds after it
+    comes, as over a slow link. A line it does not know is refused."""
+    def play(channel):
+        def answer(line):
+            if line == "configure terminal":
+                return "\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nR1(config)#"
+            if line.startswith("interface "):
+                return "\r\nR1(config-if)#"
+            if line == "end":
+                return "\r\nR1#"
+            return "\r\n               ^\r\n% Invalid input detected at '^' marker.\r\n\r\nR1(config-if)#"
+        try:
+            channel.sendall(b"\r\nAuthorized users only - report misuse to NOC-DESK>")
+            _time.sleep(0.5)
+            channel.sendall(tail.encode())
+            pending = b""
+            while True:
+                data = channel.recv(4096)
+                if not data:
+                    return
+                pending += data
+                while b"\n" in pending:
+                    raw, pending = pending.split(b"\n", 1)
+                    line = raw.decode(errors="replace").rstrip("\r")
+                    received.append(line)
+                    _time.sleep(lag)
+                    channel.sendall((line + answer(line)).encode())
+        except (OSError, EOFError):
+            pass
+    return play
+
+
+def test_a_banner_that_ends_like_a_prompt_does_not_shift_the_replies(shell_sshd):
+    """#141 review: on ios@ssh a banner whose last line ends in `NOC-DESK>`,
+    the device pausing half a second before its line break, ended the
+    login there, and the rest of the banner was the reply to `configure
+    terminal`. With the device answering each line 0.2 s after it, every
+    later reply was the one before: the `% Invalid input` for a refused
+    line was read as the reply to `end`, and the edit said APPLIED. The
+    shell echoes what is typed, so the first reply is read through its
+    echo: the refused line fails the edit."""
+    received = []
+    port = shell_sshd(ios_pty(received, "\r\nChange window 22:00-02:00 only\r\n\r\nR1>"))
+    with pytest.raises(RuntimeError, match=r"^'ip addres 10\.0\.0\.1 255\.255\.255\.0': % Invalid input detected"):
+        ssh.edit("127.0.0.1", "lab", "pw", "interface Gi0/1\nip addres 10.0.0.1 255.255.255.0\n", 5, 10, port=port,
+                 vendor_hint="ios@ssh")
+    assert received == ["configure terminal", "interface Gi0/1", "ip addres 10.0.0.1 255.255.255.0", "end"]
+
+
+def test_a_shell_banner_that_asks_for_a_password_gets_nothing_typed(shell_sshd):
+    """#141: login() answered `Password:` on the shell too. A banner ending
+    in `Password: `, the prompt 0.7 s later, got the SSH password typed into
+    the device CLI on junos@ssh, a dry run too, three times with retries;
+    its echo came back as the reply to `configure exclusive` (`Failed to
+    lock config: <password>`), and with a CLI that answers the stray line
+    with nothing every later reply was the one before. SSH has logged in:
+    nothing is typed at the banner, the first line the device gets is
+    `configure exclusive`, and the dry run's diff is the compare's."""
+    received = []
+    port = shell_sshd(junos_pty(received))
+    result = ssh.edit("127.0.0.1", "lab", "Pa55-NOC-only", "set system host-name x\n", 5, 10, port=port,
+                      vendor_hint="junos@ssh", dry_run=True)
+    assert result.status == R.DRY_RUN and result.diff == "[edit system]\n+  host-name x;"
+    assert received == ["configure exclusive", "set system host-name x", "show | compare", "rollback 0", "exit"]
+
+
+def test_the_ssh_password_never_reaches_the_runs_records(shell_sshd, tmp_path, monkeypatch, capsys):
+    """#141: the password typed at such a banner came back in the reply,
+    so it was the run's error, and the screen, --log, the audit log and the
+    store all kept it. Nothing is typed, so no reply can hold it: a dry run
+    on junos@ssh behind that banner, every record written, the password in
+    none."""
+    secret = "Pa55-NOC-only"
+    port = shell_sshd(junos_pty([]))
+    log, audit, store = tmp_path / "run.jsonl", tmp_path / "audit.jsonl", tmp_path / "runs.db"
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_USER", "HSSH_STORE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", secret)
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "lab",
+                                      "--target", f"R1:127.0.0.1:junos@ssh:{port}",
+                                      "-eC", "set system host-name x", "--dry-run",
+                                      "--log", str(log), "--audit-log", str(audit), "--store", str(store)])
+    rc = asyncio.run(cli.main())
+    out, err = capsys.readouterr()
+    assert rc == 0 and "DRY-RUN" in out and "+  host-name x;" in out
+    assert json.loads(log.read_text().splitlines()[0])["ok"] is True
+    db = sqlite3.connect(str(store))
+    try:
+        kept = "\n".join(repr(row) for table in ("runs", "results") for row in db.execute(f"SELECT * FROM {table}"))
+    finally:
+        db.close()
+    for where, text in (("stdout", out), ("stderr", err), ("--log", log.read_text()),
+                        ("the audit log", audit.read_text()), ("the store", kept)):
+        assert text and secret not in text, where
