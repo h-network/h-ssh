@@ -34,8 +34,10 @@ class Driver:
         return "COMMIT OK\n" if not dry_run else "DRY-RUN\n"
 
 
-def run(monkeypatch, capsys, tmp_path, argv, driver=None, env=None):
-    """cli.main() in-process against the fake driver; nothing is contacted."""
+def run(monkeypatch, capsys, tmp_path, argv, driver=None, env=None, watch=False):
+    """cli.main() in-process against the fake driver; nothing is contacted.
+    With `watch`, as the console script runs it: every tick of an --every,
+    with no pause between them."""
     drv = driver or Driver()
     monkeypatch.setitem(drivers.MODULES, "junos@netconf", drv)
     for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE", "HSSH_PASSWORD", "HSSH_USER"):
@@ -44,7 +46,13 @@ def run(monkeypatch, capsys, tmp_path, argv, driver=None, env=None):
     for var, value in (env or {}).items():
         monkeypatch.setenv(var, value)
     monkeypatch.setattr(sys, "argv", ["./h-app/h-ssh.py", "--config", os.devnull, *argv])
-    rc = asyncio.run(cli.main())
+    if watch:
+        monkeypatch.setattr(cli, "_watch_sleep", lambda seconds: None)
+        with pytest.raises(SystemExit) as e:
+            cli.main_sync()
+        rc = e.value.code
+    else:
+        rc = asyncio.run(cli.main())
     out, err = capsys.readouterr()
     return rc, out, err, drv
 
@@ -468,8 +476,8 @@ def test_a_typed_devices_replaces_the_files_inline_list_and_says_so(monkeypatch,
 
 def test_a_typed_target_replaces_the_files_devices_and_says_so(monkeypatch, capsys, tmp_path):
     """A target typed bare or with --target replaces the file's `devices`, a
-    list or a path, with the same line; without one the file's are used and
-    nothing is said."""
+    list or a path, with the same line, once for a whole --every watch, not
+    once a tick; without one the file's are used and nothing is said."""
     write(tmp_path, "prod.csv", "prod1,10.0.0.1,junos\n")
     for devices in ("prod.csv", "[prod1:10.0.0.1:junos]"):
         f = write(tmp_path, "run.yaml", f"devices: {devices}\nuser: u\nshow: show version\n")
@@ -479,6 +487,10 @@ def test_a_typed_target_replaces_the_files_devices_and_says_so(monkeypatch, caps
             assert f"Run file '{f}': 'devices' is ignored; the targets on the command line win.\n" in err
         rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f])
         assert rc == 0 and drv.shows == [("10.0.0.1", "show version", None)] and "ignored" not in err, devices
+    rc, out, err, drv = run(monkeypatch, capsys, tmp_path, ["--run", f, "--every", "1", "--times", "3",
+                                                            "lab1:10.0.9.1:junos"], watch=True)
+    assert rc == 0 and drv.shows == [("10.0.9.1", "show version", None)] * 3, err
+    assert err.count("'devices' is ignored") == 1, err
 
 
 def test_a_flag_typed_with_its_defaults_value_still_wins(monkeypatch, capsys, tmp_path):

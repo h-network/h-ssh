@@ -357,3 +357,44 @@ def test_an_empty_audit_log_never_turns_the_audit_trail_off(monkeypatch, capsys,
     assert rc == 0 and sent == ["10.0.0.1"] and site.is_file(), err
     rc, err = main(["-sC", "show version", "--target", "R1:10.0.0.1:junos"], audit="")
     assert rc == 0, err
+
+
+def test_an_empty_safety_file_never_turns_the_gate_off(monkeypatch, capsys, tmp_path):
+    """#140 review: HSSH_SAFETY_FILE reaches the gate through
+    --safety-file's default alone. With it set, `--safety-file ''` (which
+    fell back to the variable) and a run file's `safety_file: ''` are
+    refused before anything is sent; the variable's gate is made without
+    them. An empty HSSH_SAFETY_FILE is no gate, the run going ahead, as an
+    unset one is."""
+    sent, gates = [], []
+    fake = types.SimpleNamespace(AVAILABLE=True, show=lambda host, *a, **kw: sent.append(host) or "ok")
+    real_gate = cli.SafetyGate
+    gate = tmp_path / "gate" / "safety.json"
+
+    def main(argv, safety=str(gate)):
+        monkeypatch.setitem(drivers.MODULES, "junos@netconf", fake)
+        monkeypatch.setattr(cli, "SafetyGate", lambda safety_file=None, **kw: gates.append(safety_file)
+                            or real_gate(safety_file=safety_file, **kw))
+        for var in ("HSSH_AUDIT_LOG", "HSSH_USER"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("HSSH_SAFETY_FILE", safety)
+        monkeypatch.setenv("HSSH_PASSWORD", "p")
+        monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *argv])
+        try:
+            rc = asyncio.run(cli.main())
+        except SystemExit as e:      # argparse
+            rc = e.code
+        return rc, capsys.readouterr().err
+
+    show = ["-sC", "show version", "--target", "R1:10.0.0.1:junos"]
+    rc, err = main([*show, "--safety-file", ""])
+    assert rc == 2 and sent == [] and "argument --safety-file: empty" in err
+    run_file = tmp_path / "run.yaml"
+    run_file.write_text("devices: [R1:10.0.0.1:junos]\nshow: show version\nsafety_file: ''\n")
+    rc, err = main(["--run", str(run_file)])
+    assert rc == 2 and sent == [] and f"ERROR: run file '{run_file}': 'safety_file' is empty" in err
+    assert gates == [] and not gate.exists()
+    rc, err = main(show)
+    assert rc == 0 and sent == ["10.0.0.1"] and gates == [str(gate)] and gate.is_file(), err
+    rc, err = main(show, safety="")
+    assert rc == 0 and sent == ["10.0.0.1", "10.0.0.1"] and gates == [str(gate)], err

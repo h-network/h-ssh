@@ -797,13 +797,14 @@ value, the default's own included: `--format text` beside `format: xml` asks for
 devices.csv` beside `devices: prod.csv` reads `devices.csv`, and an `--audit-log` equal to
 `$HSSH_AUDIT_LOG` beside `audit-log:` writes where the flag says. A target typed on the command line
 (bare or `--target`) or a typed `--devices` replaces the file's `devices`, an inline list or a path
-alike, and one line on stderr says so: `Run file 'fleet-bgp.yaml': 'devices' is ignored; --devices on
-the command line wins.` A `--job` typed beside a file that holds `devices` does not replace them: a
-job's targets are its entries, so the run is refused (exit 2, nothing sent) rather than run on the
-job's devices with the file's `yes` and timer: `ERROR: run file 'fleet-bgp.yaml': 'devices' beside
---job: a job's targets are its entries.` Relative paths in the file (`devices`, `batch`,
-`edit-dir`, `edit-broadcast`, `log`, `audit-log`, `save-output`, `safety-file`) resolve against the
-file's own directory, so a run directory with its inventory and set files moves as one.
+alike, and one line on stderr says so (once for a whole `--every` watch): `Run file 'fleet-bgp.yaml':
+'devices' is ignored; --devices on the command line wins.` A `--job` typed beside a file that holds
+`devices` does not replace them: a job's targets are its entries, so the run is refused (exit 2,
+nothing sent) rather than run on the job's devices with the file's `yes` and timer: `ERROR: run file
+'fleet-bgp.yaml': 'devices' beside --job: a job's targets are its entries.` Relative paths in the file
+(`devices`, `batch`, `edit-dir`, `edit-broadcast`, `log`, `audit-log`, `save-output`, `safety-file`)
+resolve against the file's own directory, so a run directory with its inventory and set files moves as
+one.
 
 Three keys have no flag of their own. A file holds `commands` or `jobs`, not both; with `jobs` the
 targets are the entries', the file's `devices` is not used, and a target typed beside the file (bare or
@@ -1465,7 +1466,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1322 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1323 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
