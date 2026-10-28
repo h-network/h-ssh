@@ -1320,9 +1320,11 @@ in the CLI (the set-syntax guard, the probe's question, the confirmation) and in
 control character or a Tab in it itself, before it connects, and a Junos one a payload line whose first
 word is `commit` (`commit;` and `com` too), the one commit rail a library caller has (see [Transports](#transports)).
 An edit with nothing to apply, nothing but blank lines and comments for the target's dialect (`#`, and `!`
-for an IOS-shaped one), is a `ValueError` before the device is contacted, from `run_for_target()` on every
-driver and from the `edit()` of every dialect without a candidate (the IOS-shaped ones, and the plain `ssh`,
-`openssh` and `telnet` drivers); Junos's candidate has `NO CHANGES` for it.
+for an IOS-shaped one), is refused before the device is contacted: the `edit()` of every dialect without a
+candidate (the IOS-shaped ones, and the plain `ssh`, `openssh` and `telnet` drivers) raises a `ValueError`,
+and `run_for_target()` returns it as that device's failure on every driver (`ok` false, `.error` saying
+so, no driver called), as it returns every other refusal. A Junos transport's own `edit()`, which loads a
+candidate, answers it `NO CHANGES`.
 
 ### One device, one call
 
