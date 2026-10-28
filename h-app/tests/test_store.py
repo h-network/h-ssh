@@ -98,6 +98,7 @@ def test_two_runs_of_the_same_second_with_the_same_suffix_still_get_different_id
     # An id the caller chose is not replaced behind their back.
     with pytest.raises(sqlite3.IntegrityError):
         store.begin_run("show", ["h-ssh"], "me", 1, "0", run_id=first)
+    store.close()
 
 
 def test_one_row_per_command_kept_as_it_came(tmp_path):

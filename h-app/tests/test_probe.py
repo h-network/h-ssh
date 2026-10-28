@@ -7,6 +7,7 @@ stand in for the boxes (`real_probe`); elsewhere the probe's tries are
 answered here and the drivers are fakes in drivers.MODULES."""
 
 import asyncio
+import contextlib
 import errno
 import json
 import os
@@ -1312,7 +1313,7 @@ def test_fleet_probe_gives_the_results_as_values_and_keeps_them_in_the_store(mon
         assert json.loads(json.dumps(r3.to_dict()))["slow"] == r3.slow
         with pytest.raises(ValueError, match="slow_ms must be milliseconds above 0"):
             fleet.probe(slow_ms=0)
-    with sqlite3.connect(str(path)) as con:
+    with contextlib.closing(sqlite3.connect(str(path))) as con:
         runs = con.execute("SELECT mode, argv, targets, ok, failed, finished IS NOT NULL FROM runs").fetchall()
         assert runs == [("probe", "Fleet.probe", 3, 2, 1, 1)] * 2
         kept = con.execute("SELECT device, ok, error, format FROM results ORDER BY run_id, device").fetchall()
@@ -1367,7 +1368,7 @@ def test_a_close_during_the_probe_ends_the_run_at_once(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="this Fleet is closed"):
         fleet.show("show version")
     assert time.monotonic() - started < 2.0
-    with sqlite3.connect(str(path)) as con:
+    with contextlib.closing(sqlite3.connect(str(path))) as con:
         assert con.execute("SELECT ok, failed, skipped, interrupted FROM runs").fetchall() == [(0, 0, 3, 1)]
 
 
