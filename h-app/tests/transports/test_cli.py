@@ -310,9 +310,10 @@ def test_a_commit_line_is_its_first_word_whatever_ends_it():
 
 # What the Junos line editor acts on as it arrives: ^C drops the line typed so
 # far, ^U kills it, DEL rubs out a character. The rest of the line then ran as
-# a line of its own (#139).
+# a line of its own (#139). An ESC or a C1 CSI starts a key sequence, and a
+# NUL is not text.
 KEYS = ["set system host-name x\x03commit comment y\n", "set a\x15commit\n", "set " + "\x7f" * 4 + "commit\n",
-        "set system\thost-name x\n"]
+        "set system\thost-name x\n", "set a\x1b[2Kcommit\n", "set a\x9b2Kcommit\n", "set a\x00commit\n"]
 
 
 def test_a_line_with_a_control_character_or_a_tab_is_never_typed():

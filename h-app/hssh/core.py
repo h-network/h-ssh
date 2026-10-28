@@ -419,9 +419,11 @@ def read_failure(e: Exception) -> str:
 
 
 # What a command may not carry: the C0 and C1 control characters and DEL,
-# the line breaks among them. A tab is text, except to the CLI engine.
-_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]")
-_CONTROL_OR_TAB = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# the line breaks among them. A tab is text, except to the CLI engine: the
+# one class with the Tab added, so the two cannot come apart.
+_CONTROL_CLASS = r"\x00-\x08\x0a-\x1f\x7f-\x9f"
+_CONTROL = re.compile(f"[{_CONTROL_CLASS}]")
+_CONTROL_OR_TAB = re.compile(f"[\\t{_CONTROL_CLASS}]")
 _CONTROL_NAMES = {"\n": "a line break", "\r": "a carriage return", "\x00": "a NUL", "\x1b": "an ESC",
                   "\x7f": "a DEL", "\t": "a Tab"}
 

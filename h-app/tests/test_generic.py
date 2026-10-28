@@ -628,9 +628,10 @@ def test_a_commit_line_ending_in_a_semicolon_is_refused_before_connecting(no_con
             ssh.edit("10.0.0.1", "lab", "p", payload, 5, 10, vendor_hint="junos@ssh", dry_run=True)
 
 
-# ^C, ^U and DEL, which the Junos line editor acts on as they arrive, and a Tab, which completes the word (#139)
+# ^C, ^U and DEL, which the Junos line editor acts on as they arrive, a Tab, which completes the word, and
+# an ESC or a C1 CSI, which starts a key sequence (#139)
 KEYS = ["set system host-name x\x03commit comment y\n", "set a\x15commit\n", "set " + "\x7f" * 4 + "commit\n",
-        "\tset system host-name x\n"]
+        "\tset system host-name x\n", "set a\x1b[2Kcommit\n", "set a\x9b2Kcommit\n"]
 
 
 def test_a_payload_the_cli_engine_would_take_as_keys_is_refused_before_connecting(no_connection):

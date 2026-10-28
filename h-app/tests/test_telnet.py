@@ -779,20 +779,26 @@ def test_a_payload_or_comment_the_cli_would_take_as_keys_is_refused_before_conne
     the socket: what followed one in a set line ran as a line of its own, a
     `commit` too under a dry run. A Tab completes the word, and a confirm's
     comment with a line break or a double quote typed more than the
-    comment. Refused before the socket is opened, whatever the flavour."""
+    comment. Refused before the socket is opened, whatever the flavour: a
+    port that is listened on and never answered sees no connection (the
+    engine's own refusals come after one)."""
     from hssh.transports import telnet
-    srv = ScriptedTelnetServer(junos_cli())
+    dev = NoDevice()
     kw = {"dry_run": True} if hint == "telnet-junos" else {}
-    for payload in ("set system host-name x\x03commit comment y\n", "set a\x15commit\n",
-                    "set " + "\x7f" * 4 + "commit\n", "set system\thost-name x\n"):
-        with pytest.raises(ValueError, match="which a CLI takes as a key, not as text; nothing was sent to the device"):
-            telnet.edit("127.0.0.1", "lab", "secret", payload, 5, 5, port=srv.port, vendor_hint=hint, **kw)
-    if hint == "telnet-junos":
-        with pytest.raises(ValueError, match="the comment .* nothing was sent to the device"):
-            telnet.confirm("127.0.0.1", "lab", "secret", 5, 5, port=srv.port, vendor_hint=hint,
-                           comment='x"\nrollback 1\ncommit')
-    srv.stop()
-    assert srv.received == []
+    try:
+        for payload in ("set system host-name x\x03commit comment y\n", "set a\x15commit\n",
+                        "set " + "\x7f" * 4 + "commit\n", "set system\thost-name x\n"):
+            with pytest.raises(ValueError,
+                               match="which a CLI takes as a key, not as text; nothing was sent to the device"):
+                telnet.edit("127.0.0.1", "lab", "secret", payload, 1, 1, port=dev.port, vendor_hint=hint, **kw)
+        if hint == "telnet-junos":
+            for comment in ('x"\nrollback 1\ncommit', 'x"', "x\ty"):
+                with pytest.raises(ValueError, match="the comment .* nothing was sent to the device"):
+                    telnet.confirm("127.0.0.1", "lab", "secret", 1, 1, port=dev.port, vendor_hint=hint,
+                                   comment=comment)
+        assert dev.connected() == 0
+    finally:
+        dev.close()
 
 
 def test_a_username_or_password_with_a_control_character_is_refused_before_connecting():
