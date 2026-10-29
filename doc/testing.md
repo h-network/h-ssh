@@ -1,6 +1,6 @@
 # Testing
 
-h-ssh is tested at two levels, each with its own owner.
+h-ssh is tested at two levels.
 
 | Level | What it proves |
 |---|---|
@@ -72,7 +72,7 @@ done
 
 The test fleet is a set of Junos cRPD containers reserved for h-ssh testing. Fleet tests use all of it.
 
-### 2.2 What the tester runs
+### 2.2 Workloads
 
 Fleet tests use real operator workloads, at full fleet scale:
 
