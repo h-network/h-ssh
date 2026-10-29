@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from hssh.audit import write_audit_entry, redact_secrets, redact_values, secure_append
+from hssh.audit import write_audit_entry, redact_secrets, redact_values, secure_append, secure_write, probe_append
 
 
 def test_write_audit_entry_basic():
@@ -189,6 +189,21 @@ def test_redact_values_keeps_the_shape_and_loses_the_secrets():
     assert (out["ok"], out["duration_ms"], out["dry_run"]) == (True, 3, False)
     for secret in ("public", "$9$hash", "$9$psk", "hunter2"):
         assert secret not in json.dumps(out)
+
+
+def test_every_directory_made_for_a_log_is_private_whatever_the_umask(tmp_path):
+    """The parents made for the audit log, --log and a --save-output file
+    were the umask's, 0777 under umask 000 (#149): each one made is 0700."""
+    old = os.umask(0o000)
+    try:
+        secure_append(str(tmp_path / "a" / "b" / "audit.jsonl"), "{}\n")
+        secure_write(str(tmp_path / "c" / "d" / "R1.output"), "x")
+        probe_append(str(tmp_path / "e" / "f" / "run.jsonl"))
+    finally:
+        os.umask(old)
+    made = ("a", "a/b", "c", "c/d", "e", "e/f")
+    assert [os.stat(tmp_path / d).st_mode & 0o777 for d in made] == [0o700] * 6
+    assert [os.stat(tmp_path / f).st_mode & 0o777 for f in ("a/b/audit.jsonl", "c/d/R1.output", "e/f/run.jsonl")] == [0o600] * 3
 
 
 def test_secure_append_is_0600_whatever_the_umask(tmp_path):

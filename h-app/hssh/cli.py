@@ -41,7 +41,7 @@ from .runfile import load_run_file, validate_run, apply_run, edit_needs_timer
 from . import profiles
 from .safety import SafetyGate
 from . import pool
-from .audit import write_audit_entry, redact_values, secure_append, probe_append
+from .audit import write_audit_entry, redact_values, secure_append, probe_append, private_dir
 from .store import Store, StoreError, ENV_VAR as STORE_ENV, DEFAULT as STORE_DEFAULT, where as store_where
 from .store import _identity as store_identity
 from .screen import terminal_safe, is_terminal as _tty
@@ -1542,11 +1542,17 @@ async def _main(opened: list) -> int:
     if save_dir:
         # Raw device output (a config backup is the point), so the directory
         # and its files are the operator's alone: 0700 / 0600, never redacted.
+        # A DIR that is there already is the operator's as they made it (a
+        # shared one may be meant), with a warning when it is not private.
         # Proven writable before the first device, as the audit log is: a
         # file that can be written, and every result's name within what the
         # file system takes. A run never commits what it could not save (#152).
         try:
-            Path(save_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+            private_dir(save_dir)
+            loose = os.stat(save_dir).st_mode & 0o077
+            if loose:
+                print(f"WARNING: --save-output {save_dir} is not private (mode {os.stat(save_dir).st_mode & 0o777:04o}): "
+                      "its files are 0600, their names are not.", file=sys.stderr)
             fd, probe = tempfile.mkstemp(dir=save_dir, prefix=".h-ssh-", suffix=".tmp")
             os.close(fd)
             os.unlink(probe)

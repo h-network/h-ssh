@@ -1015,7 +1015,9 @@ silent preference (`--json -v` is accepted: the JSON is printed as without `-v`,
 both drop it, and `--json` reports it as its own `command` field instead of repeating it inside
 `output`.
 
-`--save-output DIR` makes DIR (0700) and writes one file into it per device that ran or that the probe
+`--save-output DIR` makes DIR, and any parent it has to make, 0700 (a DIR that is there is left as the
+operator made it, with a `WARNING: --save-output DIR is not private` when group or others can read it:
+its files are 0600 either way, their names are not) and writes one file into it per device that ran or that the probe
 found dead (0600, never redacted; none for a device the safety gate held back or `--allow-missing` left
 out, nor for `--probe` alone): `NAME.output` holds the DEVICE/HOST/MODE/VENDOR header, then the reply
 or the `ERROR:` line; a batch that ran is `NAME.json`, its commands as JSON (one that failed before it
@@ -1053,13 +1055,24 @@ edit's is opened once the edit is past its questions (the probe's, `Proceed with
 than y, an edit the probe stopped, a `--show-diff` preview that failed, a Ctrl-C) committed nothing
 and is no run, so it leaves no row. Everything is kept as it
 came: a snapshot one may have to restore from is not edited, so nothing in the store is redacted, and
-a `show configuration` keeps its hashes; escape sequences and control characters are taken out of a
+a `show configuration` keeps its hashes, and a Junos `$9$` secret is reversible, so the store, its
+exports and `--save-output` files hold the equivalent of the passwords in it: keep them as you keep
+those; escape sequences and control characters are taken out of a
 reply as a terminal is shown it, by `h-ssh` and by `h-ssh-store` alike, never out of the record: the
 store, `--log`, `--json` and the audit log hold the same bytes whether the run was started from a
 terminal or a pipe, the reply's own line endings included (a show over SSH from a device that ends
 its lines with CRLF keeps them there and on `--raw` to a pipe; telnet hands its lines over with LF),
 and `h-ssh-store` hands a pipe or an `export --out` file the rows as they were kept. The file is
-created 0600, opened and its tables made before the first device, after the checks that need no
+made 0600 at the open whatever it was (a 0644 `h-ssh.db` made by hand, or by the `sqlite3.connect`
+snippet above before the first run, is made private, and so are a `-wal` and `-shm` left beside it),
+in directories made 0700, must be this user's own regular file (one owned by another user is refused,
+`owned by another user`, as a symlink in its place is), and is checked, once SQLite has it open, to
+be the file that was made private. Its directory must be yours too, and not one other users can write
+(a symlink one of them plants between the open and SQLite's own, which reopens the file by name, would
+otherwise send the run's writes elsewhere): a directory owned by another user, or group- or
+world-writable without the sticky bit, is refused (`its directory DIR is writable by other users`); a
+sticky one such as `/tmp/yourjob`, where others cannot rename a file that is not theirs, is fine. Its
+tables are made before the first device, after the checks that need no
 file: a store that cannot be written is no run (exit 2, nothing sent), because a run nobody can look
 up afterwards is not worth having. A run refused before it starts leaves no store file: one those
 checks refuse never opens it (`--raw -v`, an edit with no terminal and no `-y`), and a store the run
@@ -1093,7 +1106,7 @@ the run wrote (`--store PATH`, given before the command: `h-ssh-store --store PA
 | `diff DEVICE RUN_A RUN_B [--seq N]` | one device's reply in two runs as a unified diff; exit 1 when they differ (lines are compared without their line endings) |
 | `history DEVICE [--command C] [--last N]` | the newest 50 stored results for a device (`--last N` for another number), newest first |
 | `slowest [RUN] [--last N]` | the 20 slowest results (`--last N` for another number), of a run or overall |
-| `export [RUN] [--all] [--device D] [--command C] [--format csv\|jsonl] [--out FILE]` | the rows as they are, for a spreadsheet or a notebook: CSV (a multi-line reply is one quoted cell, the default) or JSON Lines; one run (default: the last) or the whole store; exit 1 when no row matched; with `--out`, `N rows written to FILE` on stderr. The file itself is plain SQLite, so `pandas.read_sql("SELECT * FROM results", sqlite3.connect("h-ssh.db"))` works as well |
+| `export [RUN] [--all] [--device D] [--command C] [--format csv\|jsonl] [--out FILE]` | the rows as they are, for a spreadsheet or a notebook: CSV (a multi-line reply is one quoted cell, the default) or JSON Lines; one run (default: the last) or the whole store; exit 1 when no row matched; with `--out`, the file written 0600 as `--log` is (whatever mode a file there had; a symlink is not followed, a FIFO or anything but a regular file or a character device such as `/dev/null` is refused, and so is the store or a file SQLite keeps beside it under any name, a hard link included), `N rows written to FILE` on stderr. The file itself is plain SQLite, so `pandas.read_sql("SELECT * FROM results", sqlite3.connect("h-ssh.db"))` works as well |
 
 A run is named by its id or any unique prefix of it (`20261024-1730` when only one run started then).
 Anything else is a `sqlite3 h-ssh.db` query away: the schema is two tables, documented at the top of
@@ -1651,7 +1664,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1522 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1532 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

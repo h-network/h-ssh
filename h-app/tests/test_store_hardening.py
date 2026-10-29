@@ -7,6 +7,8 @@ import re
 import multiprocessing
 import os
 import sqlite3
+import subprocess
+import sys
 import time
 
 import pytest
@@ -279,6 +281,24 @@ def test_a_store_lets_go_of_the_directory_it_holds_when_closed_or_dropped(tmp_pa
     assert held() == []
 
 
+@pytest.mark.parametrize("side", ["-wal", "-shm"])
+def test_a_fifo_planted_beside_the_store_cannot_hang_its_opening(tmp_path, side):
+    """#149's first cut opened a side file O_RDONLY to make it 0600: a FIFO
+    planted at h-ssh.db-wal with no writer held that open for ever (the
+    review's finding), where SQLite opens the file for writing and goes on.
+    The side files are opened without blocking, so a FIFO, no regular
+    file, is left alone: the store opens beside one at -wal, and one at
+    -shm is SQLite's own disk I/O error, said and over at once."""
+    os.mkfifo(tmp_path / ("h-ssh.db" + side))
+    code = ("import sys\nfrom hssh.store import Store, StoreError\ntry:\n    Store(sys.argv[1]).close()\n"
+            "    print('opened')\nexcept StoreError as e:\n    print('refused:', e)\n")
+    env = {**os.environ, "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..")}
+    proc = subprocess.run([sys.executable, "-c", code, str(tmp_path / "h-ssh.db")], env=env, cwd=str(tmp_path),
+                          capture_output=True, text=True, timeout=20)          # a hang is TimeoutExpired here
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ("opened\n" if side == "-wal" else f"refused: {tmp_path / 'h-ssh.db'}: disk I/O error\n")
+
+
 @pytest.mark.parametrize("first", ["close", "discard"])
 def test_a_store_closed_twice_lets_go_of_its_directory_once(tmp_path, first):
     """#180: main() closes the store it opened when it returns, on most
@@ -289,8 +309,9 @@ def test_a_store_closed_twice_lets_go_of_its_directory_once(tmp_path, first):
     fd = st._where[1]
     getattr(st, first)()
     other = os.open(tmp_path, os.O_RDONLY)
-    os.dup2(other, fd)                                   # the number the store let go is another file's now
-    os.close(other)
+    if other != fd:                                      # the number the store let go is another file's now
+        os.dup2(other, fd)
+        os.close(other)
     st.close()
     os.fstat(fd)                                         # still open: the second close let go of nothing
     os.close(fd)
