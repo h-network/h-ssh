@@ -38,7 +38,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
 }
 CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 
-EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_SKIPPED = 0, 1, 2, 3
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_SKIPPED, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 
 
 class _Parser(argparse.ArgumentParser):
@@ -248,6 +248,8 @@ def report_dict(report: RunReport) -> dict[str, Any]:
 
 
 def exit_code(report: RunReport) -> int:
+    if report.interrupted:
+        return EXIT_INTERRUPTED
     if report.failed:
         return EXIT_FAILED
     if report.skipped:
@@ -304,6 +306,8 @@ def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
             render(report, args)
             worst = max(worst, exit_code(report))
             previous = report
+            if report.interrupted:
+                break
         return worst
     except Fault as e:
         print(f"ERROR: {e.kind.name}: {e.detail}", file=sys.stderr)
