@@ -70,7 +70,7 @@ done
 
 ### 2.1 The fleet
 
-The test fleet is a set of Junos cRPD containers reserved for h-ssh testing. Fleet tests use all of it.
+Fleet tests run against a fleet of virtual network devices, using the whole fleet.
 
 ### 2.2 Workloads
 

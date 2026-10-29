@@ -16,7 +16,7 @@ every result in a local SQLite store, and every change in an audit log.
   vendors and transports can be added from outside the package.
 - **Safe changes.** Dry-run by default, commit-confirmed support, rollback, and a per-device safety gate.
 - **Durable records.** Every run and result is stored. Every change is audited.
-- **Verified on real devices.** Behaviour is validated against the 250-device cRPD test fleet.
+- **Verified on real devices.** Behaviour is validated against a fleet of virtual network devices.
 
 ### Non-goals
 
@@ -308,7 +308,7 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 | Unit | Orchestrator policy, edit lifecycle, cancellation, recorder | a fake communicator |
 | Contract | Each communicator against section 4: results, fault kinds, `reached_device` | local fake servers and stubbed libraries |
 | Dialect | Prompt, refusal and warning patterns | recorded device output |
-| Fleet | Real workloads at scale: shows, batches, edits, commits, confirm, rollback, interrupts, unreachable devices | the 250-device cRPD fleet |
+| Fleet | Real workloads at scale: shows, batches, edits, commits, confirm, rollback, interrupts, unreachable devices | a fleet of virtual network devices |
 
 Each test covers one behaviour. Behaviour that the unit and contract levels can't settle is decided on the
 fleet.
