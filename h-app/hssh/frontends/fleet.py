@@ -20,7 +20,10 @@ from hssh.model import (
     Credentials, EditSettings, HostKeyPolicy, Mode, PolicySettings, RecordSettings, RunReport,
     RunSpec, SafetySettings, Target, Timeouts,
 )
-from hssh.orchestrator import DEFAULT_POLICY, DEFAULT_TIMEOUTS, run
+from hssh.orchestrator import (
+    DEFAULT_EDIT, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT,
+    DEFAULT_VENDOR, DEFAULT_WORKERS, default_username, run,
+)
 
 Runner = Callable[[RunSpec], RunReport]
 
@@ -35,7 +38,7 @@ def run_spec(spec: RunSpec) -> RunReport:
     return run(spec)
 
 
-def parse_target(spec: str, transport: str, vendor: str = "generic") -> Target:
+def parse_target(spec: str, transport: str, vendor: str = DEFAULT_VENDOR) -> Target:
     """`host` alone, `[v6]`, or NAME:HOST[:VENDOR][:PORT] in either order of the last two."""
     spec = spec.strip()
     if not spec:
@@ -62,7 +65,7 @@ def parse_target(spec: str, transport: str, vendor: str = "generic") -> Target:
     return Target(name=name, host=host, vendor=vendor, transport=transport, port=port)
 
 
-def load_devices_csv(path: str, transport: str, vendor: str = "generic") -> list[Target]:
+def load_devices_csv(path: str, transport: str, vendor: str = DEFAULT_VENDOR) -> list[Target]:
     """`name,ip[,vendor[,port]]` rows with or without a header, or one name per line; `#` comments."""
     import csv
 
@@ -89,7 +92,7 @@ def load_devices_csv(path: str, transport: str, vendor: str = "generic") -> list
     return targets
 
 
-def as_targets(specs: Iterable[TargetLike] | TargetLike, transport: str, vendor: str = "generic") -> tuple[Target, ...]:
+def as_targets(specs: Iterable[TargetLike] | TargetLike, transport: str, vendor: str = DEFAULT_VENDOR) -> tuple[Target, ...]:
     """Targets, inline specs and inventory paths, in the order given."""
     if isinstance(specs, (str, Target, os.PathLike)):
         specs = [specs]
@@ -107,16 +110,16 @@ def as_targets(specs: Iterable[TargetLike] | TargetLike, transport: str, vendor:
 class Fleet:
     """Devices and the settings every run on them shares; each method is one RunSpec run to a RunReport."""
 
-    def __init__(self, targets: Iterable[TargetLike] | TargetLike, transport: str = "ssh",
-                 vendor: str = "generic", user: str | None = None, password: str | None = None,
-                 key_file: str | None = None, workers: int = 8, timeouts: Timeouts = DEFAULT_TIMEOUTS,
-                 policy: PolicySettings = DEFAULT_POLICY, host_key_policy: HostKeyPolicy = "accept-new",
-                 probe: bool = False, safety: SafetySettings | None = None,
+    def __init__(self, targets: Iterable[TargetLike] | TargetLike, transport: str = DEFAULT_TRANSPORT,
+                 vendor: str = DEFAULT_VENDOR, user: str | None = None, password: str | None = None,
+                 key_file: str | None = None, workers: int = DEFAULT_WORKERS, timeouts: Timeouts = DEFAULT_TIMEOUTS,
+                 policy: PolicySettings = DEFAULT_POLICY, host_key_policy: HostKeyPolicy = DEFAULT_HOST_KEY_POLICY,
+                 probe: bool = DEFAULT_PROBE, safety: SafetySettings | None = None,
                  recording: RecordSettings | None = None, runner: Runner = run_spec):
         self.targets = as_targets(targets, transport, vendor)
         if not self.targets:
             raise ValueError("no targets")
-        self.credentials = Credentials(username=user or os.getlogin(), password=password, key_file=key_file)
+        self.credentials = Credentials(username=user or default_username(), password=password, key_file=key_file)
         self.workers = workers
         self.timeouts = timeouts
         self.policy = policy
@@ -140,10 +143,10 @@ class Fleet:
     def batch(self, commands: Iterable[str]) -> RunReport:
         return self._runner(self.spec("batch", commands=list(commands)))
 
-    def structured(self, rpc: str, fmt: str = "json") -> RunReport:
+    def structured(self, rpc: str, fmt: str) -> RunReport:
         return self._runner(self.spec("structured", commands=[rpc], format=fmt))
 
-    def edit(self, lines: Iterable[str], apply: bool = False, confirmed_minutes: int | None = None,
+    def edit(self, lines: Iterable[str], apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None,
              comment: str | None = None) -> RunReport:
         """Dry run unless `apply`; `confirmed_minutes` leaves a pending commit for confirm()."""
         edit = EditSettings(apply=apply, confirmed_minutes=confirmed_minutes, comment=comment)
