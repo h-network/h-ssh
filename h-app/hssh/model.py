@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Literal, Sequence
 
-Mode = Literal["show", "batch", "structured", "edit", "commit_confirmed", "rollback", "confirm", "commit_status"]
+Mode = Literal["show", "batch", "structured", "edit", "rollback", "confirm", "commit_status"]
 
 HostKeyPolicy = Literal["accept-new", "strict", "off"]
 
@@ -37,25 +37,25 @@ class Credentials:
 class Timeouts:
     """Seconds allowed before login, for each operation in a session, and for a commit."""
 
-    connect: float
-    command: float
-    commit: float
+    connect: int
+    command: int
+    commit: int
 
 
 @dataclass(frozen=True)
 class SafetySettings:
     """Safety gate settings: cooldown after a failed edit and the rate limit."""
 
-    cooldown_seconds: float
-    rate_limit: float
+    cooldown_seconds: int
+    rate_limit: int
 
 
 @dataclass(frozen=True)
 class RecordSettings:
-    """Where the run is recorded: store, audit log, log and saved output."""
+    """Where the run is recorded: store, audit log, log and saved output, each optional."""
 
-    store_path: str
-    audit_log_path: str
+    store_path: str | None = None
+    audit_log_path: str | None = None
     log_path: str | None = None
     save_output_path: str | None = None
 
