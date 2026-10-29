@@ -21,7 +21,10 @@ class ShellChannel:
 
     def recv(self, n: int, timeout: float) -> bytes:
         self.channel.settimeout(timeout)
-        return self.channel.recv(n)
+        data = self.channel.recv(n)
+        if not data:
+            raise ConnectionError("SSH channel closed by peer")
+        return data
 
     def send(self, data: bytes) -> None:
         self.channel.sendall(data)
