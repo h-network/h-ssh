@@ -17,6 +17,7 @@ from contextlib import contextmanager
 import fcntl
 import json
 import logging
+import math
 import os
 import stat
 from pathlib import Path
@@ -31,6 +32,23 @@ logger = logging.getLogger(__name__)
 def _key(host: str, port: Optional[int]) -> str:
     """A device's key in both tiers: `host|port`; the host alone without a port."""
     return host if port is None else f"{host}|{port}"
+
+
+def _expiry(host, value) -> Optional[float]:
+    """A cooldown's end as the safety file holds it: a finite number, or
+    null for none. Anything else (Infinity, NaN or 1e400, which json.load
+    takes; "never", "inf", an object) is not h-ssh's writing, and the file
+    is corrupt: int() of an inf raised OverflowError out of check_device,
+    and a word passed as no cooldown and was erased by the next save (#152)."""
+    if value is None:
+        return None
+    try:
+        expires = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else math.nan
+    except OverflowError:       # an int too large for a float (10**400): no number h-ssh wrote
+        expires = math.nan
+    if not math.isfinite(expires):
+        raise ValueError(f"cooldown of {host!r} is {value!r:.40}, not a finite number")
+    return expires
 
 
 class SafetyGate:
@@ -50,6 +68,12 @@ class SafetyGate:
         cooldown_seconds: int = 120,
         rate_window: float = 60.0,
     ):
+        for what, value in (("rate_limit", rate_limit), ("cooldown_seconds", cooldown_seconds),
+                            ("rate_window", rate_window)):
+            # inf was taken, and a cooldown of time.time() + inf wrote `Infinity`
+            # into the file, which is not JSON and crashed the next run (#152).
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"SafetyGate {what} must be a finite number, not {value!r}")
         self._safety_file = safety_file
         self._rate_limit = rate_limit
         self._cooldown_seconds = cooldown_seconds
@@ -308,13 +332,9 @@ class SafetyGate:
             now = time.time()
             disk_cooldowns = {}
             for host, expires in data.items():
-                if expires is not None:
-                    try:
-                        exp_float = float(expires)
-                        if exp_float > now:
-                            disk_cooldowns[str(host)] = exp_float
-                    except (TypeError, ValueError):
-                        continue
+                expires = _expiry(host, expires)      # a ValueError: corrupt, below
+                if expires is not None and expires > now:
+                    disk_cooldowns[str(host)] = expires
 
             # Merge: disk entries and memory entries
             for host, expires in disk_cooldowns.items():
@@ -349,15 +369,18 @@ class SafetyGate:
                 if path.exists() and path.stat().st_size > 0:
                     with open(path, "r", encoding="utf-8") as f:
                         disk_data = json.load(f)
-                        if isinstance(disk_data, dict):
-                            for h, exp in disk_data.items():
-                                if exp is not None:
-                                    try:
-                                        exp_val = float(exp)
-                                        if exp_val > now:
-                                            merged[str(h)] = exp_val
-                                    except (TypeError, ValueError):
-                                        pass
+                        if not isinstance(disk_data, dict):
+                            raise ValueError("invalid non-dictionary structure")
+                        for h, exp in disk_data.items():
+                            exp = _expiry(h, exp)
+                            if exp is not None and exp > now:
+                                merged[str(h)] = exp
+            except ValueError as e:
+                # Not h-ssh's writing (unparsable, or a cooldown that is no
+                # finite number): kept as .corrupt, never written over.
+                self._mark_corrupt(path)
+                logger.error("Could not parse safety file %s: %s (fail-closed)", self._safety_file, e)
+                return
             except Exception as e:
                 logger.warning("Could not read safety file %s: %s (writing in-memory cooldowns only)", self._safety_file, e)
 
@@ -378,13 +401,13 @@ class SafetyGate:
                 )
                 with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
                     temp_fd = None  # os.fdopen took ownership
-                    json.dump(merged, f)
+                    json.dump(merged, f, allow_nan=False)    # Infinity and NaN are not JSON: never written
                     f.flush()
                     os.fsync(f.fileno())
 
                 os.chmod(temp_path, 0o600)
                 os.replace(temp_path, str(path))
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 logger.warning("Could not write safety file %s: %s (continuing in-memory only)", self._safety_file, e)
                 if temp_fd is not None:
                     try:

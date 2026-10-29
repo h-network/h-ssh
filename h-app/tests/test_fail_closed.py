@@ -186,3 +186,79 @@ def test_a_job_may_repeat_a_device_but_not_contradict_it(monkeypatch, capsys, tm
                                {"target": "R1:10.0.0.2:junos", "show": "show version"}]))
     rc, out, err, drv = run(monkeypatch, capsys, ["--job", str(job)])
     assert rc == 2 and drv.calls == [] and "job file" in err and "used for two hosts" in err
+
+
+# --- #152: one device's trouble is that device's failure, never the run's end ----
+
+def test_a_safety_file_with_a_cooldown_that_is_no_number_fails_closed_without_a_traceback(monkeypatch, capsys,
+                                                                                         tmp_path):
+    """A cooldown of 1e400 loaded as inf and check_device, outside the
+    runner's try, raised OverflowError at int(expires - now): under
+    --no-probe one device's crash ended main() while the other's edit had
+    committed with no audit entry or store row (#152). Such a file is
+    corrupt: both devices are turned away as the gate turns a box away
+    (skipped, exit 3), each with its own audit entry and row, and nothing
+    is sent."""
+    sf, audit = tmp_path / "safety.json", tmp_path / "audit.jsonl"
+    sf.write_text('{"10.0.0.1|830": 1e400}')
+    rc, out, err, drv = run(monkeypatch, capsys, [*EDIT, "--no-probe", "--safety-file", str(sf), "--audit-log", str(audit)])
+    assert rc == 3 and drv.calls == [] and "Traceback" not in err, err
+    assert out.count("safety gate blocked: safety file corrupted (fail-closed)") == 2
+    assert "skipped by the safety gate: 2" in out and '"skipped": 2' in err
+    entries = [json.loads(ln) for ln in audit.read_text().splitlines()]
+    assert sorted(e["device"] for e in entries) == ["R1", "R2"] and not any(e["ok"] for e in entries)
+    assert sf.with_name("safety.json.corrupt").read_text() == '{"10.0.0.1|830": 1e400}' and not sf.exists()
+
+
+def test_a_gate_that_raises_is_that_devices_failure_and_cools_nothing(monkeypatch, capsys, tmp_path):
+    """Whatever the gate raises for one device (an OverflowError from a
+    cooldown it computed, a bug) is that device's FAIL: the other device
+    runs and is recorded, the device the gate crashed on is not cooled."""
+    sf = tmp_path / "safety.json"
+    real = SafetyGate.check_device
+
+    def check_device(self, host, port=None, *, login=True):
+        if host == "10.0.0.1":
+            raise OverflowError("cannot convert float infinity to integer")
+        return real(self, host, port, login=login)
+    monkeypatch.setattr(SafetyGate, "check_device", check_device)
+    rc, out, err, drv = run(monkeypatch, capsys, [*EDIT, "--no-probe", "--safety-file", str(sf), "--json"])
+    assert rc == 1 and "Traceback" not in err, err
+    assert drv.calls == [("edit", "10.0.0.2", "set system host-name x")]
+    results = {r["device"]: r for r in json.loads(out)}
+    assert results["R2"]["ok"] and not results["R1"]["ok"]
+    assert results["R1"]["error"] == "cannot convert float infinity to integer"
+    assert json.loads(sf.read_text()) == {}
+
+
+def test_a_worker_that_raises_is_that_devices_failure_and_the_run_goes_on(monkeypatch, capsys, tmp_path):
+    """An exception out of the per-device coroutine itself (not the runner,
+    which answers for its own) used to come back out of task.result() and
+    end main() with the other devices' results unreported (#152). It is
+    that device's FAIL, saved and recorded like any other; and when its
+    own file cannot be written either (a symlink loop, which Path.resolve
+    raised RuntimeError on before Python 3.13), that is the result's
+    `not_saved` too, not a second way out of the run."""
+    real = cli.run_for_target_async
+
+    async def run_for_target_async(t, **kw):
+        if t.name == "R1":
+            raise RuntimeError("boom")
+        return await real(t=t, **kw)
+    monkeypatch.setattr(cli, "run_for_target_async", run_for_target_async)
+    save = tmp_path / "out"
+    rc, out, err, drv = run(monkeypatch, capsys, [*EDIT, "--no-probe", "--json", "--save-output", str(save)])
+    assert rc == 1 and "Traceback" not in err, err
+    assert drv.calls == [("edit", "10.0.0.2", "set system host-name x")]
+    results = {r["device"]: r for r in json.loads(out)}
+    assert results["R2"]["ok"] and results["R1"]["error"] == "RuntimeError: boom"
+    assert (save / "R1.output").read_text().endswith("\n\nERROR: RuntimeError: boom\n")
+    looped = tmp_path / "looped"
+    looped.mkdir()
+    (looped / "R1.output").symlink_to("R1.output")
+    rc, out, err, drv = run(monkeypatch, capsys, [*EDIT, "--no-probe", "--json", "--save-output", str(looped)])
+    assert rc == 4 and "Traceback" not in err, err
+    results = {r["device"]: r for r in json.loads(out)}
+    assert results["R2"]["ok"] and results["R1"]["error"] == "RuntimeError: boom"
+    assert '"not_saved": 1' in err and "R1.output" in err and (looped / "R2.output").exists()
+    assert (looped / "R1.output").is_symlink()
