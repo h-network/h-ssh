@@ -74,8 +74,9 @@ between reports.
 
 ### 3.2 Orchestrator
 
-The orchestrator executes a `RunSpec` and owns all policy. It defines every default: the front ends and
-the model take their defaults from it, and define none of their own.
+The orchestrator executes a `RunSpec` and owns all policy. It defines the default of every `RunSpec`
+setting: the front ends and the model take them from it, and define none of their own. A transport's
+default port is held by its protocol, and a target's own port overrides it.
 
 | Part | Responsibility |
 |---|---|
@@ -152,6 +153,8 @@ runs. The format is in section 6.
 ```python
 class Communicator(Protocol):
     capabilities: frozenset[str]          # e.g. {"show", "batch", "edit", "commit_confirmed"}
+    default_port: int                     # e.g. 830 for netconf
+    banner: bytes | None                  # what the port sends first, for the probe; None: a connect is enough
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...
@@ -290,7 +293,7 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 - **Redaction:** the recorder redacts secrets from the audit log, using patterns the dialects provide. The
   store keeps device output as received, and is created owner-only.
 - **Host keys:** each communicator uses its library's host-key verification under one policy setting:
-  `accept-new` (default), `strict` or `off`.
+  `off` (default), `accept-new` or `strict`.
 - **Files:** the store, the audit log, logs and saved output are created with mode 0600, in directories
   created with mode 0700.
 
@@ -298,8 +301,8 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 
 - **New vendor:** add a dialect module and register `vendor@transport` drivers for the transports it
   supports.
-- **New transport:** add a communicator implementing section 4.1, declare its capabilities, and register
-  drivers.
+- **New transport:** add a communicator implementing section 4.1, declare its capabilities, default port and
+  banner, and register drivers.
 - **External packages** register through the `hssh.drivers` entry point group. A contract test suite
   verifies any communicator against section 4.
 
