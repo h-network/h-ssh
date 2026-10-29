@@ -50,6 +50,91 @@ def test_show_maps_auth_failure(fake_ssh, monkeypatch):
         openssh.show("10.0.1.1", "admin", None, "show version", 5, 10)
 
 
+@pytest.fixture
+def argv_ssh(tmp_path, monkeypatch):
+    """A stub ssh that records every invocation's argv in FAKE_SSH_ARGV
+    (one JSON list a line), answers -V as OpenSSH 9.6 and prints one line."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = bindir / "ssh"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_SSH_ARGV'], 'a') as f:\n"
+        "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if '-V' in sys.argv:\n"
+        "    sys.stderr.write('OpenSSH_9.6p1\\n'); sys.exit(0)\n"
+        "if '-O' in sys.argv:\n"
+        "    sys.exit(0)\n"
+        "print('uptime 1 day')\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("FAKE_SSH_ARGV", str(tmp_path / "argv.jsonl"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HSSH_HOST_KEY_POLICY", raising=False)
+    monkeypatch.setattr(openssh, "AVAILABLE", True)
+
+    def calls():
+        log = tmp_path / "argv.jsonl"
+        return [json.loads(ln) for ln in log.read_text().splitlines()] if log.exists() else []
+    return calls
+
+
+def test_the_host_key_policy_is_read_per_call_and_the_pins_are_one_store(argv_ssh, tmp_path, monkeypatch):
+    """HSSH_HOST_KEY_POLICY was read once at import and passed to
+    StrictHostKeyChecking as it was (#150): `ask` with a password looped
+    the askpass helper, `no` let a changed key through (OpenSSH's `no`),
+    and a value set after import differed from what the ssh transport
+    read. It is read per call, the same three values as everywhere (`no`
+    is OpenSSH's accept-new: a changed key is refused under every policy),
+    and the pins are the one store: ~/.h-ssh/known_hosts (made 0600) first,
+    ~/.ssh/known_hosts after it."""
+    def options(policy):
+        if policy is None:
+            monkeypatch.delenv("HSSH_HOST_KEY_POLICY", raising=False)
+        else:
+            monkeypatch.setenv("HSSH_HOST_KEY_POLICY", policy)
+        before = len(argv_ssh())
+        openssh.show("10.0.1.1", "admin", None, "show version", 5, 10)
+        argv = next(a for a in argv_ssh()[before:] if "show version" in a)
+        return {a.split("=", 1)[0]: a.split("=", 1)[1] for a in argv if "=" in a}
+    pins, system = tmp_path / ".h-ssh" / "known_hosts", tmp_path / ".ssh" / "known_hosts"
+    assert options(None)["StrictHostKeyChecking"] == "accept-new"
+    assert options("yes")["StrictHostKeyChecking"] == "yes"
+    assert options("no")["StrictHostKeyChecking"] == "accept-new"
+    assert options("accept-new")["UserKnownHostsFile"] == f"{pins} {system}"
+    assert pins.is_file() and stat.S_IMODE(pins.stat().st_mode) == 0o600
+    for policy in ("ask", "off", "maybe"):
+        monkeypatch.setenv("HSSH_HOST_KEY_POLICY", policy)
+        before = len(argv_ssh())
+        with pytest.raises(RuntimeError, match=f"invalid HSSH_HOST_KEY_POLICY='{policy}'"):
+            openssh.show("10.0.1.1", "admin", "hunter2", "show version", 5, 10)
+        assert all("show version" not in a for a in argv_ssh()[before:])  # no login ran (only `ssh -V`)
+
+
+def test_a_revoked_key_is_said_as_such_with_no_advice_to_remove_its_line(fake_ssh, monkeypatch):
+    """Every "Host key verification failed" got the re-keyed advice (#150):
+    for a key known_hosts marks @revoked, following it deletes the
+    revocation, and the next run pins the revoked key and sends it the
+    password. The ssh transport already said @revoked; so does this one."""
+    monkeypatch.setenv("FAKE_SSH_RC", "255")
+    monkeypatch.setenv("FAKE_SSH_STDERR",
+                       "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                       "@       WARNING: REVOKED HOST KEY DETECTED!               @\n"
+                       "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n"
+                       "The ED25519 host key for 10.0.1.1 is marked as revoked.\n"
+                       "This could mean that a stolen key is being used to\n"
+                       "impersonate this host.\n"
+                       "ED25519 host key for 10.0.1.1 was revoked and you have requested strict checking.\n"
+                       "Host key verification failed.")
+    with pytest.raises(RuntimeError) as exc:
+        openssh.show("10.0.1.1", "admin", None, "show version", 5, 10)
+    assert str(exc.value) == ("Host key verification failed for 10.0.1.1: its key is marked @revoked "
+                              "in ~/.ssh/known_hosts.")
+    assert "remove" not in str(exc.value) and "pinned" not in str(exc.value)
+
+
 def test_show_maps_host_key_failure(fake_ssh, monkeypatch):
     monkeypatch.setenv("FAKE_SSH_RC", "255")
     monkeypatch.setenv("FAKE_SSH_STDERR", "Host key verification failed.")

@@ -360,21 +360,54 @@ def _load_pins(client, known_hosts: str, timeout: float = 30.0) -> frozenset:
     return revoked
 
 
+POLICIES = ("accept-new", "yes", "no")
+
+
+def host_key_policy(var: str = "HSSH_HOST_KEY_POLICY") -> str:
+    """The host-key policy `var` names, read per call, for every transport
+    (#150): accept-new (the default: an unknown host is trusted once and
+    pinned), yes (an unknown host is refused) or no. A changed key is
+    refused under every policy. OpenSSH's own `ask` and `off`, and anything
+    else, are refused: passed through to ssh, `ask` with a password put the
+    yes/no question to the askpass helper, which answered with the password,
+    thousands of times in a few seconds, and `off` let a changed key through."""
+    policy = os.environ.get(var, "accept-new")
+    if policy not in POLICIES:
+        raise RuntimeError("invalid %s=%r (expected accept-new, yes or no)" % (var, policy))
+    return policy
+
+
 def _host_key_policy(known_hosts: str, timeout: float = 30.0):
     """The missing-host-key policy HSSH_HOST_KEY_POLICY asks for.
 
     Only an unknown host is a policy matter. A pinned host that presents a
     different key is refused by paramiko itself, whatever the policy.
     """
-    policy = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
+    policy = host_key_policy()
     if policy == "accept-new":
         return _PinPolicy(known_hosts, timeout)
     if policy == "yes":
         return _RejectPolicy()
-    if policy == "no":
-        return paramiko.WarningPolicy()
-    raise RuntimeError("invalid HSSH_HOST_KEY_POLICY=%r (expected accept-new, yes or no)"
-                       % policy)
+    return paramiko.WarningPolicy()
+
+
+def _disagreement(client, name: str):
+    """The key type under which ~/.ssh/known_hosts and the pin file hold
+    different keys for `name` (as paramiko names the host: `[host]:port`
+    off port 22), or None. paramiko looks ~/.ssh/known_hosts up first and
+    reads the pin file only when the host is absent there, so one openssh
+    first contact, or one manual ssh, that took an impostor's key K2 let
+    this transport take K2 too, with K1 still pinned (#150). Two files that
+    disagree are refused before anything is sent, whichever key the server
+    shows: one of them is wrong."""
+    pinned, known = client._host_keys.lookup(name), client._system_host_keys.lookup(name)
+    if pinned is None or known is None:
+        return None
+    for kind in list(pinned.keys()):
+        other = known.get(kind)
+        if other is not None and other.asbytes() != pinned[kind].asbytes():
+            return kind
+    return None
 
 
 class _RevokedKey(Exception):
@@ -500,6 +533,12 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
     known_hosts = _known_hosts()
     client = paramiko.SSHClient()
     revoked = _load_pins(client, known_hosts, session_timeout_float)
+    kind = _disagreement(client, host if (port or 22) == 22 else "[%s]:%d" % (host, port))
+    if kind is not None:
+        client.close()
+        raise RuntimeError("Host key verification failed for %s: %s and ~/.ssh/known_hosts hold different %s "
+                           "keys for it. One of them is not the device's: check which, and remove that line."
+                           % (host, known_hosts, kind))
     client.set_missing_host_key_policy(_host_key_policy(known_hosts, session_timeout_float))
 
     conn_params = {

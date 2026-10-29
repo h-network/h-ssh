@@ -155,6 +155,36 @@ def test_a_pinned_key_is_accepted_again(offline, home):
     assert len(offline.auth_calls) == 2
 
 
+def test_a_pin_is_not_overridden_through_the_system_known_hosts(offline, home):
+    """paramiko looks a host up in ~/.ssh/known_hosts first and reads the
+    pin file only when the host is absent there (#150): one openssh first
+    contact, or one manual ssh, that took an impostor's key K2 made this
+    transport take K2 too, with K1 still pinned in ~/.h-ssh/known_hosts,
+    and the impostor got the password. When the two files hold different
+    keys for a host, the host is refused before any credential is sent,
+    whichever key the server shows: one of the files is wrong, and the
+    message names both."""
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)       # K1 pinned
+    k1, k2 = offline.server_key, paramiko.ECDSAKey.generate()
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir()
+    system.write_text(f"10.0.0.1 {k2.get_name()} {k2.get_base64()}\n")
+    pinned = pin_file(home).read_text()
+    for shown in (k2, k1):
+        offline.auth_calls.clear()
+        offline.server_key = shown
+        with pytest.raises(RuntimeError) as refused:
+            ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+        assert str(refused.value).startswith("Host key verification failed for 10.0.0.1: ")
+        assert str(pin_file(home)) in str(refused.value) and "~/.ssh/known_hosts" in str(refused.value)
+        assert "different" in str(refused.value) and offline.auth_calls == []
+    assert pin_file(home).read_text() == pinned
+    # One file alone still decides as it did: K2 known from ~/.ssh/known_hosts only is accepted.
+    pin_file(home).write_text("")
+    offline.server_key = k2
+    assert "output-for" in ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+
+
 def test_strict_policy_refuses_an_unknown_host(offline, home, monkeypatch):
     monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "yes")
     with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.1"):
@@ -177,10 +207,15 @@ def test_no_policy_warns_and_pins_nothing(offline, home, monkeypatch):
     assert pin_file(home).read_text() == ""
 
 
-def test_unknown_policy_is_refused(offline, monkeypatch):
-    monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "maybe")
+@pytest.mark.parametrize("policy", ["maybe", "ask", "off"])
+def test_unknown_policy_is_refused(offline, home, monkeypatch, policy):
+    """OpenSSH's own `ask` and `off` included (#150): `ask` with a password
+    had the openssh transport put the yes/no question to the askpass
+    helper, which answered with the password, thousands of times."""
+    monkeypatch.setenv("HSSH_HOST_KEY_POLICY", policy)
     with pytest.raises(RuntimeError, match="invalid HSSH_HOST_KEY_POLICY"):
         ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert offline.auth_calls == [] and pin_file(home).read_text() == ""
 
 
 def test_another_port_is_pinned_under_its_own_name(offline, home):
@@ -1444,6 +1479,45 @@ def test_a_key_the_system_file_marks_revoked_is_refused_before_any_credential(ss
     assert logins == ["u"]
 
 
+def test_netconf_pins_the_router_on_first_contact_and_refuses_another_key(sshd, home, monkeypatch):
+    """#150: the NETCONF session verifies the router's key by default, on
+    the store the ssh transport keeps. First contact pins `[host]:port` in
+    ~/.h-ssh/known_hosts and logs in; a router whose key is not the one
+    pinned is refused before the password goes, and so is one the two
+    files disagree on; HSSH_NETCONF_HOSTKEY=no is the opt-out."""
+    pytest.importorskip("jnpr.junos")
+    from hssh.transports import netconf
+    port, key, logins = sshd
+    monkeypatch.delenv("HSSH_NETCONF_HOSTKEY", raising=False)
+    with pytest.raises(NotAppliedError):            # in; then refused the NETCONF subsystem, being no router
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u"]
+    pinned = pin_file(home).read_text()
+    assert pinned == _key_line(f"[127.0.0.1]:{port}", key) + "\n"
+    with pytest.raises(NotAppliedError):            # pinned: in again
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u"] and pin_file(home).read_text() == pinned
+    other = paramiko.ECDSAKey.generate()
+    pin_file(home).write_text(_key_line(f"[127.0.0.1]:{port}", other) + "\n")        # the router re-keyed
+    with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: host key verification failed for "
+                                              rf"127\.0\.0\.1:{port}: its key is not the one pinned in "
+                                              rf"{re.escape(str(pin_file(home)))} \(or ~/\.ssh/known_hosts\); "
+                                              rf"if the router was re-keyed, remove its line; nothing was sent$"):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u"]
+    pin_file(home).write_text(pinned)
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir(mode=0o700)
+    system.write_text(_key_line(f"[127.0.0.1]:{port}", other) + "\n")                # the files disagree
+    with pytest.raises(NotAppliedError, match=r"hold different keys for it"):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u"]
+    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "no")                                   # the opt-out: not checked
+    with pytest.raises(NotAppliedError):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u", "u"]
+
+
 def test_netconf_host_key_verification_reads_the_system_file_the_same_way(sshd, home, monkeypatch):
     """G2 on the junos transport: with HSSH_NETCONF_HOSTKEY=yes ncclient read
     ~/.ssh/known_hosts with paramiko's load(), and an @cert-authority or
@@ -1461,7 +1535,8 @@ def test_netconf_host_key_verification_reads_the_system_file_the_same_way(sshd, 
     lines = f"@cert-authority *.example.net {ca.get_name()} {ca.get_base64()}\n"
     system.write_text(lines)
     with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: host key verification failed for "
-                                              rf"127\.0\.0\.1:{port}: not in ~/\.ssh/known_hosts, or changed"):
+                                              rf"127\.0\.0\.1:{port}: not pinned in ~/\.h-ssh/known_hosts or "
+                                              rf"~/\.ssh/known_hosts \(HSSH_NETCONF_HOSTKEY=yes\); nothing was sent$"):
         netconf._open("127.0.0.1", "u", "p", 5, 30, port)
     assert logins == []
     lines += _key_line(f"[127.0.0.1]:{port}", key) + "\n"

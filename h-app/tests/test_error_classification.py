@@ -108,7 +108,8 @@ def _pyez(kind, cause=None, orig=None):
     (_pyez("ConnectError", orig=SSHError("Negotiation failed: Error reading SSH protocol banner")), 15.0,
      "no SSH banner from 10.0.0.1:830 within 10s"),
     (_pyez("ConnectRefusedError", SSHUnknownHostError("Unknown host key [ab:cd] for [10.0.0.1]")), 0.3,
-     "host key verification failed for 10.0.0.1:830: not in ~/.ssh/known_hosts, or changed (HSSH_NETCONF_HOSTKEY=yes); nothing was sent"),
+     "host key verification failed for 10.0.0.1:830: not pinned in ~/.h-ssh/known_hosts or ~/.ssh/known_hosts "
+     "(HSSH_NETCONF_HOSTKEY=yes); nothing was sent"),
     (_pyez("ConnectAuthError", AuthenticationError("Authentication failed")), 0.5,
      "authentication failed for u at 10.0.0.1:830"),
     (_pyez("ConnectUnknownHostError", socket.gaierror(-2, "Name or service not known")), 0.0,
