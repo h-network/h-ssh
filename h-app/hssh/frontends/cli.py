@@ -198,6 +198,9 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
     edit = None
     if mode == "edit":
         edit = EditSettings(apply=args.yes, confirmed_minutes=args.commit_confirmed, comment=args.comment)
+    safety = None
+    if args.safety_file:
+        safety = SafetySettings(cooldown_seconds=args.cooldown, rate_limit=args.rate_limit, safety_file=args.safety_file)
     return RunSpec(
         targets=resolve_targets(args), mode=mode, commands=commands, config_lines=config_lines,
         format=args.format if mode == "structured" else None,
@@ -205,7 +208,7 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         timeouts=Timeouts(connect=args.connect_timeout, command=args.command_timeout, commit=args.commit_timeout),
         workers=args.workers, host_key_policy=args.host_key_policy, probe=args.probe, edit=edit,
         policy=PolicySettings(retries=args.retries, retry_pause=args.retry_pause),
-        safety=SafetySettings(cooldown_seconds=args.cooldown, rate_limit=args.rate_limit, safety_file=args.safety_file),
+        safety=safety,
         recording=RecordSettings(store_path=None if args.no_store else (args.store or STORE_DEFAULT),
                                  audit_log_path=args.audit_log, log_path=args.log,
                                  save_output_path=args.save_output, argv=tuple(argv)),
