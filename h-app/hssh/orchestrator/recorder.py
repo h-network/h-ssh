@@ -52,14 +52,15 @@ class Recorder:
                           dialect=dialect, action=action, operation=op, edit=edit, diff=diff)
 
     def changes(self, run_id: int, target: Target, driver: str, dialect: Dialect, ops: Sequence[OperationResult],
-                edit: EditSettings) -> None:
-        """An audit entry for each audited operation; the diff's output is carried on every entry after it."""
+                edit: EditSettings, config_lines: Sequence[str] = ()) -> None:
+        """An audit entry per audited operation; a line-by-line load keeps the config line as its command and is audited as 'load'; the diff's output is carried on every entry after it."""
         diff = ""
         for op in ops:
-            if op.command == "diff" and isinstance(op.outcome, Result):
+            action = "load" if op.command in config_lines else op.command
+            if action == "diff" and isinstance(op.outcome, Result):
                 diff = op.outcome.output
-            if op.command in AUDITED:
-                self.change(run_id, target, driver, dialect, op.command, op, edit, diff)
+            if action in AUDITED:
+                self.change(run_id, target, driver, dialect, action, op, edit, diff)
 
     def save_output(self, target: Target, ops: Sequence[OperationResult]) -> None:
         """The target's device output, one file per target."""

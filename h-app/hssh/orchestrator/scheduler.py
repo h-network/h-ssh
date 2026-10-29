@@ -68,7 +68,7 @@ class Scheduler:
             results = await self._gather(run)
         counts = {status: sum(r.status == status for r in results) for status in ("ok", "failed", "skipped")}
         report = RunReport(run.run_id, spec.mode, run.started, now(), results, counts["ok"], counts["failed"],
-                           counts["skipped"], self._pending(spec, results))
+                           counts["skipped"], interrupted=run.interrupts > 0, pending=self._pending(spec, results))
         self.recorder.finish(report)
         return report
 
@@ -92,7 +92,10 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001 - one communicator bug is this target's failure, not the run's end
                 self.policy.settle(target, None)
                 result = self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{type(e).__name__}: {e}", True))
-            self.recorder.log(result)
+            try:
+                self.recorder.log(result)
+            except OSError as e:
+                print(f"log: {e}", file=sys.stderr)
             return result
 
     async def _gather(self, run: _Run) -> list[TargetResult]:
@@ -134,8 +137,11 @@ class Scheduler:
         try:
             for seq, op in enumerate(ops):
                 self.recorder.result(run.run_id, target, driver.name, seq, op)
-            if spec.mode in ("edit", "confirm"):
-                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit or EditSettings())
+            if spec.mode == "edit":
+                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit or EditSettings(),
+                                      spec.config_lines)
+            elif spec.mode == "confirm":
+                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, EditSettings(apply=True))
             self.recorder.save_output(target, ops)
         except OSError as e:
             ops.append(OperationResult("record", Fault(FaultKind.LOCAL, str(e), False), now(), 0))
