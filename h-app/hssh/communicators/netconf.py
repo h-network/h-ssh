@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from hssh.communicators.base import Communicator, Session
 from hssh.dialects.base import Dialect
@@ -49,10 +49,7 @@ class NetconfCommunicator(Communicator):
         raise NotImplementedError
 
     def show(self, session: Session, command: str) -> Result:
-        device = cast(NetconfSession, session).device
-        if command.rstrip().endswith("| no-more"):
-            command = command.rstrip()[:-len("| no-more")].rstrip()
-        return Result(output=device.cli(command, warning=False) or "")
+        raise NotImplementedError
 
     def structured(self, session: Session, rpc: str, fmt: str) -> Result:
         raise NotImplementedError
