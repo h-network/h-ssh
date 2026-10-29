@@ -17,6 +17,8 @@ class Communicator(Protocol):
 
     capabilities: frozenset[str]
     dialect: Dialect
+    default_port: int
+    banner: bytes | None
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts, host_key_policy: HostKeyPolicy) -> Session: ...
 

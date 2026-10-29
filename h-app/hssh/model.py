@@ -66,7 +66,7 @@ class RecordSettings:
 class EditSettings:
     """How an edit run commits: dry run unless apply is set."""
 
-    apply: bool = False
+    apply: bool
     confirmed_minutes: int | None = None
     comment: str | None = None
 
@@ -90,9 +90,9 @@ class RunSpec:
     format: str | None = None
     credentials: Credentials | None = None
     timeouts: Timeouts | None = None
-    workers: int = 1
-    host_key_policy: HostKeyPolicy = "accept-new"
-    probe: bool = False
+    workers: int | None = None
+    host_key_policy: HostKeyPolicy | None = None
+    probe: bool | None = None
     edit: EditSettings | None = None
     policy: PolicySettings | None = None
     safety: SafetySettings | None = None
