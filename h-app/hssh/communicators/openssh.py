@@ -237,6 +237,9 @@ class OpenSSHSession:
 class OpenSSH:
     """Communicator for the system ssh binary; one driver instance per dialect."""
 
+    default_port = 22
+    banner = b"SSH-"
+
     def __init__(self, dialect: Dialect):
         self.dialect = dialect
         caps = {"show", "batch", "edit"}
