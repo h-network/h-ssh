@@ -109,7 +109,8 @@ A communicator implements the interface in section 4.1 for one transport.
 
 A communicator:
 
-- opens and closes sessions, using its library's own connection, timeout and host-key handling
+- opens and closes sessions, using its library's own connection, timeout and host-key handling. Closing a
+  session discards any uncommitted changes, in the communicator's own way
 - executes one operation per call
 - converts library errors into a `Fault` of the right kind, keeping the library's message as detail
 - reports whether anything reached the device before a failure
@@ -237,12 +238,12 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
                                               later run: CONFIRM
 ```
 
-- **Dry run** is the default: load, diff, discard. Nothing is committed.
+- **Dry run** is the default: load, diff, close. Closing discards the candidate, so nothing is committed.
 - **Apply** requires `-y`. Without it, an edit is a dry run.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
   command that confirms them.
-- On a fault after `LOAD` and before `COMMIT`, the orchestrator sends the dialect's discard command. Where
-  the dialect has no candidate, it stops and reports which lines were applied.
+- On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
+  uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.
 - The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file.
 
 ### 5.4 Cancellation
