@@ -11,7 +11,7 @@ DEFAULT_TIMEOUTS = Timeouts(connect=3, command=20, commit=60)
 DEFAULT_POLICY = PolicySettings(retries=2, retry_pause=2)
 DEFAULT_WORKERS = 8
 DEFAULT_HOST_KEY_POLICY: HostKeyPolicy = "off"
-DEFAULT_PROBE = False
+DEFAULT_PROBE = True
 DEFAULT_EDIT = EditSettings(apply=False)
 DEFAULT_CONFIRMED_MINUTES = 10
 DEFAULT_SAFETY = SafetySettings(cooldown_seconds=300, rate_limit=6)
