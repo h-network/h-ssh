@@ -99,10 +99,37 @@ def test_an_existing_store_file_is_made_private_and_another_users_is_refused(tmp
     s.close()
     assert modes == [0o600, 0o600, 0o600]
     uid = os.geteuid()
+    monkeypatch.setattr(store_module, "_safe_dir", lambda path: None)   # the directory precondition apart (its own test)
     monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
     with pytest.raises(StoreError, match=rf"h-ssh\.db: owned by another user \(uid {uid}\); a store is this user's own$"):
         Store(str(path))
     assert [r["device"] for r in rows(path, "SELECT device FROM results")] == ["r1"]
+
+
+def test_a_store_in_a_directory_other_users_can_write_is_refused_unless_it_is_sticky(tmp_path, monkeypatch):
+    """The swap/restore race (#149) needs another user able to rename
+    entries in the store's directory; the precondition is closed by
+    refusing such a directory. One group- or world-writable without the
+    sticky bit is refused (nothing created); a sticky one (as /tmp, where
+    others cannot rename a file they do not own) is fine, and so is a
+    private one; a directory owned by another user is refused whoever may
+    write it."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)                              # world-writable, no sticky
+    with pytest.raises(StoreError, match=r"its directory .*/shared is writable by other users "
+                                         r"\(mode 0777, no sticky bit\)"):
+        Store(str(shared / "h-ssh.db"))
+    assert not (shared / "h-ssh.db").exists()
+    shared.chmod(0o1777)                             # sticky, as /tmp: others cannot rename our file
+    Store(str(shared / "h-ssh.db")).close()
+    assert (shared / "h-ssh.db").is_file()
+    shared.chmod(0o700)
+    uid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
+    with pytest.raises(StoreError, match=rf"its directory .*/shared is owned by another user \(uid {uid}\)"):
+        Store(str(shared / "other.db"))
+    assert not (shared / "other.db").exists()
 
 
 def test_a_store_path_swapped_while_it_is_opened_is_refused(tmp_path, monkeypatch):

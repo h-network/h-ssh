@@ -1067,7 +1067,12 @@ made 0600 at the open whatever it was (a 0644 `h-ssh.db` made by hand, or by the
 snippet above before the first run, is made private, and so are a `-wal` and `-shm` left beside it),
 in directories made 0700, must be this user's own regular file (one owned by another user is refused,
 `owned by another user`, as a symlink in its place is), and is checked, once SQLite has it open, to
-be the file that was made private; its tables are made before the first device, after the checks that need no
+be the file that was made private. Its directory must be yours too, and not one other users can write
+(a symlink one of them plants between the open and SQLite's own, which reopens the file by name, would
+otherwise send the run's writes elsewhere): a directory owned by another user, or group- or
+world-writable without the sticky bit, is refused (`its directory DIR is writable by other users`); a
+sticky one such as `/tmp/yourjob`, where others cannot rename a file that is not theirs, is fine. Its
+tables are made before the first device, after the checks that need no
 file: a store that cannot be written is no run (exit 2, nothing sent), because a run nobody can look
 up afterwards is not worth having. A run refused before it starts leaves no store file: one those
 checks refuse never opens it (`--raw -v`, an edit with no terminal and no `-y`), and a store the run
@@ -1659,7 +1664,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1529 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1532 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

@@ -127,9 +127,11 @@ def _same_file(path: str, st: os.stat_result) -> bool:
 def _make_private(path: str) -> None:
     """A regular file of this user's at `path`, if there is one, made 0600
     (a -wal or -shm SQLite left beside a store at the store's old mode,
-    #149); anything else, a symlink included, left alone."""
+    #149); anything else, a symlink included, left alone. Opened without
+    blocking: a FIFO planted there with no writer would hold a blocking
+    open for ever, where SQLite opens it for writing and goes on."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         return
     try:
@@ -140,6 +142,29 @@ def _make_private(path: str) -> None:
         pass
     finally:
         os.close(fd)
+
+
+def _safe_dir(path: str) -> None:
+    """Refuse a store whose directory another user can rename entries in: a
+    symlink they plant between this process opening the file and SQLite
+    reopening the path by name would send the run's writes to another file,
+    which the post-connect identity check narrows but a rename-and-restore
+    can still slip past (#149). The directory is safe when this user owns
+    it and only this user can write it, or it carries the sticky bit
+    (`/tmp`, 1777: others cannot rename a file they do not own). A directory
+    h-ssh just made is 0700 and this user's, so it passes."""
+    directory = os.path.dirname(path) or "."
+    try:
+        st = os.stat(directory)
+    except OSError:
+        return                          # gone: the open below says so, with the path
+    if st.st_uid != os.geteuid():
+        raise StoreError(f"{path}: its directory {directory} is owned by another user (uid {st.st_uid}); "
+                         "a store's directory must be yours")
+    if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
+        raise StoreError(f"{path}: its directory {directory} is writable by other users "
+                         f"(mode {stat.S_IMODE(st.st_mode):04o}, no sticky bit); another user could replace the "
+                         "store under the run")
 
 
 # A directory held for still_there(). O_PATH (Linux) needs no read permission
@@ -336,6 +361,7 @@ class Store:
         try:
             if directory:
                 private_dir(directory)
+            _safe_dir(path)
             try:
                 fd, made = os.open(path, flags | os.O_EXCL, 0o600), True
             except FileExistsError:
