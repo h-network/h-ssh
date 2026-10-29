@@ -40,6 +40,9 @@ class SSHSession:
 
 
 class SSHCommunicator(Communicator):
+    default_port: int = 22
+    banner: bytes | None = b"SSH-"
+
     # Advertise operations once connection setup is implemented.
     capabilities: frozenset[str] = frozenset()
 
