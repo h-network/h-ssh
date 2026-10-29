@@ -24,6 +24,8 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+
+from .audit import private_dir
 from typing import Generator, Optional
 
 logger = logging.getLogger(__name__)
@@ -231,7 +233,7 @@ class SafetyGate:
         refuses to start instead of continuing unguarded on a warning."""
         path = Path(self._safety_file)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            private_dir(path.parent)
         except OSError as e:
             raise OSError(f"safety file {self._safety_file}: cannot create its directory ({e.strerror})") from e
         for p in (Path(f"{self._safety_file}.lock"), path):
@@ -266,7 +268,7 @@ class SafetyGate:
         if self._safety_file:
             lock_path = Path(f"{self._safety_file}.lock")
             try:
-                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                private_dir(lock_path.parent)
                 fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise OSError(f"{lock_path} is not a regular file")
@@ -354,7 +356,7 @@ class SafetyGate:
 
         path = Path(self._safety_file)
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            private_dir(path.parent)
         except OSError as e:
             logger.warning("Could not create directory for safety file %s: %s", self._safety_file, e)
             return

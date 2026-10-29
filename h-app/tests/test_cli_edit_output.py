@@ -602,6 +602,32 @@ def test_save_output_is_proven_writable_before_the_first_device(monkeypatch, cap
     assert rc == 0 and len(driver.calls) == 1 and (tmp_path / "long" / f"{long_name[1:]}.output").exists()
 
 
+def test_save_output_makes_its_directories_private_and_warns_of_one_that_is_not(monkeypatch, capsys, tmp_path):
+    """The parents made for --save-output DIR were the umask's (0777 under
+    umask 000) and a DIR that was there kept its 0755 without a word
+    (#149): every directory made is 0700, and an existing DIR that group or
+    others can read draws a WARNING, its mode left as the operator made it
+    (its files are 0600 either way)."""
+    old = os.umask(0o000)
+    try:
+        save = tmp_path / "a" / "b"
+        rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", "set system host-name x", "-y",
+                                                              "--save-output", str(save)], "COMMIT OK")
+    finally:
+        os.umask(old)
+    assert rc == 0 and "WARNING: --save-output" not in err, err
+    assert [stat.S_IMODE(d.stat().st_mode) for d in (tmp_path / "a", save)] == [0o700, 0o700]
+    assert stat.S_IMODE((save / "R1.output").stat().st_mode) == 0o600
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", "set system host-name x", "-y",
+                                                          "--save-output", str(shared)], "COMMIT OK")
+    assert rc == 0, err
+    assert f"WARNING: --save-output {shared} is not private (mode 0755): its files are 0600, their names are not." in err
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o755 and stat.S_IMODE((shared / "R1.output").stat().st_mode) == 0o600
+
+
 def test_a_job_entry_saved_over_another_devices_file_is_refused(monkeypatch, capsys, tmp_path):
     """R1's second entry is saved as R1.2.output, which is also the file of a
     device named R1.2: one result would replace the other. Refused with the

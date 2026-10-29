@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -63,6 +64,67 @@ def test_the_store_is_a_private_file_with_the_two_tables(tmp_path):
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     names = {r["name"] for r in rows(path, "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"runs", "results"} <= names
+
+
+def test_the_directories_made_for_a_store_are_private_whatever_the_umask(tmp_path):
+    """The parents made for a store were the umask's, 0777 under umask 000
+    (os.makedirs's mode is the last directory's alone, #149): each one
+    made is 0700."""
+    old = os.umask(0o000)
+    try:
+        path = tmp_path / "a" / "b" / "runs.db"
+        Store(str(path)).close()
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert [stat.S_IMODE(d.stat().st_mode) for d in (tmp_path / "a", tmp_path / "a" / "b")] == [0o700, 0o700]
+
+
+def test_an_existing_store_file_is_made_private_and_another_users_is_refused(tmp_path, monkeypatch):
+    """`touch h-ssh.db; chmod 644`, or the README's sqlite3.connect snippet
+    run before the first run, left a 0644 store, and a run kept it so, its
+    -wal and -shm with it, holding the replies; a store owned by another
+    user, planted in a shared job directory, was opened and written (#149).
+    An existing file is made 0600 at the open, a -wal left beside it too,
+    and another user's file is refused before SQLite opens it."""
+    path, wal, shm = tmp_path / "h-ssh.db", tmp_path / "h-ssh.db-wal", tmp_path / "h-ssh.db-shm"
+    path.touch()
+    path.chmod(0o644)
+    wal.touch()
+    wal.chmod(0o644)
+    s = Store(str(path))
+    r = s.begin_run("show", [], "lab", 1, "1.0.0", command="version")
+    s.add_entry(r, SHOW, "show version")
+    modes = [stat.S_IMODE(p.stat().st_mode) for p in (path, wal, shm)]
+    s.close()
+    assert modes == [0o600, 0o600, 0o600]
+    uid = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: uid + 1)
+    with pytest.raises(StoreError, match=rf"h-ssh\.db: owned by another user \(uid {uid}\); a store is this user's own$"):
+        Store(str(path))
+    assert [r["device"] for r in rows(path, "SELECT device FROM results")] == ["r1"]
+
+
+def test_a_store_path_swapped_while_it_is_opened_is_refused(tmp_path, monkeypatch):
+    """The descriptor that made the file private was closed before SQLite
+    opened the path by name, which follows a symlink where that open did
+    not (#149): one planted in between led SQLite into another file. The
+    descriptor is held until SQLite has opened the path, which is then
+    checked to lead to that file; or the store is not opened, and the file
+    SQLite was led to is not written."""
+    path, other = tmp_path / "h-ssh.db", tmp_path / "other.db"
+    other.write_bytes(b"")
+    real_connect = sqlite3.connect
+
+    def planted(target, *a, **kw):
+        if target == str(path):
+            path.unlink()
+            path.symlink_to(other)
+        return real_connect(target, *a, **kw)
+    monkeypatch.setattr(sqlite3, "connect", planted)
+    with pytest.raises(StoreError, match="h-ssh.db: replaced while being opened"):
+        Store(str(path))
+    assert other.read_bytes() == b"" and path.is_symlink()
 
 
 def test_a_symlink_in_place_of_the_store_is_refused(tmp_path):
@@ -469,6 +531,51 @@ def test_an_export_out_file_that_cannot_be_opened_or_written_is_an_error_line_no
         ro.mkdir(mode=0o500)
         rc, out, err = reader(capsys, tmp_path / "s.db", "export", "--out", str(ro / "rows.csv"))
         assert rc == 2 and "ERROR: --out" in err and "Permission denied" in err
+
+
+def test_an_export_out_file_is_private_and_never_a_link_a_fifo_or_the_live_wal(tmp_path, capsys):
+    """--out was a plain open() (#149): 0644 under umask 022, a file that was
+    there kept its mode, a symlink was followed and its target written
+    world-readable, a FIFO blocked the reader, and a hard link to the live
+    -wal, which realpath does not see, was emptied under the store. It is
+    opened as --log is written: 0600 whatever was there, no symlink
+    followed, a FIFO failed at once, a file of the store's under any name
+    refused with the store untouched; /dev/null still takes the rows."""
+    path = tmp_path / "h-ssh.db"
+    filled(path)
+    old = os.umask(0o022)
+    try:
+        out, loose = tmp_path / "rows.csv", tmp_path / "loose.csv"
+        loose.write_text("x")
+        loose.chmod(0o644)
+        for target in (out, loose):
+            rc, _, err = reader(capsys, path, "export", "--all", "--out", str(target))
+            assert rc == 0 and err == f"5 rows written to {target}\n" and stat.S_IMODE(target.stat().st_mode) == 0o600
+            assert target.read_text().startswith("run_id,device,")
+    finally:
+        os.umask(old)
+    kept, link = tmp_path / "kept", tmp_path / "link.csv"
+    kept.write_text("keep\n")
+    link.symlink_to(kept)
+    rc, _, err = reader(capsys, path, "export", "--all", "--out", str(link))
+    assert rc == 2 and err == f"ERROR: --out {link}: a symbolic link, not followed\n" and kept.read_text() == "keep\n"
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    started = time.monotonic()
+    rc, _, err = reader(capsys, path, "export", "--all", "--out", str(fifo))
+    assert rc == 2 and err.startswith(f"ERROR: --out {fifo}: ") and time.monotonic() - started < 2
+    writer = Store(str(path))                       # the -wal is there while a writer has the store
+    run = writer.begin_run("show", [], "lab", 1, "1.0.0", command="version")
+    writer.add_entry(run, SHOW, "show version")
+    wal, hard = tmp_path / "h-ssh.db-wal", tmp_path / "hard.csv"
+    frames = wal.read_bytes()
+    os.link(wal, hard)
+    rc, _, err = reader(capsys, path, "export", "--all", "--out", str(hard))
+    assert rc == 2 and err == f"ERROR: --out {hard}: that is the store's -wal file\n"
+    assert frames and wal.read_bytes() == frames
+    writer.close()
+    rc, _, err = reader(capsys, path, "export", "--all", "--out", "/dev/null")
+    assert rc == 0 and err == "6 rows written to /dev/null\n"
 
 
 def test_an_export_onto_the_store_itself_is_refused_and_the_store_kept(tmp_path, monkeypatch, capsys):

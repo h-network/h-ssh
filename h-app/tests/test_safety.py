@@ -173,6 +173,20 @@ def test_cross_invocation_persist():
         Path(tmp).unlink(missing_ok=True)
 
 
+def test_the_directories_made_for_the_safety_file_are_private_whatever_the_umask(tmp_path):
+    """The parents made for the safety file were the umask's, 0777 under
+    umask 000 (#149): each one made is 0700, the file 0600 as before."""
+    old = os.umask(0o000)
+    try:
+        gate = SafetyGate(safety_file=str(tmp_path / "a" / "b" / "safety.json"))
+        gate.set_cooldown("10.0.1.1")
+        gate.close()
+    finally:
+        os.umask(old)
+    assert [os.stat(tmp_path / d).st_mode & 0o777 for d in ("a", "a/b")] == [0o700, 0o700]
+    assert os.stat(tmp_path / "a" / "b" / "safety.json").st_mode & 0o777 == 0o600
+
+
 # T8: a gate that cannot keep its file refuses to exist (#64); the
 # in-memory gate is still the one without a file.
 def test_an_unwritable_safety_file_refuses_the_gate(tmp_path):

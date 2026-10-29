@@ -289,8 +289,9 @@ def test_a_store_closed_twice_lets_go_of_its_directory_once(tmp_path, first):
     fd = st._where[1]
     getattr(st, first)()
     other = os.open(tmp_path, os.O_RDONLY)
-    os.dup2(other, fd)                                   # the number the store let go is another file's now
-    os.close(other)
+    if other != fd:                                      # the number the store let go is another file's now
+        os.dup2(other, fd)
+        os.close(other)
     st.close()
     os.fstat(fd)                                         # still open: the second close let go of nothing
     os.close(fd)

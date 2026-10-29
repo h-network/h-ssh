@@ -26,6 +26,7 @@ import argparse
 import csv
 import datetime as _dt
 import difflib
+import errno
 import json
 import os
 import pathlib
@@ -40,6 +41,7 @@ import time
 import weakref
 from typing import Iterable, Iterator, List, Optional
 
+from .audit import private_dir
 from .screen import is_terminal, terminal_safe
 
 ENV_VAR = "HSSH_STORE"
@@ -110,6 +112,34 @@ def _there(path: str, dir_fd: Optional[int] = None) -> bool:
     except OSError:
         return False
     return True
+
+
+def _same_file(path: str, st: os.stat_result) -> bool:
+    """Whether `path` leads (through a symlink too, as SQLite follows it) to
+    the file `st` describes."""
+    try:
+        now = os.stat(path)
+    except OSError:
+        return False
+    return (now.st_dev, now.st_ino) == (st.st_dev, st.st_ino)
+
+
+def _make_private(path: str) -> None:
+    """A regular file of this user's at `path`, if there is one, made 0600
+    (a -wal or -shm SQLite left beside a store at the store's old mode,
+    #149); anything else, a symlink included, left alone."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return
+    try:
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) != 0o600:
+            os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 # A directory held for still_there(). O_PATH (Linux) needs no read permission
@@ -221,7 +251,7 @@ class Store:
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
         else:
-            self.made = self._create_private(path)
+            self.made, fd = self._create_private(path)
             try:
                 # Not pinned to the opening thread: a library caller may open a
                 # store here and write it from the thread that consumes the results,
@@ -230,6 +260,14 @@ class Store:
                 # it at once lose rows, or worse: "bad parameter or other API
                 # misuse"), so every write below is one transaction under _writing.
                 self.conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT, check_same_thread=False)
+                # SQLite opened the path by name, following a symlink where
+                # the open above did not: the file it has is the one made
+                # private there, or it is not written (#149).
+                if not _same_file(path, os.fstat(fd)):
+                    self.conn.close()
+                    raise StoreError(f"{path}: replaced while being opened")
+                for side in ("-wal", "-shm"):
+                    _make_private(path + side)   # left beside a store that was 0644, at that mode
                 _wal(self.conn)
                 # WAL with synchronous=NORMAL: every commit is safe against the
                 # process dying, the file never corrupts, and only a power cut
@@ -240,6 +278,8 @@ class Store:
                 self.conn.commit()
             except sqlite3.Error as e:
                 raise StoreError(f"{path}: {e}") from e
+            finally:
+                os.close(fd)
         self.conn.row_factory = sqlite3.Row
         # The file is looked up by its name in its directory, which is held
         # open from here: a library script that chdirs, a `..` after a
@@ -276,19 +316,26 @@ class Store:
         return _settled(resolved) != then
 
     @staticmethod
-    def _create_private(path: str) -> bool:
-        """The file is made 0600 before SQLite ever opens it, and must be a
-        regular file (no following a planted symlink into another file). Its
+    def _create_private(path: str) -> tuple:
+        """(whether this call made the file, a descriptor on it). The file is
+        made 0600 before SQLite ever opens it, one that was there already
+        too (a 0644 h-ssh.db made by hand, or by the README's own sqlite3
+        snippet, kept its mode, and SQLite gave its -wal and -shm the same:
+        #149), must be a regular file (no following a planted symlink into
+        another file) and this user's own: a store owned by another user,
+        planted in a shared job directory, collected the run's output. The
+        descriptor is the caller's to hold until SQLite has opened the path
+        (__init__), which is then checked to lead to this file still. Its
         directory is made from the path as given, not normalised: abspath()
         takes `link/..` away as text, where the kernel (and SQLite) go up from
-        wherever the link leads. True when this call made the file: one that
-        was there already, or that another run made at the same instant, is
-        not this Store's to take away."""
+        wherever the link leads. Made is True when this call made the file:
+        one that was there already, or that another run made at the same
+        instant, is not this Store's to take away."""
         directory = os.path.dirname(path)
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         try:
             if directory:
-                os.makedirs(directory, mode=0o700, exist_ok=True)
+                private_dir(directory)
             try:
                 fd, made = os.open(path, flags | os.O_EXCL, 0o600), True
             except FileExistsError:
@@ -296,11 +343,19 @@ class Store:
         except OSError as e:
             raise StoreError(f"{path}: {e.strerror or e}") from e
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
                 raise StoreError(f"{path}: not a regular file")
-        finally:
+            if st.st_uid != os.geteuid():
+                raise StoreError(f"{path}: owned by another user (uid {st.st_uid}); a store is this user's own")
+            os.fchmod(fd, 0o600)
+        except OSError as e:
             os.close(fd)
-        return made
+            raise StoreError(f"{path}: {e.strerror or e}") from e
+        except StoreError:
+            os.close(fd)
+            raise
+        return made, fd
 
     def _open_readonly(self, resolved: str) -> sqlite3.Connection:
         """The reader never writes the store, but a WAL reader wants a -shm
@@ -705,7 +760,9 @@ EXPORT_FIELDS = ("run_id", "device", "seq", "host", "vendor", "command", "ts", "
 def _part_of_store(store: Store, out: str) -> Optional[str]:
     """What of the store `out` names, if anything: the file itself (as
     typed, through a symlink or a hard link), or one SQLite keeps beside
-    it. Opened for writing, it would empty the store under the reader."""
+    it. Opened for writing, it would empty the store under the reader.
+    Asked before anything is opened, by name; a hard link to one of the
+    side files is found once the file is open, by its inode (_is_of)."""
     try:
         if os.path.samefile(out, store.path):
             return "the store itself"
@@ -718,6 +775,57 @@ def _part_of_store(store: Store, out: str) -> Optional[str]:
     return None
 
 
+def _is_of(store: Store, st: os.stat_result) -> Optional[str]:
+    """What of the store the open file `st` is, by device and inode (a hard
+    link under any name, #149): the file itself, or one SQLite keeps
+    beside it; None for anything else."""
+    files = [(store.path, "the store itself")] + [(store.path + s, f"the store's {s} file")
+                                                  for s in ("-wal", "-shm", "-journal")]
+    for name, what in files:
+        try:
+            that = os.stat(name)
+        except OSError:
+            continue
+        if (that.st_dev, that.st_ino) == (st.st_dev, st.st_ino):
+            return what
+    return None
+
+
+def _open_out(store: Store, out: str):
+    """`--out` opened as --log and --save-output are written (#149): made
+    0600 (it was the umask's, 0644, and a file that was there kept its
+    mode), a symlink not followed (a planted one had its target written
+    world-readable), a FIFO not waited on (O_NONBLOCK: one with no reader
+    fails at once, one with a reader is no regular file), a character
+    device (/dev/null, a terminal) taken as it is; a regular file is
+    truncated only once it is known to be no file of the store's under
+    another name (a hard link to the live -wal was emptied, and the next
+    reader said `disk I/O error`)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(out, flags, 0o600)
+    except OSError as e:
+        why = "a symbolic link, not followed" if e.errno == errno.ELOOP else (e.strerror or str(e))
+        raise StoreError(f"--out {out}: {why}") from e
+    try:
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode):
+            part = _is_of(store, st)
+            if part:
+                raise StoreError(f"--out {out}: that is {part}")
+            os.ftruncate(fd, 0)
+            os.fchmod(fd, 0o600)
+        elif not stat.S_ISCHR(st.st_mode):
+            raise StoreError(f"--out {out}: not a regular file")
+    except OSError as e:
+        os.close(fd)
+        raise StoreError(f"--out {out}: {e.strerror or e}") from e
+    except StoreError:
+        os.close(fd)
+        raise
+    return os.fdopen(fd, "w", newline="", encoding="utf-8")
+
+
 def cmd_export(store: Store, args) -> int:
     """The rows as they are, for a spreadsheet or a notebook: CSV (Excel opens
     it; a multi-line reply stays one quoted cell) or JSON Lines, one object a
@@ -728,13 +836,7 @@ def cmd_export(store: Store, args) -> int:
         raise StoreError(f"--out {args.out}: that is {part}")
     run_id = None if args.all else store.resolve_run(args.run)
     rows = store.results(run_id=run_id, device=args.device, command=args.command)
-    if args.out:
-        try:
-            out = open(args.out, "w", newline="", encoding="utf-8")
-        except OSError as e:
-            raise StoreError(f"--out {args.out}: {e.strerror or e}") from e
-    else:
-        out = sys.stdout
+    out = _open_out(store, args.out) if args.out else sys.stdout
     shown = _shown_on(out)
 
     def cells(r):

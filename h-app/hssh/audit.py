@@ -125,6 +125,22 @@ def redact_values(data):
     return data
 
 
+def private_dir(path) -> None:
+    """mkdir -p, each directory made 0700, whatever the umask: the files the
+    run writes (the store, the audit log, --log, --save-output, the safety
+    file) are the operator's alone, and so are the directories made for
+    them. Path.mkdir(parents=True, mode=0o700) gave that mode to the last
+    directory only; the parents it made were the umask's, 0777 under umask
+    000 (#149). A directory that is there already is left as it is."""
+    path = Path(path)
+    for level in reversed([path, *path.parents]):
+        if not level.is_dir():
+            try:
+                level.mkdir(mode=0o700)
+            except FileExistsError:         # another run made it meanwhile (or a file is in the way: said at the open)
+                pass
+
+
 def secure_append(path: str, text: str) -> None:
     """Append `text` to a 0600 regular file under an exclusive flock, creating
     it and its directory. The audit log and --log both go through here, so a
@@ -137,7 +153,7 @@ def secure_append(path: str, text: str) -> None:
     file ignores it. The mode is set on the descriptor, and a short write
     is finished or reported, never counted as done."""
     log_path = Path(path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(log_path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(str(log_path), flags, 0o600)
@@ -170,7 +186,7 @@ def probe_append(path: str) -> None:
     commits it was supposed to record."""
     log_path = Path(path)
     try:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        private_dir(log_path.parent)
     except OSError as e:
         raise OSError(f"{path}: cannot create its directory ({e.strerror})") from e
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
@@ -190,7 +206,7 @@ def secure_write(path: str, text: str) -> None:
     """Replace a 0600 regular file of our own with `text` (--save-output):
     the same open rules as secure_append, truncating instead of appending."""
     out = Path(path)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(out.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(str(out), flags, 0o600)
