@@ -240,7 +240,8 @@ def report_dict(report: RunReport) -> dict[str, Any]:
 
     return {
         "run_id": report.run_id, "mode": report.mode, "started": report.started, "finished": report.finished,
-        "ok": report.ok, "failed": report.failed, "skipped": report.skipped, "pending": dict(report.pending),
+        "ok": report.ok, "failed": report.failed, "skipped": report.skipped, "interrupted": report.interrupted,
+        "pending": dict(report.pending),
         "results": [{"target": tr.target.name, "host": tr.target.host, "status": tr.status,
                      "operations": [{"command": op.command, "started": op.started, "elapsed_ms": op.elapsed_ms,
                                      **outcome(op)} for op in tr.operations]} for tr in report.results],
