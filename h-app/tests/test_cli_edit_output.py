@@ -579,15 +579,15 @@ def test_save_output_is_proven_writable_before_the_first_device(monkeypatch, cap
     unwritable audit log is (exit 2): a run never commits what it could not
     save. A name that fits runs."""
     driver = JobDriver()
-    save = tmp_path / "out"
-    save.mkdir()
-    save.chmod(0o500)
-    try:
-        rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", "set system host-name x", "-y",
-                                                              "--save-output", str(save)], driver=driver)
-    finally:
-        save.chmod(0o700)
-    if os.geteuid() != 0:                                # root writes anywhere
+    if os.geteuid() != 0:                                # root writes anywhere: the case is not run, not just unasserted
+        save = tmp_path / "out"
+        save.mkdir()
+        save.chmod(0o500)
+        try:
+            rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", "set system host-name x", "-y",
+                                                                  "--save-output", str(save)], driver=driver)
+        finally:
+            save.chmod(0o700)
         assert rc == 2 and driver.calls == [] and "--save-output" in err and "Permission denied" in err
     long_name = "R" * (os.pathconf(str(tmp_path), "PC_NAME_MAX") - len(".output") + 1)
     rc, out, err = run_cli(monkeypatch, capsys, tmp_path, ["-eC", "set system host-name x", "-y",
