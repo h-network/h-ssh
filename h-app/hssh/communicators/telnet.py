@@ -24,7 +24,10 @@ class TelnetChannel:
 
     def recv(self, n: int, timeout: float) -> bytes:
         self.sock.settimeout(timeout)
-        return self.sock.recv(n)
+        data = self.sock.recv(n)
+        if not data:
+            raise ConnectionError("Telnet connection closed by peer")
+        return data
 
     def send(self, data: bytes) -> None:
         self.sock.sendall(data)
