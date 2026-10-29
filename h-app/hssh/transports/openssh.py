@@ -58,13 +58,15 @@ from .cli import (Cli, edit_policy, refuse_comment, refuse_commit_lines, refuse_
                   refuse_empty_edit)
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, after_applied, budget, no_banner, tcp_timed_out,
                       where)
+from . import ssh as _ssh
+from .ssh import host_key_policy, _known_hosts as _pin_file
 
 AVAILABLE = shutil.which("ssh") is not None
 
-# accept-new trusts a host the first time and pins it after. The paramiko
-# transport reads the same variable and pins in ~/.h-ssh/known_hosts; this
-# one leaves pinning to ssh and ~/.ssh/known_hosts. Override for stricter sites.
-_HOST_KEY_POLICY = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
+# The host-key policy and the pin store are the ssh transport's (#150): one
+# HSSH_HOST_KEY_POLICY, read per call and refused unless it is one of the
+# three, and one ~/.h-ssh/known_hosts, where OpenSSH pins what it trusts
+# (host_key_policy and _pin_file, imported above).
 
 # SSH_ASKPASS_REQUIRE=force is what lets askpass work with no TTY and no
 # DISPLAY. It landed in OpenSSH 8.4; older clients would silently ignore it
@@ -183,15 +185,62 @@ class _AskPass:
         return False
 
 
+def _quoted(path: str) -> str:
+    """A path as one word of an ssh option that takes several."""
+    return '"%s"' % path if any(c.isspace() for c in path) else path
+
+
+def _system_file() -> str:
+    return os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
+
+
+def _refuse_disagreement(host: str, user: str, port: Optional[int]) -> None:
+    """Before the ssh that logs in runs (once a session, not once a
+    command): a host ~/.h-ssh/known_hosts and ~/.ssh/known_hosts hold
+    different keys for is refused, as the ssh transport refuses it (the
+    review's repro, #150): with both files in UserKnownHostsFile OpenSSH
+    takes a match in either, so the key pinned in one was overridden by
+    the other and the password went. The host is looked up under the name
+    OpenSSH looks it up under, which its configuration decides (a
+    HostKeyAlias; else the HostName, as `[name]:port` off port 22, the
+    Port there counting where the target names none): `ssh -G` says what
+    it is, read as the probe reads it, since a check under the name as
+    given would miss what a `Port` or `HostName` stanza moved. Both files
+    are read as the ssh transport reads them, by its parser, and a pin
+    file line that holds no pin is the same refusal here; @cert-authority
+    lines are no keys and stay OpenSSH's to check. Without paramiko the
+    files cannot be read, and OpenSSH is left to its own."""
+    if not _ssh.AVAILABLE:
+        return
+    from ..probe import _ssh_g, _Unknown     # hssh.probe imports the drivers, which load this module
+    try:
+        route = _ssh_g(host, port, 22, user, 30.0)
+    except _Unknown as exc:
+        raise RuntimeError("SSH transport failed: %s." % exc) from exc
+    name = route.alias or (route.host if route.port == 22 else "[%s]:%d" % (route.host, route.port))
+    with _ssh._PIN_LOCK:
+        pinned, _ = _ssh._parsed(_pin_file(), system=False, timeout=30.0)
+        known, _ = _ssh._parsed(_system_file(), system=True, timeout=30.0)
+    reason = _ssh.disagreement(pinned, known, name, _pin_file())
+    if reason is not None:
+        raise RuntimeError("Host key verification failed for %s: %s." % (host, reason))
+
+
 def _base_opts(connect_timeout, port: Optional[int],
                control_path: Optional[str], have_password: bool) -> List[str]:
     """ssh's options. `connect_timeout` is the connect phase's seconds:
     OpenSSH's ConnectTimeout bounds the TCP connect and the banner exchange
     together, as --connect-timeout does (#126)."""
-    known_hosts = os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
+    policy = host_key_policy()
+    system = _system_file()
     opts = [
-        "-o", "StrictHostKeyChecking=%s" % _HOST_KEY_POLICY,
-        "-o", "UserKnownHostsFile=%s" % known_hosts,
+        # OpenSSH's own `no` lets a changed key through; h-ssh's `no` spares
+        # an unknown host the refusal and nothing else, which for OpenSSH is
+        # accept-new (it pins on first contact, where paramiko's `no` does not).
+        "-o", "StrictHostKeyChecking=%s" % ("accept-new" if policy == "no" else policy),
+        # One pin store: h-ssh's own file first (a new pin goes there, made
+        # 0600 beforehand), then OpenSSH's own. A changed key in either is refused.
+        "-o", "UserKnownHostsFile=%s %s" % (_quoted(_pin_file()), _quoted(system)),
         "-o", "LogLevel=ERROR",
         "-o", "ConnectTimeout=%d" % max(1, math.ceil(connect_timeout)),
         "-o", "NumberOfPasswordPrompts=1",
@@ -424,7 +473,9 @@ def _log_in(host: str, user: str, askpass, cmd: str, session_timeout: int, comma
     as soon as its log level is INFO or above, and `-v` puts it there over
     `-o LogLevel=ERROR`: a login message became every command's STDERR block,
     and one that starts `error:` failed every show as refused (#143). This
-    ssh's stderr is read only to say why the login failed."""
+    ssh's stderr is read only to say why the login failed. The host key
+    check of the two files (#150) comes first, once for the session."""
+    _refuse_disagreement(host, user, port)
     proc = _exec(host, user, askpass, cmd, session_timeout, command_timeout, port, control_path,
                  connect_timeout, log_in=True)
     if proc.returncode != 0:
@@ -461,9 +512,14 @@ def _describe_failure(host: str, proc, cmd: Optional[str] = None) -> str:
                 "(wrong password, or password login is off on the server)." % host)
     if "Connection refused" in detail:
         return "Connection refused by %s." % host
+    if "REVOKED HOST KEY" in detail or "marked as revoked" in detail:
+        # Before the generic branch: its re-keyed advice would have the
+        # operator delete the revocation, and the next run pin the revoked
+        # key and send it the password (#150).
+        return "Host key verification failed for %s: its key is marked @revoked in ~/.ssh/known_hosts." % host
     if "Host key verification failed" in detail:
-        return ("Host key verification failed for %s: the key is not the one pinned. "
-                "If the device was re-keyed, remove its line from ~/.ssh/known_hosts." % host)
+        return ("Host key verification failed for %s: the key is not the one pinned. If the device was "
+                "re-keyed, remove its line from ~/.h-ssh/known_hosts (or ~/.ssh/known_hosts)." % host)
     if "Could not resolve" in detail or "Name or service not known" in detail:
         return "Cannot resolve %s." % host
     if first:
@@ -525,6 +581,7 @@ class ProcessChannel:
         off (-e none): with a forced tty ssh reads a ~ at the start of a typed
         line as a command to itself (~R, ~B, ~.), keeps it from the device
         and types the rest, so `~Rcommit` would reach it as `commit` (#139)."""
+        _refuse_disagreement(host, user, port)
         connect_s = budget(connect_timeout, session_timeout)
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
         os.close(fd)

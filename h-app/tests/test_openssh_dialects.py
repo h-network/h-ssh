@@ -44,6 +44,9 @@ args = sys.argv[1:]
 if args == ["-V"]:
     sys.stderr.write("OpenSSH_9.6p1 fake\n")
     sys.exit(0)
+if "-G" in args:                                      # ssh -G, as OpenSSH answers it
+    print("hostname " + args[-1].rpartition("@")[2])
+    sys.exit(0)
 
 LOG = args[args.index("-E") + 1] if "-E" in args else None
 

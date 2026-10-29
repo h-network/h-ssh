@@ -35,6 +35,7 @@ from ..drivers import results as R
 from ..pool import POOL
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, answered, budget, is_timeout, no_banner,
                       tcp_timed_out, timed_out)
+from .ssh import host_key_policy as _host_key_policy      # one policy parser for every transport (#150)
 
 try:
     from jnpr.junos import Device as JunosDevice
@@ -90,6 +91,8 @@ _DEADLINE = threading.local()
 
 _KEX_UNFINISHED = "the banner came, but key exchange did not finish"
 _REVOKED = "its key is marked @revoked in "
+_CHANGED = "its key is not the one pinned in "
+_DIFFER = " hold different "          # the ssh transport's disagreement(), naming both files
 
 
 if _paramiko is not None:
@@ -139,16 +142,86 @@ if _paramiko is not None:
                 raise _paramiko.SSHException(_KEX_UNFINISHED) from e
 
     class _KnownHosts(_paramiko.HostKeys):
-        """The known_hosts ncclient checks the router's key against
-        (HSSH_NETCONF_HOSTKEY=yes), read as the ssh transport reads
-        ~/.ssh/known_hosts. paramiko's own load() refused the whole file over
-        an @cert-authority or @revoked line, which an SSH CA puts in every
+        """The known_hosts ncclient checks the router's key against, on the
+        store the ssh transport keeps (#150): ~/.h-ssh/known_hosts, where
+        an unknown router is pinned on first contact under
+        HSSH_NETCONF_HOSTKEY=accept-new (the default) and refused under
+        `yes`, and ~/.ssh/known_hosts, read as the ssh transport reads it.
+        paramiko's own load() refused the whole file over an
+        @cert-authority or @revoked line, which an SSH CA puts in every
         user's file: the first is passed over, and a key the second names is
-        refused whatever else the file says."""
+        refused whatever else the file says. A router whose key is not the
+        one pinned, in either file, is refused before the password goes."""
 
         def __init__(self, filename=None):
             self._revoked = {}          # key blob -> the file that revokes it
+            self._pins = None           # ~/.h-ssh/known_hosts, read when first asked
             super().__init__(filename)
+
+        def _pinned(self):
+            if self._pins is None:
+                from .ssh import _PIN_LOCK, _known_hosts, _parsed
+                with _PIN_LOCK:
+                    self._pins, _ = _parsed(_known_hosts(), system=False, timeout=30.0)
+            return self._pins
+
+        def lookup(self, hostname):
+            """What ncclient asks for the key types to prefer: the pinned
+            ones first, as paramiko's own client prefers them, so a router
+            with several keys shows the one that is pinned."""
+            both = _paramiko.HostKeys()
+            both._entries = list(self._pinned()._entries) + list(self._entries)
+            return both.lookup(hostname)
+
+        def _expected(self, name, kind, pins):
+            """The `kind` key the two files hold for `name`, as bytes, or
+            None. Two files that disagree are refused, as the ssh transport
+            refuses them (its disagreement()): one of them is wrong."""
+            from .ssh import disagreement
+            reason = disagreement(self._pinned(), super(), name, pins)      # super(): ~/.ssh/known_hosts alone
+            if reason is not None:
+                raise _paramiko.SSHException(reason)
+            ours, theirs = self._pinned().lookup(name), super().lookup(name)
+            ours = ours.get(kind) if ours is not None else None
+            theirs = theirs.get(kind) if theirs is not None else None
+            found = ours if ours is not None else theirs
+            return None if found is None else found.asbytes()
+
+        def check(self, hostname, key):
+            """ncclient asks for the bare host, then for `[host]:port`. The
+            bare name decides when a pin under it (the ssh transport's, for
+            port 22) is the key shown; otherwise the port name decides: its
+            pin, or a first contact pinned under it (under the bare name
+            for port 22, as paramiko and OpenSSH name that port), unless
+            the bare pin says the device has another key."""
+            from .ssh import _PinPolicy, _known_hosts, host_key_policy
+            where = self._revoked.get(key.asbytes())
+            if where is not None:
+                raise _paramiko.SSHException(_REVOKED + where)
+            pins, kind, shown = _known_hosts(), key.get_name(), key.asbytes()
+            changed = _paramiko.SSHException(
+                f"{_CHANGED}{pins} (or ~/.ssh/known_hosts); if the router was re-keyed, remove its line")
+            expected = self._expected(hostname, kind, pins)
+            if expected is not None:
+                if expected == shown:
+                    return True
+                if not hostname.startswith("["):
+                    return False
+                raise changed
+            if not hostname.startswith("["):
+                return False
+            bare = hostname[1:hostname.rindex("]")]
+            known = self._expected(bare, kind, pins)
+            if known is not None and known != shown:
+                raise changed
+            if host_key_policy("HSSH_NETCONF_HOSTKEY") == "yes":
+                return False
+            try:
+                _PinPolicy(pins).missing_host_key(None, bare if hostname.endswith("]:22") else hostname, key)
+            except _paramiko.BadHostKeyException:
+                raise changed from None         # pinned by another run meanwhile, under another key
+            self._pins = None                   # the file has the pin now
+            return True
 
         def load(self, filename):
             from .ssh import _parse
@@ -157,12 +230,6 @@ if _paramiko is not None:
             keys, revoked = _parse(text, filename, system=True)
             self._entries.extend(keys._entries)
             self._revoked.update(dict.fromkeys(revoked, filename))
-
-        def check(self, hostname, key):
-            where = self._revoked.get(key.asbytes())
-            if where is not None:
-                raise _paramiko.SSHException(_REVOKED + where)
-            return super().check(hostname, key)
 
     class _ParamikoForNcclient:
         """ncclient's view of the paramiko module: as it is, except that
@@ -261,11 +328,12 @@ def _open(host: str, user: str, passwd: Optional[str], session_timeout: int,
         # A reply with a text node over 10 MB (a big configuration, a log
         # file) is rejected by lxml unless the parser is told to expect it.
         "huge_tree": True,
-        # Off by default, deliberately: the lab and the management network
-        # are trusted paths. HSSH_NETCONF_HOSTKEY=yes verifies the router's
-        # key against ~/.ssh/known_hosts (an unknown or changed key refuses
-        # the session), for a jump host on a path that is not.
-        "hostkey_verify": os.environ.get("HSSH_NETCONF_HOSTKEY", "no").strip().lower() in ("yes", "1", "true"),
+        # The router's key is verified by default (#150), on the store the
+        # ssh transport keeps (_KnownHosts): HSSH_NETCONF_HOSTKEY=accept-new
+        # pins an unknown router and refuses a changed key, `yes` refuses an
+        # unknown router too, and `no` is the opt-out (the password to
+        # whoever answers on the port). Read per call, refused if anything else.
+        "hostkey_verify": _host_key_policy("HSSH_NETCONF_HOSTKEY") != "no",
     }
     if passwd:
         params["passwd"] = passwd
@@ -378,9 +446,9 @@ def _connect_reason(exc: BaseException, host: str, user: str, port: int,
             why += " (an IPv6 literal is not accepted by this PyEZ/ncclient; use a name)"
         return why
     if cause_kind == "SSHUnknownHostError" or "unknown host key" in low:
-        return (f"host key verification failed for {where}: not in ~/.ssh/known_hosts, or changed "
-                "(HSSH_NETCONF_HOSTKEY=yes); nothing was sent")
-    if _REVOKED in text:
+        return (f"host key verification failed for {where}: not pinned in ~/.h-ssh/known_hosts or "
+                "~/.ssh/known_hosts (HSSH_NETCONF_HOSTKEY=yes); nothing was sent")
+    if _REVOKED in text or _CHANGED in text or _DIFFER in text:
         return f"host key verification failed for {where}: {text}; nothing was sent"
     if "malformed known_hosts line" in low:
         return text

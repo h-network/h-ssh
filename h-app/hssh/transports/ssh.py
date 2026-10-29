@@ -360,21 +360,78 @@ def _load_pins(client, known_hosts: str, timeout: float = 30.0) -> frozenset:
     return revoked
 
 
+POLICIES = ("accept-new", "yes", "no")
+
+
+def host_key_policy(var: str = "HSSH_HOST_KEY_POLICY") -> str:
+    """The host-key policy `var` names, read per call, for every transport
+    (#150): accept-new (the default: an unknown host is trusted once and
+    pinned), yes (an unknown host is refused) or no. A changed key is
+    refused under every policy. OpenSSH's own `ask` and `off`, and anything
+    else, are refused: passed through to ssh, `ask` with a password put the
+    yes/no question to the askpass helper, which answered with the password,
+    thousands of times in a few seconds, and `off` let a changed key through."""
+    policy = os.environ.get(var, "accept-new")
+    if policy not in POLICIES:
+        raise RuntimeError("invalid %s=%r (expected accept-new, yes or no)" % (var, policy))
+    return policy
+
+
 def _host_key_policy(known_hosts: str, timeout: float = 30.0):
     """The missing-host-key policy HSSH_HOST_KEY_POLICY asks for.
 
     Only an unknown host is a policy matter. A pinned host that presents a
     different key is refused by paramiko itself, whatever the policy.
     """
-    policy = os.environ.get("HSSH_HOST_KEY_POLICY", "accept-new")
+    policy = host_key_policy()
     if policy == "accept-new":
         return _PinPolicy(known_hosts, timeout)
     if policy == "yes":
         return _RejectPolicy()
-    if policy == "no":
-        return paramiko.WarningPolicy()
-    raise RuntimeError("invalid HSSH_HOST_KEY_POLICY=%r (expected accept-new, yes or no)"
-                       % policy)
+    return paramiko.WarningPolicy()
+
+
+def _keys_for(keys, name: str) -> dict:
+    """The keys a known_hosts file holds for `name`, {key type: key}, the
+    name compared as OpenSSH compares it (#150): a plain name, `[host]:port`
+    included, case-insensitively (`router`, `ROUTER` and `Router` are one
+    host, and paramiko's lookup, exact, found only one of them), a hashed
+    name (`|1|salt|hash`, HashKnownHosts) by OpenSSH's hash, of the name
+    lowercased. A line whose name is a pattern (`*`, `?`, a `!` negation)
+    is matched by its own text alone here, so a host it covers is OpenSSH's
+    to match, not compared. Empty for a name no line holds."""
+    wanted = name.lower()
+    found = {}
+    for host in [*(h for h in keys.keys() if h.lower() == wanted), wanted]:    # the last: hashed lines
+        for kind, key in (keys.lookup(host) or {}).items():
+            found.setdefault(kind, key)
+    return found
+
+
+def disagreement(pinned, known, name: str, pins: str):
+    """Why `name` (as paramiko and OpenSSH name the host: `[host]:port` off
+    port 22) is refused when the pin file and ~/.ssh/known_hosts hold
+    different keys for it, naming both files; None when they agree or one
+    of them does not know it. For every transport (#150): paramiko looks
+    ~/.ssh/known_hosts up first and reads the pin file only when the host
+    is absent there, and OpenSSH takes a match in either file, so one
+    openssh first contact, or one manual ssh, that took an impostor's key
+    K2 let the host in with K1 still pinned. Two files that disagree are
+    refused before anything is sent, whichever key the server shows: one
+    of them is wrong. The names are compared as OpenSSH compares them
+    (_keys_for): a line OpenSSH matched under another case was a key it
+    took with the pin unseen here. A @cert-authority line is no key and
+    is not read here, so a host known through its CA alone is left to
+    OpenSSH."""
+    ours, theirs = _keys_for(pinned, name), _keys_for(known, name)
+    if not ours or not theirs:
+        return None
+    for kind in list(ours.keys()):
+        other = theirs.get(kind)
+        if other is not None and other.asbytes() != ours[kind].asbytes():
+            return ("%s and ~/.ssh/known_hosts hold different %s keys for it: one of them is not the device's; "
+                    "check which, and remove that line" % (pins, kind))
+    return None
 
 
 class _RevokedKey(Exception):
@@ -500,6 +557,11 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
     known_hosts = _known_hosts()
     client = paramiko.SSHClient()
     revoked = _load_pins(client, known_hosts, session_timeout_float)
+    reason = disagreement(client._host_keys, client._system_host_keys,
+                          host if (port or 22) == 22 else "[%s]:%d" % (host, port), known_hosts)
+    if reason is not None:
+        client.close()
+        raise RuntimeError("Host key verification failed for %s: %s." % (host, reason))
     client.set_missing_host_key_policy(_host_key_policy(known_hosts, session_timeout_float))
 
     conn_params = {

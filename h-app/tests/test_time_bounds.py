@@ -249,6 +249,7 @@ def fake_ssh(tmp_path, monkeypatch):
     script = bindir / "ssh"
     script.write_text(
         "#!/bin/sh\n"
+        'case " $* " in *" -G "*) for a; do h="$a"; done; echo "hostname ${h#*@}"; exit 0;; esac\n'   # ssh -G, as OpenSSH answers it
         'while [ $# -gt 0 ]; do case "$1" in -E) shift; LOG="$1";; -N) LOGIN=1;; esac; shift; done\n'
         'if [ -n "$LOG" ]; then printf "%b" "$FAKE_SSH_LOG" >> "$LOG"; fi\n'
         'case "$LOGIN$FAKE_SSH_LOG" in 1*"Authenticated to "*|1*"master session id"*) exit 0;; esac\n'
@@ -758,7 +759,7 @@ def test_a_connect_timeout_of_none_gives_the_connect_phase_the_session_timeout(l
         return real(argv, **kwargs)
     monkeypatch.setattr(subprocess, "Popen", spy)
     assert "device output" in openssh.show("h", "u", None, "show version", 7, 10, connect_timeout=None)
-    assert "ConnectTimeout=7" in seen[0]
+    assert "ConnectTimeout=7" in seen[1]                                 # the login, after the host key lookup (ssh -G)
     assert "ConnectTimeout=7" in openssh.ssh_command_line("h", "u", "show version", 7, connect_timeout=None)
 
 
@@ -772,7 +773,7 @@ def test_opensshs_connect_timeout_is_the_connect_timeout(fake_ssh, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", spy)
     openssh.show("h", "u", None, "show version", 30, 10, connect_timeout=4)
     openssh.show("h", "u", None, "show version", 2, 10, connect_timeout=4)
-    (login, command), (login2, command2) = seen[:2], seen[2:]          # each logs in, then runs the show
+    (_, login, command), (_, login2, command2) = seen[:3], seen[3:]    # each looks the host key up (ssh -G), logs in, runs the show
     assert "ConnectTimeout=4" in login and "ConnectTimeout=4" in command
     assert "ConnectTimeout=2" in login2 and "ConnectTimeout=2" in command2
     assert "ConnectTimeout=3" in openssh.ssh_command_line("h", "u", "show version", session_timeout=30)
@@ -832,6 +833,7 @@ def _ssh_that_answers_once(tmp_path, monkeypatch, said):
     script = bindir / "ssh"
     script.write_text(
         "#!/bin/sh\n"
+        'case " $* " in *" -G "*) for a; do h="$a"; done; echo "hostname ${h#*@}"; exit 0;; esac\n'   # ssh -G, as OpenSSH answers it
         'while [ $# -gt 0 ]; do case "$1" in -E) shift; LOG="$1";; -N) LOGIN=1;; esac; shift; done\n'
         'if [ -n "$LOGIN" ]; then echo "Authenticated to h ([10.0.0.1]:22) using publickey." >> "$LOG"; exit 0; fi\n'
         f'n=$(cat {shlex.quote(str(count))} 2>/dev/null || echo 0); n=$((n + 1)); echo $n > {shlex.quote(str(count))}\n'

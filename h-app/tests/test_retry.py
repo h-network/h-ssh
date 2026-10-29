@@ -150,7 +150,8 @@ def test_workers_actually_run_in_parallel(tmp_path):
     bindir = tmp_path / "bin"
     bindir.mkdir()
     stub = bindir / "ssh"
-    stub.write_text('#!/bin/sh\ncase " $* " in *" -N "*) exit 0;; esac\nsleep 1\necho ok\n')   # logs in at once
+    stub.write_text('#!/bin/sh\ncase " $* " in *" -G "*) echo "hostname x"; exit 0;; esac\n'       # ssh -G, as OpenSSH answers it
+                    'case " $* " in *" -N "*) exit 0;; esac\nsleep 1\necho ok\n')                 # logs in at once
     stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
 
     devices = tmp_path / "devices.csv"

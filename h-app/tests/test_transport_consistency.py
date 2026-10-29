@@ -72,6 +72,7 @@ def fake_ssh(tmp_path, monkeypatch):
     bindir.mkdir()
     script = bindir / "ssh"
     script.write_text("#!/bin/sh\n"
+                      'case " $* " in *" -G "*) for a; do h="$a"; done; echo "hostname ${h#*@}"; exit 0;; esac\n'   # ssh -G, as OpenSSH answers it
                       'for arg in "$@"; do last="$arg"; done\n'
                       'case "$last" in *bad*) echo "error: syntax error"; exit 0;; esac\n'
                       'echo "ok: $last"\n')

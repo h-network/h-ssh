@@ -1,6 +1,8 @@
 """paramiko transport tests — host-key pinning and exit statuses, no live devices needed."""
 import io
 import os
+import shlex
+import shutil
 import stat
 import sys
 import threading
@@ -12,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import paramiko
 
-from hssh import runner
+from hssh import probe, runner
 from hssh.core import Target
 from hssh.transports import ssh
 
@@ -155,6 +157,36 @@ def test_a_pinned_key_is_accepted_again(offline, home):
     assert len(offline.auth_calls) == 2
 
 
+def test_a_pin_is_not_overridden_through_the_system_known_hosts(offline, home):
+    """paramiko looks a host up in ~/.ssh/known_hosts first and reads the
+    pin file only when the host is absent there (#150): one openssh first
+    contact, or one manual ssh, that took an impostor's key K2 made this
+    transport take K2 too, with K1 still pinned in ~/.h-ssh/known_hosts,
+    and the impostor got the password. When the two files hold different
+    keys for a host, the host is refused before any credential is sent,
+    whichever key the server shows: one of the files is wrong, and the
+    message names both."""
+    ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)       # K1 pinned
+    k1, k2 = offline.server_key, paramiko.ECDSAKey.generate()
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir()
+    system.write_text(f"10.0.0.1 {k2.get_name()} {k2.get_base64()}\n")
+    pinned = pin_file(home).read_text()
+    for shown in (k2, k1):
+        offline.auth_calls.clear()
+        offline.server_key = shown
+        with pytest.raises(RuntimeError) as refused:
+            ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+        assert str(refused.value).startswith("Host key verification failed for 10.0.0.1: ")
+        assert str(pin_file(home)) in str(refused.value) and "~/.ssh/known_hosts" in str(refused.value)
+        assert "different" in str(refused.value) and offline.auth_calls == []
+    assert pin_file(home).read_text() == pinned
+    # One file alone still decides as it did: K2 known from ~/.ssh/known_hosts only is accepted.
+    pin_file(home).write_text("")
+    offline.server_key = k2
+    assert "output-for" in ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+
+
 def test_strict_policy_refuses_an_unknown_host(offline, home, monkeypatch):
     monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "yes")
     with pytest.raises(RuntimeError, match="Host key verification failed for 10.0.0.1"):
@@ -177,10 +209,15 @@ def test_no_policy_warns_and_pins_nothing(offline, home, monkeypatch):
     assert pin_file(home).read_text() == ""
 
 
-def test_unknown_policy_is_refused(offline, monkeypatch):
-    monkeypatch.setenv("HSSH_HOST_KEY_POLICY", "maybe")
+@pytest.mark.parametrize("policy", ["maybe", "ask", "off"])
+def test_unknown_policy_is_refused(offline, home, monkeypatch, policy):
+    """OpenSSH's own `ask` and `off` included (#150): `ask` with a password
+    had the openssh transport put the yes/no question to the askpass
+    helper, which answered with the password, thousands of times."""
+    monkeypatch.setenv("HSSH_HOST_KEY_POLICY", policy)
     with pytest.raises(RuntimeError, match="invalid HSSH_HOST_KEY_POLICY"):
         ssh.show("10.0.0.1", "admin", "s3cret", "show version", 5, 10)
+    assert offline.auth_calls == [] and pin_file(home).read_text() == ""
 
 
 def test_another_port_is_pinned_under_its_own_name(offline, home):
@@ -1444,6 +1481,161 @@ def test_a_key_the_system_file_marks_revoked_is_refused_before_any_credential(ss
     assert logins == ["u"]
 
 
+def test_netconf_pins_the_router_on_first_contact_and_refuses_another_key(sshd, home, monkeypatch):
+    """#150: the NETCONF session verifies the router's key by default, on
+    the store the ssh transport keeps. First contact pins `[host]:port` in
+    ~/.h-ssh/known_hosts and logs in; a router whose key is not the one
+    pinned is refused before the password goes, and so is one the two
+    files disagree on; HSSH_NETCONF_HOSTKEY=no is the opt-out."""
+    pytest.importorskip("jnpr.junos")
+    from hssh.transports import netconf
+    port, key, logins = sshd
+    monkeypatch.delenv("HSSH_NETCONF_HOSTKEY", raising=False)
+    with pytest.raises(NotAppliedError):            # in; then refused the NETCONF subsystem, being no router
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u"]
+    pinned = pin_file(home).read_text()
+    assert pinned == _key_line(f"[127.0.0.1]:{port}", key) + "\n"
+    with pytest.raises(NotAppliedError):            # pinned: in again
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u"] and pin_file(home).read_text() == pinned
+    other = paramiko.ECDSAKey.generate()
+    pin_file(home).write_text(_key_line(f"[127.0.0.1]:{port}", other) + "\n")        # the router re-keyed
+    with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: host key verification failed for "
+                                              rf"127\.0\.0\.1:{port}: its key is not the one pinned in "
+                                              rf"{re.escape(str(pin_file(home)))} \(or ~/\.ssh/known_hosts\); "
+                                              rf"if the router was re-keyed, remove its line; nothing was sent$"):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u"]
+    pin_file(home).write_text(pinned)
+    system = home / ".ssh" / "known_hosts"
+    system.parent.mkdir(mode=0o700)
+    system.write_text(_key_line(f"[127.0.0.1]:{port}", other) + "\n")                # the files disagree
+    with pytest.raises(NotAppliedError, match=r"hold different ecdsa-sha2-nistp256 keys for it"):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u"]
+    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "no")                                   # the opt-out: not checked
+    with pytest.raises(NotAppliedError):
+        netconf._open("127.0.0.1", "u", "p", 5, 30, port)
+    assert logins == ["u", "u", "u"]
+
+
+@pytest.mark.parametrize("policy", ["accept-new", "yes", "no"])
+def test_openssh_refuses_a_host_the_two_files_hold_different_keys_for(sshd, home, monkeypatch, policy):
+    """The review's repro (#150), with the real ssh: K1 pinned in
+    ~/.h-ssh/known_hosts and K2 in ~/.ssh/known_hosts for the same
+    [127.0.0.1]:port, the server showing K2, and openssh.show sent the
+    password: with both files in UserKnownHostsFile OpenSSH takes a match
+    in either. The two files are read before ssh runs, by the ssh
+    transport's parser, and a host they disagree on is refused before any
+    credential is offered, whichever of the two keys the server shows and
+    under every policy. Files that agree are OpenSSH's to judge: on the
+    wrong key the server is refused, on the right one the login goes; a
+    host known in ~/.ssh/known_hosts alone is still in under `yes`."""
+    if not shutil.which("ssh"):
+        pytest.skip("no ssh binary on PATH")
+    from hssh.transports import openssh
+    port, key, logins = sshd
+    name, other = f"[127.0.0.1]:{port}", paramiko.ECDSAKey.generate()
+    monkeypatch.setenv("HSSH_HOST_KEY_POLICY", policy)
+    pins, system = pin_file(home), home / ".ssh" / "known_hosts"
+    pins.parent.mkdir(mode=0o700)
+    system.parent.mkdir(mode=0o700)
+    for ours, theirs in ((other, key), (key, other)):        # the server's key in one file, another in the other
+        pins.write_text(_key_line(name, ours) + "\n")
+        system.write_text(_key_line(name, theirs) + "\n")
+        with pytest.raises(RuntimeError) as refused:
+            openssh.show("127.0.0.1", "u", "p", "show version", 5, 10, port=port)
+        assert str(refused.value) == (f"Host key verification failed for 127.0.0.1: {pins} and ~/.ssh/known_hosts "
+                                      "hold different ecdsa-sha2-nistp256 keys for it: one of them is not the "
+                                      "device's; check which, and remove that line.")
+        assert logins == []
+    pins.write_text(_key_line(name, other) + "\n")            # the files agree, on a key that is not the server's
+    system.write_text(_key_line(name, other) + "\n")
+    with pytest.raises(RuntimeError, match="not the one pinned"):
+        openssh.show("127.0.0.1", "u", "p", "show version", 5, 10, port=port)
+    assert logins == []
+    pins.write_text("")                                        # known in ~/.ssh/known_hosts alone: in, under yes too
+    system.write_text(_key_line(name, key) + "\n")
+    with pytest.raises(RuntimeError, match="ssh exit 255|administratively prohibited|channel"):
+        openssh.show("127.0.0.1", "u", "p", "show version", 5, 10, port=port)   # no exec channel on this server
+    assert logins and set(logins) == {"u"}                     # the password was offered (the master's login, the command's)
+
+
+def test_the_conflict_check_compares_names_as_openssh_does():
+    """The two files' names were compared as paramiko looks a name up,
+    exactly, where OpenSSH matches a line's name case-insensitively: a
+    pin `router` K1 beside `ROUTER` K2 in ~/.ssh/known_hosts, the server
+    showing K2, was no disagreement here and OpenSSH took K2 (the review's
+    third repro, #150). A plain name, `[host]:port` included, is compared
+    case-insensitively, a hashed name by OpenSSH's hash of the lowercased
+    name; a line whose name is a pattern matches its own text alone, so a
+    host it covers is not compared (OpenSSH's to match: README)."""
+    k1, k2 = paramiko.ECDSAKey.generate(), paramiko.ECDSAKey.generate()
+    hashed = paramiko.HostKeys.hash_host("[router1]:2222")          # as HashKnownHosts writes a port-22-less host
+    pins = ssh._parse(_key_line("router", k1) + "\n" + _key_line("[Router1]:2222", k1) + "\n"
+                      + _key_line("r1.example.com", k1) + "\n", "pins", system=False)[0]
+    system = ssh._parse(_key_line("ROUTER", k2) + "\n" + _key_line(hashed, k2) + "\n"
+                        + _key_line("*.example.com", k2) + "\n", "system", system=True)[0]
+    differ = "hold different ecdsa-sha2-nistp256 keys for it"
+    assert differ in ssh.disagreement(pins, system, "router", "pins")        # ROUTER is router
+    assert differ in ssh.disagreement(pins, system, "Router", "pins")
+    assert differ in ssh.disagreement(pins, system, "[router1]:2222", "pins")     # the hashed line, by its hash
+    assert ssh.disagreement(pins, system, "r1.example.com", "pins") is None       # the pattern: OpenSSH's alone
+    assert ssh.disagreement(pins, system, "router2", "pins") is None              # known in one file
+    agreeing = ssh._parse(_key_line("ROUTER", k1) + "\n", "system", system=True)[0]
+    assert ssh.disagreement(pins, agreeing, "router", "pins") is None             # the same key under another case
+
+
+@pytest.mark.parametrize("stanza, pinned_as, known_as", [
+    ("HostName 127.0.0.1\n  Port {port}\n", "[127.0.0.1]:{port}", "[127.0.0.1]:{port}"),
+    ("HostName 127.0.0.1\n  Port {port}\n  HostKeyAlias router\n", "router", "router"),
+    ("HostName 127.0.0.1\n  Port {port}\n  HostKeyAlias router\n", "router", "ROUTER"),
+], ids=["port", "alias", "case"])
+def test_openssh_checks_the_host_under_the_name_its_configuration_gives_it(sshd, home, monkeypatch, stanza,
+                                                                            pinned_as, known_as):
+    """The review's second repro (#150): with `Host box`, `HostName
+    127.0.0.1` and `Port N` in the ssh configuration and a target that
+    names no port, the two files were compared under `box`, where OpenSSH
+    looks the host up under `[127.0.0.1]:N`, or under the `HostKeyAlias`
+    the stanza gives it, so the files disagreeing there was not seen and
+    the password went; and its third: the alias pinned as `router`, the
+    system file's `ROUTER` line matched by OpenSSH and not compared. The
+    name checked is the one OpenSSH looks up, as `ssh -G` reports it (the
+    client here reading the test's configuration through -F), compared as
+    OpenSSH compares it: the disagreement is refused before any credential,
+    and the files agreeing on the server's key under that name let it in."""
+    if not shutil.which("ssh"):
+        pytest.skip("no ssh binary on PATH")
+    from hssh.transports import openssh
+    port, key, logins = sshd
+    cfg = home / "ssh_config"
+    cfg.write_text("Host box\n  " + stanza.format(port=port))
+    bindir = home / "bin"
+    bindir.mkdir()
+    wrapper = bindir / "ssh"
+    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(shutil.which("ssh"))} -F {shlex.quote(str(cfg))} "$@"\n')
+    wrapper.chmod(0o700)
+    monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(probe, "SSH_G", ("ssh", "-G"))       # as outside the suite: the wrapper's -F for both
+    pinned_as, known_as, other = pinned_as.format(port=port), known_as.format(port=port), paramiko.ECDSAKey.generate()
+    pins, system = pin_file(home), home / ".ssh" / "known_hosts"
+    pins.parent.mkdir(mode=0o700)
+    system.parent.mkdir(mode=0o700)
+    pins.write_text(_key_line(pinned_as, other) + "\n")             # the files disagree, under that name
+    system.write_text(_key_line(known_as, key) + "\n")
+    with pytest.raises(RuntimeError) as refused:
+        openssh.show("box", "u", "p", "show version", 5, 10)
+    assert str(refused.value) == (f"Host key verification failed for box: {pins} and ~/.ssh/known_hosts "
+                                  "hold different ecdsa-sha2-nistp256 keys for it: one of them is not the "
+                                  "device's; check which, and remove that line.")
+    assert logins == []
+    pins.write_text(_key_line(pinned_as, key) + "\n")               # they agree, on the server's key: in
+    with pytest.raises(RuntimeError, match="ssh exit 255|administratively prohibited|channel"):
+        openssh.show("box", "u", "p", "show version", 5, 10)        # no exec channel on this server
+    assert logins and set(logins) == {"u"}
+
+
 def test_netconf_host_key_verification_reads_the_system_file_the_same_way(sshd, home, monkeypatch):
     """G2 on the junos transport: with HSSH_NETCONF_HOSTKEY=yes ncclient read
     ~/.ssh/known_hosts with paramiko's load(), and an @cert-authority or
@@ -1461,7 +1653,8 @@ def test_netconf_host_key_verification_reads_the_system_file_the_same_way(sshd, 
     lines = f"@cert-authority *.example.net {ca.get_name()} {ca.get_base64()}\n"
     system.write_text(lines)
     with pytest.raises(NotAppliedError, match=rf"^NETCONF connect failed: host key verification failed for "
-                                              rf"127\.0\.0\.1:{port}: not in ~/\.ssh/known_hosts, or changed"):
+                                              rf"127\.0\.0\.1:{port}: not pinned in ~/\.h-ssh/known_hosts or "
+                                              rf"~/\.ssh/known_hosts \(HSSH_NETCONF_HOSTKEY=yes\); nothing was sent$"):
         netconf._open("127.0.0.1", "u", "p", 5, 30, port)
     assert logins == []
     lines += _key_line(f"[127.0.0.1]:{port}", key) + "\n"

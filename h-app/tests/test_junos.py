@@ -896,15 +896,70 @@ def test_a_valid_timer_still_arms_the_commit():
 
 # --- #47: how the NETCONF session is opened --------------------------------------
 
-def test_open_asks_for_huge_replies_and_no_host_key_check_unless_told(monkeypatch):
+def test_open_asks_for_huge_replies_and_checks_the_host_key_unless_told_not_to(monkeypatch):
+    """#150: the router's key is verified by default (accept-new, pinned in
+    ~/.h-ssh/known_hosts as the ssh transport pins), `yes` is strict and
+    `no` is the opt-out to the old behaviour; anything else is refused,
+    read per call."""
     monkeypatch.delenv("HSSH_NETCONF_HOSTKEY", raising=False)
     netconf.show("10.0.0.1", "u", None, "show version", 5, 30)
     params = FakeDevice.instances[0].params
-    assert params["huge_tree"] is True and params["hostkey_verify"] is False
+    assert params["huge_tree"] is True and params["hostkey_verify"] is True
     assert "look_for_keys" not in params and "allow_agent" not in params     # key auth: keys and agent stay
-    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "yes")
+    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "no")
     netconf.show("10.0.0.2", "u", None, "show version", 5, 30)
-    assert FakeDevice.instances[1].params["hostkey_verify"] is True
+    assert FakeDevice.instances[1].params["hostkey_verify"] is False
+    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "yes")
+    netconf.show("10.0.0.3", "u", None, "show version", 5, 30)
+    assert FakeDevice.instances[2].params["hostkey_verify"] is True
+    for value in ("ask", "1", "true", "off"):
+        monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", value)
+        with pytest.raises(RuntimeError, match=f"invalid HSSH_NETCONF_HOSTKEY='{value}'"):
+            netconf.show("10.0.0.4", "u", None, "show version", 5, 30)
+    assert len(FakeDevice.instances) == 3                                    # nothing opened for those
+
+
+def test_the_router_is_pinned_on_first_contact_and_refused_when_its_key_changes(tmp_path, monkeypatch):
+    """What ncclient asks known_hosts (#150), on the store the ssh transport
+    keeps: an unknown router is pinned under its port name on first contact
+    (accept-new, the default), a pinned one is accepted again, one that
+    shows another key is refused before the password goes, and `yes`
+    refuses an unknown router. The bare name ncclient tries first never
+    pins; a pin under it (the ssh transport's, port 22) speaks for the
+    device as a whole. A key ~/.ssh/known_hosts marks @revoked is refused
+    whatever the pin says."""
+    import paramiko
+    from hssh.transports import ssh as ssh_transport
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("HSSH_NETCONF_HOSTKEY", raising=False)
+    pins = tmp_path / ".h-ssh" / "known_hosts"
+    k1, k2 = paramiko.ECDSAKey.generate(), paramiko.ECDSAKey.generate()
+    store = netconf._KnownHosts()
+    assert store.check("10.0.0.1", k1) is False and pins.read_text() == ""   # the bare name decides nothing
+    assert store.check("[10.0.0.1]:830", k1) is True
+    assert pins.read_text() == f"[10.0.0.1]:830 {k1.get_name()} {k1.get_base64()}\n"
+    again = netconf._KnownHosts()
+    assert again.check("[10.0.0.1]:830", k1) is True
+    assert list(again.lookup("[10.0.0.1]:830").keys()) == [k1.get_name()]  # the type ncclient will prefer
+    with pytest.raises(paramiko.SSHException, match="not the one pinned"):
+        again.check("[10.0.0.1]:830", k2)
+    assert pins.read_text().count("\n") == 1                                 # nothing pinned over it
+    assert netconf._KnownHosts().check("[10.0.0.1]:22", k1) is True          # port 22 pins the bare name
+    assert f"\n10.0.0.1 {k1.get_name()} {k1.get_base64()}\n" in pins.read_text()
+    with pytest.raises(paramiko.SSHException, match="not the one pinned"):
+        netconf._KnownHosts().check("[10.0.0.1]:22000", k2)                 # the bare pin speaks for the device
+    monkeypatch.setenv("HSSH_NETCONF_HOSTKEY", "yes")
+    assert netconf._KnownHosts().check("[10.0.0.2]:830", k1) is False and "10.0.0.2" not in pins.read_text()
+    assert netconf._KnownHosts().check("[10.0.0.1]:830", k1) is True
+    monkeypatch.delenv("HSSH_NETCONF_HOSTKEY", raising=False)
+    system = tmp_path / ".ssh" / "known_hosts"
+    system.parent.mkdir()
+    system.write_text(f"@revoked * {k1.get_name()} {k1.get_base64()}\n")
+    revoked = netconf._KnownHosts()
+    revoked.load(str(system))
+    with pytest.raises(paramiko.SSHException, match="marked @revoked"):
+        revoked.check("[10.0.0.1]:830", k1)
+    ssh_transport._PINS.clear()
 
 
 def test_a_password_is_the_credential_no_key_is_tried_first():
