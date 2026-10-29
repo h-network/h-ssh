@@ -7,8 +7,7 @@ h-ssh is tested at two levels.
 | Continuous integration | The code builds, installs, and passes lint and the unit suite on every supported Python version |
 | Fleet testing | h-ssh behaves correctly against real devices, at scale, under real workloads |
 
-A change is ready to merge when CI is green on its pull request, and a fleet test pass is reported for
-the behaviour it changes.
+Every merge requires both: CI green on the pull request, and a fleet test pass.
 
 ## 1. Continuous integration
 
@@ -52,9 +51,17 @@ python -m venv .venv
 # unit suite
 .venv/bin/python -m pytest -q
 
-# install check
+# install check: a clean install, both entry points, a refused connection ends as a failed device
 python -m venv /tmp/hssh-install && /tmp/hssh-install/bin/pip install -q .
 /tmp/hssh-install/bin/h-ssh --help >/dev/null && /tmp/hssh-install/bin/h-ssh-store --help >/dev/null
+rc=0; /tmp/hssh-install/bin/h-ssh --no-store --user u --target x:127.0.0.1:junos --session-timeout 1 \
+    --retries 0 -sC "show version" 2>/tmp/hssh-err || rc=$?
+test "$rc" -eq 1 && ! grep -q Traceback /tmp/hssh-err
+
+# installer: install from this checkout, then uninstall
+git checkout -q -B local-head
+H_SSH_REPO="file://$PWD" H_SSH_REF=local-head H_SSH_HOME=/tmp/h-ssh-home H_SSH_BIN=/tmp/h-ssh-bin sh install.sh
+H_SSH_HOME=/tmp/h-ssh-home H_SSH_BIN=/tmp/h-ssh-bin sh install.sh --uninstall
 ```
 
 To match CI's Python versions exactly, run the suite in the same containers:
@@ -81,28 +88,42 @@ Fleet tests use real operator workloads, at full fleet scale:
 | Show and batch | Every device, at low and high worker counts, on every transport the fleet supports |
 | Edit with diff, dry run | Every device |
 | Commit, and commit confirmed followed by confirm | Every device |
-| Rollback | Every device |
 | Interrupt | Ctrl-C during a commit run: every commit that landed is recorded |
 | Unreachable devices | Dead ports and stopped devices mixed into the target list |
 | Records | The store, the audit log, saved output and logs, checked against what the devices report |
 | Repeated runs | `--every` over a sustained period |
 | Library | The Fleet API running the same workloads as the CLI |
 
-Each test runs on the branch under test and on the baseline branch, against the same devices, so the
+Each test runs on the branch under test and on the baseline, `develop`, against the same devices, so the
 results can be compared directly.
 
 ### 2.3 Procedure
 
-1. **Record the starting state** of every device the test changes.
-2. **Run the workload** on the baseline, then on the branch.
-3. **Check the outcome on the devices themselves,** for example the commit history and the configuration,
-   not only in h-ssh's report.
-4. **Restore every device** to its starting state, and verify the restore.
-5. **Report** the results with the change.
+1. **Record the starting state** of every device the test changes: its running configuration.
+2. **Run the workload on the baseline,** and check the outcome on the devices themselves, for example the
+   commit history and the configuration, not only in h-ssh's report.
+3. **Restore every device** to its starting state, and verify the restore.
+4. **Run the workload on the branch,** and check the outcome on the devices in the same way.
+5. **Restore every device** again, and verify the restore.
+6. **Report** the results with the change.
+
+A device is restored when its running configuration matches the recorded starting configuration. Commit
+history entries added by the test remain.
+
+The baseline and branch runs each use their own installation, result store, audit log and output
+directory, so every record can be attributed to one run.
 
 Runs are unattended. Credentials come from keys or the environment, never from an interactive prompt.
 
-### 2.4 Report
+### 2.4 Verdict
+
+A fleet test passes when the change works and does what it is expected to do, on every device in the run.
+
+Each change states what it improves compared with the baseline: speed, or a function or feature. The
+report shows that improvement as measured on the fleet, for example run time or the result of the
+workload the change affects.
+
+### 2.5 Report
 
 ```
 Branch:     <branch> @ <commit>        Baseline: <branch> @ <commit>
@@ -111,6 +132,7 @@ Verdict:    PASS | FAIL
 Workload            Devices  Branch result            Baseline result
 <name>              <n>      <ok/failed/skipped>      <ok/failed/skipped>
 
-Failures:   <device, what happened, evidence>
-Restored:   <yes, how it was verified>
+Improvement: <speed or function, measured on branch against baseline>
+Failures:    <device, what happened, evidence>
+Restored:    <yes, how it was verified>
 ```

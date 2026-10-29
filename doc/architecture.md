@@ -14,7 +14,7 @@ every result in a local SQLite store, and every change in an audit log.
   communicator executes and reports. It does not decide.
 - **Pluggable vendors.** Vendor behaviour is described by dialects, separately from transports. New
   vendors and transports can be added from outside the package.
-- **Safe changes.** Dry-run by default, commit-confirmed support, rollback, and a per-device safety gate.
+- **Safe changes.** Dry-run by default, commit-confirmed support, and a per-device safety gate.
 - **Durable records.** Every run and result is stored. Every change is audited.
 - **Verified on real devices.** Behaviour is validated against a fleet of virtual network devices.
 
@@ -80,7 +80,7 @@ The orchestrator executes a `RunSpec` and owns all policy.
 |---|---|
 | Scheduler | Expands targets, runs them in parallel up to the worker limit, and keeps the order of results stable |
 | Policy | Maps each `Fault` to an action: retry, fail, skip, or cool down. Applies the safety gate |
-| Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed, confirm and rollback |
+| Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed and confirm |
 | Session manager | Opens, reuses and closes sessions. Pooling across calls is a session-manager option, not a communicator feature |
 | Probe | Optional pre-flight reachability check per target. Its outcome is expressed as the same fault kinds |
 | Cancellation | Handles interruption (section 5.4) |
@@ -126,7 +126,8 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 - the prompt pattern and paging control
 - the refusal and warning patterns
-- how to enter and leave configuration mode, and how to commit, if the vendor has a candidate model
+- how to enter and leave configuration mode, how to commit, and how to discard uncommitted changes, if the
+  vendor has a candidate model
 - the read-command rule, deciding which commands are safe to retry
 - a shortcut library of named commands
 
@@ -148,9 +149,10 @@ runs. The format is in section 6.
 
 ```python
 class Communicator(Protocol):
-    capabilities: frozenset[str]          # e.g. {"show", "batch", "edit", "commit_confirmed", "rollback"}
+    capabilities: frozenset[str]          # e.g. {"show", "batch", "edit", "commit_confirmed"}
 
-    def open(self, target: Target, creds: Credentials, timeouts: Timeouts) -> Session: ...
+    def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
+             host_key_policy: HostKeyPolicy) -> Session: ...
     def close(self, session: Session) -> None: ...
 
     def show(self, session: Session, command: str) -> Result: ...
@@ -160,7 +162,6 @@ class Communicator(Protocol):
     def diff(self, session: Session) -> Result: ...
     def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result: ...
     def confirm(self, session: Session) -> Result: ...
-    def rollback(self, session: Session, index: int = 0) -> Result: ...
     def commit_history(self, session: Session) -> Result: ...
 ```
 
@@ -173,7 +174,6 @@ Batch execution is the orchestrator calling `show` repeatedly on one session.
 class Result:
     output: str                  # device output as received
     data: object | None = None   # parsed structure, when the operation returns one
-    elapsed: float = 0.0
 ```
 
 ### 4.3 Fault
@@ -218,7 +218,7 @@ The retry count, pauses and cooldown period are policy settings, not communicato
 
 ### 5.1 RunSpec
 
-A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `rollback`, `confirm`,
+A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
 `commit_status`), the commands or configuration lines, credentials, timeouts, the worker limit, the safety
 settings, and the recording settings.
 
@@ -234,15 +234,15 @@ run independently, and one target's failure does not affect another's.
 OPEN → LOAD → DIFF ──(dry run)──────────────────────────────► CLOSE
                  └─(apply)→ COMMIT ─(confirmed N)→ PENDING ─► CLOSE
                                                      │
-                                         later run: CONFIRM or ROLLBACK
+                                              later run: CONFIRM
 ```
 
 - **Dry run** is the default: load, diff, discard. Nothing is committed.
-- **Apply** requires explicit confirmation, either `-y` or the interactive prompt after the diff preview.
+- **Apply** requires `-y`. Without it, an edit is a dry run.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
   command that confirms them.
-- On any fault after `LOAD`, the orchestrator discards the candidate, or rolls back where the dialect has
-  no candidate.
+- On a fault after `LOAD` and before `COMMIT`, the orchestrator sends the dialect's discard command. Where
+  the dialect has no candidate, it stops and reports which lines were applied.
 - The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file.
 
 ### 5.4 Cancellation
@@ -265,7 +265,7 @@ runs(
 results(
   run_id INTEGER REFERENCES runs(id), seq INTEGER, target TEXT, host TEXT,
   driver TEXT, command TEXT, ok INTEGER, fault TEXT, detail TEXT,
-  output TEXT, started TEXT, elapsed REAL,
+  output TEXT, started TEXT, elapsed_ms INTEGER,
   PRIMARY KEY (run_id, target, seq)
 )
 ```
@@ -308,7 +308,7 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 | Unit | Orchestrator policy, edit lifecycle, cancellation, recorder | a fake communicator |
 | Contract | Each communicator against section 4: results, fault kinds, `reached_device` | local fake servers and stubbed libraries |
 | Dialect | Prompt, refusal and warning patterns | recorded device output |
-| Fleet | Real workloads at scale: shows, batches, edits, commits, confirm, rollback, interrupts, unreachable devices | a fleet of virtual network devices |
+| Fleet | Real workloads at scale: shows, batches, edits, commits, confirm, interrupts, unreachable devices | a fleet of virtual network devices |
 
 Each test covers one behaviour. Behaviour that the unit and contract levels can't settle is decided on the
 fleet.
