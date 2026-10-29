@@ -644,11 +644,15 @@ and `no` is OpenSSH's `accept-new` as well, since OpenSSH's own `no` lets a chan
 difference from the `ssh` transport's `no`: a first contact is pinned), so a changed key in either file
 is refused under every policy; `ask`, `off` or anything else is refused (#150: passed through, `ask`
 with a password put the yes/no question to the askpass helper, which answered with the password,
-thousands of times). A host the two files hold different keys for is refused before ssh runs, as the
-`ssh` transport refuses it, since OpenSSH would take a match in either file (a port left to the ssh
-configuration is port 22 for that check; `@cert-authority` lines are no keys and stay OpenSSH's to
-check). A key `known_hosts` marks `@revoked` is said as such (`its key is marked @revoked in
-~/.ssh/known_hosts`), with no advice to remove its line.
+thousands of times). A host the two files hold different keys for is refused before the ssh that logs
+in runs (once a session, not once a command), as the `ssh` transport refuses it, since OpenSSH would
+take a match in either file. That check looks the host up under the name OpenSSH looks it up under, as
+`ssh -G` reports it: a `HostKeyAlias` from your config, else the `HostName` with the `Port` in effect
+(`[name]:port` off port 22, a `Port` stanza counting where the target names none), so a stanza that
+moves the box moves the check with it; a configuration `ssh -G` refuses fails the device with ssh's
+words (`SSH transport failed: ssh -G HOST: ...`), as the login would have. `@cert-authority` lines are
+no keys and stay OpenSSH's to check. A key `known_hosts` marks `@revoked` is said as such (`its key is
+marked @revoked in ~/.ssh/known_hosts`), with no advice to remove its line.
 
 Two limits of the plain `openssh` driver, both deliberate: `--structured` falls back to text
 (`eos@openssh` has it, through `| json`), and `--commit-confirmed` is rejected rather than silently
@@ -1624,7 +1628,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1511 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1513 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

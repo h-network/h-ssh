@@ -194,20 +194,30 @@ def _system_file() -> str:
     return os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
 
 
-def _refuse_disagreement(host: str, port: Optional[int]) -> None:
-    """Before ssh runs: a host ~/.h-ssh/known_hosts and ~/.ssh/known_hosts
-    hold different keys for is refused, as the ssh transport refuses it
-    (the review's repro, #150): with both files in UserKnownHostsFile
-    OpenSSH takes a match in either, so the key pinned in one was
-    overridden by the other and the password went. Both files are read as
-    the ssh transport reads them, by its parser, and a pin file line that
-    holds no pin is the same refusal here; @cert-authority lines are no
-    keys and stay OpenSSH's to check. A port left to the ssh configuration
-    is port 22 here. Without paramiko the files cannot be read, and
-    OpenSSH is left to its own."""
+def _refuse_disagreement(host: str, user: str, port: Optional[int]) -> None:
+    """Before the ssh that logs in runs (once a session, not once a
+    command): a host ~/.h-ssh/known_hosts and ~/.ssh/known_hosts hold
+    different keys for is refused, as the ssh transport refuses it (the
+    review's repro, #150): with both files in UserKnownHostsFile OpenSSH
+    takes a match in either, so the key pinned in one was overridden by
+    the other and the password went. The host is looked up under the name
+    OpenSSH looks it up under, which its configuration decides (a
+    HostKeyAlias; else the HostName, as `[name]:port` off port 22, the
+    Port there counting where the target names none): `ssh -G` says what
+    it is, read as the probe reads it, since a check under the name as
+    given would miss what a `Port` or `HostName` stanza moved. Both files
+    are read as the ssh transport reads them, by its parser, and a pin
+    file line that holds no pin is the same refusal here; @cert-authority
+    lines are no keys and stay OpenSSH's to check. Without paramiko the
+    files cannot be read, and OpenSSH is left to its own."""
     if not _ssh.AVAILABLE:
         return
-    name = host if not port or port == 22 else "[%s]:%d" % (host, port)
+    from ..probe import _ssh_g, _Unknown     # hssh.probe imports the drivers, which load this module
+    try:
+        route = _ssh_g(host, port, 22, user, 30.0)
+    except _Unknown as exc:
+        raise RuntimeError("SSH transport failed: %s." % exc) from exc
+    name = route.alias or (route.host if route.port == 22 else "[%s]:%d" % (route.host, route.port))
     with _ssh._PIN_LOCK:
         pinned, _ = _ssh._parsed(_pin_file(), system=False, timeout=30.0)
         known, _ = _ssh._parsed(_system_file(), system=True, timeout=30.0)
@@ -367,7 +377,6 @@ def _exec(host: str, user: str, askpass, cmd: str,
     under the command: that takes the master with it, and this ssh, its
     client, logs no word of it at -v. The master tells them apart
     (_master_running): gone, the result is `lost` (#143)."""
-    _refuse_disagreement(host, port)
     connect_s = budget(connect_timeout, session_timeout)
     # "--" ends the options: a host that starts with "-" is still the host,
     # which matters for a library caller that passes no user.
@@ -464,7 +473,9 @@ def _log_in(host: str, user: str, askpass, cmd: str, session_timeout: int, comma
     as soon as its log level is INFO or above, and `-v` puts it there over
     `-o LogLevel=ERROR`: a login message became every command's STDERR block,
     and one that starts `error:` failed every show as refused (#143). This
-    ssh's stderr is read only to say why the login failed."""
+    ssh's stderr is read only to say why the login failed. The host key
+    check of the two files (#150) comes first, once for the session."""
+    _refuse_disagreement(host, user, port)
     proc = _exec(host, user, askpass, cmd, session_timeout, command_timeout, port, control_path,
                  connect_timeout, log_in=True)
     if proc.returncode != 0:
@@ -570,7 +581,7 @@ class ProcessChannel:
         off (-e none): with a forced tty ssh reads a ~ at the start of a typed
         line as a command to itself (~R, ~B, ~.), keeps it from the device
         and types the rest, so `~Rcommit` would reach it as `commit` (#139)."""
-        _refuse_disagreement(host, port)
+        _refuse_disagreement(host, user, port)
         connect_s = budget(connect_timeout, session_timeout)
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
         os.close(fd)

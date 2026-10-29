@@ -20,6 +20,7 @@ def fake_ssh(tmp_path, monkeypatch):
     script = bindir / "ssh"
     script.write_text(
         "#!/bin/sh\n"
+        'case " $* " in *" -G "*) for a; do h="$a"; done; echo "hostname ${h#*@}"; exit 0;; esac\n'   # ssh -G, as OpenSSH answers it
         'if [ -n "$FAKE_SSH_STDERR" ]; then echo "$FAKE_SSH_STDERR" >&2; fi\n'
         'if [ "$FAKE_SSH_RC" != "" ] && [ "$FAKE_SSH_RC" != "0" ]; then exit "$FAKE_SSH_RC"; fi\n'
         'for arg in "$@"; do last="$arg"; done\n'
@@ -62,6 +63,8 @@ def argv_ssh(tmp_path, monkeypatch):
         "import json, os, sys\n"
         "with open(os.environ['FAKE_SSH_ARGV'], 'a') as f:\n"
         "    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if '-G' in sys.argv:\n"                                                          # ssh -G, as OpenSSH answers it
+        "    print('hostname ' + sys.argv[-1].rpartition('@')[2]); sys.exit(0)\n"
         "if '-V' in sys.argv:\n"
         "    sys.stderr.write('OpenSSH_9.6p1\\n'); sys.exit(0)\n"
         "if '-O' in sys.argv:\n"
@@ -243,7 +246,8 @@ def test_host_follows_an_end_of_options_marker(fake_ssh, tmp_path):
         openssh._close_master("-oProxyCommand=x", None, str(mux / "cm"), str(mux), 5, None)   # run
     finally:
         subprocess.run, subprocess.Popen = real_run, real_popen
-    login, command, close = seen[:3]        # (subprocess.run's own Popen comes after)
+    lookup, _, login, command, close = seen[:5]     # (subprocess.run, the lookup's and the close's, Popens too)
+    assert lookup[-2:] == ["--", "-oProxyCommand=x"] and "-G" in lookup       # the host key lookup (#150)
     assert login[-2:] == ["--", "-oProxyCommand=x"] and "-N" in login
     assert command[-3:] == ["--", "-oProxyCommand=x", "uptime"]
     assert close[-2:] == ["--", "-oProxyCommand=x"]
@@ -274,6 +278,8 @@ def askpass_ssh(tmp_path, monkeypatch):
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import os, subprocess, sys, select\n"
+        "if '-G' in sys.argv:\n"                                                          # ssh -G, as OpenSSH answers it
+        "    print('hostname ' + sys.argv[-1].rpartition('@')[2]); sys.exit(0)\n"
         "helper = os.environ.get('SSH_ASKPASS')\n"
         "if not helper or os.environ.get('SSH_ASKPASS_REQUIRE') != 'force':\n"
         "    sys.stderr.write('no askpass configured\\n'); sys.exit(255)\n"
@@ -458,6 +464,8 @@ def recording_ssh(askpass_ssh):
         "import json, os, subprocess, sys\n"
         "with open(os.environ['FAKE_SSH_ENV_LOG'], 'a') as f:\n"
         "    f.write(json.dumps({'argv': sys.argv[1:], 'env': dict(os.environ)}) + '\\n')\n"
+        "if '-G' in sys.argv:\n"                                                          # ssh -G, as OpenSSH answers it
+        "    print('hostname ' + sys.argv[-1].rpartition('@')[2]); sys.exit(0)\n"
         "if '-V' in sys.argv:\n"
         "    sys.stderr.write('OpenSSH_9.6p1\\n'); sys.exit(0)\n"
         "cp = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('ControlPath=')), None)\n"
@@ -484,16 +492,17 @@ def test_no_ssh_child_carries_the_password_in_its_environment(recording_ssh, tmp
     same-user process reads from /proc/<pid>/environ and a ProxyCommand
     inherits; `ssh -V` and `ssh -O exit` ran with HSSH_PASSWORD. The helper
     reads the secret from the 0600 file beside it, and the children that
-    need no credential get no HSSH_PASSWORD either."""
+    need no credential (`ssh -G`, the host key lookup of #150, too) get no
+    HSSH_PASSWORD either."""
     log = tmp_path / "ssh-env.jsonl"
     monkeypatch.setenv("FAKE_SSH_ENV_LOG", str(log))
     monkeypatch.setenv("HSSH_PASSWORD", "hunter2")
     out = openssh.show("10.0.1.1", "admin", "hunter2", "show configuration", 5, 10)
     assert "radius-server 10.0.0.1;" in out                                 # authenticated, through the helper
     calls = [json.loads(ln) for ln in log.read_text().splitlines()]
-    kinds = [("-V" if "-V" in c["argv"] else "-O" if "-O" in c["argv"] else "-N" if "-N" in c["argv"] else "command")
-             for c in calls]
-    assert sorted(kinds) == ["-N", "-O", "-V", "command"], kinds             # the version, the login, the command, the master's exit
+    kinds = [("-V" if "-V" in c["argv"] else "-G" if "-G" in c["argv"] else "-O" if "-O" in c["argv"]
+              else "-N" if "-N" in c["argv"] else "command") for c in calls]
+    assert sorted(kinds) == ["-G", "-N", "-O", "-V", "command"], kinds       # the version, the lookup, the login, the command, the master's exit
     for c in calls:
         assert "hunter2" not in json.dumps(c["env"]), c["argv"]
         assert "HSSH_PASSWORD" not in c["env"] and "HSSH_ASKPASS_SECRET" not in c["env"], c["argv"]

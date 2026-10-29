@@ -159,10 +159,14 @@ class Answer(NamedTuple):
 
 class Route(NamedTuple):
     """Where a box's transport connects: `host` and `port`, and `via`, the
-    proxy it goes through (`ProxyJump bastion`), where the probe cannot."""
+    proxy it goes through (`ProxyJump bastion`), where the probe cannot.
+    `alias` is the HostKeyAlias the ssh configuration gives the box, if
+    one: the name OpenSSH looks its host key up under instead of
+    `[host]:port` (the openssh transport's check, #150)."""
     host: str
     port: int
     via: Optional[str] = None
+    alias: Optional[str] = None
 
 
 class _Unknown(Exception):
@@ -398,7 +402,7 @@ def _ssh_g(host: str, port: Optional[int], default: int, user: Optional[str], se
         complaint = next((ln.strip() for ln in done.stderr.decode("utf-8", "replace").splitlines()
                           if ln.strip() and not ln.startswith("Pseudo-terminal")), f"exit {done.returncode}")
         raise _Unknown(f"ssh -G {host}: {complaint}")
-    to = Route(said["hostname"], int(said.get("port", port or default)))
+    to = Route(said["hostname"], int(said.get("port", port or default)), alias=said.get("hostkeyalias") or None)
     for key, name in (("proxyjump", "ProxyJump"), ("proxycommand", "ProxyCommand")):
         if said.get(key, "none").lower() != "none":
             return to._replace(via=f"{name} {said[key]} (ssh -G)")
