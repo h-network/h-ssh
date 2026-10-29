@@ -255,7 +255,7 @@ class OpenSSH:
         with _AskPass(creds.password) as askpass:
             argv = _ssh_argv(target, creds, timeouts, host_key_policy, log_path)
             channel = ProcessChannel.open(argv, askpass.env, target.host, log_path)
-            engine = CliEngine(channel, self.dialect, timeouts)
+            engine = CliEngine(channel, self.dialect, timeouts, echoes=True)
             try:
                 engine.login()
             except (ConnectionError, TimeoutError) as exc:
