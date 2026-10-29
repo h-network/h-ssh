@@ -149,7 +149,7 @@ class Scheduler:
         return TargetResult(target, status, tuple(ops))
 
     async def _attempt(self, run: _Run, index: int, target: Target, driver: Driver, attempt: int) -> _Attempt:
-        """One login under the safety gate, the mode's operations in order on that session, close, the gate settled."""
+        """One login under the safety gate, the mode's operations in order on that session, close, the gate settled. A close fault is recorded but decides nothing."""
         spec = run.spec
         creds = spec.credentials or Credentials(username="")
         timeouts = spec.timeouts or DEFAULT_TIMEOUTS
@@ -173,7 +173,6 @@ class Scheduler:
         verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
         if closed is not None:
             ops.append(closed)
-            verdict = verdict or Verdict(Action.FAIL)
         self.policy.settle(target, verdict)
         return _Attempt(ops, verdict)
 
