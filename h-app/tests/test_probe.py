@@ -1019,8 +1019,10 @@ def test_probe_alone_keeps_its_record_when_its_report_is_cut_short(monkeypatch, 
     """The record is written before the report is printed: a reader that
     leaves early (`| head`, BrokenPipeError) or a Ctrl-C while the report
     prints (where Python 3.10 raises KeyboardInterrupt) costs the report,
-    never the rows, and the run row is closed as interrupted with what the
-    probe found."""
+    never the rows. The reader gone, the run goes on without its screen
+    (#153: the screen is best effort) to its own exit code, 1 for the dead
+    box, its row closed whole; the Ctrl-C ends it, its row closed as
+    interrupted with what the probe found."""
     monkeypatch.setattr(probe, "attempt", answering(dead={"10.0.0.2"}))
 
     class Reader:
@@ -1036,11 +1038,16 @@ def test_probe_alone_keeps_its_record_when_its_report_is_cut_short(monkeypatch, 
         def flush(self):
             pass
     monkeypatch.setattr(sys, "stdout", Reader())
-    with pytest.raises(cut):
-        run(monkeypatch, capsys, ["--probe", *R12])
+    if cut is KeyboardInterrupt:
+        with pytest.raises(cut):
+            run(monkeypatch, capsys, ["--probe", *R12])
+    else:
+        rc, _, err, _, _ = run(monkeypatch, capsys, ["--probe", *R12])
+        assert rc == 1 and '"mode": "probe"' in err                   # the summary still on stderr
     run_row, = rows("SELECT * FROM runs")
     assert run_row["finished"] is not None
-    assert (run_row["ok"], run_row["failed"], run_row["skipped"], run_row["interrupted"]) == (1, 1, 0, 1)
+    assert (run_row["ok"], run_row["failed"], run_row["skipped"], run_row["interrupted"]) == (
+        1, 1, 0, 1 if cut is KeyboardInterrupt else 0)
     assert [(r["device"], r["ok"], r["error"]) for r in rows("SELECT * FROM results ORDER BY device")] == [
         ("R1", 1, None), ("R2", 0, "refused (connection refused by 10.0.0.2:830)")]
 

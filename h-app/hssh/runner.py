@@ -150,9 +150,10 @@ def _say(text: str) -> None:
     try:
         sys.stdout.write(f"[{datetime.now().strftime('%H:%M:%S')}] {text}\n")
         sys.stdout.flush()
-    except (BrokenPipeError, ValueError, AttributeError):
-        # The reader went away (`| head`) or stdout is closed: the device's
-        # result is not an error because nobody is watching the progress.
+    except (OSError, ValueError, AttributeError):
+        # The reader went away (`| head`, a BrokenPipeError), stdout can take
+        # no more (ENOSPC, EIO: #153) or is closed: the device's result is
+        # not an error because nobody is watching the progress.
         pass
 
 

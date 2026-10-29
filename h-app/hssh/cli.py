@@ -496,11 +496,13 @@ async def probe_alone(args, targets, store, user, json_mode: bool, safety_gate=N
     when none is but one was not probed (reached through a proxy, held by
     the safety gate), 4 when the store could not keep it. The record (the
     rows, the audit log, --log) is written before the report is printed,
-    so a reader that leaves early (`| head`) or a Ctrl-C while it prints
-    costs at most the report, never the record; the run row is closed
-    whatever ends the run, as interrupted where the report was cut short
-    (on 3.11+ a Ctrl-C there takes effect only at the next await, so the
-    report usually finishes and the run is whole)."""
+    so a Ctrl-C while it prints costs at most the report, never the
+    record, and a reader that leaves early (`| head`) costs the rest of
+    the report and nothing else (the screen is best effort, #153: the run
+    goes on to its exit code); the run row is closed whatever ends the
+    run, as interrupted where a Ctrl-C cut the report short (on 3.11+ a
+    Ctrl-C there takes effect only at the next await, so the report
+    usually finishes and the run is whole)."""
     limit, note = fit_probes_to_open_files(min(MAX_PROBES, len(targets)))
     if note:
         print(f"WARNING: {note}", file=sys.stderr)
@@ -605,6 +607,58 @@ def confirm_minutes_arg(text: str) -> int:
     return minutes
 
 
+class _BestEffort:
+    """A stream for the screen, best effort (#153). The first write or flush
+    that fails, because the reader left (`| head`, EPIPE), the file can take
+    no more (ENOSPC, EIO, EFBIG) or the stream is closed, mutes the stream
+    for the rest of the run, and parks its descriptor on /dev/null so the
+    interpreter's own flush at exit has nothing to say either. The run goes
+    on: an exception out of a print in the result loop used to end main()
+    while the executor threads finished their commits, with no audit
+    entry, no store row and no report for them. The record is the store,
+    the audit log and --log; the screen never was. A KeyboardInterrupt
+    raised in a write is not the stream's failure and passes."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self.muted = False
+
+    def write(self, text):
+        if not self.muted:
+            try:
+                self._stream.write(text)
+                self._stream.flush()
+            except (OSError, ValueError):       # BrokenPipeError is an OSError; ValueError: closed
+                self._mute()
+        return len(text)
+
+    def flush(self):
+        if not self.muted:
+            try:
+                self._stream.flush()
+            except (OSError, ValueError):
+                self._mute()
+
+    def _mute(self):
+        self.muted = True
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, self._stream.fileno())
+            finally:
+                os.close(devnull)
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+# The SIGINT handler the run replaced before its first device could commit
+# (see _on_sigint in _main), for main() to put back whichever way the run ends.
+_SIGINT = {"previous": None}
+
+
 async def main() -> int:
     """Main CLI entry point: one run, or one tick of a watch. The store the
     run opens is closed when main() returns, whichever way it returns
@@ -612,13 +666,28 @@ async def main() -> int:
     stopped at its question, a run stopped after its probe) returned with
     it open, which a process exiting never noticed, and a caller in-process
     (a script, the suite, the watch's next tick) kept with the fd of the
-    store's directory until garbage collection."""
+    store's directory until garbage collection. The screen streams are
+    best effort for the run (_BestEffort) and given back after it."""
     opened = []                 # the Store _main() opens, if any
+    streams = []                # (name, the stream as it was) for each one wrapped
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        if not isinstance(stream, _BestEffort):
+            streams.append((name, stream))
+            setattr(sys, name, _BestEffort(stream))
     try:
         return await _main(opened)
     finally:
         for store in opened:
             store.close()       # nothing more after the run's own close() or discard()
+        for name, stream in streams:
+            setattr(sys, name, stream)
+        if _SIGINT["previous"] is not None:
+            try:
+                signal.signal(signal.SIGINT, _SIGINT["previous"])
+            except (ValueError, OSError):
+                pass
+            _SIGINT["previous"] = None
 
 
 async def _main(opened: list) -> int:
@@ -1999,6 +2068,43 @@ async def _main(opened: list) -> int:
         # and an edit entry's session is clean again before the next one.
         pool.enable()
 
+    def _in_flight():
+        return sum(1 for i in inflight if not tasks[i].done())
+
+    signals = {"count": 0}
+    main_task, loop = asyncio.current_task(), asyncio.get_running_loop()
+
+    def _on_sigint(signum, frame):
+        """SIGINT from here until main() gives the handler back (#153). The
+        first cancels the main task, on every Python (asyncio.run does so
+        on 3.11+; on 3.10 the interpreter's own handler raised
+        KeyboardInterrupt wherever the main thread was): _completed then
+        starts no more devices and waits for the ones in flight. Every one
+        after it only says how many are in flight: asyncio's handler took a
+        second SIGINT as KeyboardInterrupt wherever the main thread was, a
+        slow stdout write included, and its clean-up cancelled the
+        in-flight tasks while the executor threads finished their commits:
+        no report, no audit entry, no row for them. Installed before the
+        first device can commit, so there is no moment at which a SIGINT
+        still reaches a handler that raises."""
+        signals["count"] += 1
+        if signals["count"] == 1:
+            main_task.cancel()
+            loop.call_soon_threadsafe(lambda: None)     # a loop asleep in select() wakes to deliver it
+            return
+        print(f"Interrupted again: {_in_flight()} device(s) in flight are waited for and recorded; "
+              "the run ends when they have.", file=sys.stderr)
+
+    previous = signal.getsignal(signal.SIGINT)
+    # Only a handler of Python's is replaced (asyncio's, or the interpreter's
+    # own that raises KeyboardInterrupt): a SIGINT ignored or left to the
+    # OS by whoever started the run stays so.
+    if not interrupted and callable(previous) and _SIGINT["previous"] is None:
+        try:
+            signal.signal(signal.SIGINT, _on_sigint)
+            _SIGINT["previous"] = previous
+        except (ValueError, OSError):       # not the main thread: nothing to replace
+            pass
     tasks = [] if interrupted else [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i),
                                                                  logs_in=i not in rides))
                                     for i in range(len(units))]
@@ -2017,9 +2123,11 @@ async def _main(opened: list) -> int:
 
     async def _completed():
         """Results as they land. On Ctrl-C the units that have not started are
-        cancelled; the ones in flight are still awaited, so a commit that is
-        on its way to a device is reported, logged and audited, never dropped."""
-        nonlocal interrupted
+        cancelled and counted skipped (`not_started`); the ones in flight are
+        still awaited, so a commit that is on its way to a device is
+        reported, logged and audited, never dropped (a second Ctrl-C ends
+        nothing: _on_sigint, #153)."""
+        nonlocal interrupted, not_started
         pending = set(tasks)
         while pending:
             try:
@@ -2034,6 +2142,7 @@ async def _main(opened: list) -> int:
                     if i not in started and task in pending:
                         task.cancel()
                         pending.discard(task)
+                        not_started += 1
                     elif task in pending and not task.done():
                         inflight.add(i)
                 continue
@@ -2296,6 +2405,30 @@ async def _main(opened: list) -> int:
     # without theirs and joined with one. With the newlines kept, a last
     # line would not match itself once a line follows it, and a changed
     # one would run into the line put in after it.
+    # The record is settled before the report: the run row closed and the
+    # counts the exit code reads final, so a reader that leaves during the
+    # report (`--json | head -c1`) or a Ctrl-C while it prints costs the
+    # report, never the row (#153: the array and the summary came first,
+    # and the row stayed open with every result in).
+    elapsed_ms = int((time.time() - run_start) * 1000)
+    ok_count = len(json_results) - failures - skipped - unreachable - interrupted_connects
+    not_kept = 0
+    if store_run is not None:
+        gone = store.still_there()
+        if gone is not None:              # SQLite kept writing into the void; nothing of this run is on disk
+            not_kept, store_reason = store_tried, gone
+        else:
+            not_kept = store_lost
+        # The run row is closed when any result was kept; with nothing kept
+        # it stays open (`?/?` in `h-ssh-store runs`), a true record of a run
+        # that could not keep its results.
+        if not_kept < store_tried or store_tried == 0:
+            try:
+                store.finish_run(store_run, ok_count, failures, skipped + not_run + unreachable + not_started,
+                                 interrupted)
+            except Exception as e:
+                print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
+
     ok_results = []
     if args.diff and mode in ["show", "show-batch"]:
         # Every result has its place: one without is an error, not a device left out.
@@ -2424,16 +2557,7 @@ async def _main(opened: list) -> int:
             print("")
 
     # Structured stderr summary
-    elapsed_ms = int((time.time() - run_start) * 1000)
-    ok_count = len(json_results) - failures - skipped - unreachable - interrupted_connects
     stderr_mode = "batch" if mode == "show-batch" else ("job" if mode == "job" else mode.split("-")[0])
-    not_kept = 0
-    if store_run is not None:
-        gone = store.still_there()
-        if gone is not None:              # SQLite kept writing into the void; nothing of this run is on disk
-            not_kept, store_reason = store_tried, gone
-        else:
-            not_kept = store_lost
     summary = json.dumps({
         "targets": len(json_results) + not_run,
         "ok": ok_count,
@@ -2449,15 +2573,6 @@ async def _main(opened: list) -> int:
     print(f"[h-ssh] {summary}", file=sys.stderr)
 
     if store_run is not None:
-        # The run row is closed when any result was kept; with nothing kept
-        # it stays open (`?/?` in `h-ssh-store runs`), a true record of a run
-        # that could not keep its results.
-        if not_kept < store_tried or store_tried == 0:
-            try:
-                store.finish_run(store_run, ok_count, failures, skipped + not_run + unreachable + not_started,
-                                 interrupted)
-            except Exception as e:
-                print(f"WARNING: store {store.path}: {e}", file=sys.stderr)
         lost = f"{not_kept} of {store_tried} results were not kept: {store_reason}" if not_kept else None
         if lost:
             print(f"WARNING: store {store.path}: {lost}", file=sys.stderr)
@@ -2616,9 +2731,11 @@ def main_sync() -> None:
             _watch_sleep(_WATCH["every"])
             rc = _worst(rc, asyncio.run(main()))    # a tick that failed is not forgotten by a clean one after it
         sys.stdout.flush()          # a reader that left shows up here, not at interpreter exit
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         # Ctrl-C is a normal way to stop a fleet run; a stack trace is not a
         # useful thing to print at someone who already knows what they did.
+        # A Ctrl-C after the run's last await leaves its task cancelled at
+        # its end (_on_sigint in _main), which is the same thing.
         ticks, kept = _WATCH["tick"], _WATCH["kept"]
         said = f" {kept} tick(s) kept in the store" + (f", {ticks - kept} not kept in full" if kept < ticks else "")
         print("\nInterrupted." + (said + "." if ticks else ""), file=sys.stderr)

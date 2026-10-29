@@ -395,8 +395,10 @@ store could not keep it), and the stderr summary gains `slow` (a box not probed 
 `connect_ms`, `banner_ms`, `banner`, `reason`, `slow`, `duration_ms`. The check is kept in the store as
 a run of mode `probe`, one row per box with the record as JSON, so `h-ssh-store failed` lists every box
 that is not live with its verdict and `h-ssh-store field connect_ms` the round trips. The rows are
-written before the report is printed: a reader that leaves early (`| head`) or a Ctrl-C while it
-prints costs at most the report, never the record; a report cut short closes its run as interrupted. `--probe` with a
+written before the report is printed: a Ctrl-C while it prints costs at most the report, never the
+record, and closes the run as interrupted; a reader that leaves early (`| head`) costs the rest of the
+report and nothing else, the run closed whole with its own exit code (the screen is best effort in
+every mode: see [Output](#output)). `--probe` with a
 command probes before the run even where the config file says `probe = no` or a run file `no-probe`.
 
 **Two times per live box, one sample each.** The connect time is the TCP handshake's round trip as
@@ -975,10 +977,15 @@ file. YAML needs PyYAML, which comes along with junos-eznc, so every install has
 | `--diff` | after the results, each device's reply against the first one in target order that answered (bare hosts, then `--target`; or the inventory's rows): the unified diff, or `(identical)`; for a batch, command by command. A show only (`-sC`, `--batch`, `--profile`): with an edit, a job, `--rollback`, `--commit-status` or `--probe` alone it is refused (exit 2, nothing sent), a run file's `diff` too |
 | `--format json\|xml` | the router's own JSON or XML reply instead of CLI text (the NETCONF `junos` driver only; `junos@ssh`, `junos@openssh` and every other driver refuse it, nothing sent, a FAIL of that device): pretty-printed wherever output is printed; in `--json`, `output` carries the JSON as data and the XML as a string. Reads only: a `-sC` or a batch line that is not a read is refused before anything is sent (exit 2), under `--dry-run` too |
 
-A reader that stops early (`h-ssh ... | head`) is not an error and gets no traceback: whatever had
-landed stands, and the exit is the run's own verdict when the run had reached it (`1` for a failed
-device), else 0. A pipe that closed in the middle of the run also cuts the summary line and leaves the
-run open in the store (`?/?`). paramiko's transport thread logs a full traceback when
+A reader that stops early (`h-ssh ... | head`) is not an error and gets no traceback, and it does not
+end the run: the screen is best effort. The first write to stdout or stderr that fails, because the
+reader left or the file can take no more (a full disk), mutes that stream for the rest of the run,
+which goes on to its end, every device run and recorded (the store, the audit log, `--log`), and exits
+with its own verdict (`1` for a failed device). Before #153 the exception out of a progress line ended
+the run while the commits in flight finished on the routers unreported, unlogged and unaudited, the
+devices still queued never ran, the run row stayed open (`?/?`) and the exit was 0 or a traceback; a
+reader that left during the `--json` report kept exit 0 with a failed device in it and the row open.
+paramiko's transport thread logs a full traceback when
 a device closes the connection mid-handshake; the CLI keeps that off the screen (the one FAIL line
 already says so) unless `-v` is given. Under `Fleet` it stays off stderr too while logging is not
 set up (paramiko's and ncclient's loggers get a `NullHandler`, no level is changed); set logging up
@@ -1164,7 +1171,15 @@ Ctrl-C stops starting new devices and lets the calls already in flight run out: 
 its way to a router is reported, logged and audited like any other, never dropped. Nothing is tried
 again after it: the attempt in flight is that device's last, so an edit whose connect runs out after
 Ctrl-C is not sent again once you have stopped the run. The run then reports how many devices
-completed (`Interrupted. Completed 1 of 3 device(s).`, on stderr) and exits `130`. Output already
+completed (`Interrupted. Completed 1 of 3 device(s).`, on stderr) and exits `130`; the devices that
+had not started are `skipped` in the summary and in the run row (#153: they were counted nowhere). A
+second Ctrl-C does not end the run either, whenever it comes (while a result is being printed too,
+and on Python 3.10, whose own handler raised at the first Ctrl-C, the same as on 3.11 and later):
+it says how many devices are still in flight (`Interrupted again: 2 device(s) in flight are waited for
+and recorded; the run ends when they have.`), and the run
+ends when they have, their results reported, logged and audited (before #153 it raised out of the run
+and cancelled the in-flight devices while their commits finished on the routers, with no report, no
+audit entry and no row: the run said `Completed 0 of 4`). Output already
 written to stdout stays valid, so a truncated `--raw` run cannot look like a complete one. A device
 that was still being connected to when Ctrl-C came, and whose connect then ran out on its own, is
 reported as `INTERRUPTED` rather than `FAIL`: nothing reached it and the operator stopped the run.
@@ -1636,7 +1651,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1515 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1522 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
