@@ -1361,17 +1361,27 @@ def test_a_second_ctrl_c_still_records_the_commits_in_flight(tmp_path):
     assert row[:5] == (4, 2, 0, 2, 1) and row[5] is not None
 
 
-def test_two_ctrl_cs_during_a_slow_screen_write_still_record_the_commits_in_flight(monkeypatch, capsys, tmp_path):
+@pytest.mark.parametrize("handler", ["asyncio", "raising"])
+def test_two_ctrl_cs_during_a_slow_screen_write_still_record_the_commits_in_flight(monkeypatch, capsys, tmp_path,
+                                                                                    handler):
     """The review's window (#153): the handler that answers a second SIGINT
     was installed only once the first cancellation reached the result
     loop's await, so a first Ctrl-C that came while a result was being
     printed, and a second before the next await (a slow screen), both
     reached asyncio's handler, which raised KeyboardInterrupt in the middle
     of the write: exit 130, three commits in the ledger, one in the audit
-    log and the store, the run row open. The handler is installed before
-    the first device can commit, the first SIGINT handed to the one it
-    replaced, and it is given back after the run."""
+    log and the store, the run row open. And on Python 3.10 asyncio.run
+    installs no handler of its own: the interpreter's raised at the first
+    Ctrl-C (here on every version: a handler of the test's that raises,
+    which asyncio.run leaves in place). The run's handler is installed
+    before the first device can commit, cancels the main task itself on
+    the first SIGINT, and is given back after the run."""
     audit = tmp_path / "audit.jsonl"
+    original = signal.getsignal(signal.SIGINT)
+    if handler == "raising":
+        def raising(signum, frame):
+            signal.default_int_handler(signum, frame)
+        signal.signal(signal.SIGINT, raising)
     before = signal.getsignal(signal.SIGINT)
 
     class Driver:
@@ -1410,10 +1420,13 @@ def test_two_ctrl_cs_during_a_slow_screen_write_still_record_the_commits_in_flig
     monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *_targets(3), "--workers", "2",
                                       "--raw", "-y", "-eC", "set system host-name X", "--audit-log", str(audit)])
     monkeypatch.setattr(sys, "stdout", SlowScreen(sys.stdout))
-    with pytest.raises(SystemExit) as left:
-        cli.main_sync()
-    out, err = capsys.readouterr()
-    assert left.value.code == 130 and signal.getsignal(signal.SIGINT) is before
+    try:
+        with pytest.raises(SystemExit) as left:
+            cli.main_sync()
+        out, err = capsys.readouterr()
+        assert left.value.code == 130 and signal.getsignal(signal.SIGINT) is before
+    finally:
+        signal.signal(signal.SIGINT, original)
     assert "Interrupted again:" in err and "device(s) in flight" in err, err
     audited, stored, run = _record(audit)
     assert audited == stored == sorted(driver.committed) and "10.0.0.1" in stored

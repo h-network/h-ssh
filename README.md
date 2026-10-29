@@ -1173,7 +1173,8 @@ again after it: the attempt in flight is that device's last, so an edit whose co
 Ctrl-C is not sent again once you have stopped the run. The run then reports how many devices
 completed (`Interrupted. Completed 1 of 3 device(s).`, on stderr) and exits `130`; the devices that
 had not started are `skipped` in the summary and in the run row (#153: they were counted nowhere). A
-second Ctrl-C does not end the run either, whenever it comes (while a result is being printed too):
+second Ctrl-C does not end the run either, whenever it comes (while a result is being printed too,
+and on Python 3.10, whose own handler raised at the first Ctrl-C, the same as on 3.11 and later):
 it says how many devices are still in flight (`Interrupted again: 2 device(s) in flight are waited for
 and recorded; the run ends when they have.`), and the run
 ends when they have, their results reported, logged and audited (before #153 it raised out of the run
@@ -1650,7 +1651,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1521 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1522 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release
