@@ -9,8 +9,7 @@ from typing import Protocol, Sequence
 
 from hssh.dialects.base import Dialect
 from hssh.model import Fault, FaultKind, PolicySettings, Target
-
-DEFAULT_POLICY = PolicySettings(retries=2, retry_pause=2)
+from hssh.orchestrator.defaults import DEFAULT_POLICY
 
 # The communicator's operation that opens the session: a fault from it is "before login".
 OPEN = "open"
