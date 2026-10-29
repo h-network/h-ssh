@@ -16,25 +16,29 @@ from pathlib import Path
 from typing import Any
 
 from hssh.frontends import profiles
-from hssh.frontends.fleet import DEFAULT_POLICY, DEFAULT_TIMEOUTS, Runner, load_devices_csv, parse_target, run_spec
+from hssh.frontends.fleet import Runner, load_devices_csv, parse_target, run_spec
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
     Credentials, EditSettings, Fault, Mode, PolicySettings, RecordSettings, RunReport, RunSpec,
     SafetySettings, Target, Timeouts,
 )
+from hssh.orchestrator import (
+    DEFAULT_CONFIRMED_MINUTES, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SAFETY,
+    DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, default_username,
+)
 
 TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
 HOST_KEY_CHOICES = ("accept-new", "strict", "off")
 FORMAT_CHOICES = ("text", "json", "xml")
-STORE_DEFAULT = "h-ssh.db"
 
-# Config-file keys with their built-in default; None means "no value".
+# Config-file keys with the orchestrator's default; None means "no value".
 CONFIG_DEFAULTS: dict[str, Any] = {
-    "transport": "ssh", "vendor": "generic", "user": None, "workers": 8,
+    "transport": DEFAULT_TRANSPORT, "vendor": DEFAULT_VENDOR, "user": None, "workers": DEFAULT_WORKERS,
     "connect_timeout": DEFAULT_TIMEOUTS.connect, "command_timeout": DEFAULT_TIMEOUTS.command,
     "commit_timeout": DEFAULT_TIMEOUTS.commit, "retries": DEFAULT_POLICY.retries,
-    "retry_pause": DEFAULT_POLICY.retry_pause, "host_key_policy": "accept-new", "probe": False,
-    "cooldown": 300, "rate_limit": 6, "store": None, "audit_log": None, "safety_file": None,
+    "retry_pause": DEFAULT_POLICY.retry_pause, "host_key_policy": DEFAULT_HOST_KEY_POLICY, "probe": DEFAULT_PROBE,
+    "cooldown": DEFAULT_SAFETY.cooldown_seconds, "rate_limit": DEFAULT_SAFETY.rate_limit,
+    "store": None, "audit_log": None, "safety_file": None,
 }
 CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 
@@ -81,8 +85,8 @@ def build_parser() -> _Parser:
     p.add_argument("hosts", nargs="*", metavar="HOST", help="bare host or name:host[:vendor][:port]; with any target given the inventory is not read")
     p.add_argument("--target", action="append", metavar="SPEC", help="inline target name:host[:vendor][:port] (repeatable)")
     p.add_argument("--devices", metavar="CSV", help=f"inventory (default: {default_devices_path()})")
-    p.add_argument("--transport", choices=TRANSPORT_CHOICES, help="transport for targets that name none (default: ssh)")
-    p.add_argument("--vendor", metavar="NAME", help="vendor for targets that name none (default: generic)")
+    p.add_argument("--transport", choices=TRANSPORT_CHOICES, help=f"transport for targets that name none (default: {DEFAULT_TRANSPORT})")
+    p.add_argument("--vendor", metavar="NAME", help=f"vendor for targets that name none (default: {DEFAULT_VENDOR})")
     p.add_argument("--user", metavar="NAME", help="username (default: config, then the login name)")
     p.add_argument("--config", metavar="FILE", help="defaults file (default: ~/.h-ssh/config)")
     p.add_argument("--run", metavar="FILE", help="YAML or JSON run file; a typed flag wins over it")
@@ -99,7 +103,8 @@ def build_parser() -> _Parser:
 
     edit = p.add_argument_group("edit")
     edit.add_argument("-y", "--yes", action="store_true", help="apply; without it an edit is a dry run")
-    edit.add_argument("--commit-confirmed", type=int, nargs="?", const=10, metavar="MIN", help="commit confirmed, minutes (default 10)")
+    edit.add_argument("--commit-confirmed", type=int, nargs="?", const=DEFAULT_CONFIRMED_MINUTES, metavar="MIN",
+                      help=f"commit confirmed, minutes (default {DEFAULT_CONFIRMED_MINUTES})")
     edit.add_argument("--comment", metavar="TEXT", help="commit comment")
 
     behaviour = p.add_argument_group("behaviour")
@@ -122,7 +127,7 @@ def build_parser() -> _Parser:
     out.add_argument("--json", action="store_true", help="the report as JSON")
     out.add_argument("--raw", action="store_true", help="device output only")
     out.add_argument("-v", "--verbose", action="store_true")
-    out.add_argument("--store", metavar="FILE", help=f"SQLite result store (default: ./{STORE_DEFAULT})")
+    out.add_argument("--store", metavar="FILE", help=f"SQLite result store (default: ./{DEFAULT_STORE})")
     out.add_argument("--no-store", action="store_true")
     out.add_argument("--audit-log", metavar="FILE", default=os.environ.get("HSSH_AUDIT_LOG") or None)
     out.add_argument("--log", metavar="FILE")
@@ -177,7 +182,7 @@ def resolve_mode(args: argparse.Namespace) -> Mode:
 
 def resolve_credentials(args: argparse.Namespace) -> Credentials:
     """The user from flags or config, else the login name; the password from HSSH_PASSWORD or a terminal prompt."""
-    user = args.user or os.environ.get("HSSH_USER") or getpass.getuser()
+    user = args.user or os.environ.get("HSSH_USER") or default_username()
     password = os.environ.get("HSSH_PASSWORD")
     if password is None and sys.stdin.isatty():
         password = getpass.getpass(f"Password for {user}: ") or None
@@ -209,7 +214,7 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         workers=args.workers, host_key_policy=args.host_key_policy, probe=args.probe, edit=edit,
         policy=PolicySettings(retries=args.retries, retry_pause=args.retry_pause),
         safety=safety,
-        recording=RecordSettings(store_path=None if args.no_store else (args.store or STORE_DEFAULT),
+        recording=RecordSettings(store_path=None if args.no_store else (args.store or DEFAULT_STORE),
                                  audit_log_path=args.audit_log, log_path=args.log,
                                  save_output_path=args.save_output, argv=tuple(argv)),
     )
