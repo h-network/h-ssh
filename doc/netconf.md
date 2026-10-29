@@ -3,6 +3,8 @@
 The `junos@netconf` driver supports `show` and `batch` through PyEZ. Connections use
 port 830 unless the target specifies another port. The connect timeout is passed
 to PyEZ, and the command timeout applies to operations on the open session.
+Port 23 is rejected before any connection; NETCONF never falls back to telnet.
+Show output has leading and trailing newlines removed.
 
 For example, with a key available through SSH key discovery or the SSH agent:
 
@@ -19,7 +21,8 @@ disables host-key verification. The default, `accept-new`, records unknown keys
 in `~/.ssh/known_hosts` with an additional SSH handshake before authentication.
 PyEZ then verifies the recorded key on the NETCONF connection. Known keys use
 PyEZ's verification directly, and changed keys are refused. Concurrent sessions
-within one process serialize their known-hosts reads and writes.
+share a process-wide known-hosts cache, loaded once and refreshed after an append.
+New entries are appended under a file lock, preserving the file's existing content.
 
 Library failures become `Fault` with the library's message and whether the
 operation may have reached the device. The communicator does not retry. Closing

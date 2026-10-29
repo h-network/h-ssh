@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
+import os
 from pathlib import Path
 import socket
 from threading import Lock
@@ -15,22 +17,28 @@ from hssh.model import Credentials, Fault, FaultKind, HostKeyPolicy, Result, Tar
 if TYPE_CHECKING:
     from jnpr.junos import Device
     from jnpr.junos.utils.config import Config
+    from paramiko import HostKeys
 
 
 DEFAULT_PORT = 830
 _HOST_KEYS_LOCK = Lock()
+_HOST_KEYS: HostKeys | None = None
 
 
 def _accept_new(host: str, port: int, timeout: int) -> None:
     """Pin an unknown key before PyEZ authenticates, then let PyEZ verify it."""
     import paramiko
 
+    global _HOST_KEYS
     path = Path.home() / ".ssh" / "known_hosts"
     name = host if port == 22 else f"[{host}]:{port}"
     with _HOST_KEYS_LOCK:
-        keys = paramiko.HostKeys()
-        if path.exists():
-            keys.load(str(path))
+        if _HOST_KEYS is None:
+            keys = paramiko.HostKeys()
+            if path.exists():
+                keys.load(str(path))
+            _HOST_KEYS = keys
+        keys = _HOST_KEYS
         if keys.lookup(host) or keys.lookup(name):
             return
     with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -38,17 +46,20 @@ def _accept_new(host: str, port: int, timeout: int) -> None:
             transport.start_client(timeout=timeout)
             key = transport.get_remote_server_key()
     with _HOST_KEYS_LOCK:
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path.touch(mode=0o600, exist_ok=True)
-        keys = paramiko.HostKeys(str(path))
+        keys = _HOST_KEYS
         current = keys.lookup(host) or keys.lookup(name)
         if current:
             expected = current.get(key.get_name())
             if expected != key:
                 raise paramiko.BadHostKeyException(host, key, expected or next(iter(current.values())))
         else:
-            keys.add(name, key.get_name(), key)
-            keys.save(str(path))
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "a") as known_hosts:
+                fcntl.flock(known_hosts, fcntl.LOCK_EX)
+                known_hosts.write(f"{name} {key.get_name()} {key.get_base64()}\n")
+                known_hosts.flush()
+                _HOST_KEYS = paramiko.HostKeys(str(path))
 
 
 def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> Fault:
@@ -67,6 +78,7 @@ def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> 
     while isinstance(cause, BaseException) and cause not in errors:
         errors.append(cause)
         cause = getattr(cause, "_orig", None) or cause.__cause__ or cause.__context__
+    detail = str(errors[-1])
     mappings = (
         ((transport.SSHUnknownHostError, BadHostKeyException), FaultKind.HOST_KEY),
         ((pyez.ConnectAuthError, transport.AuthenticationError, AuthenticationException), FaultKind.AUTH),
@@ -81,8 +93,8 @@ def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> 
     )
     for types, kind in mappings:
         if any(isinstance(exc, types) for exc in errors):
-            return Fault(kind, str(error), reached_device)
-    return Fault(FaultKind.LOCAL, str(error), reached_device)
+            return Fault(kind, detail, reached_device)
+    return Fault(FaultKind.LOCAL, detail, reached_device)
 
 
 @dataclass
@@ -107,11 +119,13 @@ class NetconfCommunicator(Communicator):
         timeouts: Timeouts,
         host_key_policy: HostKeyPolicy,
     ) -> NetconfSession:
+        port = target.port if target.port is not None else DEFAULT_PORT
+        if port in (23, "23"):
+            raise Fault(FaultKind.LOCAL, "port 23 is telnet, not NETCONF", False)
         device = None
         try:
             from jnpr.junos import Device
 
-            port = target.port if target.port is not None else DEFAULT_PORT
             if host_key_policy == "accept-new":
                 _accept_new(target.host, port, timeouts.connect)
             device = Device(
@@ -159,7 +173,7 @@ class NetconfCommunicator(Communicator):
         try:
             if command.rstrip().endswith("| no-more"):
                 command = command.rstrip()[:-len("| no-more")].rstrip()
-            return Result(output=device.cli(command, warning=False) or "")
+            return Result(output=(device.cli(command, warning=False) or "").strip("\r\n"))
         except Exception as error:
             raise _fault(error, reached_device) from error
 
