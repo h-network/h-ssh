@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from hssh.model import Credentials, Result, Target, Timeouts
+from hssh.dialects.base import Dialect
+from hssh.model import Credentials, HostKeyPolicy, Result, Target, Timeouts
 
 
 class Session(Protocol):
@@ -15,8 +16,9 @@ class Communicator(Protocol):
     """One transport: opens sessions, executes one operation per call, returns Result or raises Fault; capability names are the mode names plus commit_confirmed."""
 
     capabilities: frozenset[str]
+    dialect: Dialect
 
-    def open(self, target: Target, creds: Credentials, timeouts: Timeouts) -> Session: ...
+    def open(self, target: Target, creds: Credentials, timeouts: Timeouts, host_key_policy: HostKeyPolicy) -> Session: ...
 
     def close(self, session: Session) -> None: ...
 
@@ -31,7 +33,5 @@ class Communicator(Protocol):
     def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result: ...
 
     def confirm(self, session: Session) -> Result: ...
-
-    def rollback(self, session: Session, index: int = 0) -> Result: ...
 
     def commit_history(self, session: Session) -> Result: ...

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Literal, Sequence
 
-Mode = Literal["show", "batch", "structured", "edit", "rollback", "confirm", "commit_status"]
+Mode = Literal["show", "batch", "structured", "edit", "confirm", "commit_status"]
 
 HostKeyPolicy = Literal["accept-new", "strict", "off"]
 
@@ -48,6 +48,7 @@ class SafetySettings:
 
     cooldown_seconds: int
     rate_limit: int
+    safety_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,24 @@ class RecordSettings:
     audit_log_path: str | None = None
     log_path: str | None = None
     save_output_path: str | None = None
+    argv: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class EditSettings:
+    """How an edit run commits: dry run unless apply is set."""
+
+    apply: bool = False
+    confirmed_minutes: int | None = None
+    comment: str | None = None
+
+
+@dataclass(frozen=True)
+class PolicySettings:
+    """Retry policy: attempts and the pause between them in whole seconds."""
+
+    retries: int
+    retry_pause: int
 
 
 @dataclass(frozen=True)
@@ -68,10 +87,14 @@ class RunSpec:
     mode: Mode
     commands: tuple[str, ...] = ()
     config_lines: tuple[str, ...] = ()
+    format: str | None = None
     credentials: Credentials | None = None
     timeouts: Timeouts | None = None
     workers: int = 1
     host_key_policy: HostKeyPolicy = "accept-new"
+    probe: bool = False
+    edit: EditSettings | None = None
+    policy: PolicySettings | None = None
     safety: SafetySettings | None = None
     recording: RecordSettings | None = None
 
@@ -110,11 +133,21 @@ class Fault(Exception):
 
 
 @dataclass(frozen=True)
+class OperationResult:
+    """One operation on a target: the command, its Result or Fault, and elapsed whole seconds."""
+
+    command: str
+    outcome: Result | Fault
+    elapsed: int
+
+
+@dataclass(frozen=True)
 class TargetResult:
-    """One target's outcome: its status and its Result or Fault, or None when skipped."""
+    """One target's outcome: its status, its operations, and a target-level Fault when none ran."""
 
     target: Target
     status: TargetStatus
+    operations: Sequence[OperationResult] = ()
     outcome: Result | Fault | None = None
 
 

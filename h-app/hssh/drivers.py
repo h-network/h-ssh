@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Iterator, Protocol, Union
 
 from hssh.communicators.base import Communicator
+from hssh.dialects.base import Dialect
 from hssh.model import Mode, Target
 
 ENTRY_POINT_GROUP = "hssh.drivers"
@@ -18,7 +19,7 @@ class Driver:
     """One dialect paired with one communicator, named dialect@transport."""
 
     name: str
-    dialect: object
+    dialect: Dialect
     communicator: Communicator
 
 
