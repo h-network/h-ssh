@@ -654,8 +654,8 @@ class _BestEffort:
         return getattr(self._stream, name)
 
 
-# The SIGINT handler the run replaced after its first Ctrl-C (see _completed
-# in _main), for main() to put back whichever way the run ends.
+# The SIGINT handler the run replaced before its first device could commit
+# (see _on_sigint in _main), for main() to put back whichever way the run ends.
 _SIGINT = {"previous": None}
 
 
@@ -2068,6 +2068,39 @@ async def _main(opened: list) -> int:
         # and an edit entry's session is clean again before the next one.
         pool.enable()
 
+    def _in_flight():
+        return sum(1 for i in inflight if not tasks[i].done())
+
+    signals = {"count": 0}
+
+    def _on_sigint(signum, frame):
+        """SIGINT from here until main() gives the handler back (#153): the
+        first goes to the handler this one replaced (asyncio's own, which
+        cancels the main task: _completed then starts no more devices and
+        waits for the ones in flight), every one after it only says how
+        many are in flight. asyncio's handler took a second SIGINT as
+        KeyboardInterrupt wherever the main thread was, a slow stdout write
+        included, and its clean-up cancelled the in-flight tasks while the
+        executor threads finished their commits: no report, no audit entry,
+        no row for them. Installed before the first device can commit, so
+        there is no moment at which a second SIGINT still reaches it."""
+        signals["count"] += 1
+        if signals["count"] == 1:
+            _SIGINT["previous"](signum, frame)
+            return
+        print(f"Interrupted again: {_in_flight()} device(s) in flight are waited for and recorded; "
+              "the run ends when they have.", file=sys.stderr)
+
+    previous = signal.getsignal(signal.SIGINT)
+    # Only a handler of Python's is replaced (asyncio's, or the interpreter's
+    # own that raises KeyboardInterrupt): a SIGINT ignored or left to the
+    # OS by whoever started the run stays so.
+    if not interrupted and callable(previous) and _SIGINT["previous"] is None:
+        try:
+            signal.signal(signal.SIGINT, _on_sigint)
+            _SIGINT["previous"] = previous
+        except (ValueError, OSError):       # not the main thread: nothing to replace
+            pass
     tasks = [] if interrupted else [asyncio.create_task(_run_unit(i, expected_diff=expected.get(i),
                                                                  logs_in=i not in rides))
                                     for i in range(len(units))]
@@ -2084,21 +2117,12 @@ async def _main(opened: list) -> int:
     log_ts = datetime.now().isoformat()
     log_warned = False
 
-    def _in_flight():
-        return sum(1 for i in inflight if not tasks[i].done())
-
-    def _second_ctrl_c(signum, frame):
-        print(f"Interrupted again: {_in_flight()} device(s) in flight are waited for and recorded; "
-              "the run ends when they have.", file=sys.stderr)
-
     async def _completed():
         """Results as they land. On Ctrl-C the units that have not started are
         cancelled and counted skipped (`not_started`); the ones in flight are
         still awaited, so a commit that is on its way to a device is
-        reported, logged and audited, never dropped. A second Ctrl-C used to
-        raise KeyboardInterrupt out of the loop, whose clean-up cancelled the
-        in-flight tasks too while the executor threads finished their commits
-        (#153): after the first, SIGINT only says how many are in flight."""
+        reported, logged and audited, never dropped (a second Ctrl-C ends
+        nothing: _on_sigint, #153)."""
         nonlocal interrupted, not_started
         pending = set(tasks)
         while pending:
@@ -2117,11 +2141,6 @@ async def _main(opened: list) -> int:
                         not_started += 1
                     elif task in pending and not task.done():
                         inflight.add(i)
-                if _SIGINT["previous"] is None:
-                    try:
-                        _SIGINT["previous"] = signal.signal(signal.SIGINT, _second_ctrl_c)
-                    except (ValueError, OSError):       # not the main thread: nothing to replace
-                        pass
                 continue
             for task in done:
                 if not task.cancelled():
