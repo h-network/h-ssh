@@ -6,20 +6,20 @@ import asyncio
 import concurrent.futures
 import signal
 import sys
+import dataclasses
 import time
 from dataclasses import dataclass, field
 
 from hssh.communicators.base import Session
 from hssh.drivers import Driver, DriverRegistry
-from hssh.model import (Credentials, EditSettings, Fault, FaultKind, OperationResult, RunReport, RunSpec,
-                        Target, TargetResult, TargetStatus, Timeouts)
+from hssh.model import (Fault, FaultKind, OperationResult, RunReport, RunSpec, Target, TargetResult, TargetStatus)
 from hssh.orchestrator import lifecycle, probe
+from hssh.orchestrator.defaults import complete
 from hssh.orchestrator.lifecycle import EditLifecycle, Stage, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
 from hssh.orchestrator.sessions import SessionManager
 
-DEFAULT_TIMEOUTS = Timeouts(connect=3, command=20, commit=60)
 READ_MODES = ("show", "batch", "structured", "commit_status")
 
 
@@ -73,11 +73,19 @@ class Scheduler:
         return report
 
     async def _probe(self, spec: RunSpec) -> dict[str, Fault | None]:
-        """Dead targets by name; a target the safety gate holds is not probed."""
-        timeouts = spec.timeouts or DEFAULT_TIMEOUTS
+        """Dead targets by name, asked at the port the target names or its transport's default; a target the gate holds or whose driver is unknown is not probed."""
         held = self.policy.held(spec.targets)
-        free = [t for t in spec.targets if t.name not in held]
-        return await probe.probe(free, timeouts.connect)
+        boxes = []
+        for target in spec.targets:
+            if target.name in held:
+                continue
+            try:
+                comm = self.registry.resolve(target).communicator
+            except Fault:
+                continue
+            port = target.port if target.port is not None else comm.default_port
+            boxes.append((target, port, comm.banner))
+        return await probe.probe(boxes, spec.timeouts.connect)
 
     async def _bounded(self, run: _Run, index: int, target: Target, slots: asyncio.Semaphore,
                        dead: Fault | None) -> TargetResult:
@@ -138,10 +146,10 @@ class Scheduler:
             for seq, op in enumerate(ops):
                 self.recorder.result(run.run_id, target, driver.name, seq, op)
             if spec.mode == "edit":
-                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit or EditSettings(),
-                                      spec.config_lines)
+                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit, spec.config_lines)
             elif spec.mode == "confirm":
-                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, EditSettings(apply=True))
+                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops,
+                                      dataclasses.replace(spec.edit, apply=True))
             self.recorder.save_output(target, ops)
         except OSError as e:
             ops.append(OperationResult("record", Fault(FaultKind.LOCAL, str(e), False), now(), 0))
@@ -151,8 +159,7 @@ class Scheduler:
     async def _attempt(self, run: _Run, index: int, target: Target, driver: Driver, attempt: int) -> _Attempt:
         """One login under the safety gate, the mode's operations in order on that session, close, the gate settled. A close fault is recorded but decides nothing."""
         spec = run.spec
-        creds = spec.credentials or Credentials(username="")
-        timeouts = spec.timeouts or DEFAULT_TIMEOUTS
+        creds, timeouts = spec.credentials, spec.timeouts
         started, t0 = now(), time.monotonic()
         held = self.policy.admit(target, login=not self.sessions.pooled(driver, target, creds))
         if held is not None:
@@ -188,11 +195,9 @@ class Scheduler:
                     break
             return ops
         if spec.mode == "structured":
-            fmt = spec.format or "xml"
-            return [await operation(c, lambda c=c: comm.structured(session, c, fmt)) for c in spec.commands]
+            return [await operation(c, lambda c=c: comm.structured(session, c, spec.format)) for c in spec.commands]
         if spec.mode == "edit":
-            edit = await EditLifecycle(comm, driver.dialect, session).run(list(spec.config_lines),
-                                                                           spec.edit or EditSettings())
+            edit = await EditLifecycle(comm, driver.dialect, session).run(list(spec.config_lines), spec.edit)
             if edit.stage in (Stage.COMMIT, Stage.PENDING, Stage.CLOSE):
                 run.past_commit.add(index)
             return list(edit.operations)
@@ -242,6 +247,9 @@ class _on_interrupt:
 async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate | None = None,
                   store: StoreWriter | None = None, pool: bool = False) -> RunReport:
     """execute() with injected collaborators, for callers that have an event loop or want to inject."""
+    spec = complete(spec)
+    if spec.mode == "structured" and not spec.format:
+        raise Fault(FaultKind.LOCAL, "structured mode needs a format, json or xml; nothing was sent", False)
     sessions = SessionManager(pool=pool)
     scheduler = Scheduler(registry, Policy(spec.policy, gate), sessions, Recorder(spec.recording, store))
     try:
@@ -256,6 +264,7 @@ def run(spec: RunSpec) -> RunReport:
     """The entry point the front ends call: one RunSpec executed, its RunReport returned. Per-target failures are in the report; a local refusal before any device is contacted raises Fault(LOCAL)."""
     from hssh.drivers import Registry
 
+    spec = complete(spec)
     registry = Registry()
     registry.load_entry_points()
     try:
@@ -271,15 +280,13 @@ def run(spec: RunSpec) -> RunReport:
 
 
 def _gate(spec: RunSpec) -> SafetyGate | None:
-    if spec.safety is None:
-        return None
     from hssh.safety import SafetyGate as Gate
 
     return Gate(spec.safety)
 
 
 def _store(spec: RunSpec) -> StoreWriter | None:
-    if spec.recording is None or spec.recording.store_path is None:
+    if spec.recording.store_path is None:
         return None
     from hssh.store import Store
 
