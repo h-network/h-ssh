@@ -44,7 +44,7 @@ class Timeouts:
 
 @dataclass(frozen=True)
 class SafetySettings:
-    """Safety gate settings: cooldown after a failed edit and the rate limit."""
+    """Safety gate settings: cooldown_seconds after a failed edit, and rate_limit as login attempts per minute per device."""
 
     cooldown_seconds: int
     rate_limit: int
