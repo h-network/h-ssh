@@ -7,6 +7,8 @@ from importlib import metadata
 from typing import Iterable, Iterator, Protocol, Union
 
 from hssh.communicators.base import Communicator
+from hssh.communicators.netconf import NetconfCommunicator
+from hssh.dialects import junos
 from hssh.dialects.base import Dialect
 from hssh.model import Fault, FaultKind, Mode, Target
 
@@ -57,8 +59,9 @@ class DriverRegistry(Protocol):
     def __iter__(self) -> Iterator[Driver]: ...
 
 
-# Built-in drivers are registered here once the communicators and dialects exist.
-BUILTIN: tuple[Driver, ...] = ()
+BUILTIN: tuple[Driver, ...] = (
+    Driver("junos@netconf", junos.DIALECT, NetconfCommunicator(junos.DIALECT)),
+)
 
 
 def _drivers_in(obj: object) -> list[Driver]:
