@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Literal, Mapping
+from typing import Literal, Sequence
 
-Mode = Literal["show", "batch", "structured", "edit", "rollback", "confirm", "commit_status"]
+Mode = Literal["show", "batch", "structured", "edit", "commit_confirmed", "rollback", "confirm", "commit_status"]
+
+HostKeyPolicy = Literal["accept-new", "strict", "off"]
+
+TargetStatus = Literal["ok", "failed", "skipped"]
 
 
 @dataclass(frozen=True)
@@ -22,7 +26,7 @@ class Target:
 
 @dataclass(frozen=True)
 class Credentials:
-    """Login material handed to a communicator; never recorded or logged."""
+    """Login material handed to a communicator; with neither password nor key_file set, the library uses the SSH agent."""
 
     username: str
     password: str | None = None
@@ -31,10 +35,29 @@ class Credentials:
 
 @dataclass(frozen=True)
 class Timeouts:
-    """Seconds allowed before login and for each operation in a session."""
+    """Seconds allowed before login, for each operation in a session, and for a commit."""
 
     connect: float
     command: float
+    commit: float
+
+
+@dataclass(frozen=True)
+class SafetySettings:
+    """Safety gate settings: cooldown after a failed edit and the rate limit."""
+
+    cooldown_seconds: float
+    rate_limit: float
+
+
+@dataclass(frozen=True)
+class RecordSettings:
+    """Where the run is recorded: store, audit log, log and saved output."""
+
+    store_path: str
+    audit_log_path: str
+    log_path: str | None = None
+    save_output_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,8 +71,9 @@ class RunSpec:
     credentials: Credentials | None = None
     timeouts: Timeouts | None = None
     workers: int = 1
-    safety: Mapping[str, object] = field(default_factory=dict)
-    recording: Mapping[str, object] = field(default_factory=dict)
+    host_key_policy: HostKeyPolicy = "accept-new"
+    safety: SafetySettings | None = None
+    recording: RecordSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +110,15 @@ class Fault(Exception):
 
 
 @dataclass(frozen=True)
+class TargetResult:
+    """One target's outcome: its status and its Result or Fault, or None when skipped."""
+
+    target: Target
+    status: TargetStatus
+    outcome: Result | Fault | None = None
+
+
+@dataclass(frozen=True)
 class RunReport:
     """What one run produced: per-target outcomes, counts and pending commits."""
 
@@ -93,8 +126,8 @@ class RunReport:
     mode: Mode
     started: str
     finished: str
-    results: tuple[tuple[Target, Result | Fault | None], ...]
+    results: Sequence[TargetResult]
     ok: int
     failed: int
     skipped: int
-    pending: Mapping[str, str] = field(default_factory=dict)
+    pending: dict[str, str] = field(default_factory=dict)

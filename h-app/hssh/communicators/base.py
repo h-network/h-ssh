@@ -12,7 +12,7 @@ class Session(Protocol):
 
 
 class Communicator(Protocol):
-    """One transport: opens sessions, executes one operation per call, returns Result or raises Fault."""
+    """One transport: opens sessions, executes one operation per call, returns Result or raises Fault; capability names equal mode names."""
 
     capabilities: frozenset[str]
 

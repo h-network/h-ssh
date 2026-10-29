@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Protocol
+from typing import Iterator, Protocol, Union
 
 from hssh.communicators.base import Communicator
 from hssh.model import Mode, Target
 
 ENTRY_POINT_GROUP = "hssh.drivers"
+
+EntryPointValue = Union["Driver", list["Driver"]]
 
 
 @dataclass(frozen=True)
@@ -35,12 +37,16 @@ class DriverRegistry(Protocol):
 
     def register(self, driver: Driver) -> None: ...
 
-    def load_entry_points(self, group: str = ENTRY_POINT_GROUP) -> None: ...
+    def load_entry_points(self, group: str = ENTRY_POINT_GROUP) -> None:
+        """Register every Driver or list of Drivers loaded from the entry point group."""
+        ...
 
     def get(self, name: str) -> Driver: ...
 
     def resolve(self, target: Target) -> Driver: ...
 
-    def check_mode(self, driver: Driver, mode: Mode) -> None: ...
+    def check_mode(self, driver: Driver, mode: Mode) -> None:
+        """Raise Fault(UNSUPPORTED) when the driver's capabilities don't include the mode."""
+        ...
 
     def __iter__(self) -> Iterator[Driver]: ...
