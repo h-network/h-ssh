@@ -9,7 +9,6 @@ import socket
 from hssh.model import Fault, FaultKind, Target
 
 MAX_PROBES = 100
-RETRY_PAUSE = 0.5
 SSH_BANNER = b"SSH-"
 DEFAULT_PORTS = {"netconf": 830, "telnet": 23}
 
@@ -50,12 +49,7 @@ async def attempt(host: str, port: int, banner: bool, seconds: float) -> Fault |
 
 
 async def probe_one(target: Target, seconds: float, slots: asyncio.Semaphore) -> Fault | None:
-    """The target's probe: one try, and one more after RETRY_PAUSE when the first did not find it live."""
-    async with slots:
-        fault = await attempt(target.host, port_of(target), expects_banner(target), seconds)
-    if fault is None or fault.kind is FaultKind.LOCAL:
-        return fault
-    await asyncio.sleep(RETRY_PAUSE)
+    """The target's probe: one attempt; any retry is the policy's decision."""
     async with slots:
         return await attempt(target.host, port_of(target), expects_banner(target), seconds)
 

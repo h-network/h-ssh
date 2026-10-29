@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import getpass
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from hssh.dialects.base import Dialect
-from hssh.model import EditSettings, OperationResult, RecordSettings, RunReport, RunSpec, Target
+from hssh.orchestrator.lifecycle import now
+from hssh.model import EditSettings, Fault, OperationResult, RecordSettings, Result, RunReport, RunSpec, Target, TargetResult
+
+AUDITED = ("load", "diff", "commit", "confirm")
 
 
 class StoreWriter(Protocol):
@@ -48,12 +51,34 @@ class Recorder:
         write_audit_entry(self.settings.audit_log_path, run_id=run_id, user=self.user, target=target, driver=driver,
                           dialect=dialect, action=action, operation=op, edit=edit, diff=diff)
 
-    def save_output(self, target: Target, text: str) -> None:
+    def changes(self, run_id: int, target: Target, driver: str, dialect: Dialect, ops: Sequence[OperationResult],
+                edit: EditSettings) -> None:
+        """An audit entry for each audited operation; the diff's output is carried on every entry after it."""
+        diff = ""
+        for op in ops:
+            if op.command == "diff" and isinstance(op.outcome, Result):
+                diff = op.outcome.output
+            if op.command in AUDITED:
+                self.change(run_id, target, driver, dialect, op.command, op, edit, diff)
+
+    def save_output(self, target: Target, ops: Sequence[OperationResult]) -> None:
+        """The target's device output, one file per target."""
         if self.settings.save_output_path is None:
             return
         from hssh.audit import secure_write
 
+        text = "\n".join(op.outcome.output for op in ops if isinstance(op.outcome, Result))
         secure_write(f"{self.settings.save_output_path}/{target.name}.output", text)
+
+    def log(self, result: TargetResult) -> None:
+        """One line per target in the run log."""
+        if self.settings.log_path is None:
+            return
+        from hssh.audit import secure_append
+
+        last = result.operations[-1] if result.operations else None
+        detail = f" {last.outcome.kind.name}: {last.outcome.detail}" if last and isinstance(last.outcome, Fault) else ""
+        secure_append(self.settings.log_path, f"{now()} {result.target.name} {result.status}{detail}\n")
 
     def finish(self, report: RunReport) -> None:
         """Close the run's row with its counts."""

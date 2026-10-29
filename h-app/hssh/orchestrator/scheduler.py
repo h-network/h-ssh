@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import signal
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -17,7 +19,7 @@ from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, 
 from hssh.orchestrator.recorder import Recorder, StoreWriter
 from hssh.orchestrator.sessions import SessionManager
 
-DEFAULT_TIMEOUTS = Timeouts(connect=10, command=30, commit=120)
+DEFAULT_TIMEOUTS = Timeouts(connect=3, command=20, commit=60)
 READ_MODES = ("show", "batch", "structured", "commit_status")
 
 
@@ -32,6 +34,7 @@ class _Run:
     begun: set[int] = field(default_factory=set)
     past_commit: set[int] = field(default_factory=set)
     interrupts: int = 0
+    stopping: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,8 @@ class Scheduler:
         dead = await self._probe(spec) if spec.probe else {}
         run.tasks = [asyncio.create_task(self._bounded(run, i, t, slots, dead.get(t.name)))
                      for i, t in enumerate(spec.targets)]
-        results = await self._gather(run)
+        with _on_interrupt(loop, lambda: self._interrupt(run)):
+            results = await self._gather(run)
         counts = {status: sum(r.status == status for r in results) for status in ("ok", "failed", "skipped")}
         report = RunReport(run.run_id, spec.mode, run.started, now(), results, counts["ok"], counts["failed"],
                            counts["skipped"], self._pending(spec, results))
@@ -81,61 +85,88 @@ class Scheduler:
             run.begun.add(index)
             if dead is not None:
                 return self._failed_before(run, target, dead)
-            return await self._run_target(run, index, target)
+            try:
+                result = await self._run_target(run, index, target)
+            except asyncio.CancelledError:
+                result = self._failed_before(run, target, Fault(FaultKind.LOCAL, "interrupted", True))
+            except Exception as e:  # noqa: BLE001 - one communicator bug is this target's failure, not the run's end
+                self.policy.settle(target, None)
+                result = self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{type(e).__name__}: {e}", True))
+            self.recorder.log(result)
+            return result
 
     async def _gather(self, run: _Run) -> list[TargetResult]:
-        """Results in target order; an interrupt while waiting ends the run as section 5.4 says."""
-        try:
-            return list(await asyncio.gather(*run.tasks))
-        except asyncio.CancelledError:
-            return await self._interrupted(run)
+        """Results in target order; a task cancelled before it began is its target skipped (section 5.4)."""
+        results = await asyncio.gather(*run.tasks, return_exceptions=True)
+        return [r if isinstance(r, TargetResult) else TargetResult(t, "skipped")
+                for t, r in zip(run.spec.targets, results)]
 
-    async def _interrupted(self, run: _Run) -> list[TargetResult]:
-        """Unstarted targets skipped, targets past COMMIT waited for, the rest cancelled; a second interrupt only reports what is in flight."""
-        ...
+    def _interrupt(self, run: _Run) -> None:
+        """The first interrupt: no new targets, in-flight ones past COMMIT waited for, the rest cancelled. Later ones only report."""
+        run.interrupts += 1
+        in_flight = [i for i in run.begun if not run.tasks[i].done()]
+        if run.interrupts > 1:
+            print(f"interrupted again: {len(in_flight)} target(s) still in flight are waited for and recorded",
+                  file=sys.stderr)
+            return
+        run.stopping.set()
+        for i, task in enumerate(run.tasks):
+            if i not in run.begun or (i in in_flight and i not in run.past_commit):
+                task.cancel()
 
     async def _run_target(self, run: _Run, index: int, target: Target) -> TargetResult:
-        """One target: the safety gate, its driver, attempts while the policy says retry, then its rows."""
+        """One target: its driver, attempts while the policy says retry and no interrupt came, then its records."""
         spec = run.spec
-        held = self.policy.admit(target)
-        if held is not None:
-            return self._failed_before(run, target, Fault(FaultKind.LOCAL, f"safety gate: {held}", False))
         try:
             driver = self.registry.resolve(target)
             self.registry.check_mode(driver, spec.mode)
         except Fault as f:
-            self.policy.settle(target, None)
             return self._failed_before(run, target, f)
         attempt = 1
         while True:
             tried = await self._attempt(run, index, target, driver, attempt)
-            if tried.verdict is None or tried.verdict.action is not Action.RETRY:
+            if tried.verdict is None or tried.verdict.action is not Action.RETRY or run.stopping.is_set():
                 break
             attempt += 1
             await self.policy.pause()
-        self.policy.settle(target, tried.verdict)
-        for seq, op in enumerate(tried.operations):
-            self.recorder.result(run.run_id, target, driver.name, seq, op)
         status: TargetStatus = "ok" if tried.verdict is None else "failed"
-        return TargetResult(target, status, tuple(tried.operations))
+        ops = tried.operations
+        try:
+            for seq, op in enumerate(ops):
+                self.recorder.result(run.run_id, target, driver.name, seq, op)
+            if spec.mode in ("edit", "confirm"):
+                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit or EditSettings())
+            self.recorder.save_output(target, ops)
+        except OSError as e:
+            ops.append(OperationResult("record", Fault(FaultKind.LOCAL, str(e), False), now(), 0))
+            status = "failed"
+        return TargetResult(target, status, tuple(ops))
 
     async def _attempt(self, run: _Run, index: int, target: Target, driver: Driver, attempt: int) -> _Attempt:
-        """Open, the mode's operations in order on that session, close."""
+        """One login under the safety gate, the mode's operations in order on that session, close, the gate settled."""
         spec = run.spec
         creds = spec.credentials or Credentials(username="")
         timeouts = spec.timeouts or DEFAULT_TIMEOUTS
         started, t0 = now(), time.monotonic()
+        held = self.policy.admit(target, login=not self.sessions.pooled(driver, target, creds))
+        if held is not None:
+            opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate: {held}", False), started, 0)
+            return _Attempt([opened], Verdict(Action.FAIL))
         try:
             session = await self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy)
         except Fault as f:
             opened = OperationResult(OPEN, f, started, int((time.monotonic() - t0) * 1000))
-            return _Attempt([opened], self._judge(spec, driver, opened, attempt))
+            verdict = self._judge(spec, driver, opened, attempt)
+            self.policy.settle(target, verdict)
+            return _Attempt([opened], verdict)
         try:
             ops = await self._operations(run, index, target, driver, session)
         finally:
             await self.sessions.release(driver, target, creds)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
-        return _Attempt(ops, None if first_fault is None else self._judge(spec, driver, first_fault, attempt))
+        verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
+        self.policy.settle(target, verdict)
+        return _Attempt(ops, verdict)
 
     async def _operations(self, run: _Run, index: int, target: Target, driver: Driver,
                           session: Session) -> list[OperationResult]:
@@ -180,6 +211,24 @@ class Scheduler:
         if spec.mode != "edit" or edit is None or not edit.apply or not edit.confirmed_minutes:
             return {}
         return {r.target.name: lifecycle.confirm_command(r.target) for r in results if r.status == "ok"}
+
+
+class _on_interrupt:
+    """SIGINT handed to `handler` while the run is on; where no handler can be installed, the run is left as it was."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, handler) -> None:
+        self.loop, self.handler, self.installed = loop, handler, False
+
+    def __enter__(self) -> None:
+        try:
+            self.loop.add_signal_handler(signal.SIGINT, self.handler)
+            self.installed = True
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+    def __exit__(self, *_exc) -> None:
+        if self.installed:
+            self.loop.remove_signal_handler(signal.SIGINT)
 
 
 async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate | None = None,

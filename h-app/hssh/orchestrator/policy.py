@@ -10,7 +10,7 @@ from typing import Protocol, Sequence
 from hssh.dialects.base import Dialect
 from hssh.model import Fault, FaultKind, PolicySettings, Target
 
-DEFAULT_POLICY = PolicySettings(retries=2, retry_pause=1)
+DEFAULT_POLICY = PolicySettings(retries=2, retry_pause=2)
 
 # The communicator's operation that opens the session: a fault from it is "before login".
 OPEN = "open"
@@ -79,11 +79,11 @@ class Policy:
         self.settings = settings or DEFAULT_POLICY
         self.gate = gate
 
-    def admit(self, target: Target) -> str | None:
-        """Why the safety gate turns `target` away, or None when it is admitted and reserved."""
+    def admit(self, target: Target, login: bool = True) -> str | None:
+        """Why the safety gate turns `target` away, or None when it is admitted and reserved; `login` counts against the rate limit."""
         if self.gate is None:
             return None
-        allowed, reason = self.gate.check_device(target, login=True)
+        allowed, reason = self.gate.check_device(target, login=login)
         return None if allowed else reason
 
     def held(self, targets: Sequence[Target]) -> dict[str, str]:

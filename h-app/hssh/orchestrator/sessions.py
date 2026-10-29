@@ -3,16 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Hashable
 
 from hssh.communicators.base import Communicator, Session
 from hssh.drivers import Driver
 from hssh.model import Credentials, HostKeyPolicy, Target, Timeouts
-
-DEFAULT_IDLE_TIMEOUT = 300.0
-
 
 def session_key(driver: Driver, target: Target, creds: Credentials) -> Hashable:
     return (driver.name, target.host, target.port, creds.username)
@@ -22,18 +18,21 @@ def session_key(driver: Driver, target: Target, creds: Credentials) -> Hashable:
 class _Entry:
     communicator: Communicator
     session: Session
-    last_used: float = field(default_factory=time.monotonic)
     in_use: bool = False
 
 
 class SessionManager:
-    """One open session per (driver, host, port, user). Without pooling, release() closes; with it, the session waits for the next acquire() until idle_timeout."""
+    """One open session per (driver, host, port, user). Without pooling, release() closes; with it, the session waits for the next acquire() until close_all()."""
 
-    def __init__(self, pool: bool = False, idle_timeout: float = DEFAULT_IDLE_TIMEOUT) -> None:
+    def __init__(self, pool: bool = False) -> None:
         self.pool = pool
-        self.idle_timeout = idle_timeout
         self._entries: dict[Hashable, _Entry] = {}
         self._lock = asyncio.Lock()
+
+    def pooled(self, driver: Driver, target: Target, creds: Credentials) -> bool:
+        """Whether an idle session to `target` is waiting, so the next acquire() is no login."""
+        entry = self._entries.get(session_key(driver, target, creds))
+        return entry is not None and not entry.in_use
 
     async def acquire(self, driver: Driver, target: Target, creds: Credentials, timeouts: Timeouts,
                       host_key_policy: HostKeyPolicy) -> Session:
@@ -57,16 +56,17 @@ class SessionManager:
             if entry is None:
                 return
             entry.in_use = False
-            entry.last_used = time.monotonic()
             if self.pool and not discard:
                 return
             del self._entries[key]
         await asyncio.to_thread(entry.communicator.close, entry.session)
 
-    async def close_idle(self, now: float | None = None) -> int:
-        """Close pooled sessions idle longer than idle_timeout; returns how many."""
-        ...
-
     async def close_all(self) -> None:
-        """Close every session, in-flight ones included, without waiting on their operations."""
-        ...
+        """Close every session, in-flight ones included; a close that fails is not the run's failure."""
+        async with self._lock:
+            entries, self._entries = list(self._entries.values()), {}
+        for entry in entries:
+            try:
+                await asyncio.to_thread(entry.communicator.close, entry.session)
+            except Exception:  # noqa: BLE001
+                pass
