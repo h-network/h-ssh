@@ -58,6 +58,7 @@ from .cli import (Cli, edit_policy, refuse_comment, refuse_commit_lines, refuse_
                   refuse_empty_edit)
 from .connect import (DEFAULT as DEFAULT_CONNECT_TIMEOUT, after_applied, budget, no_banner, tcp_timed_out,
                       where)
+from . import ssh as _ssh
 from .ssh import host_key_policy, _known_hosts as _pin_file
 
 AVAILABLE = shutil.which("ssh") is not None
@@ -189,13 +190,39 @@ def _quoted(path: str) -> str:
     return '"%s"' % path if any(c.isspace() for c in path) else path
 
 
+def _system_file() -> str:
+    return os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
+
+
+def _refuse_disagreement(host: str, port: Optional[int]) -> None:
+    """Before ssh runs: a host ~/.h-ssh/known_hosts and ~/.ssh/known_hosts
+    hold different keys for is refused, as the ssh transport refuses it
+    (the review's repro, #150): with both files in UserKnownHostsFile
+    OpenSSH takes a match in either, so the key pinned in one was
+    overridden by the other and the password went. Both files are read as
+    the ssh transport reads them, by its parser, and a pin file line that
+    holds no pin is the same refusal here; @cert-authority lines are no
+    keys and stay OpenSSH's to check. A port left to the ssh configuration
+    is port 22 here. Without paramiko the files cannot be read, and
+    OpenSSH is left to its own."""
+    if not _ssh.AVAILABLE:
+        return
+    name = host if not port or port == 22 else "[%s]:%d" % (host, port)
+    with _ssh._PIN_LOCK:
+        pinned, _ = _ssh._parsed(_pin_file(), system=False, timeout=30.0)
+        known, _ = _ssh._parsed(_system_file(), system=True, timeout=30.0)
+    reason = _ssh.disagreement(pinned, known, name, _pin_file())
+    if reason is not None:
+        raise RuntimeError("Host key verification failed for %s: %s." % (host, reason))
+
+
 def _base_opts(connect_timeout, port: Optional[int],
                control_path: Optional[str], have_password: bool) -> List[str]:
     """ssh's options. `connect_timeout` is the connect phase's seconds:
     OpenSSH's ConnectTimeout bounds the TCP connect and the banner exchange
     together, as --connect-timeout does (#126)."""
     policy = host_key_policy()
-    system = os.path.join(os.path.expanduser("~"), ".ssh", "known_hosts")
+    system = _system_file()
     opts = [
         # OpenSSH's own `no` lets a changed key through; h-ssh's `no` spares
         # an unknown host the refusal and nothing else, which for OpenSSH is
@@ -340,6 +367,7 @@ def _exec(host: str, user: str, askpass, cmd: str,
     under the command: that takes the master with it, and this ssh, its
     client, logs no word of it at -v. The master tells them apart
     (_master_running): gone, the result is `lost` (#143)."""
+    _refuse_disagreement(host, port)
     connect_s = budget(connect_timeout, session_timeout)
     # "--" ends the options: a host that starts with "-" is still the host,
     # which matters for a library caller that passes no user.
@@ -542,6 +570,7 @@ class ProcessChannel:
         off (-e none): with a forced tty ssh reads a ~ at the start of a typed
         line as a command to itself (~R, ~B, ~.), keeps it from the device
         and types the rest, so `~Rcommit` would reach it as `commit` (#139)."""
+        _refuse_disagreement(host, port)
         connect_s = budget(connect_timeout, session_timeout)
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
         os.close(fd)

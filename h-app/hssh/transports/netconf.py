@@ -92,7 +92,7 @@ _DEADLINE = threading.local()
 _KEX_UNFINISHED = "the banner came, but key exchange did not finish"
 _REVOKED = "its key is marked @revoked in "
 _CHANGED = "its key is not the one pinned in "
-_DIFFER = " hold different keys for it: one of them is not the router's; check which, and remove that line"
+_DIFFER = " hold different "          # the ssh transport's disagreement(), naming both files
 
 
 if _paramiko is not None:
@@ -176,12 +176,14 @@ if _paramiko is not None:
         def _expected(self, name, kind, pins):
             """The `kind` key the two files hold for `name`, as bytes, or
             None. Two files that disagree are refused, as the ssh transport
-            refuses them: one of them is wrong."""
+            refuses them (its disagreement()): one of them is wrong."""
+            from .ssh import disagreement
+            reason = disagreement(self._pinned(), super(), name, pins)      # super(): ~/.ssh/known_hosts alone
+            if reason is not None:
+                raise _paramiko.SSHException(reason)
             ours, theirs = self._pinned().lookup(name), super().lookup(name)
             ours = ours.get(kind) if ours is not None else None
             theirs = theirs.get(kind) if theirs is not None else None
-            if ours is not None and theirs is not None and ours.asbytes() != theirs.asbytes():
-                raise _paramiko.SSHException(f"{pins} and ~/.ssh/known_hosts{_DIFFER}")
             found = ours if ours is not None else theirs
             return None if found is None else found.asbytes()
 

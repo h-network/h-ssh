@@ -391,22 +391,26 @@ def _host_key_policy(known_hosts: str, timeout: float = 30.0):
     return paramiko.WarningPolicy()
 
 
-def _disagreement(client, name: str):
-    """The key type under which ~/.ssh/known_hosts and the pin file hold
-    different keys for `name` (as paramiko names the host: `[host]:port`
-    off port 22), or None. paramiko looks ~/.ssh/known_hosts up first and
-    reads the pin file only when the host is absent there, so one openssh
-    first contact, or one manual ssh, that took an impostor's key K2 let
-    this transport take K2 too, with K1 still pinned (#150). Two files that
-    disagree are refused before anything is sent, whichever key the server
-    shows: one of them is wrong."""
-    pinned, known = client._host_keys.lookup(name), client._system_host_keys.lookup(name)
-    if pinned is None or known is None:
+def disagreement(pinned, known, name: str, pins: str):
+    """Why `name` (as paramiko and OpenSSH name the host: `[host]:port` off
+    port 22) is refused when the pin file and ~/.ssh/known_hosts hold
+    different keys for it, naming both files; None when they agree or one
+    of them does not know it. For every transport (#150): paramiko looks
+    ~/.ssh/known_hosts up first and reads the pin file only when the host
+    is absent there, and OpenSSH takes a match in either file, so one
+    openssh first contact, or one manual ssh, that took an impostor's key
+    K2 let the host in with K1 still pinned. Two files that disagree are
+    refused before anything is sent, whichever key the server shows: one
+    of them is wrong. A @cert-authority line is no key and is not read
+    here, so a host known through its CA alone is left to OpenSSH."""
+    ours, theirs = pinned.lookup(name), known.lookup(name)
+    if ours is None or theirs is None:
         return None
-    for kind in list(pinned.keys()):
-        other = known.get(kind)
-        if other is not None and other.asbytes() != pinned[kind].asbytes():
-            return kind
+    for kind in list(ours.keys()):
+        other = theirs.get(kind)
+        if other is not None and other.asbytes() != ours[kind].asbytes():
+            return ("%s and ~/.ssh/known_hosts hold different %s keys for it: one of them is not the device's; "
+                    "check which, and remove that line" % (pins, kind))
     return None
 
 
@@ -533,12 +537,11 @@ def _connect(host: str, user: str, passwd: Optional[str], session_timeout: int,
     known_hosts = _known_hosts()
     client = paramiko.SSHClient()
     revoked = _load_pins(client, known_hosts, session_timeout_float)
-    kind = _disagreement(client, host if (port or 22) == 22 else "[%s]:%d" % (host, port))
-    if kind is not None:
+    reason = disagreement(client._host_keys, client._system_host_keys,
+                          host if (port or 22) == 22 else "[%s]:%d" % (host, port), known_hosts)
+    if reason is not None:
         client.close()
-        raise RuntimeError("Host key verification failed for %s: %s and ~/.ssh/known_hosts hold different %s "
-                           "keys for it. One of them is not the device's: check which, and remove that line."
-                           % (host, known_hosts, kind))
+        raise RuntimeError("Host key verification failed for %s: %s." % (host, reason))
     client.set_missing_host_key_policy(_host_key_policy(known_hosts, session_timeout_float))
 
     conn_params = {
