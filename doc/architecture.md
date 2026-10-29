@@ -134,7 +134,7 @@ Dialects contain no I/O and no policy.
 
 ### 3.6 Result store
 
-SQLite, one database per user (default `./h-ssh.db`). The recorder writes. `h-ssh-store` reads: it lists
+One SQLite database, `./h-ssh.db` by default. The recorder writes. `h-ssh-store` reads: it lists
 runs, shows output, compares results and exports. The schema is in section 6.
 
 ### 3.7 Audit log
@@ -275,7 +275,7 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 ### 6.2 Audit entry
 
 ```json
-{"time": "...", "run_id": 42, "user": "...", "target": "R1", "host": "10.0.0.1",
+{"time": "...", "run_id": 42, "user": "...", "target": "R1", "host": "192.0.2.1",
  "driver": "junos@netconf", "action": "commit", "dry_run": false,
  "confirmed_minutes": 10, "comment": "...", "diff": "...", "ok": true, "fault": null}
 ```
@@ -327,17 +327,3 @@ h-app/hssh/
 ├── audit.py
 └── safety.py       safety gate state
 ```
-
-## 11. Size guidelines
-
-| Area | Target lines |
-|---|---:|
-| Orchestrator | 900 |
-| Communicators, including the CLI engine | 1,300 |
-| Dialects | 400 |
-| Front ends | 900 |
-| Model, drivers, store, audit, safety | 700 |
-| **Total** | **about 4,200** |
-
-A component exceeding its target is reviewed before it grows further. Docstrings describe behaviour in one
-or two lines.
