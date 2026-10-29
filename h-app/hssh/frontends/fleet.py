@@ -20,13 +20,11 @@ from hssh.model import (
     Credentials, EditSettings, HostKeyPolicy, Mode, PolicySettings, RecordSettings, RunReport,
     RunSpec, SafetySettings, Target, Timeouts,
 )
+from hssh.orchestrator import DEFAULT_POLICY, DEFAULT_TIMEOUTS, run
 
 Runner = Callable[[RunSpec], RunReport]
 
 TargetLike = Union[str, Target, os.PathLike]
-
-DEFAULT_TIMEOUTS = Timeouts(connect=3, command=20, commit=60)
-DEFAULT_POLICY = PolicySettings(retries=2, retry_pause=2)
 
 # NAME:[v6]... — an IPv6 literal has colons of its own, so it goes in brackets.
 _BRACKETED_HOST = re.compile(r"^([^:]+):\[([^\]]+)\](?::(.*))?$")
@@ -34,8 +32,6 @@ _BRACKETED_HOST = re.compile(r"^([^:]+):\[([^\]]+)\](?::(.*))?$")
 
 def run_spec(spec: RunSpec) -> RunReport:
     """Hand the spec to the orchestrator; it raises Fault(LOCAL) only for a refusal before any device is contacted."""
-    from hssh.orchestrator import run
-
     return run(spec)
 
 
