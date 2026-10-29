@@ -190,7 +190,7 @@ class ProcessChannel:
             self.proc.wait(timeout=_EXIT_GRACE)
         except subprocess.TimeoutExpired:
             return False
-        return self.proc.returncode != 0
+        return True
 
     def send(self, data: bytes) -> None:
         try:
@@ -250,9 +250,9 @@ class OpenSSH:
 
         if not AVAILABLE:
             raise Fault(FaultKind.LOCAL, "no 'ssh' binary found on PATH", reached_device=False)
-        fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
-        os.close(fd)
         with _AskPass(creds.password) as askpass:
+            fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
+            os.close(fd)
             argv = _ssh_argv(target, creds, timeouts, host_key_policy, log_path)
             channel = ProcessChannel.open(argv, askpass.env, target.host, log_path)
             engine = CliEngine(channel, self.dialect, timeouts, echoes=True)
@@ -262,6 +262,9 @@ class OpenSSH:
                 log = channel.log()
                 channel.close()
                 raise _login_fault(target.host, log) from exc
+            except BaseException:
+                channel.close()
+                raise
         return OpenSSHSession(target, channel, engine, timeouts)
 
     def close(self, session: OpenSSHSession) -> None:
