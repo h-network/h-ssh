@@ -26,6 +26,12 @@ import pytest
 _SUITE_STORE_DIR = tempfile.mkdtemp(prefix="hssh-tests-")
 os.environ.setdefault("HSSH_STORE", os.path.join(_SUITE_STORE_DIR, "h-ssh.db"))
 
+# The operator's real home. Every test runs with a scratch HOME instead
+# (`_home_in_tmp`), so #194's first-contact pins cannot land in ~/.h-ssh
+# again; a test that still reads or writes the real home fails the suite.
+_REAL_HOME = os.path.expanduser("~")
+_REAL_HOME_DIRS = (os.path.join(_REAL_HOME, ".h-ssh"), os.path.join(_REAL_HOME, ".ssh"))
+
 from hssh import probe as _probe          # noqa: E402 - after the store's place is set
 
 _REAL_ATTEMPT = _probe.attempt
@@ -34,6 +40,46 @@ _REAL_ATTEMPT = _probe.attempt
 @pytest.fixture(autouse=True)
 def _store_in_tmp(tmp_path, monkeypatch):
     monkeypatch.setenv("HSSH_STORE", str(tmp_path / "test-h-ssh.db"))
+
+
+def _real_home_state():
+    """The real home's dot-directories, as a comparable state: path-relative
+    names with size and mtime, or None where a directory does not exist."""
+    state = []
+    for root in _REAL_HOME_DIRS:
+        if not os.path.isdir(root):
+            state.append((root, None))
+            continue
+        seen = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            for name in sorted(dirnames + filenames):
+                path = os.path.join(dirpath, name)
+                st = os.lstat(path)
+                seen.append((os.path.relpath(path, root), st.st_size, st.st_mtime_ns))
+        state.append((root, sorted(seen)))
+    return state
+
+
+@pytest.fixture(autouse=True)
+def _home_in_tmp(tmp_path, monkeypatch):
+    """A scratch HOME for every test: first-contact pins land in
+    tmp_path/home, and nothing in the real ~/.ssh or ~/.h-ssh is read or
+    written. Both HOME and USERPROFILE are set because Windows resolves ~
+    through USERPROFILE when it is set. A test that asks for a home of its
+    own -- the `home` fixture or a setenv in the test -- is set up after
+    this one and overrides it; a test that still touches the real home
+    fails the suite, so #194's pin pollution cannot come back."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    before = _real_home_state()
+    yield home
+    if _real_home_state() != before:
+        raise AssertionError(
+            "a test read or wrote the operator's real home directory "
+            f"({_REAL_HOME}); give it a home of its own (the `home` "
+            "fixture in tests/test_generic.py) instead")
 
 
 @pytest.fixture(autouse=True)
