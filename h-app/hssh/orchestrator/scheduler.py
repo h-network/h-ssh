@@ -66,7 +66,7 @@ class Scheduler:
                      for i, t in enumerate(spec.targets)]
         with _on_interrupt(loop, lambda: self._interrupt(run)):
             results = await self._gather(run)
-        late = await asyncio.to_thread(self.sessions.wait_for_closes)
+            late = await asyncio.to_thread(self.sessions.wait_for_closes)
         results = [self._with_close(run, r, late[r.target.name]) if r.target.name in late else r for r in results]
         counts = {status: sum(r.status == status for r in results) for status in ("ok", "failed", "skipped")}
         report = RunReport(run.run_id, spec.mode, run.started, now(), results, counts["ok"], counts["failed"],
