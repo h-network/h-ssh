@@ -137,6 +137,7 @@ class OperationResult:
 
     command: str
     outcome: Result | Fault
+    started: str
     elapsed_ms: int
 
 
