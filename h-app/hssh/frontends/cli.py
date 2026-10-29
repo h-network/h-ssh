@@ -221,6 +221,9 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
         return
     for tr in report.results:
         for op in tr.operations:
+            if isinstance(op.outcome, Fault) and op.command == "close":
+                print(f"WARNING: {tr.target.name}: close failed: {op.outcome.detail}", file=sys.stderr)
+                continue
             if isinstance(op.outcome, Fault):
                 print(f"{tr.target.name}: FAIL {op.command}: {op.outcome.kind.name} {op.outcome.detail}", file=out)
                 continue
