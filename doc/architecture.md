@@ -286,8 +286,8 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 - **Credentials:** an SSH agent or keys through the communicator's library, `HSSH_PASSWORD`, or an
   interactive prompt. Passwords never appear in arguments, in the environment of child processes, in
   logs, in the store, or in the audit log.
-- **Redaction:** the recorder redacts secrets from output written to logs and the audit log, using
-  patterns the dialects provide. The store keeps device output as received, and is created owner-only.
+- **Redaction:** the recorder redacts secrets from the audit log, using patterns the dialects provide. The
+  store keeps device output as received, and is created owner-only.
 - **Host keys:** each communicator uses its library's host-key verification under one policy setting:
   `accept-new` (default), `strict` or `off`.
 - **Files:** the store, the audit log, logs and saved output are created with mode 0600, in directories
