@@ -6,12 +6,11 @@ import sqlite3
 from collections.abc import Iterator, Sequence
 
 from hssh.model import OperationResult, RunReport, RunSpec, Target
-
-DEFAULT = "h-ssh.db"
+from hssh.orchestrator.defaults import DEFAULT_STORE
 
 
 class Store:
-    def __init__(self, path: str = DEFAULT, readonly: bool = False) -> None:
+    def __init__(self, path: str = DEFAULT_STORE, readonly: bool = False) -> None:
         self.path = path
         self.readonly = readonly
         raise NotImplementedError
