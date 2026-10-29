@@ -570,7 +570,8 @@ a re-image, remove its line from `~/.h-ssh/known_hosts` — and so is a key `~/.
 `@revoked`. A host the two files hold different keys for is refused as well, whichever key it shows
 (paramiko reads `~/.ssh/known_hosts` first and the pin file only for a host absent there, so one key
 taken through `openssh` or a manual `ssh` overrode the pin, #150): one of the files is wrong, and the
-message names both. Its `@cert-authority` lines are passed over: paramiko cannot check a host certificate, so
+message names both (the names compared as the `openssh` transport's check compares them: see there for
+what it covers). Its `@cert-authority` lines are passed over: paramiko cannot check a host certificate, so
 a host known only through its CA is an unknown host here (`accept-new` pins its key; the `openssh`
 transport checks the certificate). A pin is written to a new file renamed over the old one, with the
 old one's mode and group and its other lines byte for byte, under a file lock a reading run waits for,
@@ -650,9 +651,16 @@ take a match in either file. That check looks the host up under the name OpenSSH
 `ssh -G` reports it: a `HostKeyAlias` from your config, else the `HostName` with the `Port` in effect
 (`[name]:port` off port 22, a `Port` stanza counting where the target names none), so a stanza that
 moves the box moves the check with it; a configuration `ssh -G` refuses fails the device with ssh's
-words (`SSH transport failed: ssh -G HOST: ...`), as the login would have. `@cert-authority` lines are
-no keys and stay OpenSSH's to check. A key `known_hosts` marks `@revoked` is said as such (`its key is
-marked @revoked in ~/.ssh/known_hosts`), with no advice to remove its line.
+words (`SSH transport failed: ssh -G HOST: ...`), as the login would have. What the check compares, in
+both files, is exactly this: a line whose name is that name written plainly, the `[host]:port` form
+included, compared case-insensitively as OpenSSH compares it (`router`, `ROUTER` and `[Router]:2222`
+name one host), and a line whose name is hashed (`|1|…`, as `HashKnownHosts` writes it) by OpenSSH's
+hash, of the name lowercased. It does not compare a line whose name is a pattern (`*.example.com`,
+`router?`, a `!` negation), a hashed name made from the name in another case, the entry OpenSSH keeps
+for the address under `CheckHostIP`, or a host known through a `@cert-authority` line: those lines are
+OpenSSH's alone to match, so a conflict that reaches the host only through one of them is not refused
+by this check. A key `known_hosts` marks `@revoked` is said as such (`its key is marked @revoked in
+~/.ssh/known_hosts`), with no advice to remove its line.
 
 Two limits of the plain `openssh` driver, both deliberate: `--structured` falls back to text
 (`eos@openssh` has it, through `| json`), and `--commit-confirmed` is rejected rather than silently
@@ -1628,7 +1636,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The unit suite (1513 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
+The unit suite (1515 tests) needs no devices and runs on every push to `main` or `develop` and on every pull request (GitHub Actions, Python 3.10–3.13, plain
 `python` containers, no JavaScript actions). It is laid out by layer where the package is (`tests/dialects`, `tests/drivers`, `tests/transports`), with the
 contract test running over every registered driver, entry points included. Beyond it, live runs against Junos vMX routers cover the session pool, the NETCONF
 edit paths, the RPC/JSON paths, a full commit-confirmed maintenance flow, the confirm under the lock, and a 29-check release

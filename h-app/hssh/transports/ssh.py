@@ -391,6 +391,23 @@ def _host_key_policy(known_hosts: str, timeout: float = 30.0):
     return paramiko.WarningPolicy()
 
 
+def _keys_for(keys, name: str) -> dict:
+    """The keys a known_hosts file holds for `name`, {key type: key}, the
+    name compared as OpenSSH compares it (#150): a plain name, `[host]:port`
+    included, case-insensitively (`router`, `ROUTER` and `Router` are one
+    host, and paramiko's lookup, exact, found only one of them), a hashed
+    name (`|1|salt|hash`, HashKnownHosts) by OpenSSH's hash, of the name
+    lowercased. A line whose name is a pattern (`*`, `?`, a `!` negation)
+    is matched by its own text alone here, so a host it covers is OpenSSH's
+    to match, not compared. Empty for a name no line holds."""
+    wanted = name.lower()
+    found = {}
+    for host in [*(h for h in keys.keys() if h.lower() == wanted), wanted]:    # the last: hashed lines
+        for kind, key in (keys.lookup(host) or {}).items():
+            found.setdefault(kind, key)
+    return found
+
+
 def disagreement(pinned, known, name: str, pins: str):
     """Why `name` (as paramiko and OpenSSH name the host: `[host]:port` off
     port 22) is refused when the pin file and ~/.ssh/known_hosts hold
@@ -401,10 +418,13 @@ def disagreement(pinned, known, name: str, pins: str):
     openssh first contact, or one manual ssh, that took an impostor's key
     K2 let the host in with K1 still pinned. Two files that disagree are
     refused before anything is sent, whichever key the server shows: one
-    of them is wrong. A @cert-authority line is no key and is not read
-    here, so a host known through its CA alone is left to OpenSSH."""
-    ours, theirs = pinned.lookup(name), known.lookup(name)
-    if ours is None or theirs is None:
+    of them is wrong. The names are compared as OpenSSH compares them
+    (_keys_for): a line OpenSSH matched under another case was a key it
+    took with the pin unseen here. A @cert-authority line is no key and
+    is not read here, so a host known through its CA alone is left to
+    OpenSSH."""
+    ours, theirs = _keys_for(pinned, name), _keys_for(known, name)
+    if not ours or not theirs:
         return None
     for kind in list(ours.keys()):
         other = theirs.get(kind)

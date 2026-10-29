@@ -1562,20 +1562,49 @@ def test_openssh_refuses_a_host_the_two_files_hold_different_keys_for(sshd, home
     assert logins and set(logins) == {"u"}                     # the password was offered (the master's login, the command's)
 
 
-@pytest.mark.parametrize("stanza, under", [
-    ("HostName 127.0.0.1\n  Port {port}\n", "[127.0.0.1]:{port}"),
-    ("HostName 127.0.0.1\n  Port {port}\n  HostKeyAlias router\n", "router"),
-], ids=["port", "alias"])
-def test_openssh_checks_the_host_under_the_name_its_configuration_gives_it(sshd, home, monkeypatch, stanza, under):
+def test_the_conflict_check_compares_names_as_openssh_does():
+    """The two files' names were compared as paramiko looks a name up,
+    exactly, where OpenSSH matches a line's name case-insensitively: a
+    pin `router` K1 beside `ROUTER` K2 in ~/.ssh/known_hosts, the server
+    showing K2, was no disagreement here and OpenSSH took K2 (the review's
+    third repro, #150). A plain name, `[host]:port` included, is compared
+    case-insensitively, a hashed name by OpenSSH's hash of the lowercased
+    name; a line whose name is a pattern matches its own text alone, so a
+    host it covers is not compared (OpenSSH's to match: README)."""
+    k1, k2 = paramiko.ECDSAKey.generate(), paramiko.ECDSAKey.generate()
+    hashed = paramiko.HostKeys.hash_host("[router1]:2222")          # as HashKnownHosts writes a port-22-less host
+    pins = ssh._parse(_key_line("router", k1) + "\n" + _key_line("[Router1]:2222", k1) + "\n"
+                      + _key_line("r1.example.com", k1) + "\n", "pins", system=False)[0]
+    system = ssh._parse(_key_line("ROUTER", k2) + "\n" + _key_line(hashed, k2) + "\n"
+                        + _key_line("*.example.com", k2) + "\n", "system", system=True)[0]
+    differ = "hold different ecdsa-sha2-nistp256 keys for it"
+    assert differ in ssh.disagreement(pins, system, "router", "pins")        # ROUTER is router
+    assert differ in ssh.disagreement(pins, system, "Router", "pins")
+    assert differ in ssh.disagreement(pins, system, "[router1]:2222", "pins")     # the hashed line, by its hash
+    assert ssh.disagreement(pins, system, "r1.example.com", "pins") is None       # the pattern: OpenSSH's alone
+    assert ssh.disagreement(pins, system, "router2", "pins") is None              # known in one file
+    agreeing = ssh._parse(_key_line("ROUTER", k1) + "\n", "system", system=True)[0]
+    assert ssh.disagreement(pins, agreeing, "router", "pins") is None             # the same key under another case
+
+
+@pytest.mark.parametrize("stanza, pinned_as, known_as", [
+    ("HostName 127.0.0.1\n  Port {port}\n", "[127.0.0.1]:{port}", "[127.0.0.1]:{port}"),
+    ("HostName 127.0.0.1\n  Port {port}\n  HostKeyAlias router\n", "router", "router"),
+    ("HostName 127.0.0.1\n  Port {port}\n  HostKeyAlias router\n", "router", "ROUTER"),
+], ids=["port", "alias", "case"])
+def test_openssh_checks_the_host_under_the_name_its_configuration_gives_it(sshd, home, monkeypatch, stanza,
+                                                                            pinned_as, known_as):
     """The review's second repro (#150): with `Host box`, `HostName
     127.0.0.1` and `Port N` in the ssh configuration and a target that
     names no port, the two files were compared under `box`, where OpenSSH
     looks the host up under `[127.0.0.1]:N`, or under the `HostKeyAlias`
     the stanza gives it, so the files disagreeing there was not seen and
-    the password went. The name checked is the one OpenSSH looks up, as
-    `ssh -G` reports it (the client here reading the test's configuration
-    through -F): the disagreement is refused before any credential, and
-    the files agreeing on the server's key under that name let it in."""
+    the password went; and its third: the alias pinned as `router`, the
+    system file's `ROUTER` line matched by OpenSSH and not compared. The
+    name checked is the one OpenSSH looks up, as `ssh -G` reports it (the
+    client here reading the test's configuration through -F), compared as
+    OpenSSH compares it: the disagreement is refused before any credential,
+    and the files agreeing on the server's key under that name let it in."""
     if not shutil.which("ssh"):
         pytest.skip("no ssh binary on PATH")
     from hssh.transports import openssh
@@ -1589,19 +1618,19 @@ def test_openssh_checks_the_host_under_the_name_its_configuration_gives_it(sshd,
     wrapper.chmod(0o700)
     monkeypatch.setenv("PATH", str(bindir) + os.pathsep + os.environ["PATH"])
     monkeypatch.setattr(probe, "SSH_G", ("ssh", "-G"))       # as outside the suite: the wrapper's -F for both
-    name, other = under.format(port=port), paramiko.ECDSAKey.generate()
+    pinned_as, known_as, other = pinned_as.format(port=port), known_as.format(port=port), paramiko.ECDSAKey.generate()
     pins, system = pin_file(home), home / ".ssh" / "known_hosts"
     pins.parent.mkdir(mode=0o700)
     system.parent.mkdir(mode=0o700)
-    pins.write_text(_key_line(name, other) + "\n")                  # the files disagree, under that name
-    system.write_text(_key_line(name, key) + "\n")
+    pins.write_text(_key_line(pinned_as, other) + "\n")             # the files disagree, under that name
+    system.write_text(_key_line(known_as, key) + "\n")
     with pytest.raises(RuntimeError) as refused:
         openssh.show("box", "u", "p", "show version", 5, 10)
     assert str(refused.value) == (f"Host key verification failed for box: {pins} and ~/.ssh/known_hosts "
                                   "hold different ecdsa-sha2-nistp256 keys for it: one of them is not the "
                                   "device's; check which, and remove that line.")
     assert logins == []
-    pins.write_text(_key_line(name, key) + "\n")                    # they agree, on the server's key: in
+    pins.write_text(_key_line(pinned_as, key) + "\n")               # they agree, on the server's key: in
     with pytest.raises(RuntimeError, match="ssh exit 255|administratively prohibited|channel"):
         openssh.show("box", "u", "p", "show version", 5, 10)        # no exec channel on this server
     assert logins and set(logins) == {"u"}
