@@ -62,7 +62,7 @@ The CLI, the Fleet library API, run files and profiles are front ends. Each one:
 
 - parses its input
 - resolves configuration precedence: flags, then run file, then profile, then `~/.h-ssh/config`, then
-  defaults
+  the orchestrator's defaults
 - builds a `RunSpec`
 - passes the `RunSpec` to the orchestrator and renders the `RunReport` it returns
 
@@ -74,7 +74,8 @@ between reports.
 
 ### 3.2 Orchestrator
 
-The orchestrator executes a `RunSpec` and owns all policy.
+The orchestrator executes a `RunSpec` and owns all policy. It defines every default: the front ends and
+the model take their defaults from it, and define none of their own.
 
 | Part | Responsibility |
 |---|---|
