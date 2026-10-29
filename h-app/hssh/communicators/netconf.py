@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from paramiko import PKey
 
 
-DEFAULT_PORT = 830
 _HOST_KEYS_LOCK = RLock()
 _HOST_KEYS: dict[Path, list[tuple[str | tuple[bytes, bytes], PKey]]] = {}
 _RESOLVED: dict[tuple[Path, str, int], dict[str, dict[str, PKey]]] = {}
@@ -189,6 +188,8 @@ class NetconfSession(Session):
 
 
 class NetconfCommunicator(Communicator):
+    default_port: int = 830
+    banner: bytes | None = b"SSH-"
     capabilities: frozenset[str] = frozenset({"show", "batch"})
 
     def __init__(self, dialect: Dialect) -> None:
@@ -201,7 +202,7 @@ class NetconfCommunicator(Communicator):
         timeouts: Timeouts,
         host_key_policy: HostKeyPolicy,
     ) -> NetconfSession:
-        port = target.port if target.port is not None else DEFAULT_PORT
+        port = target.port if target.port is not None else self.default_port
         if port in (23, "23"):
             raise Fault(FaultKind.LOCAL, "port 23 is telnet, not NETCONF", False)
         device = None

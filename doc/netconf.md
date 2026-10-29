@@ -16,8 +16,8 @@ h-ssh --no-store --transport netconf --vendor junos --user reviewer \
 Library callers can select a key explicitly with `Credentials.key_file`.
 An explicit password or key file disables agent and default-key discovery.
 
-`strict` verifies the server against the library's known-hosts files. `off`
-disables host-key verification. The default, `accept-new`, records unknown keys
+The default, `off`, disables host-key verification. Opt in with `strict` to verify
+the server against the library's known-hosts files, or `accept-new` to record unknown keys
 in `~/.ssh/known_hosts` with an additional SSH handshake before authentication.
 PyEZ then verifies the recorded key on the NETCONF connection. Known keys use
 PyEZ's verification directly, and changed keys are refused. Concurrent sessions
