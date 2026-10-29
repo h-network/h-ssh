@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import socket
+from threading import Lock
 from typing import TYPE_CHECKING, cast
 
 from hssh.communicators.base import Communicator, Session
@@ -16,6 +18,37 @@ if TYPE_CHECKING:
 
 
 DEFAULT_PORT = 830
+_HOST_KEYS_LOCK = Lock()
+
+
+def _accept_new(host: str, port: int, timeout: int) -> None:
+    """Pin an unknown key before PyEZ authenticates, then let PyEZ verify it."""
+    import paramiko
+
+    path = Path.home() / ".ssh" / "known_hosts"
+    name = host if port == 22 else f"[{host}]:{port}"
+    with _HOST_KEYS_LOCK:
+        keys = paramiko.HostKeys()
+        if path.exists():
+            keys.load(str(path))
+        if keys.lookup(host) or keys.lookup(name):
+            return
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        with paramiko.Transport(sock) as transport:
+            transport.start_client(timeout=timeout)
+            key = transport.get_remote_server_key()
+    with _HOST_KEYS_LOCK:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.touch(mode=0o600, exist_ok=True)
+        keys = paramiko.HostKeys(str(path))
+        current = keys.lookup(host) or keys.lookup(name)
+        if current:
+            expected = current.get(key.get_name())
+            if expected != key:
+                raise paramiko.BadHostKeyException(host, key, expected or next(iter(current.values())))
+        else:
+            keys.add(name, key.get_name(), key)
+            keys.save(str(path))
 
 
 def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> Fault:
@@ -74,13 +107,13 @@ class NetconfCommunicator(Communicator):
         timeouts: Timeouts,
         host_key_policy: HostKeyPolicy,
     ) -> NetconfSession:
-        if host_key_policy == "accept-new":
-            raise Fault(FaultKind.UNSUPPORTED, "NETCONF accept-new host-key handling is not implemented", False)
         device = None
         try:
             from jnpr.junos import Device
 
             port = target.port if target.port is not None else DEFAULT_PORT
+            if host_key_policy == "accept-new":
+                _accept_new(target.host, port, timeouts.connect)
             device = Device(
                 host=target.host, port=port, user=creds.username, passwd=creds.password,
                 ssh_private_key_file=str(Path(creds.key_file).expanduser()) if creds.key_file else None,
