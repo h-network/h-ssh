@@ -8,7 +8,7 @@ For example, with a key available through SSH key discovery or the SSH agent:
 
 ```sh
 h-ssh --no-store --transport netconf --vendor junos --user reviewer \
-  --host-key-policy strict --target router:10.91.0.2:junos:830 -sC "show version"
+  --host-key-policy strict --target router:192.0.2.1:junos:830 -sC "show version"
 ```
 
 Library callers can select a key explicitly with `Credentials.key_file`.
@@ -25,6 +25,3 @@ Library failures become `Fault` with the library's message and whether the
 operation may have reached the device. The communicator does not retry. Closing
 a configuration session attempts candidate discard, unlock and disconnect even
 if an earlier cleanup step fails, then reports the first failure.
-
-Structured output and configuration operations remain unimplemented and are not
-advertised as driver capabilities.
