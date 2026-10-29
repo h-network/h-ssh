@@ -162,4 +162,5 @@ class RunReport:
     ok: int
     failed: int
     skipped: int
+    interrupted: bool = False
     pending: dict[str, str] = field(default_factory=dict)
