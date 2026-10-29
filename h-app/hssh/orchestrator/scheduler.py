@@ -280,13 +280,15 @@ def run(spec: RunSpec) -> RunReport:
 
 
 def _gate(spec: RunSpec) -> SafetyGate | None:
+    if spec.safety is None:
+        return None
     from hssh.safety import SafetyGate as Gate
 
     return Gate(spec.safety)
 
 
 def _store(spec: RunSpec) -> StoreWriter | None:
-    if spec.recording.store_path is None:
+    if spec.recording is None or spec.recording.store_path is None:
         return None
     from hssh.store import Store
 
