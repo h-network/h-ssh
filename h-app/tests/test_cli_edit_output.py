@@ -1159,3 +1159,202 @@ def test_a_reply_reaches_a_terminal_without_what_it_would_act_on_and_a_pipe_as_i
             assert not any(c in out for c in "\x1b\x07\x9b"), shape
         else:
             assert EVIL in out, shape
+
+
+# --- #153: an abort in the result loop, or a second Ctrl-C, keeps the record ----
+
+class LedgerDriver:
+    """A junos fake whose commits take a while and are written down as they
+    land, so a test can tell what reached the devices from what the run
+    reported, logged and audited."""
+    AVAILABLE = True
+
+    def __init__(self, delay=0.2, fail=()):
+        self.committed, self.delay, self.fail = [], delay, fail
+
+    def edit(self, host, user, passwd, payload, *a, **kw):
+        time.sleep(self.delay)
+        self.committed.append(host)
+        if host in self.fail:
+            raise RuntimeError("commit check failed")
+        return "COMMIT OK\n\nDIFF:\n+ host-name X"
+
+
+class GoneReader:
+    """stdout whose reader went away: every write after the first raises
+    BrokenPipeError, as a pipe to `head -1` does."""
+
+    def __init__(self):
+        self.writes = 0
+
+    def write(self, text):
+        self.writes += 1
+        if self.writes > 1:
+            raise BrokenPipeError
+        return len(text)
+
+    def flush(self):
+        pass
+
+
+def _targets(n):
+    return [arg for i in range(1, n + 1) for arg in ("--target", f"R{i}:10.0.0.{i}:junos")]
+
+
+def _record(audit):
+    """(hosts audited, hosts stored, the run row) after a run."""
+    audited = [json.loads(ln)["host"] for ln in audit.read_text().splitlines()] if audit.exists() else []
+    stored = [r["host"] for r in _store_rows("SELECT host FROM results ORDER BY host")]
+    (run,) = _store_rows("SELECT * FROM runs")
+    return sorted(audited), sorted(stored), run
+
+
+@pytest.mark.parametrize("stdout", ["gone", "/dev/full"])
+def test_a_reader_that_leaves_does_not_end_the_run_before_its_commits_are_recorded(monkeypatch, capsys, tmp_path,
+                                                                                   stdout):
+    """An exception out of the result loop's prints (BrokenPipeError from
+    `--raw | head -1`, ENOSPC from a stdout on a full disk) escaped main():
+    asyncio.run cancelled every task while the executor threads finished
+    their commits, so commits landed with no audit entry, no store row and
+    no report, the queued devices never ran, the run row stayed open, and
+    the exit was 0 or a traceback (#153). The screen is best effort: the
+    stream that fails is muted and the run goes on to its end, every commit
+    recorded, with the run's own exit code."""
+    audit = tmp_path / "audit.jsonl"
+    driver = LedgerDriver()
+    reader = GoneReader() if stdout == "gone" else open("/dev/full", "w")
+    try:
+        monkeypatch.setattr(sys, "stdout", reader)
+        rc, out, err = run_cli(monkeypatch, capsys, tmp_path, [*_targets(8), "--workers", "4", "--raw", "-y",
+                                                              "-eC", "set system host-name X",
+                                                              "--audit-log", str(audit)], driver=driver,
+                               target=None)
+    finally:
+        if stdout != "gone":
+            reader.close()
+    assert rc == 0 and "Traceback" not in err, err
+    hosts = sorted(f"10.0.0.{i}" for i in range(1, 9))
+    assert sorted(driver.committed) == hosts
+    audited, stored, run = _record(audit)
+    assert audited == hosts and stored == hosts
+    assert run["finished"] is not None and (run["targets"], run["ok"], run["failed"], run["skipped"]) == (8, 8, 0, 0)
+    assert '"ok": 8' in err                                   # the summary still reaches stderr
+
+
+def test_the_run_row_is_closed_and_the_exit_code_kept_when_the_reader_leaves_during_the_report(monkeypatch,
+                                                                                               capsys, tmp_path):
+    """The --json array and the summary printed before store.finish_run, and
+    main_sync's BrokenPipeError branch kept rc 0: `--json | head -c1` with a
+    failed device gave exit 0 and an open run row though every result was
+    in (#153). The row is closed and the exit code settled before the report
+    prints, and a report nobody reads is no error."""
+    driver = LedgerDriver(fail={"10.0.0.2"})
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *_targets(3), "--json", "-y",
+                                      "-eC", "set system host-name X"])
+
+    class Head:
+        """`| head -c1`: the first byte of the array is the last one read."""
+        def write(self, text):
+            if text.lstrip().startswith("["):
+                raise BrokenPipeError
+            return len(text)
+
+        def flush(self):
+            pass
+    monkeypatch.setattr(sys, "stdout", Head())
+    monkeypatch.setattr(os, "dup2", lambda a, b: None)
+    with pytest.raises(SystemExit) as left:
+        cli.main_sync()
+    assert left.value.code == 1
+    _, stored, run = _record(tmp_path / "none")
+    assert stored == ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    assert run["finished"] is not None and (run["targets"], run["ok"], run["failed"], run["skipped"]) == (3, 2, 1, 0)
+
+
+def test_a_mid_run_ctrl_c_counts_the_devices_that_never_started_as_skipped(monkeypatch, capsys, tmp_path):
+    """A Ctrl-C during the run cancelled the units that had not started and
+    counted them nowhere: the run row said targets=6 ok=2 failed=0 skipped=0
+    (#153), where a Ctrl-C during the probe counts every device skipped.
+    They are `not_started`, skipped in the row and the summary alike."""
+    driver = LedgerDriver(delay=0.8)
+    monkeypatch.setitem(drivers.MODULES, "junos@netconf", driver)
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HSSH_PASSWORD", "p")
+    monkeypatch.setattr(sys, "argv", ["h-ssh", "--config", os.devnull, "--user", "u", *_targets(6), "--workers", "2",
+                                      "-y", "-eC", "set system host-name X"])
+    rc = _main_cancelled_after(0.3)
+    out, err = capsys.readouterr()
+    assert rc == 130 and sorted(driver.committed) == ["10.0.0.1", "10.0.0.2"]
+    assert "Interrupted. Completed 2 of 6" in err and '"skipped": 4' in err, err
+    _, stored, run = _record(tmp_path / "none")
+    assert stored == ["10.0.0.1", "10.0.0.2"]
+    assert (run["targets"], run["ok"], run["failed"], run["skipped"], run["interrupted"]) == (6, 2, 0, 4, 1)
+
+
+SECOND_CTRL_C = r'''
+import os, signal, sys, threading, time
+from hssh import cli, drivers
+
+ledger, started = sys.argv[1], []
+
+class Driver:
+    AVAILABLE = True
+    def edit(self, host, user, passwd, payload, *a, **kw):
+        started.append(host)
+        time.sleep(1.5)                                   # the commit is on its way
+        with open(ledger, "a") as f:
+            f.write(host + "\n")
+        return "COMMIT OK"
+
+drivers.MODULES["junos@netconf"] = Driver()
+
+def interrupt_twice():
+    while len(started) < 2:
+        time.sleep(0.02)
+    time.sleep(0.2)
+    os.kill(os.getpid(), signal.SIGINT)
+    time.sleep(0.3)
+    os.kill(os.getpid(), signal.SIGINT)
+threading.Thread(target=interrupt_twice, daemon=True).start()
+
+sys.argv = ["h-ssh", "--config", os.devnull, "--user", "u", "--no-probe", "--workers", "2", "-y",
+            "-eC", "set system host-name X", "--audit-log", sys.argv[2],
+            "--target", "R1:10.0.0.1:junos", "--target", "R2:10.0.0.2:junos",
+            "--target", "R3:10.0.0.3:junos", "--target", "R4:10.0.0.4:junos"]
+cli.main_sync()
+'''
+
+
+def test_a_second_ctrl_c_still_records_the_commits_in_flight(tmp_path):
+    """On the second SIGINT asyncio raised KeyboardInterrupt and cancelled
+    every task, the in-flight ones included; the executor threads finished
+    the commits, the run said `Interrupted. Completed 0 of 4` and closed its
+    row with ok=0, and the audit log had nothing (#153). After the first
+    Ctrl-C a SIGINT only says how many are in flight; they are waited for,
+    reported, logged and audited as under a single Ctrl-C."""
+    import subprocess
+    ledger, audit, store = tmp_path / "ledger", tmp_path / "audit.jsonl", tmp_path / "s.db"
+    env = {**os.environ, "HSSH_STORE": str(store), "HSSH_PASSWORD": "p", "HSSH_USER": "u",
+           "PYTHONPATH": os.path.join(os.path.dirname(__file__), "..")}
+    for var in ("HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
+        env.pop(var, None)
+    proc = subprocess.run([sys.executable, "-c", SECOND_CTRL_C, str(ledger), str(audit)], env=env, cwd=str(tmp_path),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 130, proc.stderr
+    assert "Traceback" not in proc.stderr, proc.stderr
+    assert sorted(ledger.read_text().split()) == ["10.0.0.1", "10.0.0.2"]
+    assert "Interrupted. Completed 2 of 4" in proc.stderr and "2 device(s) in flight" in proc.stderr, proc.stderr
+    assert sorted(json.loads(ln)["host"] for ln in audit.read_text().splitlines()) == ["10.0.0.1", "10.0.0.2"]
+    con = sqlite3.connect(str(store))
+    try:
+        stored = sorted(r[0] for r in con.execute("SELECT host FROM results"))
+        (row,) = con.execute("SELECT targets, ok, failed, skipped, interrupted, finished FROM runs").fetchall()
+    finally:
+        con.close()
+    assert stored == ["10.0.0.1", "10.0.0.2"]
+    assert row[:5] == (4, 2, 0, 2, 1) and row[5] is not None
