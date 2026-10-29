@@ -8,7 +8,8 @@ from typing import Hashable
 
 from hssh.communicators.base import Communicator, Session
 from hssh.drivers import Driver
-from hssh.model import Credentials, HostKeyPolicy, Target, Timeouts
+from hssh.model import Credentials, Fault, HostKeyPolicy, OperationResult, Target, Timeouts
+from hssh.orchestrator.lifecycle import operation
 
 def session_key(driver: Driver, target: Target, creds: Credentials) -> Hashable:
     return (driver.name, target.host, target.port, creds.username)
@@ -48,18 +49,20 @@ class SessionManager:
             self._entries[key] = _Entry(driver.communicator, session, in_use=True)
         return session
 
-    async def release(self, driver: Driver, target: Target, creds: Credentials, discard: bool = False) -> None:
-        """Give the session back: closed unless pooling keeps it; `discard` closes it regardless."""
+    async def release(self, driver: Driver, target: Target, creds: Credentials,
+                      discard: bool = False) -> OperationResult | None:
+        """Give the session back: closed unless pooling keeps it; `discard` closes it regardless. A close that faults is returned as an operation named 'close'."""
         key = session_key(driver, target, creds)
         async with self._lock:
             entry = self._entries.get(key)
             if entry is None:
-                return
+                return None
             entry.in_use = False
             if self.pool and not discard:
-                return
+                return None
             del self._entries[key]
-        await asyncio.to_thread(entry.communicator.close, entry.session)
+        closed = await operation("close", lambda: entry.communicator.close(entry.session))
+        return closed if isinstance(closed.outcome, Fault) else None
 
     async def close_all(self) -> None:
         """Close every session, in-flight ones included; a close that fails is not the run's failure."""
