@@ -184,7 +184,7 @@ class Scheduler:
 async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate | None = None,
                   store: StoreWriter | None = None, audit: AuditWriter | None = None,
                   saver: OutputSaver | None = None, pool: bool = False) -> RunReport:
-    """The orchestrator's entry point: one RunSpec executed, its RunReport returned."""
+    """execute() with injected collaborators, for callers that have an event loop or want to inject."""
     sessions = SessionManager(pool=pool)
     scheduler = Scheduler(registry, Policy(spec.policy, gate), sessions, Recorder(spec.recording, store, audit, saver))
     try:
@@ -193,3 +193,37 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
         await sessions.close_all()
         if gate is not None:
             gate.close()
+
+
+def run(spec: RunSpec) -> RunReport:
+    """The entry point the front ends call: one RunSpec executed, its RunReport returned. Per-target failures are in the report; a local refusal before any device is contacted raises Fault(LOCAL)."""
+    from hssh.drivers import Registry
+
+    registry = Registry()
+    registry.load_entry_points()
+    try:
+        gate = _gate(spec)
+        store = _store(spec)
+    except OSError as e:
+        raise Fault(FaultKind.LOCAL, str(e), False) from e
+    try:
+        return asyncio.run(execute(spec, registry, gate=gate, store=store))
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _gate(spec: RunSpec) -> SafetyGate | None:
+    if spec.safety is None:
+        return None
+    from hssh.safety import SafetyGate as Gate
+
+    return Gate(spec.safety)
+
+
+def _store(spec: RunSpec) -> StoreWriter | None:
+    if spec.recording is None or spec.recording.store_path is None:
+        return None
+    from hssh.store import Store
+
+    return Store(spec.recording.store_path)
