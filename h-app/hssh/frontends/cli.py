@@ -289,21 +289,25 @@ def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
     except (ValueError, OSError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return EXIT_USAGE
-    if args.every is None:
-        report = runner(spec)
-        render(report, args)
-        return exit_code(report)
-    previous = None
-    worst = EXIT_OK
-    for tick in range(args.times or sys.maxsize):
-        if tick:
-            time.sleep(args.every)
-        report = runner(spec)
-        print("\n".join(changed_lines(previous, report)) if previous else "", end="")
-        render(report, args)
-        worst = max(worst, exit_code(report))
-        previous = report
-    return worst
+    try:
+        if args.every is None:
+            report = runner(spec)
+            render(report, args)
+            return exit_code(report)
+        previous = None
+        worst = EXIT_OK
+        for tick in range(args.times or sys.maxsize):
+            if tick:
+                time.sleep(args.every)
+            report = runner(spec)
+            print("\n".join(changed_lines(previous, report)) if previous else "", end="")
+            render(report, args)
+            worst = max(worst, exit_code(report))
+            previous = report
+        return worst
+    except Fault as e:
+        print(f"ERROR: {e.kind.name}: {e.detail}", file=sys.stderr)
+        return EXIT_USAGE
 
 
 def main_sync() -> None:

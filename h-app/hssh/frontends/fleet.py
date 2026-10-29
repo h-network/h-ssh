@@ -33,7 +33,7 @@ _BRACKETED_HOST = re.compile(r"^([^:]+):\[([^\]]+)\](?::(.*))?$")
 
 
 def run_spec(spec: RunSpec) -> RunReport:
-    """Hand the spec to the orchestrator."""
+    """Hand the spec to the orchestrator; it raises Fault(LOCAL) only for a refusal before any device is contacted."""
     from hssh.orchestrator import run
 
     return run(spec)
