@@ -168,9 +168,12 @@ class Scheduler:
         try:
             ops = await self._operations(run, index, target, driver, session)
         finally:
-            await self.sessions.release(driver, target, creds)
+            closed = await self.sessions.release(driver, target, creds)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
         verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
+        if closed is not None:
+            ops.append(closed)
+            verdict = verdict or Verdict(Action.FAIL)
         self.policy.settle(target, verdict)
         return _Attempt(ops, verdict)
 
