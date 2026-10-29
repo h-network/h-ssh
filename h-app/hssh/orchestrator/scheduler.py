@@ -14,7 +14,7 @@ from hssh.model import (Credentials, EditSettings, Fault, FaultKind, OperationRe
 from hssh.orchestrator import lifecycle, probe
 from hssh.orchestrator.lifecycle import EditLifecycle, Stage, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
-from hssh.orchestrator.recorder import AuditWriter, OutputSaver, Recorder, StoreWriter
+from hssh.orchestrator.recorder import Recorder, StoreWriter
 from hssh.orchestrator.sessions import SessionManager
 
 DEFAULT_TIMEOUTS = Timeouts(connect=10, command=30, commit=120)
@@ -71,7 +71,8 @@ class Scheduler:
     async def _probe(self, spec: RunSpec) -> dict[str, Fault | None]:
         """Dead targets by name; a target the safety gate holds is not probed."""
         timeouts = spec.timeouts or DEFAULT_TIMEOUTS
-        free = [t for t in spec.targets if self.policy.admit(t, login=False) is None]
+        held = self.policy.held(spec.targets)
+        free = [t for t in spec.targets if t.name not in held]
         return await probe.probe(free, timeouts.connect)
 
     async def _bounded(self, run: _Run, index: int, target: Target, slots: asyncio.Semaphore,
@@ -96,7 +97,7 @@ class Scheduler:
     async def _run_target(self, run: _Run, index: int, target: Target) -> TargetResult:
         """One target: the safety gate, its driver, attempts while the policy says retry, then its rows."""
         spec = run.spec
-        held = self.policy.admit(target, login=True)
+        held = self.policy.admit(target)
         if held is not None:
             return self._failed_before(run, target, Fault(FaultKind.LOCAL, f"safety gate: {held}", False))
         try:
@@ -114,7 +115,7 @@ class Scheduler:
             await self.policy.pause()
         self.policy.settle(target, tried.verdict)
         for seq, op in enumerate(tried.operations):
-            self.recorder.result(run.run_id, target, driver.name, seq, op, driver.dialect.redaction_patterns)
+            self.recorder.result(run.run_id, target, driver.name, seq, op)
         status: TargetStatus = "ok" if tried.verdict is None else "failed"
         return TargetResult(target, status, tuple(tried.operations))
 
@@ -169,7 +170,7 @@ class Scheduler:
     def _failed_before(self, run: _Run, target: Target, fault: Fault) -> TargetResult:
         """A target that failed before any operation: one operation named 'open', recorded without a driver."""
         op = OperationResult(OPEN, fault, now(), 0)
-        self.recorder.result(run.run_id, target, "", 0, op, ())
+        self.recorder.result(run.run_id, target, "", 0, op)
         return TargetResult(target, "failed", (op,))
 
     @staticmethod
@@ -182,11 +183,10 @@ class Scheduler:
 
 
 async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate | None = None,
-                  store: StoreWriter | None = None, audit: AuditWriter | None = None,
-                  saver: OutputSaver | None = None, pool: bool = False) -> RunReport:
+                  store: StoreWriter | None = None, pool: bool = False) -> RunReport:
     """execute() with injected collaborators, for callers that have an event loop or want to inject."""
     sessions = SessionManager(pool=pool)
-    scheduler = Scheduler(registry, Policy(spec.policy, gate), sessions, Recorder(spec.recording, store, audit, saver))
+    scheduler = Scheduler(registry, Policy(spec.policy, gate), sessions, Recorder(spec.recording, store))
     try:
         return await scheduler.run(spec)
     finally:

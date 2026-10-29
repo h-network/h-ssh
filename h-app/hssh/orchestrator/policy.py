@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from hssh.dialects.base import Dialect
 from hssh.model import Fault, FaultKind, PolicySettings, Target
@@ -32,15 +32,19 @@ class Verdict:
 
 
 class SafetyGate(Protocol):
-    """The per-device gate (hssh.safety): asked before OPEN for edits, released or cooled after."""
+    """What the policy calls on hssh.safety.SafetyGate."""
 
-    def check(self, target: Target, login: bool) -> str | None:
-        """None when the target may be contacted, else why it is held."""
+    def check_device(self, target: Target, *, login: bool = True) -> tuple[bool, str]:
+        """(admitted, reason); admission reserves the device until release_device or set_cooldown."""
         ...
 
-    def release(self, target: Target) -> None: ...
+    def holds(self, targets: Sequence[Target]) -> dict[str, str]:
+        """Target names held by a cooldown, and why, without reserving anything."""
+        ...
 
-    def cool_down(self, target: Target) -> None: ...
+    def release_device(self, target: Target) -> None: ...
+
+    def set_cooldown(self, target: Target) -> None: ...
 
     def close(self) -> None: ...
 
@@ -75,18 +79,25 @@ class Policy:
         self.settings = settings or DEFAULT_POLICY
         self.gate = gate
 
-    def admit(self, target: Target, login: bool) -> str | None:
-        """Why the safety gate holds `target`, or None when it may be contacted."""
-        return self.gate.check(target, login) if self.gate else None
+    def admit(self, target: Target) -> str | None:
+        """Why the safety gate turns `target` away, or None when it is admitted and reserved."""
+        if self.gate is None:
+            return None
+        allowed, reason = self.gate.check_device(target, login=True)
+        return None if allowed else reason
+
+    def held(self, targets: Sequence[Target]) -> dict[str, str]:
+        """Targets a cooldown holds now, for the probe to leave alone."""
+        return self.gate.holds(targets) if self.gate else {}
 
     def settle(self, target: Target, verdict: Verdict | None) -> None:
         """Release the target in the gate, or cool it down as the verdict says."""
         if self.gate is None:
             return
         if verdict is not None and verdict.cool_down:
-            self.gate.cool_down(target)
+            self.gate.set_cooldown(target)
         else:
-            self.gate.release(target)
+            self.gate.release_device(target)
 
     async def pause(self) -> None:
         await asyncio.sleep(self.settings.retry_pause)
