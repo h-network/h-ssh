@@ -105,7 +105,6 @@ class Result:
 
     output: str
     data: object | None = None
-    elapsed: float = 0.0
 
 
 class FaultKind(Enum):
@@ -134,21 +133,20 @@ class Fault(Exception):
 
 @dataclass(frozen=True)
 class OperationResult:
-    """One operation on a target: the command, its Result or Fault, and elapsed whole seconds."""
+    """One operation on a target: the command, or 'open' for a failure before any ran, with its Result or Fault and elapsed milliseconds."""
 
     command: str
     outcome: Result | Fault
-    elapsed: int
+    elapsed_ms: int
 
 
 @dataclass(frozen=True)
 class TargetResult:
-    """One target's outcome: its status, its operations, and a target-level Fault when none ran."""
+    """One target's outcome: its status and its operations in order."""
 
     target: Target
     status: TargetStatus
     operations: Sequence[OperationResult] = ()
-    outcome: Result | Fault | None = None
 
 
 @dataclass(frozen=True)
