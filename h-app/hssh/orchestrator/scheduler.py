@@ -66,6 +66,8 @@ class Scheduler:
                      for i, t in enumerate(spec.targets)]
         with _on_interrupt(loop, lambda: self._interrupt(run)):
             results = await self._gather(run)
+            late = await asyncio.to_thread(self.sessions.wait_for_closes)
+        results = [self._with_close(run, r, late[r.target.name]) if r.target.name in late else r for r in results]
         counts = {status: sum(r.status == status for r in results) for status in ("ok", "failed", "skipped")}
         report = RunReport(run.run_id, spec.mode, run.started, now(), results, counts["ok"], counts["failed"],
                            counts["skipped"], interrupted=run.interrupts > 0, pending=self._pending(spec, results))
@@ -157,7 +159,7 @@ class Scheduler:
         return TargetResult(target, status, tuple(ops))
 
     async def _attempt(self, run: _Run, index: int, target: Target, driver: Driver, attempt: int) -> _Attempt:
-        """One login under the safety gate, the mode's operations in order on that session, close, the gate settled. A close fault is recorded but decides nothing."""
+        """One login under the safety gate, the mode's operations in order on that session, the close started beside the work, the gate settled."""
         spec = run.spec
         creds, timeouts = spec.credentials, spec.timeouts
         started, t0 = now(), time.monotonic()
@@ -175,11 +177,9 @@ class Scheduler:
         try:
             ops = await self._operations(run, index, target, driver, session)
         finally:
-            closed = await self.sessions.release(driver, target, creds)
+            await self.sessions.release(driver, target, creds)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
         verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
-        if closed is not None:
-            ops.append(closed)
         self.policy.settle(target, verdict)
         return _Attempt(ops, verdict)
 
@@ -210,6 +210,12 @@ class Scheduler:
         read = spec.mode in READ_MODES and all(is_read(driver.dialect, c) for c in spec.commands)
         return decide(op.outcome, read=read, editing=spec.mode == "edit", operation=op.command, attempt=attempt,
                       settings=self.policy.settings)
+
+    def _with_close(self, run: _Run, result: TargetResult, late: tuple[str, OperationResult]) -> TargetResult:
+        """The close fault appended as the trailing operation and recorded; status untouched."""
+        driver, op = late
+        self.recorder.result(run.run_id, result.target, driver, len(result.operations), op)
+        return dataclasses.replace(result, operations=(*result.operations, op))
 
     def _failed_before(self, run: _Run, target: Target, fault: Fault) -> TargetResult:
         """A target that failed before any operation: one operation named 'open', recorded without a driver."""
