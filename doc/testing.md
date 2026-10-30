@@ -36,10 +36,6 @@ The unit suite needs no network devices. It tests:
 
 Each test covers one behaviour.
 
-Run the current suite with `python -m pytest -q h-app/tests`. Dialect tests live in
-`h-app/tests/dialects`; their [coverage notes](../h-app/tests/dialects/README.md) identify the reused
-device-output cases, deferred behaviour and checks that deliberately break an implementation.
-
 ### 1.3 Running CI locally
 
 Run the same steps as the workflow before every push. From the repository root:
