@@ -38,4 +38,21 @@ On `junos@ssh`: shows and batches.
 
 Next: edits over SSH, then OpenSSH, then other vendors.
 
+## From Python
+
+```python
+from hssh.frontends.fleet import Fleet
+
+with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin", password="…") as fleet:
+    report = fleet.show("show bgp summary")                 # one login per device, kept for the next call
+    report = fleet.batch(["show version", "show route summary"])
+    report = fleet.structured("show interfaces terse", "json")   # the reply as data, NETCONF only
+    for result in report.results:
+        for op in result.operations:
+            print(result.target.name, op.command, op.outcome)
+```
+
+`Fleet.structured(command, fmt)` is the library's alone: `fmt` is `json` or `xml`, and `Result.data`
+carries the parsed reply. The CLI has no `--format`; its reads return the device's text.
+
 Documentation: [architecture](doc/architecture.md), [testing](doc/testing.md), [result store](doc/store.md), [NETCONF](doc/netconf.md).

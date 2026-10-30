@@ -45,7 +45,6 @@ from hssh.store import Store, operation_dict
 
 TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
 HOST_KEY_CHOICES = ("accept-new", "strict", "off")
-FORMAT_CHOICES = ("text", "json", "xml")
 
 # Config-file keys with the orchestrator's default; None means "no value".
 CONFIG_DEFAULTS: dict[str, Any] = {
@@ -108,7 +107,6 @@ def build_parser() -> _Parser:
     mode.add_argument("-sC", "--show-command", metavar="CMD", help="one show command on every target")
     mode.add_argument("--batch", metavar="FILE", help="show commands, one per line")
     mode.add_argument("--profile", metavar="NAME", help="a named command set, run like --batch")
-    mode.add_argument("--format", choices=FORMAT_CHOICES, default=None, help="json or xml asks for structured data (NETCONF)")
     mode.add_argument("-eC", "--edit-command", metavar="TEXT", help="configuration lines for every target")
     mode.add_argument("-eB", "--edit-file", metavar="FILE", help="configuration file for every target")
     mode.add_argument("-eD", "--edit-dir", metavar="DIR", help="one <NAME>.set configuration file per target")
@@ -217,12 +215,8 @@ def resolve_mode(args: argparse.Namespace) -> Mode:
                             ("--commit-confirmed", args.commit_confirmed is not None)):
             if given:
                 raise ValueError(f"{flag} goes with an edit (-eC, -eB, -eD); it would do nothing here")
-    if "format" in args.typed and chosen[0] != "show":
-        raise ValueError("--format goes with -sC: a batch, an edit, a confirm or the commit status has no format")
     if args.every is not None and chosen[0] not in ("show", "batch"):
         raise ValueError("--every repeats reads (-sC, --batch, --profile), not edits, confirms or the commit status")
-    if chosen[0] == "show" and args.format not in (None, "text"):
-        return "structured"
     return chosen[0]
 
 
@@ -367,7 +361,7 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
     targets = resolve_targets(args)
     commands: tuple[str, ...] = ()
     payloads: dict[str, tuple[str, ...]] = {}
-    if mode in ("show", "structured"):
+    if mode == "show":
         commands = (args.show_command,)
         check_commands(commands, "-sC")
     elif mode == "batch":
@@ -384,7 +378,6 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         safety = SafetySettings(cooldown_seconds=args.cooldown, rate_limit=args.rate_limit, safety_file=args.safety_file)
     return RunSpec(
         targets=targets, mode=mode, commands=commands, payloads=payloads,
-        format=args.format if mode == "structured" else None,
         credentials=resolve_credentials(args),
         timeouts=Timeouts(connect=args.connect_timeout, setup=args.session_timeout, command=args.command_timeout,
                           commit=args.commit_timeout),

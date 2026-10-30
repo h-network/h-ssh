@@ -119,11 +119,11 @@ def test_the_defaults_are_the_orchestrators(runner, monkeypatch):
 def test_each_method_is_one_mode(runner):
     f = fleet.Fleet(["R1:10.0.0.1"], transport="netconf", vendor="junos", user="u", runner=runner)
     f.batch(["show a", "show b"])
-    f.structured("get-software-information", "xml")
+    f.structured("show version", "xml")
     f.confirm()
     f.commit_status()
     modes = [(s.mode, s.commands, s.format) for s in runner.seen]
-    assert modes == [("batch", ("show a", "show b"), None), ("structured", ("get-software-information",), "xml"),
+    assert modes == [("batch", ("show a", "show b"), None), ("structured", ("show version",), "xml"),
                      ("confirm", (), None), ("commit_status", (), None)]
 
 
