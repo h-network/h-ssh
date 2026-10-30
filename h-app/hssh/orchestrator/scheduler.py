@@ -68,7 +68,8 @@ class Scheduler:
         with _on_interrupt(loop, lambda: self._interrupt(run)):
             try:
                 self.recorder.preflight()
-                dead = await self._probed(run) if spec.probe else {}
+                held = self.policy.held([self._device(t) for t in spec.targets])
+                dead = await self._probed(run, held) if spec.probe else {}
                 if run.stopping.is_set() and spec.mode == "edit":
                     raise Fault(FaultKind.LOCAL, "interrupted during the probe; nothing was sent", False)
                 if spec.mode == "edit" and any(dead.values()):
@@ -80,7 +81,7 @@ class Scheduler:
                 stopped = Fault(FaultKind.LOCAL, "interrupted during the probe", False)
                 results = [self._failed_before(run, t, stopped, "skipped") for t in spec.targets]
             else:
-                run.tasks = [asyncio.create_task(self._bounded(run, i, t, slots, dead.get(t.name)))
+                run.tasks = [asyncio.create_task(self._bounded(run, i, t, slots, dead.get(t.name), held.get(t.name)))
                              for i, t in enumerate(spec.targets)]
                 results = await self._gather(run)
             late = await asyncio.to_thread(self.sessions.wait_for_closes)
@@ -95,9 +96,9 @@ class Scheduler:
             report = dataclasses.replace(report, not_kept=self.recorder.not_kept)
         return report
 
-    async def _probed(self, run: _Run) -> dict[str, Fault | None]:
+    async def _probed(self, run: _Run, held: dict[str, str]) -> dict[str, Fault | None]:
         """The probe as a task the first interrupt can cancel; cancelled, it found nothing dead."""
-        run.probing = asyncio.create_task(self._probe(run.spec))
+        run.probing = asyncio.create_task(self._probe(run.spec, held))
         try:
             return await run.probing
         except asyncio.CancelledError:
@@ -105,9 +106,8 @@ class Scheduler:
         finally:
             run.probing = None
 
-    async def _probe(self, spec: RunSpec) -> dict[str, Fault | None]:
+    async def _probe(self, spec: RunSpec, held: dict[str, str]) -> dict[str, Fault | None]:
         """Dead targets by name, asked where the connection will go; a target the gate holds, whose driver is unknown, or reached through a proxy is not probed."""
-        held = self.policy.held(spec.targets)
         boxes = []
         for target in spec.targets:
             if target.name in held:
@@ -125,9 +125,11 @@ class Scheduler:
         return await probe.probe(boxes, spec.timeouts.connect)
 
     async def _bounded(self, run: _Run, index: int, target: Target, slots: asyncio.Semaphore,
-                       dead: Fault | None) -> TargetResult:
+                       dead: Fault | None, held: str | None) -> TargetResult:
         async with slots:
             run.begun.add(index)
+            if held is not None:
+                return self._failed_before(run, target, Fault(FaultKind.LOCAL, f"safety gate: {held}", False), "skipped")
             if dead is not None:
                 skipped = run.spec.mode == "edit" and run.spec.skip_unreachable
                 return self._failed_before(run, target, dead, "skipped" if skipped else "failed")
@@ -138,7 +140,7 @@ class Scheduler:
                 fault = Fault(FaultKind.LOCAL, f"interrupted during {step}", step != OPEN)
                 result = self._failed_before(run, target, fault, "skipped", step)
             except Exception as e:  # noqa: BLE001 - one communicator bug is this target's failure, not the run's end
-                self.policy.settle(target, None)
+                self.policy.settle(self._device(target), None)
                 result = self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{type(e).__name__}: {e}", True))
             self.recorder.log(result)
             return result
@@ -191,7 +193,7 @@ class Scheduler:
             except asyncio.CancelledError:
                 break
             attempt += 1
-        status: TargetStatus = "ok" if tried.verdict is None else "failed"
+        status: TargetStatus = "ok" if tried.verdict is None else "skipped" if tried.verdict.action is Action.SKIP else "failed"
         ops = tried.operations
         if run.stopping.is_set() and self._interrupted_connect(ops):
             status = "skipped"
@@ -210,10 +212,15 @@ class Scheduler:
         spec = run.spec
         creds, timeouts = spec.credentials, spec.timeouts
         started, t0 = now(), time.monotonic()
-        held = self.policy.admit(target, login=not self.sessions.pooled(driver, target, creds))
+        device = self._device(target, driver)
+        try:
+            held = self.policy.admit(device, login=not self.sessions.pooled(driver, target, creds))
+        except OSError as e:
+            opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate unusable: {e}", False), started, 0)
+            return _Attempt([opened], Verdict(Action.FAIL))
         if held is not None:
             opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate: {held}", False), started, 0)
-            return _Attempt([opened], Verdict(Action.FAIL))
+            return _Attempt([opened], Verdict(Action.SKIP))
         run.steps[index] = OPEN
         try:
             session = await asyncio.wait_for(self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy),
@@ -227,21 +234,31 @@ class Scheduler:
                 f = Fault(FaultKind.LOCAL, "interrupted while connecting", False)
             opened = OperationResult(OPEN, f, started, int((time.monotonic() - t0) * 1000))
             verdict = self._judge(spec, driver, opened, attempt)
-            self.policy.settle(target, verdict)
+            self.policy.settle(device, verdict)
             return _Attempt([opened], verdict)
         ops: list[OperationResult] = []
         try:
             ops = await self._operations(run, index, target, driver, session)
         except asyncio.CancelledError:
-            self.policy.settle(target, None)
+            self.policy.settle(device, None)
             raise
         finally:
             stale = any(isinstance(op.outcome, Fault) and op.outcome.kind in DISCARDING for op in ops)
             await self.sessions.release(driver, target, creds, discard=stale)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
         verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
-        self.policy.settle(target, verdict)
+        self.policy.settle(device, verdict)
         return _Attempt(ops, verdict)
+
+    def _device(self, target: Target, driver: Driver | None = None) -> Target:
+        """The target as the safety gate keys it: with the port the connection uses, the transport's default when none is given."""
+        if target.port is not None:
+            return target
+        try:
+            driver = driver or self.registry.resolve(target)
+        except Fault:
+            return target
+        return dataclasses.replace(target, port=driver.communicator.default_port)
 
     async def _operations(self, run: _Run, index: int, target: Target, driver: Driver,
                           session: Session) -> list[OperationResult]:

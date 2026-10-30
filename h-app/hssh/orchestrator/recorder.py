@@ -36,6 +36,7 @@ class Recorder:
         self.store = store
         self.user = getpass.getuser()
         self.not_kept = 0
+        self._said: set[str] = set()
 
     def preflight(self) -> None:
         """Prove the audit log, the run log and the saved-output directory usable; an OSError here refuses the run before any device."""
@@ -53,17 +54,21 @@ class Recorder:
         """Open the run's row, which creates the store; 0 without a store. An OSError here refuses the run."""
         return self.store.start_run(spec, started, user=self.user) if self.store is not None else 0
 
-    def _kept(self, write: Callable[[], None]) -> None:
+    def _kept(self, destination: str, write: Callable[[], None]) -> None:
+        """Every lost record is counted; each destination's failure is said once, with its first error."""
         try:
             write()
         except Exception as e:  # noqa: BLE001 - whatever fails in a record write, the device outcome stands
             self.not_kept += 1
-            print(f"record not kept: {type(e).__name__ if not str(e) else e}", file=sys.stderr)
+            if destination not in self._said:
+                self._said.add(destination)
+                print(f"{destination} not kept: {type(e).__name__ if not str(e) else e}; the run goes on, "
+                      "its lost records are counted", file=sys.stderr)
 
     def result(self, run_id: int, target: Target, driver: str, seq: int, op: OperationResult, status: TargetStatus) -> None:
         """One operation's row with the target's final status; `driver` is "" when the target failed before a driver was resolved."""
         if self.store is not None:
-            self._kept(lambda: self.store.add(run_id, target, driver, seq, op, status=status))
+            self._kept("store", lambda: self.store.add(run_id, target, driver, seq, op, status=status))
 
     def change(self, run_id: int, target: Target, driver: str, dialect: Dialect, action: str,
                op: OperationResult, edit: EditSettings, diff: str = "", lines: Sequence[str] = ()) -> None:
@@ -72,7 +77,7 @@ class Recorder:
             return
         from hssh.audit import write_audit_entry
 
-        self._kept(lambda: write_audit_entry(self.settings.audit_log_path, run_id=run_id, user=self.user, target=target,
+        self._kept("audit log", lambda: write_audit_entry(self.settings.audit_log_path, run_id=run_id, user=self.user, target=target,
                                              driver=driver, dialect=dialect, action=action, operation=op, edit=edit,
                                              diff=diff, lines=lines))
 
@@ -100,7 +105,7 @@ class Recorder:
             path = path_inside(Path(self.settings.save_output_path), f"{validate_device_name(target.name)}.output")
             secure_write(str(path), "\n".join(op.outcome.output for op in ops if isinstance(op.outcome, Result)))
 
-        self._kept(write)
+        self._kept("saved output", write)
 
     def log(self, result: TargetResult) -> None:
         """One line per target in the run log."""
@@ -110,14 +115,15 @@ class Recorder:
 
         last = result.operations[-1] if result.operations else None
         detail = f" {last.outcome.kind.name}: {last.outcome.detail}" if last and isinstance(last.outcome, Fault) else ""
-        self._kept(lambda: secure_append(self.settings.log_path, f"{now()} {result.target.name} {result.status}{detail}\n"))
+        self._kept("run log", lambda: secure_append(self.settings.log_path,
+                                                   f"{now()} {result.target.name} {result.status}{detail}\n"))
 
     def finish(self, report: RunReport) -> None:
         """Close the run's row with its counts; a row that cannot be closed is counted like any other record."""
         if self.store is not None:
-            self._kept(lambda: self.store.finish_run(report))
+            self._kept("store", lambda: self.store.finish_run(report))
 
     def close(self) -> None:
         """Close the store; a close that fails is counted like any other record, never the run's end."""
         if self.store is not None:
-            self._kept(self.store.close)
+            self._kept("store", self.store.close)

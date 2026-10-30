@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Protocol, Sequence
@@ -79,6 +80,7 @@ class Policy:
     def __init__(self, settings: PolicySettings | None, gate: SafetyGate | None) -> None:
         self.settings = settings or DEFAULT_POLICY
         self.gate = gate
+        self._said = False
 
     def admit(self, target: Target, login: bool = True) -> str | None:
         """Why the safety gate turns `target` away, or None when it is admitted and reserved; `login` counts against the rate limit."""
@@ -92,13 +94,18 @@ class Policy:
         return self.gate.holds(targets) if self.gate else {}
 
     def settle(self, target: Target, verdict: Verdict | None) -> None:
-        """Release the target in the gate, or cool it down as the verdict says."""
+        """Release the target in the gate, or cool it down as the verdict says; a gate that cannot persist is said once, the verdict stands."""
         if self.gate is None:
             return
-        if verdict is not None and verdict.cool_down:
-            self.gate.set_cooldown(target)
-        else:
-            self.gate.release_device(target)
+        try:
+            if verdict is not None and verdict.cool_down:
+                self.gate.set_cooldown(target)
+            else:
+                self.gate.release_device(target)
+        except OSError as e:
+            if not self._said:
+                self._said = True
+                print(f"safety gate: {e}; the run goes on", file=sys.stderr)
 
     async def pause(self, attempt: int, unanswered: bool) -> None:
         """Before attempt + 1: the connect backoff after a connect nothing answered, else the settings' retry pause, which also lets a device that dropped the setup recover."""
