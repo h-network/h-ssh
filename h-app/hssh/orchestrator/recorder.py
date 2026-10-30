@@ -116,3 +116,8 @@ class Recorder:
         """Close the run's row with its counts; a row that cannot be closed is counted like any other record."""
         if self.store is not None:
             self._kept(lambda: self.store.finish_run(report))
+
+    def close(self) -> None:
+        """Close the store; a close that fails is counted like any other record, never the run's end."""
+        if self.store is not None:
+            self._kept(self.store.close)
