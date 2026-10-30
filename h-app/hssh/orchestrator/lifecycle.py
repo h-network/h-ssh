@@ -65,9 +65,10 @@ class EditLifecycle:
         self.timeouts = timeouts
 
     async def load(self, lines: list[str]) -> tuple[list[OperationResult], int]:
-        """The candidate loaded in one call; without a candidate model, line by line, so the lines applied are known."""
+        """The candidate loaded in one call, under a command timeout per line and one for the lock, since a CLI types it line by line; without a candidate model, line by line here, so the lines applied are known."""
         if self.dialect.has_candidate:
-            op = await operation("load", lambda: self.communicator.load(self.session, lines), 2 * self.timeouts.command)
+            op = await operation("load", lambda: self.communicator.load(self.session, lines),
+                                 max(2, len(lines) + 1) * self.timeouts.command)
             return [op], 0 if failed(op) else len(lines)
         ops: list[OperationResult] = []
         for line in lines:
