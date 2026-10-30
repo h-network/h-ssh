@@ -400,9 +400,19 @@ conversion error never changes the target outcome or escapes from `add` as `Valu
 will obtain the default from the orchestrator in slice 3. Writable construction defers
 opening and creation to `start_run`, before any device work.
 Read-only construction opens an existing compatible store without creating it. SQLite runs
-in WAL mode with a busy timeout, `synchronous=NORMAL` and serialized write transactions.
+in WAL mode with a 10-second busy timeout, a separate bounded 5-second first-open WAL
+wait, `synchronous=NORMAL` and serialized write transactions. Each operation row is committed
+in one transaction. NORMAL protects against a process crash; a power loss can lose recent
+commits. Store creation/opening failures close every acquired resource. Construction alone
+creates no files, and close is idempotent. The writer never deletes a database to undo a
+refused run.
 `finish_run` and `close` complete the writer interface; SQLite and file failures are exposed
 as contextual `OSError`, so the recorder can count lost records without failing the device.
+The writer checks the database identity before and after writes and when closing, using a
+held directory so a working-directory change or directory rename does not look like a lost
+store. A deleted or replaced database is reported even if SQLite could still write its open
+file. The writer is implemented in slice 1; read-only construction and reader methods remain
+stubs until slice 3.
 
 The reader interfaces in `store.py` return stored column names unchanged:
 
@@ -458,6 +468,16 @@ symlinks and non-regular files without blocking on FIFOs, and set the file to 06
 parent directories are 0700. An append failure raises an `OSError` with the recording path;
 the recorder counts it as `not_kept` without changing the device outcome.
 
+Before device work, `probe_append(path)` exercises the same open and lock path with no
+content, preserving an existing log. `probe_output_dir(path)` creates private parents,
+creates and closes a temporary 0600 file in that directory, then removes it. Neither probe
+promises that a later write cannot fail. Both raise contextual `OSError` on failure.
+`secure_write(path, text)` saves raw UTF-8 output: it checks a regular file owned by the
+current user, locks it and sets 0600 before truncating, then completes all short writes.
+It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
+The recorder validates the target name and containment through `hssh.paths` before calling
+it. Saved output stays one file per target, including batches.
+
 For JSON text in audit fields, the writer parses objects and lists and masks the entire value of a
 secret key, including wrapped values. A key is secret when a dialect redaction pattern matches
 `json.dumps(key) + ': "x"'`. For other text, the dialect patterns capture the keyword/prefix in
@@ -474,8 +494,11 @@ The secret vocabulary belongs to the dialect; stored device output is left uncha
   store keeps device output as received, and is created owner-only.
 - **Host keys:** each communicator uses its library's host-key verification under one policy setting:
   `off` (default), `accept-new` or `strict`.
-- **Files:** the store, the audit log, logs and saved output are created with mode 0600, in directories
-  created with mode 0700.
+- **Files:** the store, its SQLite sidecars, the audit log, logs and saved output are made
+  0600; newly created directories are 0700 and existing directory permissions are preserved.
+  Recording files must be regular files owned by the current user; symlinks and FIFOs are
+  refused. The store directory must also belong to that user and must not be writable by
+  others unless it has the sticky bit, because SQLite reopens the path itself.
 
 ## 8. Extensibility
 
