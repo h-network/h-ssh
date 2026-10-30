@@ -144,8 +144,8 @@ class Scheduler:
             tried = await self._attempt(run, index, target, driver, attempt)
             if tried.verdict is None or tried.verdict.action is not Action.RETRY or run.stopping.is_set():
                 break
+            await self.policy.pause(attempt, tried.operations[-1].command == OPEN)
             attempt += 1
-            await self.policy.pause()
         status: TargetStatus = "ok" if tried.verdict is None else "failed"
         ops = tried.operations
         try:

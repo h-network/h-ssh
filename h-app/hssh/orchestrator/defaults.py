@@ -7,8 +7,9 @@ import getpass
 
 from hssh.model import Credentials, EditSettings, HostKeyPolicy, PolicySettings, RunSpec, SafetySettings, Timeouts
 
-DEFAULT_TIMEOUTS = Timeouts(connect=3, command=20, commit=60)
+DEFAULT_TIMEOUTS = Timeouts(connect=3, setup=30, command=20, commit=60)
 DEFAULT_POLICY = PolicySettings(retries=2, retry_pause=2)
+CONNECT_BACKOFF = (0.5, 1.0)
 DEFAULT_WORKERS = 8
 DEFAULT_HOST_KEY_POLICY: HostKeyPolicy = "off"
 DEFAULT_PROBE = True
