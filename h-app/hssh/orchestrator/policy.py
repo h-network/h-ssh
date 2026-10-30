@@ -42,6 +42,10 @@ class SafetyGate(Protocol):
         """Target names held by a cooldown, and why, without reserving anything."""
         ...
 
+    def count_login(self, target: Target) -> tuple[bool, str]:
+        """(allowed, reason) for a further login to a device this run already holds: counted in the window, nothing reserved."""
+        ...
+
     def release_device(self, target: Target) -> None: ...
 
     def set_cooldown(self, target: Target) -> None: ...
@@ -87,6 +91,13 @@ class Policy:
         if self.gate is None:
             return None
         allowed, reason = self.gate.check_device(target, login=login)
+        return None if allowed else reason
+
+    def login(self, target: Target) -> str | None:
+        """Why the gate refuses one more login to a device already admitted (a reopen inside a borrow), or None when it is counted."""
+        if self.gate is None:
+            return None
+        allowed, reason = self.gate.count_login(target)
         return None if allowed else reason
 
     def held(self, targets: Sequence[Target]) -> dict[str, str]:

@@ -289,6 +289,18 @@ class OpenSSH:
         finally:
             session.channel.close()
 
+    def reuse(self, session: OpenSSHSession, timeouts: Timeouts, idle_seconds: int) -> bool:
+        return False
+
+    def release(self, session: OpenSSHSession) -> None:
+        self.close(session)
+
+    def discard(self, session: OpenSSHSession) -> None:
+        try:
+            self.close(session)
+        except Exception:  # noqa: BLE001 - a session in doubt is torn down, never reported
+            pass
+
     def show(self, session: OpenSSHSession, command: str) -> Result:
         return session.engine.show(command)
 

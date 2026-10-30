@@ -41,7 +41,7 @@ def test_without_pooling_release_closes_and_the_next_acquire_opens_again():
         await sessions.close_all()
 
     asyncio.run(go())
-    assert [c[0] for c in comm.calls] == ["open", "close", "open", "close"]
+    assert [c[0] for c in comm.calls] == ["open", "close", "open", "discard"]
 
 
 def test_with_pooling_the_session_waits_for_the_next_acquire_and_counts_as_no_login():
@@ -60,7 +60,7 @@ def test_with_pooling_the_session_waits_for_the_next_acquire_and_counts_as_no_lo
         await sessions.close_all()
 
     asyncio.run(go())
-    assert [c[0] for c in comm.calls] == ["open", "close"]
+    assert [c[0] for c in comm.calls] == ["open", "release", "reuse", "discard"]
 
 
 def test_the_close_runs_beside_the_work_and_its_fault_comes_back_from_the_join():

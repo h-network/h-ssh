@@ -311,13 +311,13 @@ def test_a_target_cancelled_during_a_read_is_skipped_with_the_step_named():
 
 
 @pytest.mark.parametrize("during", ["load", "diff"])
-def test_an_edit_cancelled_before_commit_is_skipped_at_its_step_and_its_session_closed(during):
+def test_an_edit_cancelled_before_commit_is_skipped_at_its_step_and_its_session_discarded(during):
     comm, gate = InterruptsIn(during), Gate()
     report = run(edit_spec(T1, workers=1), comm, gate=gate)
     result = report.results[0]
     assert result.status == "skipped" and result.operations[0].command == during
     assert fault_of(result.operations[0]).detail == f"interrupted during {during}"
-    assert not commits(comm) and ("close", "r1") in comm.calls
+    assert not commits(comm) and ("discard", "r1") in comm.calls
     assert ("release", "r1") in gate.calls and ("cooldown", "r1") not in gate.calls
 
 

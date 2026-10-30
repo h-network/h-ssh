@@ -114,6 +114,15 @@ The run's provenance in `RecordSettings` is the front end's: `origin` is `h-ssh`
 the library (unless the caller set one), `version` is the installed package version from `importlib.metadata`,
 None when h-ssh runs from source. Set-file names and containment (`-eD`) use the shared `hssh.paths` helpers.
 
+The Fleet keeps its sessions. It owns a pooled `SessionManager` for its lifetime and hands it to every
+`run(spec, sessions=…)`, so a device is logged in once per Fleet: `show()`, `batch()` and
+`edit()` on the same Fleet reuse the session the first call opened (a changed credential or policy opens anew,
+section 3.2). One run at a time: a call while another is in flight raises `RuntimeError`, and so does a call on a
+closed Fleet. `close(wait=0)` closes the kept sessions, giving the devices `wait` seconds in all to acknowledge,
+and `with Fleet(...) as fleet:` does it on the way out; a Fleet dropped without `close()` closes its sessions
+when it is collected or at interpreter exit (`weakref.finalize`), so no session outlives the script. The CLI
+stays one session per run: its `run()` owns a manager without pooling and closes it when the run ends.
+
 ### 3.2 Orchestrator
 
 The orchestrator executes a `RunSpec` and owns all policy. It defines the default of every `RunSpec`
@@ -125,7 +134,7 @@ default port is held by its protocol, and a target's own port overrides it.
 | Scheduler | Expands targets, runs them in parallel up to the worker limit, and keeps the order of results stable |
 | Policy | Maps each `Fault` to an action: retry, fail, skip, or cool down. Applies the safety gate |
 | Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed and confirm |
-| Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature |
+| Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature: a caller (the Fleet API) hands `run` or `execute` its own manager and keeps it, across event loops, and closes it with `close_all(timeout)`, which still joins the closes when the interpreter is shutting down; the CLI's run owns and closes its own. `run` refuses to start inside a running event loop and names `execute` instead. A session is keyed by driver, host, the port the connection uses, user, host-key policy and the credential as a process-secret HMAC, so a changed secret or policy opens anew. One session per key: a second borrower waits for it instead of logging in again. A kept session is offered again only after the communicator's `reuse` vouches for it (the cheap check on every borrow, the device asked past its idle threshold) under a 5 s budget; a borrow owns it through its `release` cleanup (two command timeouts), and only then is it idle. A session in doubt (timeout, loss, unknown commit outcome, a cancelled or over-budget call still running, a failed cleanup or close) is torn down by `discard` with no cleanup and never offered again. The kept sessions live inside the open-file budget (6 descriptors per worker, 4 per kept session, 1 per probe, 32 base): when a session goes idle and before every open or probe, the least recently used idle sessions are closed while the limit cannot hold the kept ones beside what is about to run, a close still running counted as held until its thread ends; before an open or the probe the manager waits for those closes (1 s in all) so the descriptors are really free, and the probe runs no more at once than the budget still has. Workers are lowered to the limit per run and said once per session manager, so a Fleet hears it once, not on every call; a lowered probe concurrency is said the same way |
 | Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, following ssh config, and skips targets reached through a proxy. Its outcome is expressed as the same fault kinds |
 | Cancellation | Handles interruption (section 5.4) |
 | Recorder | Writes every result to the store and every change to the audit log, with redaction |
@@ -226,6 +235,9 @@ class Communicator(Protocol):
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...
     def close(self, session: Session) -> None: ...
+    def reuse(self, session: Session, timeouts: Timeouts, idle_seconds: int) -> bool: ...  # before a borrow: apply the timeouts; cheap check always, the device asked only past idle_seconds
+    def release(self, session: Session) -> None: ...   # end of a borrow: discard the candidate, unlock; raises Fault when that fails
+    def discard(self, session: Session) -> None: ...   # session in doubt: tear down, no rollback or unlock, interrupt a running call, never raises
 
     def show(self, session: Session, command: str) -> Result: ...
     def structured(self, session: Session, rpc: str, fmt: str) -> Result: ...   # NETCONF only
@@ -317,7 +329,12 @@ The orchestrator runs on asyncio. Blocking libraries such as paramiko and PyEZ r
 the worker limit at once, so a call that never returns keeps its thread, never the interpreter's exit. Each communicator
 call gets its own timeout (`connect` plus `setup` for open, `command`, or `commit`) plus a grace period; one that has not
 returned by then is that target's `TIMEOUT` fault, and its thread is left to finish. Each target is one task. A target's operations run in order on one session. Targets
-run independently, and one target's failure does not affect another's.
+run independently, and one target's failure does not affect another's. A `TIMEOUT` on one command of a batch ends the
+use of that session before the next command: it is torn down at once, and the rest of the batch goes on under the read
+policy on a fresh session, one more login; a `REFUSED` reply continues on the same session and `SESSION_LOST` still ends
+the batch. Every open that is not a borrow's first (that fresh session, or an open after a kept session fails its reuse
+check) is counted by the safety gate's `count_login` first: a full window refuses it as a `LOCAL` fault, "safety gate: …",
+which skips the target at the start of a borrow and fails it mid-batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts.
 
 ### 5.3 Edit lifecycle
 
@@ -554,6 +571,11 @@ one in-process lock, and reserves the device before returning `(True, "ok")`. A 
 returns `(False, reason)` without a reservation or login count. The sliding window counts
 admitted logins in the last 60 seconds using monotonic time. `login=False` still checks
 cooldowns and active reservations but neither checks nor consumes the login budget.
+`count_login(target)` accounts for a further login inside an existing borrow, using the
+same window and `(allowed, reason)` result as admission. It never changes the active
+reservation or rechecks cooldowns; a full window refuses the login without counting it.
+It raises `OSError` when the gate is closed or has latched an unavailable state. The
+orchestrator calls it immediately before reopening a session within the borrow.
 `release_device` removes the reservation. `holds(targets)` returns cooldown reasons by
 target name without reserving devices or counting logins, so the orchestrator can exclude
 held targets before probing. Active reservations and login history are local to the gate

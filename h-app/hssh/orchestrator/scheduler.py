@@ -16,11 +16,11 @@ from hssh.communicators.base import Session
 from hssh.drivers import Driver, DriverRegistry
 from hssh.model import (Fault, FaultKind, OperationResult, Result, RunReport, RunSpec, Target, TargetResult, TargetStatus)
 from hssh.orchestrator import lifecycle, probe
-from hssh.orchestrator.defaults import GRACE_SECONDS, check_edit, complete
+from hssh.orchestrator.defaults import FDS_PER_PROBE, GRACE_SECONDS, check_edit, complete, fit_workers, open_file_limit
 from hssh.orchestrator.lifecycle import EditLifecycle, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
-from hssh.orchestrator.sessions import SessionManager, session_key
+from hssh.orchestrator.sessions import LoginRefused, SessionManager, session_key
 
 READ_MODES = ("show", "batch", "structured", "commit_status")
 DISCARDING = (FaultKind.TIMEOUT, FaultKind.SESSION_LOST, FaultKind.OUTCOME_UNKNOWN)
@@ -40,6 +40,15 @@ class _Run:
     interrupts: int = 0
     probing: asyncio.Task | None = None
     stopping: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
+class _Borrow:
+    """The session an attempt holds now (None between a discard and a fresh open), and whether it is in doubt."""
+
+    session: Session | None
+    doubtful: bool = False
+    fresh_at: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,9 +71,12 @@ class Scheduler:
     async def run(self, spec: RunSpec) -> RunReport:
         """The whole run: the record destinations proved, the probe, the run row, every target under the worker limit, the report, the run row closed. A refusal before the first device is Fault(LOCAL)."""
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(_DaemonThreads(spec.workers, thread_name_prefix="hssh"))
+        workers, note = fit_workers(spec.workers)
+        self.sessions.workers = workers
+        self._say(note)
+        loop.set_default_executor(_DaemonThreads(workers, thread_name_prefix="hssh"))
         run = _Run(spec, 0, now())
-        slots = asyncio.Semaphore(spec.workers)
+        slots = asyncio.Semaphore(workers)
         with _on_interrupt(loop, lambda: self._interrupt(run)):
             try:
                 self.recorder.preflight()
@@ -122,7 +134,17 @@ class Scheduler:
             where = probe.route(target.host, target.port, comm.default_port)
             if where is not None:
                 boxes.append((target, where[0], where[1], comm.banner))
-        return await probe.probe(boxes, spec.timeouts.connect)
+        wanted = min(probe.MAX_PROBES, len(boxes))
+        probes = await self.sessions.room(wanted * FDS_PER_PROBE) // FDS_PER_PROBE
+        if probes < wanted:
+            self._say(f"probing {max(1, probes)} at a time, not {wanted}: the open-file limit is {open_file_limit()}")
+        return await probe.probe(boxes, spec.timeouts.connect, limit=probes)
+
+    def _say(self, note: str | None) -> None:
+        """A limit note on stderr once per session manager, so a Fleet hears it once, not on every call."""
+        if note is not None and note not in self.sessions.said:
+            self.sessions.said.add(note)
+            print(note, file=sys.stderr)
 
     async def _bounded(self, run: _Run, index: int, target: Target, slots: asyncio.Semaphore,
                        dead: Fault | None, held: str | None) -> TargetResult:
@@ -214,7 +236,7 @@ class Scheduler:
         started, t0 = now(), time.monotonic()
         device = self._device(target, driver)
         try:
-            held = self.policy.admit(device, login=not self.sessions.pooled(driver, target, creds))
+            held = self.policy.admit(device, login=not self.sessions.pooled(driver, target, creds, spec.host_key_policy))
         except OSError as e:
             opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate unusable: {e}", False), started, 0)
             return _Attempt([opened], Verdict(Action.FAIL))
@@ -223,8 +245,13 @@ class Scheduler:
             return _Attempt([opened], Verdict(Action.SKIP))
         run.steps[index] = OPEN
         try:
-            session = await asyncio.wait_for(self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy),
-                                             timeouts.connect + timeouts.setup + GRACE_SECONDS)
+            session = await asyncio.wait_for(
+                self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy, lambda: self.policy.login(device)),
+                timeouts.connect + timeouts.setup + GRACE_SECONDS)
+        except LoginRefused as e:
+            opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate: {e}", False), started, 0)
+            self.policy.settle(device, None)
+            return _Attempt([opened], Verdict(Action.SKIP))
         except (Fault, asyncio.TimeoutError, asyncio.CancelledError) as e:
             if isinstance(e, Fault):
                 f = e
@@ -237,14 +264,18 @@ class Scheduler:
             self.policy.settle(device, verdict)
             return _Attempt([opened], verdict)
         ops: list[OperationResult] = []
+        borrow = _Borrow(session)
         try:
-            ops = await self._operations(run, index, target, driver, session)
+            ops = await self._operations(run, index, target, driver, borrow)
         except asyncio.CancelledError:
+            borrow.doubtful = True
             self.policy.settle(device, None)
             raise
         finally:
-            stale = any(isinstance(op.outcome, Fault) and op.outcome.kind in DISCARDING for op in ops)
-            await self.sessions.release(driver, target, creds, discard=stale)
+            stale = borrow.doubtful or any(isinstance(op.outcome, Fault) and op.outcome.kind in DISCARDING
+                                           for op in ops[borrow.fresh_at:])
+            await self.sessions.release(driver, target, creds, discard=stale, timeouts=timeouts,
+                                        host_key_policy=spec.host_key_policy)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
         verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
         self.policy.settle(device, verdict)
@@ -261,9 +292,9 @@ class Scheduler:
         return dataclasses.replace(target, port=driver.communicator.default_port)
 
     async def _operations(self, run: _Run, index: int, target: Target, driver: Driver,
-                          session: Session) -> list[OperationResult]:
-        """The mode's operations on an open session, each named in run.steps as it starts; a batch goes on after a refused or timed-out command and ends when the session is lost."""
-        spec, comm = run.spec, driver.communicator
+                          borrow: _Borrow) -> list[OperationResult]:
+        """The mode's operations on the borrowed session, each named in run.steps as it starts. A batch goes on after a refused command on the same session, after a timed-out command on a fresh one, and ends when the session is lost."""
+        spec, comm, session = run.spec, driver.communicator, borrow.session
 
         def step(name: str) -> None:
             run.steps[index] = name
@@ -273,8 +304,17 @@ class Scheduler:
             for command in spec.commands:
                 step(command)
                 ops.append(await operation(command, lambda c=command: comm.show(session, c), spec.timeouts.command))
-                if isinstance(ops[-1].outcome, Fault) and ops[-1].outcome.kind is FaultKind.SESSION_LOST:
+                if not isinstance(ops[-1].outcome, Fault):
+                    continue
+                if ops[-1].outcome.kind is FaultKind.SESSION_LOST:
                     break
+                if ops[-1].outcome.kind is FaultKind.TIMEOUT and command != spec.commands[-1]:
+                    try:
+                        session = await self._fresh(run, index, target, driver, borrow)
+                    except Fault as f:
+                        ops.append(OperationResult(OPEN, f, now(), 0))
+                        break
+                    borrow.fresh_at = len(ops)
             return ops
         if spec.mode == "structured":
             ops = []
@@ -295,6 +335,23 @@ class Scheduler:
         if spec.mode == "confirm":
             return await lifecycle.confirm(comm, session, spec.timeouts)
         return [await lifecycle.commit_history(comm, session, spec.timeouts)]
+
+    async def _fresh(self, run: _Run, index: int, target: Target, driver: Driver, borrow: _Borrow) -> Session:
+        """A timed-out session ends there: torn down, and the rest of the batch gets a new one within the open budget."""
+        spec = run.spec
+        await self.sessions.release(driver, target, spec.credentials, discard=True, timeouts=spec.timeouts,
+                                    host_key_policy=spec.host_key_policy)
+        borrow.session = None
+        run.steps[index] = OPEN
+        if (reason := self.policy.login(self._device(target, driver))) is not None:
+            raise Fault(FaultKind.LOCAL, f"safety gate: {reason}", False)
+        try:
+            borrow.session = await asyncio.wait_for(
+                self.sessions.acquire(driver, target, spec.credentials, spec.timeouts, spec.host_key_policy),
+                spec.timeouts.connect + spec.timeouts.setup + GRACE_SECONDS)
+        except asyncio.TimeoutError as e:
+            raise Fault(FaultKind.TIMEOUT, "open has not returned within its budget", True) from e
+        return borrow.session
 
     @staticmethod
     def _lines_for(spec: RunSpec, target: Target) -> tuple[str, ...] | None:
@@ -403,8 +460,9 @@ class _on_interrupt:
 
 
 async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate | None = None,
-                  store: StoreWriter | None = None, pool: bool = False) -> RunReport:
-    """execute() with injected collaborators, for callers that have an event loop or want to inject."""
+                  store: StoreWriter | None = None, pool: bool = False,
+                  sessions: SessionManager | None = None) -> RunReport:
+    """execute() with injected collaborators, for callers that have an event loop or want to inject. A caller's `sessions` is used and left open for its next run; the run's own is closed at the end."""
     spec = complete(spec)
     if spec.mode == "structured" and not spec.format:
         raise Fault(FaultKind.LOCAL, "structured mode needs a format, json or xml; nothing was sent", False)
@@ -412,20 +470,28 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
         raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
     if spec.safety is not None:
         _plan_logins(spec, registry)
-    sessions = SessionManager(pool=pool)
+    own = sessions is None
+    sessions = sessions or SessionManager(pool=pool)
     scheduler = Scheduler(registry, Policy(spec.policy, gate), sessions, Recorder(spec.recording, store))
     try:
         return await scheduler.run(spec)
     finally:
-        await sessions.close_all()
+        if own:
+            await sessions.close_all()
         if gate is not None:
             _closed_quietly("safety gate", gate.close)
 
 
-def run(spec: RunSpec) -> RunReport:
-    """The entry point the front ends call: one RunSpec executed, its RunReport returned. Per-target failures are in the report; a local refusal before any device is contacted raises Fault(LOCAL)."""
+def run(spec: RunSpec, *, sessions: SessionManager | None = None) -> RunReport:
+    """The entry point the front ends call: one RunSpec executed, its RunReport returned. Per-target failures are in the report; a local refusal before any device is contacted raises Fault(LOCAL). A caller's `sessions` is used and left open, as with execute()."""
     from hssh.drivers import Registry
 
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("run() starts its own event loop; inside one, await execute() instead")
     spec = complete(spec)
     registry = Registry()
     registry.load_entry_points()
@@ -437,7 +503,7 @@ def run(spec: RunSpec) -> RunReport:
     except OSError as e:
         raise Fault(FaultKind.LOCAL, str(e), False) from e
     try:
-        return asyncio.run(execute(spec, registry, gate=gate, store=store))
+        return asyncio.run(execute(spec, registry, gate=gate, store=store, sessions=sessions))
     finally:
         if store is not None:
             _closed_quietly("store", store.close)

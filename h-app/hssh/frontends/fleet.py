@@ -10,11 +10,14 @@ The library reads no environment variable and no config file: what it is given i
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import importlib.metadata
 import logging
 import os
 import re
+import threading
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Callable, Union
@@ -166,15 +169,20 @@ def check_unique(targets: Sequence[Target]) -> None:
         by_host[where] = t.name
 
 
+def close_sessions(sessions, wait: float) -> None:
+    """Close a Fleet's kept sessions; also what a Fleet dropped without close() runs on collection or at exit."""
+    asyncio.run(sessions.close_all(timeout=wait))
+
+
 class Fleet:
-    """Devices and the settings every run on them shares; each method is one RunSpec run to a RunReport."""
+    """Devices and the settings every run on them shares; each method is one RunSpec run to a RunReport. The Fleet keeps its sessions: a device logged in once stays logged in until close(), the end of the `with` block, or the Fleet is collected."""
 
     def __init__(self, targets: Iterable[TargetLike] | TargetLike, transport: str = DEFAULT_TRANSPORT,
                  vendor: str = DEFAULT_VENDOR, user: str | None = None, password: str | None = None,
                  key_file: str | None = None, workers: int = DEFAULT_WORKERS, timeouts: Timeouts = DEFAULT_TIMEOUTS,
                  policy: PolicySettings = DEFAULT_POLICY, host_key_policy: HostKeyPolicy = DEFAULT_HOST_KEY_POLICY,
                  probe: bool = DEFAULT_PROBE, safety: SafetySettings | None = None,
-                 recording: RecordSettings | None = None, runner: Runner = run_spec):
+                 recording: RecordSettings | None = None, runner: Runner | None = None):
         quiet_library_logs()
         self.targets = as_targets(targets, transport, vendor)
         if not self.targets:
@@ -190,7 +198,47 @@ class Fleet:
             recording = dataclasses.replace(recording, origin=recording.origin or "fleet",
                                             version=recording.version or package_version())
         self.recording = recording
-        self._runner = runner
+        self._busy = threading.Lock()
+        self._closed = False
+        self._sessions = self._finalizer = None
+        if runner is None:
+            from hssh.orchestrator import CLOSE_WAIT, SessionManager
+
+            self._sessions = SessionManager(pool=True)
+            self._finalizer = weakref.finalize(self, close_sessions, self._sessions, CLOSE_WAIT)
+        self._runner = runner or self._run_pooled
+
+    def _run_pooled(self, spec: RunSpec) -> RunReport:
+        """One run on the Fleet's own session manager, so a device logged in once stays logged in for the next call."""
+        return run(spec, sessions=self._sessions)
+
+    def _run(self, spec: RunSpec) -> RunReport:
+        if self._closed:
+            raise RuntimeError("this Fleet is closed")
+        if not self._busy.acquire(blocking=False):
+            raise RuntimeError("a run on this Fleet is still in flight; one run at a time")
+        try:
+            return self._runner(spec)
+        finally:
+            self._busy.release()
+
+    def close(self, wait: float = 0.0) -> None:
+        """Close the kept sessions, giving the devices `wait` seconds in all to acknowledge; a closed Fleet refuses further runs."""
+        if self._closed:
+            return
+        if self._busy.locked():
+            raise RuntimeError("close() while a run is in flight; wait for it to return")
+        self._closed = True
+        if self._finalizer is not None:
+            self._finalizer.detach()
+        if self._sessions is not None:
+            close_sessions(self._sessions, wait)
+
+    def __enter__(self) -> "Fleet":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def spec(self, mode: Mode, commands: Sequence[str] = (), config_lines: Sequence[str] = (),
              payloads: Mapping[str, Sequence[str]] | None = None, format: str | None = None,
@@ -204,13 +252,13 @@ class Fleet:
                        safety=self.safety, recording=self.recording)
 
     def show(self, command: str) -> RunReport:
-        return self._runner(self.spec("show", commands=[command]))
+        return self._run(self.spec("show", commands=[command]))
 
     def batch(self, commands: Iterable[str]) -> RunReport:
-        return self._runner(self.spec("batch", commands=list(commands)))
+        return self._run(self.spec("batch", commands=list(commands)))
 
     def structured(self, rpc: str, fmt: str) -> RunReport:
-        return self._runner(self.spec("structured", commands=[rpc], format=fmt))
+        return self._run(self.spec("structured", commands=[rpc], format=fmt))
 
     def edit(self, lines: Iterable[str] | None = None, payloads: Mapping[str, Sequence[str]] | None = None,
              apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None, comment: str | None = None,
@@ -219,14 +267,14 @@ class Fleet:
         if lines is None and payloads is None:
             raise ValueError("edit needs lines or payloads")
         edit = EditSettings(apply=apply, confirmed_minutes=confirmed_minutes, comment=comment)
-        return self._runner(self.spec("edit", config_lines=list(lines or ()), payloads=payloads, edit=edit,
-                                      skip_unreachable=skip_unreachable))
+        return self._run(self.spec("edit", config_lines=list(lines or ()), payloads=payloads, edit=edit,
+                                   skip_unreachable=skip_unreachable))
 
     def confirm(self) -> RunReport:
-        return self._runner(self.spec("confirm"))
+        return self._run(self.spec("confirm"))
 
     def commit_status(self) -> RunReport:
-        return self._runner(self.spec("commit_status"))
+        return self._run(self.spec("commit_status"))
 
     def __len__(self) -> int:
         return len(self.targets)

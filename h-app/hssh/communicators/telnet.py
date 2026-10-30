@@ -53,6 +53,18 @@ class TelnetCommunicator:
     def close(self, session: Session) -> None:
         raise NotImplementedError
 
+    def reuse(self, session: Session, timeouts: Timeouts, idle_seconds: int) -> bool:
+        return False
+
+    def release(self, session: Session) -> None:
+        self.close(session)
+
+    def discard(self, session: Session) -> None:
+        try:
+            self.close(session)
+        except Exception:  # noqa: BLE001 - a session in doubt is torn down, never reported
+            pass
+
     def show(self, session: Session, command: str) -> Result:
         raise NotImplementedError
 

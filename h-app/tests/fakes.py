@@ -30,6 +30,16 @@ class FakeNetconf:
     def close(self, session):
         self.calls.append(("close", session["name"]))
 
+    def reuse(self, session, timeouts, idle_seconds):
+        self.calls.append(("reuse", session["name"]))
+        return True
+
+    def release(self, session):
+        self.calls.append(("release", session["name"]))
+
+    def discard(self, session):
+        self.calls.append(("discard", session["name"]))
+
     def show(self, session, command):
         self.calls.append(("show", command))
         return Result("output")
