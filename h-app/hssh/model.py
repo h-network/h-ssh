@@ -109,6 +109,15 @@ class Result:
     data: object | None = None
 
 
+@dataclass(frozen=True)
+class CommitStatus:
+    """The newest commit history entry: whether a commit-confirmed is pending and its minutes left."""
+
+    pending: bool
+    remaining_minutes: int | None
+    newest: str
+
+
 class FaultKind(Enum):
     """Why an operation failed (section 4.3)."""
 
@@ -165,4 +174,5 @@ class RunReport:
     failed: int
     skipped: int
     interrupted: bool = False
-    pending: dict[str, str] = field(default_factory=dict)
+    not_kept: int = 0
+    pending: dict[str, int] = field(default_factory=dict)

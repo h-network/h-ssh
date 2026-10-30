@@ -164,10 +164,10 @@ class Communicator(Protocol):
     def structured(self, session: Session, rpc: str, fmt: str) -> Result: ...   # NETCONF only
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
-    def diff(self, session: Session) -> Result: ...
+    def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
     def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result: ...
     def confirm(self, session: Session) -> Result: ...
-    def commit_history(self, session: Session) -> Result: ...
+    def commit_history(self, session: Session) -> Result: ...                 # data: CommitStatus
 ```
 
 Batch execution is the orchestrator calling `show` repeatedly on one session.
@@ -180,6 +180,12 @@ A refused or timed-out command does not stop the batch; a lost session does.
 class Result:
     output: str                  # device output as received
     data: object | None = None   # parsed structure, when the operation returns one
+
+@dataclass(frozen=True)
+class CommitStatus:              # commit_history's data, from the newest history entry
+    pending: bool
+    remaining_minutes: int | None
+    newest: str
 ```
 
 ### 4.3 Fault
@@ -257,7 +263,7 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
   An apply the operator declines gets one audit entry per target through `audit_aborted`.
 - **Apply** requires `-y`. Without it, an edit is a dry run.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
-  command that confirms them.
+  minutes left on each, from the device; the front end builds the command that confirms them.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
   uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.
 - The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file. Before the
@@ -272,7 +278,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
    target whose connect the interrupt cut short, or whose connect then ran out, with `reached_device` false, is
    recorded as skipped with the reason, not failed: nothing reached it and the operator stopped the run.
 3. A second interrupt reports what is still in flight. It does not abandon records.
-4. The run is always closed in the store, with counts for ok, failed and skipped.
+4. The run is always closed in the store, with counts for ok, failed and skipped. The report also counts the
+   records that could not be kept.
 
 ## 6. Data model
 
