@@ -137,13 +137,15 @@ class Scheduler:
                 task.cancel()
 
     async def _run_target(self, run: _Run, index: int, target: Target) -> TargetResult:
-        """One target: its driver, attempts while the policy says retry and no interrupt came, then its records."""
+        """One target: its driver, the dialect's check of an edit payload, attempts while the policy says retry and no interrupt came, then its records."""
         spec = run.spec
         try:
             driver = self.registry.resolve(target)
             self.registry.check_mode(driver, spec.mode)
         except Fault as f:
             return self._failed_before(run, target, f)
+        if spec.mode == "edit" and (why := driver.dialect.check_edit(list(spec.config_lines))):
+            return self._failed_before(run, target, Fault(FaultKind.LOCAL, why, False))
         attempt = 1
         while True:
             tried = await self._attempt(run, index, target, driver, attempt)
