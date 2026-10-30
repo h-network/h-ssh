@@ -62,8 +62,10 @@ The CLI, the Fleet library API, run files and profiles are front ends. Each one:
 
 - parses its input
 - resolves configuration precedence: flags, then run file, then profile, then `~/.h-ssh/config`, then
-  the orchestrator's defaults; the user alone has an environment step: `--user`, run file, `HSSH_USER`,
-  config `user`, then the login name
+  the orchestrator's defaults; four settings have an environment step between the run file and the
+  config: the user (`HSSH_USER`, then the login name) and the three paths `HSSH_STORE`, `HSSH_AUDIT_LOG`,
+  `HSSH_SAFETY_FILE`, resolved in `frontends/settings.py` for the CLI and `h-ssh-store` alike, so both
+  find the same store; an explicitly empty path is refused, not taken for the flag left out
 - builds a `RunSpec`
 - passes the `RunSpec` to the orchestrator and renders the `RunReport` it returns
 

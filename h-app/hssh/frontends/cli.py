@@ -21,7 +21,7 @@ from typing import Any, Sequence
 
 from hssh.dialects.base import Dialect
 from hssh.drivers import Registry
-from hssh.frontends import profiles
+from hssh.frontends import profiles, settings
 from hssh.frontends.fleet import (
     LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, package_version, parse_target, quiet_library_logs,
     run_spec,
@@ -52,7 +52,6 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "retry_pause": DEFAULT_POLICY.retry_pause, "host_key_policy": DEFAULT_HOST_KEY_POLICY, "probe": DEFAULT_PROBE,
     "skip_unreachable": DEFAULT_SKIP_UNREACHABLE,
     "cooldown": DEFAULT_SAFETY.cooldown_seconds, "rate_limit": DEFAULT_SAFETY.rate_limit,
-    "store": None, "audit_log": None, "safety_file": None,
 }
 CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 
@@ -141,7 +140,7 @@ def build_parser() -> _Parser:
                            help="edits: go on without the devices the probe found dead; they are skipped")
     behaviour.add_argument("--cooldown", type=int, metavar="SECONDS")
     behaviour.add_argument("--rate-limit", type=int, metavar="PER_MINUTE")
-    behaviour.add_argument("--safety-file", metavar="FILE")
+    behaviour.add_argument("--safety-file", metavar="FILE", help="safety gate state (or HSSH_SAFETY_FILE); off without one")
     behaviour.add_argument("--every", type=float, metavar="SECONDS", help="repeat the run and print what changed")
     behaviour.add_argument("--times", type=int, help="with --every: stop after this many runs")
 
@@ -149,9 +148,9 @@ def build_parser() -> _Parser:
     out.add_argument("--json", action="store_true", help="the report as JSON")
     out.add_argument("--raw", action="store_true", help="device output only")
     out.add_argument("-v", "--verbose", action="store_true")
-    out.add_argument("--store", metavar="FILE", help=f"SQLite result store (default: ./{DEFAULT_STORE})")
+    out.add_argument("--store", metavar="FILE", help=f"SQLite result store (or HSSH_STORE; default: ./{DEFAULT_STORE})")
     out.add_argument("--no-store", action="store_true")
-    out.add_argument("--audit-log", metavar="FILE", default=os.environ.get("HSSH_AUDIT_LOG") or None)
+    out.add_argument("--audit-log", metavar="FILE", help="JSONL audit trail of changes (or HSSH_AUDIT_LOG)")
     out.add_argument("--log", metavar="FILE")
     out.add_argument("--save-output", metavar="DIR")
     out.add_argument("--list-profiles", action="store_true")
@@ -174,6 +173,9 @@ def apply_config_defaults(args: argparse.Namespace, config: dict[str, str]) -> N
     """Fill options the command line and run file left unset: config file, then the built-in default."""
     if args.user is None:
         args.user = os.environ.get("HSSH_USER") or None
+    args.store = settings.store_path(args.store, config)
+    args.audit_log = settings.audit_log_path(args.audit_log, config)
+    args.safety_file = settings.safety_file_path(args.safety_file, config)
     for key, fallback in CONFIG_DEFAULTS.items():
         if getattr(args, key, None) is not None:
             continue
@@ -340,7 +342,7 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         skip_unreachable=args.skip_unreachable, edit=edit,
         policy=PolicySettings(retries=args.retries, retry_pause=args.retry_pause),
         safety=safety,
-        recording=RecordSettings(store_path=None if args.no_store else (args.store or DEFAULT_STORE),
+        recording=RecordSettings(store_path=None if args.no_store else args.store,
                                  audit_log_path=args.audit_log, log_path=args.log,
                                  save_output_path=args.save_output, argv=tuple(argv),
                                  origin="h-ssh", version=package_version()),
