@@ -1,6 +1,7 @@
 import re
 
 from hssh.dialects.base import Dialect
+from hssh.model import CommitStatus, Fault, FaultKind
 
 
 _VALUE = r'("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s;"\']+)'
@@ -10,12 +11,19 @@ _SECRET_WORDS = (r'password(?:-value)?|passwd|secret|key|key-string|key-hex|hexa
 
 class GenericDialect(Dialect):
     prompt_pattern: re.Pattern[str] = re.compile(r'[\w\-\.]+(\([^\s()]+\))?[>#]\s*$')
+    prompt_name_pattern: re.Pattern[str] = re.compile(r'^([\w\-\.]+)')
+    prompt_tail_pattern: re.Pattern[str] = re.compile(r'(\([^\s()]+\))?[>#]\s*$')
+    context_pattern: re.Pattern[str] | None = None
     paging_off_command: str | None = None
+    pager_pattern: re.Pattern[str] | None = re.compile(r'^\s*(?:--More--|---?\(more(?: \d+%)?\)---?)\s*$', re.I)
+    pager_reply: bytes = b" "
     refusal_patterns: tuple[re.Pattern[str], ...] = (re.compile(r"^\s*(error:|% )", re.M),)
     warning_patterns: tuple[re.Pattern[str], ...] = ()
     config_enter_command: str | None = "configure terminal"
     config_exit_command: str | None = "end"
     commit_command: str | None = None
+    diff_command: str | None = None
+    history_command: str | None = None
     discard_commands: tuple[str, ...] = ()
     has_candidate: bool = False
     redaction_patterns: tuple[re.Pattern[str], ...] = (
@@ -47,6 +55,17 @@ class GenericDialect(Dialect):
     def is_read(self, command: str) -> bool:
         text = command.strip().lower()
         return text.startswith("show ") or text.startswith("get") or text == "show"
+
+    def build_commit(self, confirmed_minutes: int | None, comment: str | None) -> str:
+        if self.commit_command is None:
+            raise Fault(FaultKind.UNSUPPORTED, "this dialect has no candidate configuration to commit", False)
+        return self.commit_command
+
+    def parse_commit_history(self, output: str) -> CommitStatus:
+        return CommitStatus(False, None, output.strip().splitlines()[0] if output.strip() else "")
+
+    def encode_line(self, text: str) -> bytes:
+        return text.encode("utf-8") + b"\n"
 
 
 DIALECT: Dialect = GenericDialect()

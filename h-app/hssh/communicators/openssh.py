@@ -9,6 +9,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -204,12 +205,19 @@ class ProcessChannel:
             return False
         return True
 
-    def send(self, data: bytes) -> None:
-        try:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
-        except (OSError, ValueError) as exc:
-            raise ConnectionError("connection lost: %s" % exc) from exc
+    def send(self, data: bytes, deadline: float) -> None:
+        fd = self.proc.stdin.fileno()
+        while data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("write to %s not finished by its deadline" % self.host)
+            try:
+                _, ready, _ = select.select([], [fd], [], remaining)
+                if not ready:
+                    raise TimeoutError("write to %s not finished by its deadline" % self.host)
+                data = data[os.write(fd, data):]
+            except (OSError, ValueError) as exc:
+                raise ConnectionError("connection lost: %s" % exc) from exc
 
     def log(self) -> str:
         return _read(self.log_path)
@@ -272,7 +280,7 @@ class OpenSSH:
             channel = ProcessChannel.open(argv, askpass.env, target.host, log_path)
             engine = CliEngine(channel, self.dialect, timeouts, echoes=True)
             try:
-                engine.login()
+                engine.login(time.monotonic() + timeouts.setup)
             except (ConnectionError, TimeoutError) as exc:
                 log = channel.log()
                 channel.close()

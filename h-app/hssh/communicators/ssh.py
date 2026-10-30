@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -26,8 +28,13 @@ class ShellChannel:
             raise ConnectionError("SSH channel closed by peer")
         return data
 
-    def send(self, data: bytes) -> None:
-        self.channel.sendall(data)
+    def send(self, data: bytes, deadline: float) -> None:
+        while data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("write not finished by its deadline")
+            self.channel.settimeout(remaining)
+            data = data[self.channel.send(data):]
 
     def close(self) -> None:
         self.channel.close()
