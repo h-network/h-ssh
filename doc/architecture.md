@@ -226,6 +226,9 @@ class Communicator(Protocol):
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...
     def close(self, session: Session) -> None: ...
+    def reuse(self, session: Session, timeouts: Timeouts, idle_seconds: int) -> bool: ...  # before a borrow: apply the timeouts; cheap check always, the device asked only past idle_seconds
+    def release(self, session: Session) -> None: ...   # end of a borrow: discard the candidate, unlock; raises Fault when that fails
+    def discard(self, session: Session) -> None: ...   # session in doubt: tear down, no rollback or unlock, interrupt a running call, never raises
 
     def show(self, session: Session, command: str) -> Result: ...
     def structured(self, session: Session, rpc: str, fmt: str) -> Result: ...   # NETCONF only

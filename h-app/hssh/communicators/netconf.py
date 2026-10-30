@@ -506,6 +506,15 @@ class NetconfCommunicator(Communicator):
         if failure is not None:
             raise failure
 
+    def reuse(self, session: Session, timeouts: Timeouts, idle_seconds: int) -> bool:
+        return False
+
+    def release(self, session: Session) -> None:
+        self.close(session)
+
+    def discard(self, session: Session) -> None:
+        self._discard(cast(NetconfSession, session))
+
     def show(self, session: Session, command: str) -> Result:
         from lxml import etree
 
