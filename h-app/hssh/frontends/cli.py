@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+from hssh.dialects.base import Dialect
 from hssh.drivers import Registry
 from hssh.frontends import profiles
 from hssh.frontends.fleet import (
@@ -209,18 +210,33 @@ def resolve_credentials(args: argparse.Namespace) -> Credentials:
     return Credentials(username=user, password=password)
 
 
-def comment_prefixes(targets: Sequence[Target]) -> tuple[str, ...]:
-    """What starts a full-line comment for every target's dialect; a target without a driver is left to run() to refuse."""
+def target_dialects(targets: Sequence[Target]) -> list[Dialect]:
+    """Each target's dialect; a target without a driver is left to run() to refuse."""
     registry = Registry()
     registry.load_entry_points()
-    common: set[str] | None = None
+    dialects = []
     for target in targets:
         try:
-            prefixes = set(registry.resolve(target).dialect.comment_prefixes)
+            dialects.append(registry.resolve(target).dialect)
         except Fault:
             continue
+    return dialects
+
+
+def comment_prefixes(dialects: Sequence[Dialect]) -> tuple[str, ...]:
+    """What starts a full-line comment for every dialect given."""
+    common: set[str] | None = None
+    for dialect in dialects:
+        prefixes = set(dialect.comment_prefixes)
         common = prefixes if common is None else common & prefixes
     return tuple(sorted(common or ()))
+
+
+def check_payload(dialects: Sequence[Dialect], lines: Sequence[str]) -> None:
+    """The first dialect refusal of the payload, said before the password; the orchestrator's gate enforces the same."""
+    for dialect in dialects:
+        if why := dialect.check_edit(list(lines)):
+            raise ValueError(why)
 
 
 def payload_lines(text: str, prefixes: Sequence[str]) -> tuple[str, ...]:
@@ -251,7 +267,9 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         commands = tuple(args.batch_commands or profiles.read_commands(Path(args.batch)))
     elif mode == "edit":
         text = args.edit_command or Path(args.edit_file).read_text(encoding="utf-8-sig")
-        config_lines = payload_lines(text, comment_prefixes(targets))
+        dialects = target_dialects(targets)
+        config_lines = payload_lines(text, comment_prefixes(dialects))
+        check_payload(dialects, config_lines)
     edit = None
     if mode == "edit":
         edit = EditSettings(apply=args.yes, confirmed_minutes=args.commit_confirmed, comment=args.comment)
