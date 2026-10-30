@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import pty
 import re
 import select
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
+import termios
+import time
+import tty
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -32,7 +38,17 @@ _STRICT_HOST_KEY = {"accept-new": "accept-new", "strict": "yes", "off": "no"}
 
 _EXIT_GRACE = 2.0
 
+_POLL = 0.1
+
+# Rows and columns ssh requests for the remote pty, the size paramiko's shell asks for (#166).
+_PTY_SIZE = (1000, 511)
+
+_BANNER = "Remote protocol version"
+
 _SESSION_UP = ("Authenticated to ", "Entering interactive session")
+
+_HOST_KEY = ("Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED",
+             "REVOKED HOST KEY", "marked as revoked")
 
 _CLOSED = ("Connection closed by", "Connection reset", "kex_exchange_identification")
 
@@ -144,13 +160,13 @@ def _ssh_argv(target: Target, creds: Credentials, timeouts: Timeouts, policy: Ho
     return argv + ["--", "%s@%s" % (creds.username, target.host)]
 
 
-def _login_fault(host: str, log: str, setup: int | None = None) -> Fault:
-    """Classify a failed login from ssh's own log; `setup` is the engine's wait that ran out, when it did."""
+def _login_fault(host: str, log: str, waited: int | None = None) -> Fault:
+    """Classify a failed login from ssh's own log; `waited` is the wait that ran out, in seconds, when one did."""
     detail = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug"))
-    reached = "Remote protocol version" in log
+    reached = _BANNER in log
     if "Permission denied" in detail or "Authentication failed" in detail:
         return Fault(FaultKind.AUTH, detail, reached)
-    if "Host key verification failed" in detail or "REMOTE HOST IDENTIFICATION HAS CHANGED" in detail:
+    if any(marker in detail for marker in _HOST_KEY):
         return Fault(FaultKind.HOST_KEY, detail, reached)
     if "timed out" in detail:
         return Fault(FaultKind.TIMEOUT, detail, reached)
@@ -159,43 +175,63 @@ def _login_fault(host: str, log: str, setup: int | None = None) -> Fault:
         return Fault(FaultKind.AUTH, detail, reached)
     if any(marker in detail for marker in _CLOSED) or any(marker in log for marker in _SESSION_UP):
         return Fault(FaultKind.SESSION_LOST, detail, True)
-    if setup is not None:
+    if waited is not None:
         if reached:
-            return Fault(FaultKind.TIMEOUT, "the banner came, but key exchange did not finish within %ds" % setup, True)
-        return Fault(FaultKind.TIMEOUT, "no SSH banner within %ds" % setup, False)
+            return Fault(FaultKind.TIMEOUT, "the banner came, but key exchange did not finish within %ds" % waited, True)
+        return Fault(FaultKind.TIMEOUT, "no SSH banner within %ds" % waited, False)
     return Fault(FaultKind.UNREACHABLE, detail, reached)
 
 
 class ProcessChannel:
-    """The ssh process's pipes as the CLI engine's channel: recv(n, timeout), send(data), close()."""
+    """The ssh process on a local pty as the CLI engine's channel: recv(n, timeout), send(data), close()."""
 
-    def __init__(self, proc: subprocess.Popen, host: str, log_path: str):
+    def __init__(self, proc: subprocess.Popen, master: int, host: str, log_path: str):
         self.proc = proc
+        self.master = master
         self.host = host
         self.log_path = log_path
         self.closed = False
 
     @classmethod
     def open(cls, argv: list[str], env: dict[str, str], host: str, log_path: str) -> ProcessChannel:
+        master, slave = pty.openpty()
         try:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, env=env, bufsize=0)
+            tty.setraw(slave)
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", *_PTY_SIZE, 0, 0))
+            proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=subprocess.DEVNULL,
+                                    env=env, start_new_session=True)
         except OSError as exc:
+            os.close(master)
+            os.close(slave)
             _unlink(log_path)
             raise Fault(FaultKind.LOCAL, str(exc), reached_device=False) from exc
-        return cls(proc, host, log_path)
+        os.close(slave)
+        return cls(proc, master, host, log_path)
 
     def recv(self, n: int, timeout: float) -> bytes:
         try:
-            ready, _, _ = select.select([self.proc.stdout], [], [], max(0.0, timeout))
+            ready, _, _ = select.select([self.master], [], [], max(0.0, timeout))
         except (OSError, ValueError) as exc:
             raise ConnectionError("connection lost: %s" % exc) from exc
         if not ready:
             raise TimeoutError("nothing from %s within %.1fs" % (self.host, timeout))
-        data = os.read(self.proc.stdout.fileno(), n)
+        try:
+            data = os.read(self.master, n)
+        except OSError:
+            data = b""
         if not data and self._ended():
             raise ConnectionError(self.log())
         return data
+
+    def wait_for_banner(self, seconds: int) -> None:
+        """Block until the device's SSH banner is in ssh's log, or ssh ended, or `seconds` passed."""
+        until = time.monotonic() + seconds + _EXIT_GRACE
+        while _BANNER not in self.log():
+            if self.proc.poll() is not None:
+                raise ConnectionError(self.log())
+            if time.monotonic() >= until:
+                raise TimeoutError("no SSH banner from %s within %ds" % (self.host, seconds))
+            time.sleep(_POLL)
 
     def _ended(self) -> bool:
         try:
@@ -205,10 +241,11 @@ class ProcessChannel:
         return True
 
     def send(self, data: bytes) -> None:
+        view = memoryview(data)
         try:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
-        except (OSError, ValueError) as exc:
+            while view:
+                view = view[os.write(self.master, view):]
+        except OSError as exc:
             raise ConnectionError("connection lost: %s" % exc) from exc
 
     def log(self) -> str:
@@ -220,7 +257,7 @@ class ProcessChannel:
         self.closed = True
         proc = self.proc
         try:
-            proc.stdin.close()
+            os.close(self.master)
         except OSError:
             pass
         if proc.poll() is None:
@@ -271,13 +308,15 @@ class OpenSSH:
             argv = _ssh_argv(target, creds, timeouts, host_key_policy, log_path)
             channel = ProcessChannel.open(argv, askpass.env, target.host, log_path)
             engine = CliEngine(channel, self.dialect, timeouts, echoes=True)
+            waited = timeouts.connect
             try:
-                engine.login()
+                channel.wait_for_banner(timeouts.connect)
+                waited = timeouts.setup
+                engine.login(deadline=time.monotonic() + timeouts.setup)
             except (ConnectionError, TimeoutError) as exc:
                 log = channel.log()
                 channel.close()
-                setup = timeouts.setup if isinstance(exc, TimeoutError) else None
-                raise _login_fault(target.host, log, setup) from exc
+                raise _login_fault(target.host, log, waited if isinstance(exc, TimeoutError) else None) from exc
             except BaseException:
                 channel.close()
                 raise
@@ -296,10 +335,7 @@ class OpenSSH:
         self.close(session)
 
     def discard(self, session: OpenSSHSession) -> None:
-        try:
-            self.close(session)
-        except Exception:  # noqa: BLE001 - a session in doubt is torn down, never reported
-            pass
+        session.channel.close()
 
     def show(self, session: OpenSSHSession, command: str) -> Result:
         return session.engine.show(command)
