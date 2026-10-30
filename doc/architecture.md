@@ -369,6 +369,8 @@ the worker limit, the safety
 settings, and the recording settings (the record paths, and the run row's provenance: `argv`, `origin` and
 `version`, supplied by the front end, all optional).
 
+Structured mode is the library's call, `Fleet.structured(command, fmt)`: exactly one `show` command on one line, with `fmt` `json` or `xml`, both checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The NETCONF communicator asks PyEZ for the command in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; the CLI has no structured mode.
+
 ### 5.2 Concurrency
 
 The orchestrator runs on asyncio. Blocking libraries such as paramiko and PyEZ run on daemon worker threads, at most
