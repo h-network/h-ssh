@@ -475,6 +475,12 @@ def run(spec: RunSpec, *, sessions: SessionManager | None = None) -> RunReport:
     """The entry point the front ends call: one RunSpec executed, its RunReport returned. Per-target failures are in the report; a local refusal before any device is contacted raises Fault(LOCAL). A caller's `sessions` is used and left open, as with execute()."""
     from hssh.drivers import Registry
 
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("run() starts its own event loop; inside one, await execute() instead")
     spec = complete(spec)
     registry = Registry()
     registry.load_entry_points()

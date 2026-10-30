@@ -187,4 +187,7 @@ class SessionManager:
             if entry.session is not None:
                 how = entry.communicator.discard if entry.in_use else entry.communicator.close
                 self._start(_Close("", ""), how, entry.session)
-        await asyncio.to_thread(self.wait_for_closes, timeout)
+        try:
+            await asyncio.to_thread(self.wait_for_closes, timeout)
+        except RuntimeError:
+            self.wait_for_closes(timeout)
