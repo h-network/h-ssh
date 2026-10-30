@@ -256,7 +256,9 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
   command that confirms them.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
   uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.
-- The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file.
+- The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file. Before the
+  run starts, the policy counts the logins the run may make to one device (retries + 1 per listing) against the rate
+  limit and refuses the run when it would pass it, so the gate never turns a device away half-way.
 
 ### 5.4 Cancellation
 

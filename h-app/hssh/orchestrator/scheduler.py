@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
 import threading
 import signal
@@ -19,7 +20,7 @@ from hssh.orchestrator.defaults import GRACE_SECONDS, complete
 from hssh.orchestrator.lifecycle import EditLifecycle, Stage, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
-from hssh.orchestrator.sessions import SessionManager
+from hssh.orchestrator.sessions import SessionManager, session_key
 
 READ_MODES = ("show", "batch", "structured", "commit_status")
 
@@ -272,6 +273,19 @@ class _DaemonThreads(concurrent.futures.ThreadPoolExecutor):
         threading.Thread(target=run, name=self._thread_name_prefix, daemon=True).start()
         return future
 
+def _plan_logins(spec: RunSpec, registry: DriverRegistry) -> None:
+    """The logins the run may make per device, retries + 1 per listing, against the rate limit: a run that would pass it is refused here, so the gate never turns a device away half-way."""
+    devices: collections.Counter = collections.Counter()
+    for target in spec.targets:
+        try:
+            devices[session_key(registry.resolve(target), target, spec.credentials)] += 1
+        except Fault:
+            devices[(target.host, target.port)] += 1
+    logins = max(devices.values(), default=0) * (spec.policy.retries + 1)
+    if logins > spec.safety.rate_limit:
+        raise Fault(FaultKind.LOCAL, f"the run may log in {logins} times to one device, above the rate limit of "
+                    f"{spec.safety.rate_limit} per minute; lower retries or raise the limit; nothing was sent", False)
+
 
 class _on_interrupt:
     """SIGINT handed to `handler` while the run is on; where no handler can be installed, the run is left as it was."""
@@ -297,6 +311,8 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
     spec = complete(spec)
     if spec.mode == "structured" and not spec.format:
         raise Fault(FaultKind.LOCAL, "structured mode needs a format, json or xml; nothing was sent", False)
+    if spec.safety is not None:
+        _plan_logins(spec, registry)
     sessions = SessionManager(pool=pool)
     scheduler = Scheduler(registry, Policy(spec.policy, gate), sessions, Recorder(spec.recording, store))
     try:
