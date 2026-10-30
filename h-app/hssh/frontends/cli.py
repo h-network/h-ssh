@@ -41,7 +41,7 @@ from hssh.orchestrator import (
 )
 from hssh.paths import path_inside, validate_device_name
 from hssh.screen import is_terminal, terminal_safe
-from hssh.store import Store, json_data
+from hssh.store import Store, operation_dict
 
 TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
 HOST_KEY_CHOICES = ("accept-new", "strict", "off")
@@ -475,18 +475,13 @@ def summary_line(report: RunReport) -> str:
 
 
 def report_dict(report: RunReport) -> dict[str, Any]:
-    def outcome(op) -> dict[str, Any]:
-        if isinstance(op.outcome, Fault):
-            return {"ok": False, "fault": op.outcome.kind.name, "detail": op.outcome.detail}
-        return {"ok": True, "output": op.outcome.output, "data": json_data(op.outcome.data)}
-
+    """The report as JSON data; each operation is the store's operation_dict, so --json, saved batches and the store rows agree."""
     return {
         "run_id": report.run_id, "mode": report.mode, "started": report.started, "finished": report.finished,
         "ok": report.ok, "failed": report.failed, "skipped": report.skipped, "interrupted": report.interrupted,
         "not_kept": report.not_kept, "pending": dict(report.pending),
         "results": [{"target": tr.target.name, "host": tr.target.host, "status": tr.status,
-                     "operations": [{"command": op.command, "started": op.started, "elapsed_ms": op.elapsed_ms,
-                                     **outcome(op)} for op in tr.operations]} for tr in report.results],
+                     "operations": [operation_dict(op) for op in tr.operations]} for tr in report.results],
     }
 
 

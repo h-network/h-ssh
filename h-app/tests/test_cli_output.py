@@ -79,7 +79,7 @@ def test_json_marks_a_failed_operation(cli_run):
     _, _, out, _ = cli_run("R1:10.0.0.1:junos", "-sC", "x", "--json", *NETCONF, reports=[rep])
     operation = json.loads(out)["results"][0]["operations"][0]
     assert operation == {"command": "open", "started": "2026-10-30T10:00:00+00:00", "elapsed_ms": 5, "ok": False,
-                         "fault": "TIMEOUT", "detail": "no answer"}
+                         "fault": "TIMEOUT", "detail": "no answer", "reached_device": False}
 
 
 def test_the_reminder_names_the_minutes_and_the_confirm_command(cli_run):

@@ -109,7 +109,8 @@ device output only and the verdict goes to stderr when something failed, was ski
 `Interrupted. Completed a of n device(s).` Device text shown on a terminal goes through `hssh.screen.terminal_safe`
 (control sequences stripped); a pipe, a file and the store get it as it came. A reader that leaves (`| head`)
 ends the program quietly with exit 0: the record is the store, the screen is best effort. `--json`
-renders each `Result.data` through the store's `json_data`, so the file and the store hold the same shapes.
+renders each operation through the store's `operation_dict` (`Result.data` via `json_data`, a fault with its
+`reached_device`), so `--json`, a saved batch's JSON and the store rows agree field for field.
 The run's provenance in `RecordSettings` is the front end's: `origin` is `h-ssh` from the CLI and `fleet` from
 the library (unless the caller set one), `version` is the installed package version from `importlib.metadata`,
 None when h-ssh runs from source. Set-file names and containment (`-eD`) use the shared `hssh.paths` helpers.
