@@ -3,6 +3,7 @@
 The `junos@netconf` driver supports `show` and `batch` through PyEZ. Connections use
 port 830 unless the target specifies another port. The connect timeout is passed
 to PyEZ, and the command timeout applies to operations on the open session.
+TCP connect and the SSH banner share the connect timeout; after the banner, key exchange, login and NETCONF hello share one setup timeout.
 Port 23 is rejected before any connection; NETCONF never falls back to telnet.
 Show output has leading and trailing newlines removed.
 A reply beginning with a Junos refusal is reported as a failed command. Plain-text
@@ -33,8 +34,17 @@ applies only while this communicator opens a PyEZ device; other ncclient session
 keep their normal loader. New entries start on their own line and are appended under a file lock, preserving
 the file's existing content, then refreshing the file cache and its resolutions.
 A new process reads external changes to known-hosts files.
+With `strict` or `accept-new`, revoked keys are refused even if a normal entry
+matches; certificate-authority entries are skipped. Before pinning, accept-new
+re-reads the file under its lock and checks any key pinned by another process.
+Waiting for that lock is limited to the connect timeout and fails as a local fault.
+Appending preserves existing bytes, including comments that are not UTF-8.
 
 Library failures become `Fault` with the library's message and whether the
-operation may have reached the device. The communicator does not retry. Closing
-a configuration session attempts candidate discard, unlock and disconnect even
+operation may have reached the device. The communicator does not retry.
+Running out of local file descriptors is a local fault with the OS error preserved;
+it does not retry or put the target into cooldown.
+Closing a configuration session attempts candidate discard, unlock and disconnect even
 if an earlier cleanup step fails, then reports the first failure.
+The background close waits up to five seconds for close-session. If closing fails,
+it tears down the underlying transport so its reader thread does not linger.

@@ -16,7 +16,9 @@ from hssh.orchestrator.lifecycle import now
 CLOSE_WAIT = 1.0
 
 def session_key(driver: Driver, target: Target, creds: Credentials) -> Hashable:
-    return (driver.name, target.host, target.port, creds.username)
+    """One device is its host and the port the connection uses: the target's own, else the communicator's default."""
+    port = target.port if target.port is not None else driver.communicator.default_port
+    return (driver.name, target.host, port, creds.username)
 
 
 @dataclass

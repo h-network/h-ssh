@@ -7,11 +7,14 @@ import getpass
 
 from hssh.model import Credentials, EditSettings, HostKeyPolicy, PolicySettings, RunSpec, SafetySettings, Timeouts
 
-DEFAULT_TIMEOUTS = Timeouts(connect=3, command=20, commit=60)
+DEFAULT_TIMEOUTS = Timeouts(connect=3, setup=30, command=20, commit=60)
 DEFAULT_POLICY = PolicySettings(retries=2, retry_pause=2)
+CONNECT_BACKOFF = (0.5, 1.0)
+GRACE_SECONDS = 10
 DEFAULT_WORKERS = 8
 DEFAULT_HOST_KEY_POLICY: HostKeyPolicy = "off"
 DEFAULT_PROBE = True
+DEFAULT_SKIP_UNREACHABLE = False
 DEFAULT_EDIT = EditSettings(apply=False)
 DEFAULT_CONFIRMED_MINUTES = 10
 DEFAULT_SAFETY = SafetySettings(cooldown_seconds=300, rate_limit=6)
@@ -37,6 +40,7 @@ def complete(spec: RunSpec) -> RunSpec:
         workers=DEFAULT_WORKERS if spec.workers is None else spec.workers,
         host_key_policy=spec.host_key_policy or DEFAULT_HOST_KEY_POLICY,
         probe=DEFAULT_PROBE if spec.probe is None else spec.probe,
+        skip_unreachable=DEFAULT_SKIP_UNREACHABLE if spec.skip_unreachable is None else spec.skip_unreachable,
         edit=spec.edit or DEFAULT_EDIT,
         policy=spec.policy or DEFAULT_POLICY,
     )

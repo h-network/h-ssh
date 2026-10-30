@@ -9,7 +9,7 @@ from typing import Protocol, Sequence
 
 from hssh.dialects.base import Dialect
 from hssh.model import Fault, FaultKind, PolicySettings, Target
-from hssh.orchestrator.defaults import DEFAULT_POLICY
+from hssh.orchestrator.defaults import CONNECT_BACKOFF, DEFAULT_POLICY
 
 # The communicator's operation that opens the session: a fault from it is "before login".
 OPEN = "open"
@@ -58,9 +58,11 @@ def decide(fault: Fault, *, read: bool, editing: bool, operation: str, attempt: 
     """The default policy table (section 4.4) for one fault on attempt `attempt` (1-based) of operation `operation`."""
     kind = fault.kind
     retries_left = attempt <= settings.retries
-    if kind in (FaultKind.UNREACHABLE, FaultKind.TIMEOUT) and operation == OPEN:
-        return Verdict(Action.RETRY if retries_left else Action.FAIL)
-    if kind in (FaultKind.AUTH, FaultKind.HOST_KEY, FaultKind.UNSUPPORTED, FaultKind.LOCAL):
+    if operation == OPEN and kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST):
+        unanswered = kind is FaultKind.TIMEOUT and not fault.reached_device
+        dropped = kind is FaultKind.SESSION_LOST
+        return Verdict(Action.RETRY if (unanswered or dropped) and retries_left else Action.FAIL)
+    if kind in (FaultKind.UNREACHABLE, FaultKind.AUTH, FaultKind.HOST_KEY, FaultKind.UNSUPPORTED, FaultKind.LOCAL):
         return Verdict(Action.FAIL)
     if kind is FaultKind.OUTCOME_UNKNOWN:
         return Verdict(Action.FAIL, cool_down=True, note="commit outcome unknown: check the device")
@@ -98,5 +100,7 @@ class Policy:
         else:
             self.gate.release_device(target)
 
-    async def pause(self) -> None:
-        await asyncio.sleep(self.settings.retry_pause)
+    async def pause(self, attempt: int, opening: bool) -> None:
+        """Before attempt + 1: the connect backoff after a failed open, else the settings' retry pause."""
+        backoff = CONNECT_BACKOFF[min(attempt, len(CONNECT_BACKOFF)) - 1] if opening else self.settings.retry_pause
+        await asyncio.sleep(backoff)

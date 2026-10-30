@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from hssh.frontends import profiles
-from hssh.frontends.fleet import LIBRARY_LOGGERS, Runner, load_devices_csv, parse_target, quiet_library_logs, run_spec
+from hssh.frontends.fleet import (
+    LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, parse_target, quiet_library_logs, run_spec,
+)
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
     Credentials, EditSettings, Fault, Mode, PolicySettings, RecordSettings, RunReport, RunSpec,
@@ -25,6 +27,7 @@ from hssh.model import (
 )
 from hssh.orchestrator import (
     DEFAULT_CONFIRMED_MINUTES, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SAFETY,
+    DEFAULT_SKIP_UNREACHABLE,
     DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, default_username,
 )
 
@@ -35,9 +38,10 @@ FORMAT_CHOICES = ("text", "json", "xml")
 # Config-file keys with the orchestrator's default; None means "no value".
 CONFIG_DEFAULTS: dict[str, Any] = {
     "transport": DEFAULT_TRANSPORT, "vendor": DEFAULT_VENDOR, "user": None, "workers": DEFAULT_WORKERS,
-    "connect_timeout": DEFAULT_TIMEOUTS.connect, "command_timeout": DEFAULT_TIMEOUTS.command,
-    "commit_timeout": DEFAULT_TIMEOUTS.commit, "retries": DEFAULT_POLICY.retries,
+    "connect_timeout": DEFAULT_TIMEOUTS.connect, "session_timeout": DEFAULT_TIMEOUTS.setup,
+    "command_timeout": DEFAULT_TIMEOUTS.command, "commit_timeout": DEFAULT_TIMEOUTS.commit, "retries": DEFAULT_POLICY.retries,
     "retry_pause": DEFAULT_POLICY.retry_pause, "host_key_policy": DEFAULT_HOST_KEY_POLICY, "probe": DEFAULT_PROBE,
+    "skip_unreachable": DEFAULT_SKIP_UNREACHABLE,
     "cooldown": DEFAULT_SAFETY.cooldown_seconds, "rate_limit": DEFAULT_SAFETY.rate_limit,
     "store": None, "audit_log": None, "safety_file": None,
 }
@@ -113,11 +117,15 @@ def build_parser() -> _Parser:
     behaviour.add_argument("--retries", type=int)
     behaviour.add_argument("--retry-pause", type=int, metavar="SECONDS")
     behaviour.add_argument("--connect-timeout", type=int, metavar="SECONDS")
+    behaviour.add_argument("--session-timeout", type=int, metavar="SECONDS",
+                           help="seconds for the session setup after the SSH banner: key exchange, login, NETCONF hello")
     behaviour.add_argument("--command-timeout", type=int, metavar="SECONDS")
     behaviour.add_argument("--commit-timeout", type=int, metavar="SECONDS")
     behaviour.add_argument("--host-key-policy", choices=HOST_KEY_CHOICES)
     behaviour.add_argument("--probe", dest="probe", action="store_const", const=True, default=None, help="reachability check before the run")
     behaviour.add_argument("--no-probe", dest="probe", action="store_const", const=False)
+    behaviour.add_argument("--skip-unreachable", action="store_const", const=True, default=None,
+                           help="edits: go on without the devices the probe found dead; they are skipped")
     behaviour.add_argument("--cooldown", type=int, metavar="SECONDS")
     behaviour.add_argument("--rate-limit", type=int, metavar="PER_MINUTE")
     behaviour.add_argument("--safety-file", metavar="FILE")
@@ -166,8 +174,11 @@ def apply_config_defaults(args: argparse.Namespace, config: dict[str, str]) -> N
 
 def resolve_targets(args: argparse.Namespace) -> tuple[Target, ...]:
     if args.target:
-        return tuple(parse_target(s, args.transport, args.vendor) for s in args.target)
-    return tuple(load_devices_csv(args.devices or default_devices_path(), args.transport, args.vendor))
+        targets = [parse_target(s, args.transport, args.vendor) for s in args.target]
+    else:
+        targets = load_devices_csv(args.devices or default_devices_path(), args.transport, args.vendor)
+    check_unique(targets)
+    return tuple(targets)
 
 
 def resolve_mode(args: argparse.Namespace) -> Mode:
@@ -176,6 +187,8 @@ def resolve_mode(args: argparse.Namespace) -> Mode:
                                  ("commit_status", args.commit_status)) if given]
     if len(chosen) != 1:
         raise ValueError("give exactly one of -sC, --batch/--profile, -eC/-eB, --confirm, --commit-status")
+    if args.skip_unreachable and chosen[0] != "edit":
+        raise ValueError("--skip-unreachable goes with an edit (-eC, -eB)")
     if chosen[0] == "show" and args.format not in (None, "text"):
         return "structured"
     return chosen[0]
@@ -211,8 +224,10 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         targets=resolve_targets(args), mode=mode, commands=commands, config_lines=config_lines,
         format=args.format if mode == "structured" else None,
         credentials=resolve_credentials(args),
-        timeouts=Timeouts(connect=args.connect_timeout, command=args.command_timeout, commit=args.commit_timeout),
-        workers=args.workers, host_key_policy=args.host_key_policy, probe=args.probe, edit=edit,
+        timeouts=Timeouts(connect=args.connect_timeout, setup=args.session_timeout, command=args.command_timeout,
+                          commit=args.commit_timeout),
+        workers=args.workers, host_key_policy=args.host_key_policy, probe=args.probe,
+        skip_unreachable=args.skip_unreachable, edit=edit,
         policy=PolicySettings(retries=args.retries, retry_pause=args.retry_pause),
         safety=safety,
         recording=RecordSettings(store_path=None if args.no_store else (args.store or DEFAULT_STORE),
@@ -226,6 +241,10 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
         print(json.dumps(report_dict(report), indent=2), file=out)
         return
     for tr in report.results:
+        if tr.status == "skipped":
+            faults = [op.outcome.detail for op in tr.operations if isinstance(op.outcome, Fault)]
+            print(f"{tr.target.name}: SKIPPED" + (f": {faults[0]}" if faults else ""), file=out)
+            continue
         for op in tr.operations:
             if isinstance(op.outcome, Fault) and op.command == "close":
                 print(f"WARNING: {tr.target.name}: close failed: {op.outcome.detail}", file=sys.stderr)
@@ -236,8 +255,6 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
             if not args.raw:
                 print(f"=== {tr.target.name} ({tr.target.host}) {op.command} [{op.elapsed_ms} ms]", file=out)
             print(op.outcome.output, file=out)
-        if tr.status == "skipped":
-            print(f"{tr.target.name}: SKIPPED", file=out)
     if not args.raw:
         print(f"run {report.run_id}: {report.ok} ok, {report.failed} failed, {report.skipped} skipped", file=out)
         for name, command in report.pending.items():

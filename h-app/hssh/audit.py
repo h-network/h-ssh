@@ -50,5 +50,7 @@ def write_audit_entry(
     edit: EditSettings,
     diff: str = "",
 ) -> None:
-    """Append JSONL using operation.started as time; write errors propagate."""
+    """Append JSONL using operation.started as time; write errors propagate.
+    Actions: load, diff, commit, confirm, probe (edit stopped by probe failure), aborted (operator declined).
+    """
     raise NotImplementedError

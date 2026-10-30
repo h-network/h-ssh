@@ -186,10 +186,10 @@ class Result:
 
 ```python
 class FaultKind(Enum):
-    UNREACHABLE      # no connection, or no response before login
+    UNREACHABLE      # the connect was refused or cannot be attempted: nothing listening, no route, no such name
     AUTH             # credentials rejected
     HOST_KEY         # host key rejected by the communicator's library
-    TIMEOUT          # no response within the timeout during a session
+    TIMEOUT          # nothing answered in time: at open, no TCP answer or no SSH banner within the connect timeout (reached_device false), or the banner came and setup did not finish within the setup budget (true); in session, no reply
     SESSION_LOST     # the session closed unexpectedly
     REFUSED          # the device rejected the command or configuration
     COMMIT_FAILED    # the commit was rejected; nothing was committed
@@ -211,7 +211,10 @@ device, unless the dialect marks it as a read.
 
 | Fault | Read | Edit, nothing reached the device | Edit, reached the device |
 |---|---|---|---|
-| `UNREACHABLE`, `TIMEOUT` before login | retry, then fail | retry, then fail | n/a |
+| `UNREACHABLE` before login | fail | fail | n/a |
+| `TIMEOUT` before login, no TCP answer or no SSH banner (`reached_device` false) | retry after 0.5 s, then 1 s, then fail | retry after 0.5 s, then 1 s, then fail | n/a |
+| `SESSION_LOST` before login, the device dropped the connection during setup | retry after 0.5 s, then 1 s, then fail | retry after 0.5 s, then 1 s, then fail | n/a |
+| `TIMEOUT` before login, the banner came but setup did not finish in the setup budget (`reached_device` true) | fail | fail | n/a |
 | `AUTH`, `HOST_KEY` | fail | fail | n/a |
 | `TIMEOUT`, `SESSION_LOST` in session | retry | fail | fail, cool down |
 | `REFUSED`, `COMMIT_FAILED` | fail | fail, cool down | fail, cool down |
@@ -225,13 +228,18 @@ The retry count, pauses and cooldown period are policy settings, not communicato
 ### 5.1 RunSpec
 
 A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
-`commit_status`), the commands or configuration lines, credentials, timeouts, the worker limit, the safety
+`commit_status`), the commands or configuration lines, credentials, timeouts (`connect` for the TCP connect and the
+SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
+operation, `commit`),
+the worker limit, the safety
 settings, and the recording settings.
 
 ### 5.2 Concurrency
 
-The orchestrator runs on asyncio. Blocking libraries such as paramiko and PyEZ run in a thread pool sized
-to the worker limit. Each target is one task. A target's operations run in order on one session. Targets
+The orchestrator runs on asyncio. Blocking libraries such as paramiko and PyEZ run on daemon worker threads, at most
+the worker limit at once, so a call that never returns keeps its thread, never the interpreter's exit. Each communicator
+call gets its own timeout (`connect` plus `setup` for open, `command`, or `commit`) plus a grace period; one that has not
+returned by then is that target's `TIMEOUT` fault, and its thread is left to finish. Each target is one task. A target's operations run in order on one session. Targets
 run independently, and one target's failure does not affect another's.
 
 ### 5.3 Edit lifecycle
@@ -244,18 +252,25 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 ```
 
 - **Dry run** is the default: load, diff, close. Closing discards the candidate, so nothing is committed.
+- The probe runs before `OPEN`. An edit whose probe found a target dead stops before any device, with one audit
+  entry per dead target and no run row, unless `skip_unreachable` is set, which skips those targets; a read fails them.
+  An apply the operator declines gets one audit entry per target through `audit_aborted`.
 - **Apply** requires `-y`. Without it, an edit is a dry run.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
   command that confirms them.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
   uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.
-- The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file.
+- The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file. Before the
+  run starts, the policy counts the logins the run may make to one device (retries + 1 per listing) against the rate
+  limit and refuses the run when it would pass it, so the gate never turns a device away half-way.
 
 ### 5.4 Cancellation
 
 1. On the first interrupt, the scheduler starts no new targets. Targets that have not started are recorded
    as skipped.
-2. Targets past `COMMIT` are waited for and recorded. Other in-flight targets are cancelled and recorded.
+2. Targets past `COMMIT` are waited for and recorded. Other in-flight targets are cancelled and recorded. A
+   target whose connect the interrupt cut short, or whose connect then ran out, with `reached_device` false, is
+   recorded as skipped with the reason, not failed: nothing reached it and the operator stopped the run.
 3. A second interrupt reports what is still in flight. It does not abandon records.
 4. The run is always closed in the store, with counts for ok, failed and skipped.
 

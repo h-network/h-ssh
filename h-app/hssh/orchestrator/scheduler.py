@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
+import threading
 import signal
 import sys
 import dataclasses
@@ -14,11 +16,11 @@ from hssh.communicators.base import Session
 from hssh.drivers import Driver, DriverRegistry
 from hssh.model import (Fault, FaultKind, OperationResult, RunReport, RunSpec, Target, TargetResult, TargetStatus)
 from hssh.orchestrator import lifecycle, probe
-from hssh.orchestrator.defaults import complete
+from hssh.orchestrator.defaults import GRACE_SECONDS, complete
 from hssh.orchestrator.lifecycle import EditLifecycle, Stage, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
-from hssh.orchestrator.sessions import SessionManager
+from hssh.orchestrator.sessions import SessionManager, session_key
 
 READ_MODES = ("show", "batch", "structured", "commit_status")
 
@@ -57,11 +59,13 @@ class Scheduler:
     async def run(self, spec: RunSpec) -> RunReport:
         """The whole run: probe, every target under the worker limit, the report, always closed in the store."""
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(spec.workers, thread_name_prefix="hssh"))
+        loop.set_default_executor(_DaemonThreads(spec.workers, thread_name_prefix="hssh"))
         run = _Run(spec, 0, now())
-        run.run_id = self.recorder.begin(spec, run.started)
         slots = asyncio.Semaphore(spec.workers)
         dead = await self._probe(spec) if spec.probe else {}
+        if spec.mode == "edit" and any(dead.values()):
+            self._dead_edit(spec, dead)
+        run.run_id = self.recorder.begin(spec, run.started)
         run.tasks = [asyncio.create_task(self._bounded(run, i, t, slots, dead.get(t.name)))
                      for i, t in enumerate(spec.targets)]
         with _on_interrupt(loop, lambda: self._interrupt(run)):
@@ -98,7 +102,8 @@ class Scheduler:
         async with slots:
             run.begun.add(index)
             if dead is not None:
-                return self._failed_before(run, target, dead)
+                skipped = run.spec.mode == "edit" and run.spec.skip_unreachable
+                return self._failed_before(run, target, dead, "skipped" if skipped else "failed")
             try:
                 result = await self._run_target(run, index, target)
             except asyncio.CancelledError:
@@ -144,10 +149,12 @@ class Scheduler:
             tried = await self._attempt(run, index, target, driver, attempt)
             if tried.verdict is None or tried.verdict.action is not Action.RETRY or run.stopping.is_set():
                 break
+            await self.policy.pause(attempt, tried.operations[-1].command == OPEN)
             attempt += 1
-            await self.policy.pause()
         status: TargetStatus = "ok" if tried.verdict is None else "failed"
         ops = tried.operations
+        if run.stopping.is_set() and self._interrupted_connect(ops):
+            status = "skipped"
         try:
             for seq, op in enumerate(ops):
                 self.recorder.result(run.run_id, target, driver.name, seq, op)
@@ -172,8 +179,15 @@ class Scheduler:
             opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate: {held}", False), started, 0)
             return _Attempt([opened], Verdict(Action.FAIL))
         try:
-            session = await self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy)
-        except Fault as f:
+            session = await asyncio.wait_for(self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy),
+                                             timeouts.connect + timeouts.setup + GRACE_SECONDS)
+        except (Fault, asyncio.TimeoutError, asyncio.CancelledError) as e:
+            if isinstance(e, Fault):
+                f = e
+            elif isinstance(e, asyncio.TimeoutError):
+                f = Fault(FaultKind.TIMEOUT, "open has not returned within its budget", True)
+            else:
+                f = Fault(FaultKind.LOCAL, "interrupted while connecting", False)
             opened = OperationResult(OPEN, f, started, int((time.monotonic() - t0) * 1000))
             verdict = self._judge(spec, driver, opened, attempt)
             self.policy.settle(target, verdict)
@@ -197,20 +211,26 @@ class Scheduler:
         if spec.mode in ("show", "batch"):
             ops: list[OperationResult] = []
             for command in spec.commands:
-                ops.append(await operation(command, lambda c=command: comm.show(session, c)))
+                ops.append(await operation(command, lambda c=command: comm.show(session, c), spec.timeouts.command))
                 if isinstance(ops[-1].outcome, Fault) and ops[-1].outcome.kind is FaultKind.SESSION_LOST:
                     break
             return ops
         if spec.mode == "structured":
-            return [await operation(c, lambda c=c: comm.structured(session, c, spec.format)) for c in spec.commands]
+            return [await operation(c, lambda c=c: comm.structured(session, c, spec.format), spec.timeouts.command)
+                    for c in spec.commands]
         if spec.mode == "edit":
-            edit = await EditLifecycle(comm, driver.dialect, session).run(list(spec.config_lines), spec.edit)
+            edit = await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(list(spec.config_lines), spec.edit)
             if edit.stage in (Stage.COMMIT, Stage.PENDING, Stage.CLOSE):
                 run.past_commit.add(index)
             return list(edit.operations)
         if spec.mode == "confirm":
-            return [await lifecycle.confirm(comm, session)]
-        return [await lifecycle.commit_history(comm, session)]
+            return [await lifecycle.confirm(comm, session, spec.timeouts)]
+        return [await lifecycle.commit_history(comm, session, spec.timeouts)]
+
+    @staticmethod
+    def _interrupted_connect(ops: list[OperationResult]) -> bool:
+        """A connect the interrupt cut short: the only operation is an open fault that reached nothing (never message text)."""
+        return len(ops) == 1 and ops[0].command == OPEN and isinstance(ops[0].outcome, Fault) and not ops[0].outcome.reached_device
 
     def _judge(self, spec: RunSpec, driver: Driver, op: OperationResult, attempt: int) -> Verdict:
         """The policy's verdict on a failed operation; a run reads when its mode and every command do."""
@@ -224,11 +244,29 @@ class Scheduler:
         self.recorder.result(run.run_id, result.target, driver, len(result.operations), op)
         return dataclasses.replace(result, operations=(*result.operations, op))
 
-    def _failed_before(self, run: _Run, target: Target, fault: Fault) -> TargetResult:
-        """A target that failed before any operation: one operation named 'open', recorded without a driver."""
+    def _failed_before(self, run: _Run, target: Target, fault: Fault, status: TargetStatus = "failed") -> TargetResult:
+        """A target that failed, or was skipped, before any operation: one operation named 'open', recorded without a driver."""
         op = OperationResult(OPEN, fault, now(), 0)
         self.recorder.result(run.run_id, target, "", 0, op)
-        return TargetResult(target, "failed", (op,))
+        return TargetResult(target, status, (op,))
+
+    def _dead_edit(self, spec: RunSpec, dead: dict[str, Fault | None]) -> None:
+        """An edit whose probe found a target dead: skipped when the spec says so, else the run stops before any device, one audit entry per dead target and no run row."""
+        if spec.skip_unreachable:
+            return
+        names = [t.name for t in spec.targets if dead.get(t.name) is not None]
+        for target in spec.targets:
+            if dead.get(target.name) is None:
+                continue
+            try:
+                driver = self.registry.resolve(target)
+            except Fault:
+                continue
+            op = OperationResult(OPEN, dead[target.name], now(), 0)
+            self.recorder.change(0, target, driver.name, driver.dialect, "probe", op, spec.edit)
+        reachable = len(spec.targets) - len(names)
+        raise Fault(FaultKind.LOCAL, f"{len(names)} device(s) unreachable: {', '.join(names)}; aborting to prevent a "
+                    f"partial deployment; skip_unreachable goes on with the {reachable} reachable", False)
 
     @staticmethod
     def _pending(spec: RunSpec, results: list[TargetResult]) -> dict[str, str]:
@@ -237,6 +275,37 @@ class Scheduler:
         if spec.mode != "edit" or edit is None or not edit.apply or not edit.confirmed_minutes:
             return {}
         return {r.target.name: lifecycle.confirm_command(r.target) for r in results if r.status == "ok"}
+
+
+class _DaemonThreads(concurrent.futures.ThreadPoolExecutor):
+    """Communicator calls on daemon threads, one per call: a call that never returns keeps its thread, never the interpreter's exit."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as e:  # noqa: BLE001 - handed to the awaiting task
+                future.set_exception(e)
+
+        threading.Thread(target=run, name=self._thread_name_prefix, daemon=True).start()
+        return future
+
+def _plan_logins(spec: RunSpec, registry: DriverRegistry) -> None:
+    """The logins the run may make per device, retries + 1 per listing, against the rate limit: a run that would pass it is refused here, so the gate never turns a device away half-way."""
+    devices: collections.Counter = collections.Counter()
+    for target in spec.targets:
+        try:
+            devices[session_key(registry.resolve(target), target, spec.credentials)] += 1
+        except Fault:
+            devices[(target.host, target.port)] += 1
+    logins = max(devices.values(), default=0) * (spec.policy.retries + 1)
+    if logins > spec.safety.rate_limit:
+        raise Fault(FaultKind.LOCAL, f"the run may log in {logins} times to one device, above the rate limit of "
+                    f"{spec.safety.rate_limit} per minute; lower retries or raise the limit; nothing was sent", False)
 
 
 class _on_interrupt:
@@ -263,6 +332,8 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
     spec = complete(spec)
     if spec.mode == "structured" and not spec.format:
         raise Fault(FaultKind.LOCAL, "structured mode needs a format, json or xml; nothing was sent", False)
+    if spec.safety is not None:
+        _plan_logins(spec, registry)
     sessions = SessionManager(pool=pool)
     scheduler = Scheduler(registry, Policy(spec.policy, gate), sessions, Recorder(spec.recording, store))
     try:
@@ -280,6 +351,8 @@ def run(spec: RunSpec) -> RunReport:
     spec = complete(spec)
     registry = Registry()
     registry.load_entry_points()
+    if spec.safety is not None:
+        _plan_logins(spec, registry)
     try:
         gate = _gate(spec)
         store = _store(spec)
@@ -290,6 +363,23 @@ def run(spec: RunSpec) -> RunReport:
     finally:
         if store is not None:
             store.close()
+
+
+def audit_aborted(spec: RunSpec, reason: str) -> None:
+    """One audit entry per target when the operator declines to apply an edit: action 'aborted' with the reason, no run row."""
+    from hssh.drivers import Registry
+
+    spec = complete(spec)
+    registry = Registry()
+    registry.load_entry_points()
+    recorder = Recorder(spec.recording)
+    op = OperationResult("aborted", Fault(FaultKind.LOCAL, reason, False), now(), 0)
+    for target in spec.targets:
+        try:
+            driver = registry.resolve(target)
+        except Fault:
+            continue
+        recorder.change(0, target, driver.name, driver.dialect, "aborted", op, spec.edit)
 
 
 def _gate(spec: RunSpec) -> SafetyGate | None:
