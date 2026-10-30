@@ -55,6 +55,20 @@ run/target/sequence order. Destination files are private, and the reader refuses
 or any SQLite sidecar as a destination, including symlink and hard-link aliases, before
 truncating. Symlinks and FIFOs are refused; character devices such as `/dev/null` are allowed.
 
+`runs`, `failed`, `history` and `slowest` print aligned columns on terminals. Column
+widths are fixed per command so rows can stream without buffering the table; numeric
+columns align right and long cells end in `…`. Terminal controls are filtered before
+measuring, and tabs within a terminal cell become spaces. Pipes and files keep the
+existing tab-separated table rows, with no alignment padding. Use `output` or `export`
+for full values rather than shortened table cells.
+
+Batch saved output is `<name>.json`: an ordered array of every operation, including
+failures. Each object contains `command`, `started`, `elapsed_ms` and `ok`; successful
+operations add raw `output` and structured `data`, and failures add `fault`, `detail` and
+`reached_device`. Non-batch saved output remains `<name>.output`. These files use the same
+private-file rules as the store; a failed save is counted as `not_kept` without changing
+the device outcome.
+
 Device output, stored values and exports are left raw in pipes and files. Terminal output
 uses the shared terminal filter; table fields are sanitized before shortening. `output`
 writes the stored text without adding a newline. If a downstream reader closes a pipe,
@@ -70,5 +84,5 @@ A read-only archive is read normally when SQLite can use its sidecars. If the di
 not writable, the reader uses an immutable view only when no WAL data or journal is pending.
 If there is pending data, copy the database with its sidecars to a writable directory and
 read it there. An archive changed while being read is reported as incomplete, never as a
-trustworthy partial result. Older incompatible stores remain readable with develop's
-`h-ssh-store`; the rewrite does not migrate or adapt them.
+trustworthy partial result. An incompatible schema is refused; choose a new store path.
+The reader does not migrate or adapt other schemas.

@@ -109,7 +109,8 @@ device output only and the verdict goes to stderr when something failed, was ski
 `Interrupted. Completed a of n device(s).` Device text shown on a terminal goes through `hssh.screen.terminal_safe`
 (control sequences stripped); a pipe, a file and the store get it as it came. A reader that leaves (`| head`)
 ends the program quietly with exit 0: the record is the store, the screen is best effort. `--json`
-renders each `Result.data` through the store's `json_data`, so the file and the store hold the same shapes.
+renders each operation through the store's `operation_dict` (`Result.data` via `json_data`, a fault with its
+`reached_device`), so `--json`, a saved batch's JSON and the store rows agree field for field.
 The run's provenance in `RecordSettings` is the front end's: `origin` is `h-ssh` from the CLI and `fleet` from
 the library (unless the caller set one), `version` is the installed package version from `importlib.metadata`,
 None when h-ssh runs from source. Set-file names and containment (`-eD`) use the shared `hssh.paths` helpers.
@@ -256,7 +257,7 @@ The recorder proves every record destination before the probe: the audit log and
 append, the saved-output directory by a private temporary file. The store is opened and created by the run row,
 written after the probe and before the first target. A failure in either refuses the run as `LOCAL` before any
 device is contacted. Once targets run, every record is attempted on its own: each store row, each audit entry,
-the saved-output file, the log line, the run row's finish and the store's close. One that cannot be written is
+the saved-output file (named by the run's mode, a batch as `<name>.json`, the format being the store's), the log line, the run row's finish and the store's close. One that cannot be written is
 counted once in `RunReport.not_kept`; each destination's failure is said once on stderr, with its first error; the device outcome stands, no cooldown follows, and the
 report still reaches the caller, so a store that vanished mid-run ends in exit 4, not a traceback. Every operation row carries the target's final
 status. Saved output is named through `hssh.paths` inside its directory.
@@ -496,6 +497,10 @@ value, not serialized text: dataclass instances become dictionaries with `asdict
 bool, None, dict and list are accepted. Nested values must be JSON values with string keys
 and finite numbers. Unsupported values raise `ValueError`. The recorder and front end use
 this same converter for structured output; raw output is never parsed to populate `data`.
+`hssh.store.operation_dict(operation)` is the shared per-operation JSON representation for
+saved batches and CLI JSON: `command`, `started`, `elapsed_ms` and `ok`, followed by
+`output` and `data` on success, or `fault` (the kind name), `detail` and `reached_device`
+on failure. Structured data uses `json_data`; output and fault detail stay unmodified.
 If `add` cannot convert unsupported `Result.data`, it still writes the row with `data` NULL,
 preserving raw output and the operation outcome, then raises a contextual `OSError` naming
 the unsupported type. The recorder counts this incomplete record as `not_kept`; the
@@ -503,15 +508,17 @@ conversion error never changes the target outcome or escapes from `add` as `Valu
 
 `Store(path, readonly=False)` requires an explicit path. The orchestrator supplies it from
 `RecordSettings`; the store imports no orchestrator defaults. The `h-ssh-store` front end
-will obtain the default from the orchestrator in slice 3. Writable construction defers
+obtains the default from the orchestrator. Writable construction defers
 opening and creation to `start_run`, before any device work.
 Read-only construction opens an existing compatible store without creating it. SQLite runs
 in WAL mode with a 10-second busy timeout, a separate bounded 5-second first-open WAL
 wait, `synchronous=NORMAL` and serialized write transactions. Each operation row is committed
 in one transaction. NORMAL protects against a process crash; a power loss can lose recent
 commits. Store creation/opening failures close every acquired resource. Construction alone
-creates no files, and close is idempotent. The writer never deletes a database to undo a
-refused run.
+creates no files, and close is idempotent. If the first open fails, the writer removes the
+database only when that open created it with `O_EXCL`; a pre-existing file stays. Cleanup
+is deliberately simple and does not coordinate with another process opening the new file
+at the same time. A successfully opened store is retained.
 `finish_run` and `close` complete the writer interface; SQLite and file failures are exposed
 as contextual `OSError`, so the recorder can count lost records without failing the device.
 The writer checks the database identity before and after writes and when closing, using a
@@ -551,8 +558,10 @@ The reader interfaces in `store.py` return stored column names unchanged:
 The `h-ssh-store` entry point is `hssh.frontends.store:main_sync`; parsing, rendering,
 configuration and default resolution belong to that front end. `store.py` imports no
 front-end modules. The reader shares `frontends.settings.store_path` with the writer.
-[Reader usage](store.md) covers the commands and exit codes. Display tables stream rows,
-and sanitize terminal-bound metadata before shortening; files and pipes retain raw text.
+[Reader usage](store.md) covers the commands and exit codes. Display tables stream rows.
+On a terminal, runs/failed/history/slowest use declared column widths, right-aligned numeric
+cells and visibly shortened long cells, with metadata sanitized before measuring. Pipes and
+files retain tab-separated rows without terminal padding or filtering.
 Exports check destination path and inode against the database and its sidecars before
 truncation, including hard-link aliases. A closed downstream pipe preserves the command's
 known verdict and produces no traceback.
@@ -594,7 +603,10 @@ promises that a later write cannot fail. Both raise contextual `OSError` on fail
 current user, locks it and sets 0600 before truncating, then completes all short writes.
 It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
 The recorder validates the target name and containment through `hssh.paths` before calling
-it. Saved output stays one file per target, including batches.
+it. Saved output stays one file per target: batch mode writes `<name>.json`, an ordered
+array of every recorded operation using `operation_dict`, including failed operations.
+Other modes keep `<name>.output`. The recorder uses the explicit run mode, not the number
+of operations, to select the format; conversion or write failures count as `not_kept`.
 
 For JSON text in audit fields, the writer parses objects and lists and masks the entire value of a
 secret key, including wrapped values. A key is secret when a dialect redaction pattern matches
@@ -607,9 +619,9 @@ The secret vocabulary belongs to the dialect; stored device output is left uncha
 
 `SafetyGate(settings)` consumes `SafetySettings`; it defines no run defaults or fault policy.
 The orchestrator supplies each target's effective port. State keys are `host|port`, so two
-ports on one host are independent. A legacy host-only cooldown holds every port of that
-host. A caller supplying no port queries the host as a whole, including its port-specific
-cooldowns; the gate does not guess a transport port.
+ports on one host are independent. A target without an effective port raises `OSError`;
+the gate does not guess a transport port. The orchestrator excludes targets whose driver
+cannot be resolved from gate calls and reports their resolution failure separately.
 
 `check_device(target, login=True)` checks cooldown, active reservation and login budget under
 one in-process lock, and reserves the device before returning `(True, "ok")`. A refusal
@@ -638,9 +650,10 @@ fsynced. Admission and `holds` refresh under the same file lock. The state and l
 are regular owner-only 0600 files, symlinks and FIFOs are refused, and newly created parent
 directories are 0700. Temporary files and descriptors are released on failure.
 
-The file is a JSON object mapping keys to finite Unix expiry timestamps. A missing or
-empty file is initially empty; legacy null expiries mean no hold. Invalid JSON, a non-object
-root, or a non-numeric/non-finite expiry is preserved by moving the file to
+The file is a JSON object mapping `host|port` keys to finite Unix expiry timestamps;
+ports are decimal integers from 1 to 65535. A missing or empty file is initially empty.
+Invalid JSON, unsupported keys, a non-object root, or a null/non-numeric/non-finite expiry
+is preserved by moving the file to
 `<safety_file>.corrupt`. That marker prevents further use; inspect and repair the state and
 remove the marker before starting a new gate. Existing `.corrupt` evidence is not overwritten.
 State, lock, and persistence errors raise contextual `OSError`; there is no unlocked or

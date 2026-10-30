@@ -18,12 +18,12 @@ from hssh.model import SafetySettings, Target
 
 
 def _key(target: Target) -> str:
-    return target.host if target.port is None else f"{target.host}|{target.port}"
+    if target.port is None:
+        raise OSError("safety gate requires an effective port")
+    return f"{target.host}|{target.port}"
 
 
-def _expiry(key: str, value: object) -> float | None:
-    if value is None:
-        return None
+def _expiry(key: str, value: object) -> float:
     try:
         expires = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else math.nan
     except OverflowError:
@@ -60,10 +60,7 @@ class SafetyGate:
             raise OSError(self._failure)
 
     def _reason(self, target: Target, now: float) -> str | None:
-        keys = {_key(target), target.host}
-        if target.port is None:
-            keys.update(key for key in self._cooldowns if key.startswith(f"{target.host}|"))
-        expires = max((self._cooldowns.get(key, now) for key in keys), default=now)
+        expires = self._cooldowns.get(_key(target), now)
         if expires > now:
             return f"cooldown active ({math.ceil(expires - now)}s remaining)"
         return None
@@ -150,9 +147,10 @@ class SafetyGate:
                 raise ValueError("safety state must be a JSON object")
             cooldowns = {}
             for key, value in data.items():
-                expires = _expiry(key, value)
-                if expires is not None:
-                    cooldowns[key] = expires
+                host, separator, port = key.rpartition("|")
+                if not host or not separator or not port.isdecimal() or not 1 <= int(port) <= 65535:
+                    raise ValueError(f"unsupported safety key {key!r}; expected host|port")
+                cooldowns[key] = _expiry(key, value)
             return cooldowns
         except FileNotFoundError:
             return {}
