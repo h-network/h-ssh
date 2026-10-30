@@ -114,7 +114,7 @@ def build_parser() -> _Parser:
     behaviour.add_argument("--retry-pause", type=int, metavar="SECONDS")
     behaviour.add_argument("--connect-timeout", type=int, metavar="SECONDS")
     behaviour.add_argument("--session-timeout", type=int, metavar="SECONDS",
-                           help="seconds for the session setup after the TCP connect: key exchange, login, NETCONF hello")
+                           help="seconds for the session setup after the SSH banner: key exchange, login, NETCONF hello")
     behaviour.add_argument("--command-timeout", type=int, metavar="SECONDS")
     behaviour.add_argument("--commit-timeout", type=int, metavar="SECONDS")
     behaviour.add_argument("--host-key-policy", choices=HOST_KEY_CHOICES)
