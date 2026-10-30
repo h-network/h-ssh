@@ -256,7 +256,7 @@ The recorder proves every record destination before the probe: the audit log and
 append, the saved-output directory by a private temporary file. The store is opened and created by the run row,
 written after the probe and before the first target. A failure in either refuses the run as `LOCAL` before any
 device is contacted. Once targets run, every record is attempted on its own: each store row, each audit entry,
-the saved-output file, the log line, the run row's finish and the store's close. One that cannot be written is
+the saved-output file (named by the run's mode, a batch as `<name>.json`, the format being the store's), the log line, the run row's finish and the store's close. One that cannot be written is
 counted once in `RunReport.not_kept`; each destination's failure is said once on stderr, with its first error; the device outcome stands, no cooldown follows, and the
 report still reaches the caller, so a store that vanished mid-run ends in exit 4, not a traceback. Every operation row carries the target's final
 status. Saved output is named through `hssh.paths` inside its directory.
@@ -564,8 +564,6 @@ files retain tab-separated rows without terminal padding or filtering.
 Exports check destination path and inode against the database and its sidecars before
 truncation, including hard-link aliases. A closed downstream pipe preserves the command's
 known verdict and produces no traceback.
-
-Saved output is one file per target in the `--save-output` directory, written by the recorder from the run's mode, never inferred from the operation count: a batch as `<name>.json`, every operation in order as `store.operation_dict` renders it; any other mode as `<name>.output`, the outputs joined. A file not written counts in `not_kept` like any record.
 
 `hssh.paths.validate_device_name(name: str) -> str` and
 `path_inside(base: Path, filename: str) -> Path` are the shared file-name helpers for `-eD`
