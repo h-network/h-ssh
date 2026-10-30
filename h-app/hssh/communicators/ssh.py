@@ -307,7 +307,40 @@ class ShellChannel:
 @dataclass
 class SSHSession:
     client: SSHClient
-    engine: CliEngine
+    timeouts: Timeouts
+    setup_deadline: float
+    engine: CliEngine | None = None
+    ready: bool = True
+
+
+def _drain(stream, deadline: float) -> str:
+    chunks = []
+    while True:
+        _remaining(deadline)
+        chunk = stream.read(65536)
+        if not chunk:
+            return b"".join(chunks).decode("utf-8", errors="replace")
+        chunks.append(chunk)
+
+
+def _exec(session: SSHSession, command: str, deadline: float) -> tuple[int, str, str]:
+    _, stdout, stderr = session.client.exec_command(command, timeout=_remaining(deadline))
+    channel = stdout.channel
+    try:
+        out = _drain(stdout, deadline)
+        err = _drain(stderr, deadline)
+        if not channel.status_event.wait(_remaining(deadline)):
+            raise TimeoutError("SSH command sent no exit status before its deadline")
+        status = channel.recv_exit_status()
+        if not channel.eof_received:
+            transport = channel.get_transport()
+            if transport.saved_exception is None and transport.is_active():
+                transport.join(min(0.5, _remaining(deadline)))
+            if transport.saved_exception is not None or not transport.is_active():
+                raise ConnectionError("SSH session lost before command output finished")
+        return status, out, err
+    finally:
+        channel.close()
 
 
 class SSHCommunicator(Communicator):
@@ -325,8 +358,6 @@ class SSHCommunicator(Communicator):
             import paramiko
         except ImportError as exc:
             raise Fault(FaultKind.LOCAL, "Paramiko is required for SSH", False) from exc
-        from hssh.communicators.cli_engine import CliEngine
-
         client = paramiko.SSHClient()
         opening = _Opening(client, timeouts)
         path = Path("~/.ssh/known_hosts").expanduser()
@@ -375,13 +406,8 @@ class SSHCommunicator(Communicator):
                            allow_agent=implicit_keys, look_for_keys=implicit_keys,
                            banner_timeout=_remaining(opening.deadline), auth_timeout=timeouts.setup,
                            channel_timeout=timeouts.setup, transport_factory=transport_factory)
-            opening.stage = "channel open and PTY/shell acknowledgement"
-            channel = client.invoke_shell(term="vt100", width=511, height=1000)
-            opening.stage = "CLI prompt discovery"
-            engine = CliEngine(ShellChannel(channel), self.dialect, timeouts, echoes=True)
-            engine.login(opening.deadline)
             opening.finish()
-            return SSHSession(client, engine)
+            return SSHSession(client, timeouts, opening.deadline)
         except BaseException as exc:
             _abort(client, opening.sock)
             if isinstance(exc, Fault):
@@ -392,52 +418,138 @@ class SSHCommunicator(Communicator):
         finally:
             opening.stop()
 
+    def _engine(self, session: Session) -> CliEngine:
+        from hssh.communicators.cli_engine import CliEngine
+
+        ssh_session = cast(SSHSession, session)
+        if ssh_session.engine is None:
+            client = ssh_session.client
+            guard = _Deadline(ssh_session.setup_deadline,
+                              lambda: _abort(client, getattr(client.get_transport(), "sock", None)))
+            try:
+                channel = client.invoke_shell(term="vt100", width=511, height=1000)
+                engine = CliEngine(ShellChannel(channel), self.dialect, ssh_session.timeouts, echoes=True)
+                engine.login(guard.deadline)
+                guard.finish()
+                ssh_session.engine = engine
+            except BaseException:
+                self.discard(ssh_session)
+                raise
+            finally:
+                guard.stop()
+        return ssh_session.engine
+
     def close(self, session: Session) -> None:
         ssh_session = cast(SSHSession, session)
         sock = getattr(ssh_session.client.get_transport(), "sock", None)
-        guard = _Deadline(time.monotonic() + ssh_session.engine.timeouts.command,
+        guard = _Deadline(time.monotonic() + ssh_session.timeouts.command,
                           lambda: _abort(ssh_session.client, sock))
         try:
-            ssh_session.engine.close()
+            if ssh_session.engine is not None:
+                ssh_session.engine.close()
+            ssh_session.client.close()
         finally:
             guard.stop()
+            ssh_session.ready = False
             _abort(ssh_session.client, sock)
 
     def reuse(self, session: Session, timeouts: Timeouts, idle_seconds: int) -> bool:
         ssh_session = cast(SSHSession, session)
         transport = ssh_session.client.get_transport()
-        channel = ssh_session.engine.channel.channel
-        if (transport is None or not transport.is_active() or not transport.is_authenticated() or
-                channel.closed or channel.eof_received or not ssh_session.engine.ready):
+        if (transport is None or not transport.is_active() or not transport.is_authenticated()
+                or not ssh_session.ready):
             return False
-        ssh_session.engine.timeouts = timeouts
-        return idle_seconds < IDLE_CHECK_SECONDS or ssh_session.engine.probe(time.monotonic() + PROBE_SECONDS)
+        ssh_session.timeouts = timeouts
+        if ssh_session.engine is not None:
+            engine = ssh_session.engine
+            channel = engine.channel.channel
+            if channel.closed or channel.eof_received or not engine.ready:
+                return False
+            engine.timeouts = timeouts
+            return idle_seconds < IDLE_CHECK_SECONDS or engine.probe(time.monotonic() + PROBE_SECONDS)
+        ssh_session.setup_deadline = time.monotonic() + timeouts.setup
+        if idle_seconds < IDLE_CHECK_SECONDS:
+            return True
+        guard = _Deadline(time.monotonic() + PROBE_SECONDS, lambda: _abort(ssh_session.client, transport.sock))
+        try:
+            channel = transport.open_session(timeout=_remaining(guard.deadline))
+            channel.close()
+            guard.finish()
+            return True
+        except Exception:
+            self.discard(ssh_session)
+            return False
+        finally:
+            guard.stop()
 
     def release(self, session: Session) -> None:
-        cast(SSHSession, session).engine.release()
+        ssh_session = cast(SSHSession, session)
+        if not ssh_session.ready:
+            raise Fault(FaultKind.SESSION_LOST, "SSH session is no longer usable", True)
+        if ssh_session.engine is not None:
+            ssh_session.engine.release()
 
     def discard(self, session: Session) -> None:
         ssh_session = cast(SSHSession, session)
+        ssh_session.ready = False
         _abort(ssh_session.client, getattr(ssh_session.client.get_transport(), "sock", None))
-        ssh_session.engine.discard()
+        if ssh_session.engine is not None:
+            ssh_session.engine.discard()
 
     def show(self, session: Session, command: str) -> Result:
-        return cast(SSHSession, session).engine.show(command)
+        if not command.strip() or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 0xd800 <= ord(c) <= 0xdfff for c in command):
+            raise Fault(FaultKind.LOCAL, "a command must be nonempty text without controls or Tab", False)
+        ssh_session = cast(SSHSession, session)
+        if not ssh_session.ready:
+            raise Fault(FaultKind.SESSION_LOST, "SSH session is no longer usable", True)
+        deadline = time.monotonic() + ssh_session.timeouts.command
+        client = ssh_session.client
+        guard = _Deadline(deadline, lambda: _abort(client, getattr(client.get_transport(), "sock", None)))
+        try:
+            status, out, err = _exec(ssh_session, command.strip(), deadline)
+            guard.finish()
+        except Exception as exc:
+            self.discard(ssh_session)
+            kind = FaultKind.TIMEOUT if guard.expired or isinstance(exc, TimeoutError) else FaultKind.SESSION_LOST
+            raise Fault(kind, str(exc) or type(exc).__name__, True) from exc
+        except BaseException:
+            self.discard(ssh_session)
+            raise
+        finally:
+            guard.stop()
+        if status > 0:
+            detail = err.strip() or out.strip() or "no diagnostic output"
+            raise Fault(FaultKind.REFUSED, f"exit {status}: {detail}", True)
+        for text in (out, err):
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or set(line) == {"^"}:
+                    continue
+                if (any(p.search(line) for p in self.dialect.refusal_patterns)
+                        and not any(p.search(line) for p in self.dialect.warning_patterns)):
+                    raise Fault(FaultKind.REFUSED, line, True)
+                break
+            else:
+                continue
+            break
+        if err:
+            out += ("\n" if out and not out.endswith("\n") else "") + err
+        return Result(out)
 
     def structured(self, session: Session, rpc: str, fmt: str) -> Result:
         raise Fault(FaultKind.UNSUPPORTED, "Structured RPCs require NETCONF", False)
 
     def load(self, session: Session, lines: list[str]) -> Result:
-        return cast(SSHSession, session).engine.load(lines)
+        return self._engine(session).load(lines)
 
     def diff(self, session: Session) -> Result:
-        return cast(SSHSession, session).engine.diff()
+        return self._engine(session).diff()
 
     def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result:
-        return cast(SSHSession, session).engine.commit(confirmed_minutes, comment)
+        return self._engine(session).commit(confirmed_minutes, comment)
 
     def confirm(self, session: Session) -> Result:
-        return cast(SSHSession, session).engine.confirm()
+        return self._engine(session).confirm()
 
     def commit_history(self, session: Session) -> Result:
-        return cast(SSHSession, session).engine.commit_history()
+        return self._engine(session).commit_history()
