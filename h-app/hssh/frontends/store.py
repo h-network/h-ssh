@@ -67,7 +67,7 @@ def _runs(store: Store, args) -> int:
                  r["not_kept"], "interrupted" if r["interrupted"] else "", _short(r["argv"], 60))
                 for r in records)
         _table(("run", "started", "mode", "user", "targets/ok/failed/skipped", "not_kept", "state", "argv"), rows,
-               widths=(6, 32, 13, 12, 23, 8, 11, 60), numeric=(0, 4, 5))
+               widths=(6, 32, 13, 12, 25, 8, 11, 60), numeric=(0, 4, 5))
     return 0
 
 
