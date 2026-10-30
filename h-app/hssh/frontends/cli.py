@@ -229,6 +229,10 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
         print(json.dumps(report_dict(report), indent=2), file=out)
         return
     for tr in report.results:
+        if tr.status == "skipped":
+            faults = [op.outcome.detail for op in tr.operations if isinstance(op.outcome, Fault)]
+            print(f"{tr.target.name}: SKIPPED" + (f": {faults[0]}" if faults else ""), file=out)
+            continue
         for op in tr.operations:
             if isinstance(op.outcome, Fault) and op.command == "close":
                 print(f"WARNING: {tr.target.name}: close failed: {op.outcome.detail}", file=sys.stderr)
@@ -239,8 +243,6 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
             if not args.raw:
                 print(f"=== {tr.target.name} ({tr.target.host}) {op.command} [{op.elapsed_ms} ms]", file=out)
             print(op.outcome.output, file=out)
-        if tr.status == "skipped":
-            print(f"{tr.target.name}: SKIPPED", file=out)
     if not args.raw:
         print(f"run {report.run_id}: {report.ok} ok, {report.failed} failed, {report.skipped} skipped", file=out)
         for name, command in report.pending.items():
