@@ -351,6 +351,8 @@ class SSHCommunicator(Communicator):
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
+        if dialect.has_candidate:
+            self.capabilities = self.capabilities | {"edit", "confirm", "commit_status"}
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> SSHSession:
@@ -422,18 +424,29 @@ class SSHCommunicator(Communicator):
         from hssh.communicators.cli_engine import CliEngine
 
         ssh_session = cast(SSHSession, session)
+        if not ssh_session.ready:
+            raise Fault(FaultKind.SESSION_LOST, "SSH session is no longer usable", True)
         if ssh_session.engine is None:
             client = ssh_session.client
             guard = _Deadline(ssh_session.setup_deadline,
                               lambda: _abort(client, getattr(client.get_transport(), "sock", None)))
+            stage = "SSH channel open and PTY/shell acknowledgement"
             try:
+                _remaining(guard.deadline)
                 channel = client.invoke_shell(term="vt100", width=511, height=1000)
+                stage = "CLI prompt discovery and paging setup"
                 engine = CliEngine(ShellChannel(channel), self.dialect, ssh_session.timeouts, echoes=True)
                 engine.login(guard.deadline)
                 guard.finish()
                 ssh_session.engine = engine
-            except BaseException:
+            except BaseException as exc:
                 self.discard(ssh_session)
+                if isinstance(exc, Fault):
+                    raise
+                if isinstance(exc, Exception):
+                    timed_out = guard.expired or time.monotonic() >= guard.deadline or isinstance(exc, TimeoutError)
+                    kind = FaultKind.TIMEOUT if timed_out else FaultKind.SESSION_LOST
+                    raise Fault(kind, f"{stage}: {type(exc).__name__}: {exc}", True) from exc
                 raise
             finally:
                 guard.stop()
@@ -442,10 +455,10 @@ class SSHCommunicator(Communicator):
     def close(self, session: Session) -> None:
         ssh_session = cast(SSHSession, session)
         sock = getattr(ssh_session.client.get_transport(), "sock", None)
-        guard = _Deadline(time.monotonic() + ssh_session.timeouts.command,
+        guard = _Deadline(time.monotonic() + 2 * ssh_session.timeouts.command,
                           lambda: _abort(ssh_session.client, sock))
         try:
-            if ssh_session.engine is not None:
+            if ssh_session.ready and ssh_session.engine is not None:
                 ssh_session.engine.close()
             ssh_session.client.close()
         finally:
@@ -493,8 +506,6 @@ class SSHCommunicator(Communicator):
         ssh_session = cast(SSHSession, session)
         ssh_session.ready = False
         _abort(ssh_session.client, getattr(ssh_session.client.get_transport(), "sock", None))
-        if ssh_session.engine is not None:
-            ssh_session.engine.discard()
 
     def show(self, session: Session, command: str) -> Result:
         if not command.strip() or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 0xd800 <= ord(c) <= 0xdfff for c in command):

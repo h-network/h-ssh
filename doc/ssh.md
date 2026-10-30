@@ -2,10 +2,25 @@
 
 The SSH communicator connects directly to the target host. An explicit target port
 wins; otherwise SSH uses port 22. It does not read SSH client configuration.
-The Junos read slice supports `show` and `batch`. Each read uses an SSH exec
-channel on the authenticated connection, ending at EOF and exit status. A batch
+Junos supports `show`, `batch`, `edit`, `confirm` and `commit_status`.
+Show and batch commands use SSH exec channels on the authenticated connection,
+ending at EOF and exit status. A batch
 keeps the connection across commands. Reads do not allocate a PTY, learn prompts,
-disable paging or wait for a quiet prompt. Edits are a later slice.
+disable paging or wait for a quiet prompt.
+
+Edits, confirmations and commit history use one lazily opened interactive shell.
+The shared engine acquires the exclusive candidate before loading, stops at the
+first refused line, and returns a diff whose `data` says whether anything changed.
+The orchestrator chooses dry run or apply and does not commit an empty diff.
+Commit uses the supplied comment and optional confirmed timer. Confirmation is a
+separate run; the engine checks the newest pending commit again while holding the
+exclusive lock before sending the confirming commit. Commit history returns the
+newest entry as `CommitStatus`.
+
+Each loaded line uses the configured command budget. Commit uses the configured
+commit budget. A write or reply lost after a commit may have been sent is
+`OUTCOME_UNKNOWN`; subsequent cleanup sends no discard command. The engine
+cleans only the uncommitted candidate it acquired.
 
 A supplied password disables implicit SSH agent and key-file discovery. An
 explicit key file is expanded from `~` and passed to Paramiko; it also disables
@@ -43,10 +58,17 @@ using the remaining setup deadline. It uses a vt100 PTY, 511 columns by 1000 row
 and the shared engine for echo, prompt, paging and reply handling. Every shell
 write observes one absolute deadline across partial writes and rekey waits. A
 disconnected channel raises `ConnectionError`; expiry raises `TimeoutError`.
+Shell setup failures are reported as `TIMEOUT` or `SESSION_LOST` with the failing
+phase; failed or interrupted setup tears down the connection. The orchestrator's
+first load or commit-history allowance includes setup, while the communicator
+keeps the original absolute setup deadline.
 
 Pooling reuses only an authenticated, live transport whose last operation left it
 usable. Current timeouts apply on reuse. At 30 seconds idle, an exec-only session
 checks liveness by opening and closing a session channel within five seconds. An
 existing interactive engine uses its synchronized-prompt probe instead. A later
 borrow that first needs a shell gets its current setup allowance. Release preserves
-a healthy session; discard closes the connection without CLI cleanup commands.
+a healthy session after the engine discards its uncommitted candidate and exits
+configuration mode. Graceful close allows two command budgets for discard and
+exit before closing the client. Discard tears down only the transport, without
+invoking engine cleanup or sending CLI commands.
