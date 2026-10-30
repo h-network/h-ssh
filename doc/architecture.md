@@ -177,8 +177,12 @@ deadlines; each adapter holds one deadline across the whole write. Login takes n
 OpenSSH sessions arrive authenticated.
 It reads vendor behaviour from the dialect.
 
-For CLI reads, login learns a whole-line prompt and disables paging within the remaining setup deadline.
-Junos uses `set cli screen-length 0`; the echoed command also separates any delayed banner from replies.
+SSH and OpenSSH reads use exec channels. Their edit shells use a 511-column, 1000-row terminal and the
+engine's pager handling; login sends no paging-disable command. During login only, a prompt suffix may
+follow announcement text on the same line. The first command is read through its echo to separate any
+delayed banner and learn the device's whole-line prompt; command replies always require whole-line prompts.
+Replies containing only echo, prompt context and the prompt return immediately. Replies with output settle
+for 0.15 seconds, or 0.3 seconds for a refusal. Login retains its 0.15-second settle.
 Each command's write, reply and prompt settling share one command deadline. The reader decodes UTF-8
 incrementally, handles terminal redraws and recognises pager markers only on the current terminal line.
 It removes command echoes, prompt context and terminal control sequences, without redacting or formatting

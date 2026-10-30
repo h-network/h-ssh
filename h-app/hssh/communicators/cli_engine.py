@@ -107,6 +107,10 @@ class CliEngine:
         self.echoes = echoes
         self.initial = initial
         self.prompt_pattern = dialect.prompt_pattern
+        self._login_prompt_pattern = re.compile(
+            dialect.prompt_pattern.pattern.removeprefix("^").removeprefix(r"\A"),
+            dialect.prompt_pattern.flags,
+        )
         self.ready = False
         self._closed = False
         self._synchronized = False
@@ -116,7 +120,9 @@ class CliEngine:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._terminal = _Terminal()
 
-    def _prompt(self, line: str, learning: bool = False) -> bool:
+    def _prompt(self, line: str, learning: bool = False, *, login: bool = False) -> bool:
+        if login:
+            return bool(line.strip()) and self._login_prompt_pattern.search(line.strip()) is not None
         pattern = self.dialect.prompt_pattern if learning else self.prompt_pattern
         return bool(line.strip()) and pattern.fullmatch(line.strip()) is not None
 
@@ -160,7 +166,8 @@ class CliEngine:
             lines.pop()
         return "\n".join(lines)
 
-    def _read(self, deadline: float, command: str = "", *, learning: bool = False) -> tuple[str, str]:
+    def _read(self, deadline: float, command: str = "", *, learning: bool = False,
+              login: bool = False) -> tuple[str, str]:
         lines: list[str] = []
         waiting_echo = self.echoes and bool(command)
         judged = refused = False
@@ -184,16 +191,19 @@ class CliEngine:
         consume(initial)
         while True:
             tail = self._terminal.tail()
-            prompt = not waiting_echo and self._prompt(tail, learning)
+            prompt = not waiting_echo and self._prompt(tail, learning, login=login)
             pager = (not waiting_echo and self.dialect.pager_pattern is not None
                      and bool(tail.strip()) and self.dialect.pager_pattern.fullmatch(tail) is not None)
+            if prompt and not login and not self._output(lines.copy()).strip():
+                self._terminal.clear_line()
+                return self._output(lines), tail
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if prompt:
                     self._terminal.clear_line()
                     return self._output(lines), tail
                 raise TimeoutError("no complete CLI prompt before the operation deadline")
-            quiet = _REFUSAL_SETTLE if prompt and refused else _SETTLE
+            quiet = _REFUSAL_SETTLE if prompt and refused and not login else _SETTLE
             wait = min(remaining, quiet) if prompt or pager else remaining
             try:
                 data = self.channel.recv(65536, wait)
@@ -227,13 +237,12 @@ class CliEngine:
         try:
             halfway = time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
             try:
-                _, prompt = self._read(halfway, learning=True)
+                _, prompt = self._read(halfway, login=True)
             except TimeoutError:
                 self.channel.send(b"\n", deadline)
-                _, prompt = self._read(deadline, learning=True)
-            self._learn_prompt(prompt)
-            if self.dialect.paging_off_command:
-                self._exchange(self.dialect.paging_off_command, deadline)
+                _, prompt = self._read(deadline, login=True)
+            if self._prompt(prompt, learning=True):
+                self._learn_prompt(prompt)
             self.ready = True
         except BaseException:
             self.ready = False
