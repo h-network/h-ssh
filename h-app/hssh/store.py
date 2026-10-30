@@ -7,7 +7,6 @@ from collections.abc import Iterator, Sequence
 from typing import Literal
 
 from hssh.model import OperationResult, RunReport, RunSpec, Target, TargetStatus
-from hssh.orchestrator.defaults import DEFAULT_STORE
 
 
 def json_data(value: object) -> bool | None | dict[str, object] | list[object]:
@@ -15,12 +14,12 @@ def json_data(value: object) -> bool | None | dict[str, object] | list[object]:
 
 
 class Store:
-    def __init__(self, path: str = DEFAULT_STORE, readonly: bool = False) -> None:
+    def __init__(self, path: str, readonly: bool = False) -> None:
         self.path = path
         self.readonly = readonly
         raise NotImplementedError
 
-    def start_run(self, spec: RunSpec, started: str) -> int:
+    def start_run(self, spec: RunSpec, started: str, *, user: str) -> int:
         raise NotImplementedError
 
     def add(

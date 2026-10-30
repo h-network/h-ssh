@@ -358,10 +358,11 @@ CREATE TABLE results (
 );
 ```
 
-`start_run(spec, started)` assigns an integer ID in SQLite. `runs.user` is the local invoking
-user, as in the audit recorder, not the device login. `argv` is a JSON array from
-`RecordSettings.argv`, or SQL NULL when absent; configuration payloads are not copied into
-this row. `format` is the requested `RunSpec.format`, or NULL when unspecified. `origin` and
+`start_run(spec, started, *, user: str)` assigns an integer ID in SQLite. The recorder
+passes its local invoking user for `runs.user`; the store does not discover a second user
+or use the device login. `argv` is a JSON array from `RecordSettings.argv`, or SQL NULL
+when absent. Payload files are not copied into this row; an inline `-eC` payload is already
+part of argv. `format` is the requested `RunSpec.format`, or NULL when unspecified. `origin` and
 `version` are optional strings from `RecordSettings`, supplied by the front end; the store
 does not discover them. `targets` is the number requested. Until `finish_run(report)`,
 `finished` and the three outcome counts are NULL; finalization copies the report's finished
@@ -385,8 +386,15 @@ value, not serialized text: dataclass instances become dictionaries with `asdict
 bool, None, dict and list are accepted. Nested values must be JSON values with string keys
 and finite numbers. Unsupported values raise `ValueError`. The recorder and front end use
 this same converter for structured output; raw output is never parsed to populate `data`.
+If `add` cannot convert unsupported `Result.data`, it still writes the row with `data` NULL,
+preserving raw output and the operation outcome, then raises a contextual `OSError` naming
+the unsupported type. The recorder counts this incomplete record as `not_kept`; the
+conversion error never changes the target outcome or escapes from `add` as `ValueError`.
 
-Writable construction defers opening and creation to `start_run`, before any device work.
+`Store(path, readonly=False)` requires an explicit path. The orchestrator supplies it from
+`RecordSettings`; the store imports no orchestrator defaults. The `h-ssh-store` front end
+will obtain the default from the orchestrator in slice 3. Writable construction defers
+opening and creation to `start_run`, before any device work.
 Read-only construction opens an existing compatible store without creating it. SQLite runs
 in WAL mode with a busy timeout, `synchronous=NORMAL` and serialized write transactions.
 `finish_run` and `close` complete the writer interface; SQLite and file failures are exposed
