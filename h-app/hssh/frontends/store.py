@@ -13,7 +13,7 @@ from collections.abc import Sequence
 from contextlib import closing, contextmanager
 
 from hssh.audit import private_dir, private_file
-from hssh.frontends.settings import store_path
+from hssh.frontends.settings import load_config, store_path
 from hssh.screen import is_terminal, terminal_safe
 from hssh.store import Store
 
@@ -306,8 +306,6 @@ def _flush(stream) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    from hssh.frontends.cli import load_config
-
     try:
         store = Store(store_path(args.store, load_config(args.config)), readonly=True)
     except (OSError, ValueError) as error:
