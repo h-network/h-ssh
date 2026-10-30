@@ -35,6 +35,7 @@ class _Run:
     started: str
     tasks: list[asyncio.Task] = field(default_factory=list)
     begun: set[int] = field(default_factory=set)
+    steps: dict[int, str] = field(default_factory=dict)
     past_commit: set[int] = field(default_factory=set)
     interrupts: int = 0
     not_kept: int = 0
@@ -110,7 +111,9 @@ class Scheduler:
             try:
                 result = await self._run_target(run, index, target)
             except asyncio.CancelledError:
-                result = self._failed_before(run, target, Fault(FaultKind.LOCAL, "interrupted", True))
+                step = run.steps.get(index, OPEN)
+                fault = Fault(FaultKind.LOCAL, f"interrupted during {step}", step != OPEN)
+                result = self._failed_before(run, target, fault, "skipped", step)
             except Exception as e:  # noqa: BLE001 - one communicator bug is this target's failure, not the run's end
                 self.policy.settle(target, None)
                 result = self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{type(e).__name__}: {e}", True))
@@ -137,7 +140,7 @@ class Scheduler:
                 task.cancel()
 
     async def _run_target(self, run: _Run, index: int, target: Target) -> TargetResult:
-        """One target: its driver, the dialect's check of an edit payload, attempts while the policy says retry and no interrupt came, then its records."""
+        """One target: its driver, the dialect's check of an edit payload, attempts while the policy says retry and no interrupt came, then its records. An interrupt during the pause makes the attempt before it the last."""
         spec = run.spec
         try:
             driver = self.registry.resolve(target)
@@ -158,7 +161,10 @@ class Scheduler:
                 break
             last = tried.operations[-1]
             unanswered = last.command == OPEN and last.outcome.kind is FaultKind.TIMEOUT and not last.outcome.reached_device
-            await self.policy.pause(attempt, unanswered)
+            try:
+                await self.policy.pause(attempt, unanswered)
+            except asyncio.CancelledError:
+                break
             attempt += 1
         status: TargetStatus = "ok" if tried.verdict is None else "failed"
         ops = tried.operations
@@ -193,6 +199,7 @@ class Scheduler:
         if held is not None:
             opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate: {held}", False), started, 0)
             return _Attempt([opened], Verdict(Action.FAIL))
+        run.steps[index] = OPEN
         try:
             session = await asyncio.wait_for(self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy),
                                              timeouts.connect + timeouts.setup + GRACE_SECONDS)
@@ -210,6 +217,9 @@ class Scheduler:
         ops: list[OperationResult] = []
         try:
             ops = await self._operations(run, index, target, driver, session)
+        except asyncio.CancelledError:
+            self.policy.settle(target, None)
+            raise
         finally:
             stale = any(isinstance(op.outcome, Fault) and op.outcome.kind in DISCARDING for op in ops)
             await self.sessions.release(driver, target, creds, discard=stale)
@@ -220,22 +230,36 @@ class Scheduler:
 
     async def _operations(self, run: _Run, index: int, target: Target, driver: Driver,
                           session: Session) -> list[OperationResult]:
-        """The mode's operations on an open session; a batch goes on after a refused or timed-out command and ends when the session is lost."""
+        """The mode's operations on an open session, each named in run.steps as it starts; a batch goes on after a refused or timed-out command and ends when the session is lost."""
         spec, comm = run.spec, driver.communicator
+
+        def step(name: str) -> None:
+            run.steps[index] = name
+
         if spec.mode in ("show", "batch"):
             ops: list[OperationResult] = []
             for command in spec.commands:
+                step(command)
                 ops.append(await operation(command, lambda c=command: comm.show(session, c), spec.timeouts.command))
                 if isinstance(ops[-1].outcome, Fault) and ops[-1].outcome.kind is FaultKind.SESSION_LOST:
                     break
             return ops
         if spec.mode == "structured":
-            return [await operation(c, lambda c=c: comm.structured(session, c, spec.format), spec.timeouts.command)
-                    for c in spec.commands]
+            ops = []
+            for command in spec.commands:
+                step(command)
+                ops.append(await operation(command, lambda c=command: comm.structured(session, c, spec.format),
+                                           spec.timeouts.command))
+            return ops
         if spec.mode == "edit":
+            def before_commit() -> None:
+                step("commit")
+                run.past_commit.add(index)
+
             edit = await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(
-                list(self._lines_for(spec, target) or ()), spec.edit, before_commit=lambda: run.past_commit.add(index))
+                list(self._lines_for(spec, target) or ()), spec.edit, before_commit=before_commit, on_step=step)
             return list(edit.operations)
+        step(spec.mode)
         if spec.mode == "confirm":
             return await lifecycle.confirm(comm, session, spec.timeouts)
         return [await lifecycle.commit_history(comm, session, spec.timeouts)]
@@ -247,7 +271,7 @@ class Scheduler:
 
     @staticmethod
     def _interrupted_connect(ops: list[OperationResult]) -> bool:
-        """A connect the interrupt cut short: the only operation is an open fault that reached nothing (never message text)."""
+        """A connect the interrupt cut short, or an unanswered one the interrupt kept from its retry: the only operation is an open fault that reached nothing (never message text)."""
         return len(ops) == 1 and ops[0].command == OPEN and isinstance(ops[0].outcome, Fault) and not ops[0].outcome.reached_device
 
     def _judge(self, spec: RunSpec, driver: Driver, op: OperationResult, attempt: int) -> Verdict:
@@ -262,9 +286,10 @@ class Scheduler:
         self._record(run, lambda: self.recorder.result(run.run_id, result.target, driver, len(result.operations), op))
         return dataclasses.replace(result, operations=(*result.operations, op))
 
-    def _failed_before(self, run: _Run, target: Target, fault: Fault, status: TargetStatus = "failed") -> TargetResult:
-        """A target that failed, or was skipped, before any operation: one operation named 'open', recorded without a driver."""
-        op = OperationResult(OPEN, fault, now(), 0)
+    def _failed_before(self, run: _Run, target: Target, fault: Fault, status: TargetStatus = "failed",
+                       command: str = OPEN) -> TargetResult:
+        """A target that failed, or was skipped, with no operation completed: one operation, 'open' or the step the interrupt cut, recorded without a driver."""
+        op = OperationResult(command, fault, now(), 0)
         self._record(run, lambda: self.recorder.result(run.run_id, target, "", 0, op))
         return TargetResult(target, status, (op,))
 

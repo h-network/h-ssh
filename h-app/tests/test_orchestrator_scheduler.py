@@ -251,7 +251,8 @@ def test_a_connect_cut_by_the_interrupt_is_skipped_not_failed():
     assert len(opens(Slow())) == 0 and report.skipped == 3
 
 
-def test_a_stop_during_the_pause_starts_no_new_attempt_and_a_connect_that_reached_the_device_is_failed(monkeypatch):
+@pytest.fixture
+def interrupt_during_the_pause(monkeypatch):
     real_sleep = asyncio.sleep
 
     async def interrupting_sleep(seconds):
@@ -259,10 +260,69 @@ def test_a_stop_during_the_pause_starts_no_new_attempt_and_a_connect_that_reache
         await real_sleep(0.2)
 
     monkeypatch.setattr(policy_module.asyncio, "sleep", interrupting_sleep)
+
+
+def test_a_stop_during_the_pause_starts_no_new_attempt_and_keeps_the_attempts_own_fault(interrupt_during_the_pause):
     comm = FakeNetconf(open_fault=Fault(FaultKind.SESSION_LOST, "dropped during kex", True))
     report = run(show_spec(T1, workers=1), comm)
     assert report.interrupted and len(opens(comm)) == 1
     assert report.results[0].status == "failed"
+    assert fault_of(report.results[0].operations[0]).kind is FaultKind.SESSION_LOST
+
+
+def test_a_stop_during_the_pause_after_an_unanswered_connect_is_skipped(interrupt_during_the_pause):
+    comm = FakeNetconf(open_fault=Fault(FaultKind.TIMEOUT, "no banner", False))
+    report = run(show_spec(T1, workers=1), comm)
+    assert len(opens(comm)) == 1 and report.results[0].status == "skipped"
+    assert fault_of(report.results[0].operations[0]).kind is FaultKind.TIMEOUT
+
+
+class InterruptsIn(FakeNetconf):
+    """Sends the interrupt from inside the named operation, which then takes a moment."""
+
+    def __init__(self, during, **kw):
+        super().__init__(**kw)
+        self.during = during
+
+    def _hit(self, name, then):
+        if name == self.during:
+            interrupt_self()
+            time.sleep(0.2)
+        return then()
+
+    def show(self, session, command):
+        return self._hit("show", lambda: super(InterruptsIn, self).show(session, command))
+
+    def load(self, session, lines):
+        return self._hit("load", lambda: super(InterruptsIn, self).load(session, lines))
+
+    def diff(self, session):
+        return self._hit("diff", lambda: super(InterruptsIn, self).diff(session))
+
+
+def test_a_target_cancelled_during_a_read_is_skipped_with_the_step_named():
+    comm = InterruptsIn("show")
+    report = run(show_spec(T1, T2, workers=1), comm)
+    first = report.results[0]
+    assert first.status == "skipped" and first.operations[0].command == "show version"
+    fault = fault_of(first.operations[0])
+    assert fault.detail == "interrupted during show version" and fault.reached_device
+    assert report.results[1].status == "skipped" and report.interrupted and report.ok == 0
+
+
+@pytest.mark.parametrize("during", ["load", "diff"])
+def test_an_edit_cancelled_before_commit_is_skipped_at_its_step_and_its_session_closed(during):
+    comm, gate = InterruptsIn(during), Gate()
+    report = run(edit_spec(T1, workers=1), comm, gate=gate)
+    result = report.results[0]
+    assert result.status == "skipped" and result.operations[0].command == during
+    assert fault_of(result.operations[0]).detail == f"interrupted during {during}"
+    assert not commits(comm) and ("close", "r1") in comm.calls
+    assert ("release", "r1") in gate.calls and ("cooldown", "r1") not in gate.calls
+
+
+def commits(comm):
+    return [c for c in comm.calls if c[0] == "commit"]
 
 
 def test_a_target_past_commit_is_waited_for_when_interrupted():
