@@ -12,6 +12,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import shlex
 import sys
 import time
@@ -111,6 +112,7 @@ def build_parser() -> _Parser:
     mode.add_argument("--format", choices=FORMAT_CHOICES, default=None, help="json or xml asks for structured data (NETCONF)")
     mode.add_argument("-eC", "--edit-command", metavar="TEXT", help="configuration lines for every target")
     mode.add_argument("-eB", "--edit-file", metavar="FILE", help="configuration file for every target")
+    mode.add_argument("-eD", "--edit-dir", metavar="DIR", help="one <NAME>.set configuration file per target")
     mode.add_argument("--confirm", action="store_true", help="confirm the pending commit on every target")
     mode.add_argument("--commit-status", action="store_true", help="show the commit history")
 
@@ -119,6 +121,7 @@ def build_parser() -> _Parser:
     edit.add_argument("--commit-confirmed", type=int, nargs="?", const=DEFAULT_CONFIRMED_MINUTES, metavar="MIN",
                       help=f"commit confirmed, minutes (default {DEFAULT_CONFIRMED_MINUTES})")
     edit.add_argument("--comment", metavar="TEXT", help="commit comment")
+    edit.add_argument("--allow-missing", action="store_true", help="-eD: skip the targets that have no <NAME>.set")
 
     behaviour = p.add_argument_group("behaviour")
     behaviour.add_argument("--workers", type=int)
@@ -192,12 +195,18 @@ def resolve_targets(args: argparse.Namespace) -> tuple[Target, ...]:
 
 def resolve_mode(args: argparse.Namespace) -> Mode:
     chosen = [m for m, given in (("show", args.show_command), ("batch", args.batch or args.batch_commands),
-                                 ("edit", args.edit_command or args.edit_file), ("confirm", args.confirm),
-                                 ("commit_status", args.commit_status)) if given]
+                                 ("edit", args.edit_command or args.edit_file or args.edit_dir),
+                                 ("confirm", args.confirm), ("commit_status", args.commit_status)) if given]
     if len(chosen) != 1:
-        raise ValueError("give exactly one of -sC, --batch/--profile, -eC/-eB, --confirm, --commit-status")
+        raise ValueError("give exactly one of -sC, --batch/--profile, -eC/-eB/-eD, --confirm, --commit-status")
+    if args.edit_dir and (args.edit_command or args.edit_file):
+        raise ValueError("-eD goes alone: -eC or -eB beside it is refused")
+    if args.allow_missing and not args.edit_dir:
+        raise ValueError("--allow-missing goes with -eD: it skips the targets that have no <NAME>.set")
     if args.skip_unreachable and chosen[0] != "edit":
-        raise ValueError("--skip-unreachable goes with an edit (-eC, -eB)")
+        raise ValueError("--skip-unreachable goes with an edit (-eC, -eB, -eD)")
+    if args.every is not None and chosen[0] not in ("show", "batch"):
+        raise ValueError("--every repeats reads (-sC, --batch, --profile), not edits, confirms or the commit status")
     if chosen[0] == "show" and args.format not in (None, "text"):
         return "structured"
     return chosen[0]
@@ -212,39 +221,96 @@ def resolve_credentials(args: argparse.Namespace) -> Credentials:
     return Credentials(username=user, password=password)
 
 
-def target_dialects(targets: Sequence[Target]) -> list[Dialect]:
-    """Each target's dialect; a target without a driver is left to run() to refuse."""
+def target_dialects(targets: Sequence[Target]) -> dict[str, Dialect]:
+    """Each target's dialect by target name; a target without a driver is refused here, before the password."""
     registry = Registry()
     registry.load_entry_points()
-    dialects = []
-    for target in targets:
-        try:
-            dialects.append(registry.resolve(target).dialect)
-        except Fault:
-            continue
-    return dialects
-
-
-def comment_prefixes(dialects: Sequence[Dialect]) -> tuple[str, ...]:
-    """What starts a full-line comment for every dialect given."""
-    common: set[str] | None = None
-    for dialect in dialects:
-        prefixes = set(dialect.comment_prefixes)
-        common = prefixes if common is None else common & prefixes
-    return tuple(sorted(common or ()))
-
-
-def check_payload(dialects: Sequence[Dialect], lines: Sequence[str]) -> None:
-    """The first dialect refusal of the payload, said before the password; the orchestrator's gate enforces the same."""
-    for dialect in dialects:
-        if why := dialect.check_edit(list(lines)):
-            raise ValueError(why)
+    try:
+        return {target.name: registry.resolve(target).dialect for target in targets}
+    except Fault as f:
+        raise ValueError(f.detail) from f
 
 
 def payload_lines(text: str, prefixes: Sequence[str]) -> tuple[str, ...]:
     """The configuration lines to send: blank lines and full-line comments dropped, an inline "#" kept."""
     lines = (line.rstrip() for line in text.splitlines())
     return tuple(line for line in lines if line.strip() and not line.lstrip().startswith(tuple(prefixes)))
+
+
+# C0 controls but Tab, DEL and C1 controls; a payload keeps its line breaks, nothing else of these.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_CONTROL_NAMES = {"\r": "a carriage return", "\x00": "a NUL", "\x1b": "an ESC", "\x7f": "a DEL"}
+_DEVICE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*")
+
+
+def control_line(text: str) -> tuple[int, str, str] | None:
+    """(line number, the line, what) for the first control character in a payload, or None."""
+    for number, line in enumerate(text.split("\n"), 1):
+        if m := _CONTROL.search(line.rstrip("\r")):
+            return number, line, _CONTROL_NAMES.get(m.group(), f"a control character {m.group()!r}")
+    return None
+
+
+def validate_device_name(name: str) -> str:
+    """A target name as it may appear in a file name: no separator, no leading '-' or '.'."""
+    if not _DEVICE_NAME.fullmatch(name):
+        raise ValueError(f"invalid device name {name!r}: letters, digits, '_', '.', ':' and '-' only, not starting with '-' or '.'")
+    return name
+
+
+def path_inside(base: Path, filename: str) -> Path:
+    """`base/filename`, refused unless it stays inside `base` once resolved."""
+    if (base.resolve() / filename).resolve().parent != base.resolve():
+        raise ValueError(f"{filename!r} does not stay inside {base}")
+    return base / filename
+
+
+def set_files(args: argparse.Namespace, targets: Sequence[Target]) -> dict[str, Path]:
+    """-eD: the <NAME>.set of each target; the targets without one end the run, or are skipped with --allow-missing."""
+    base = Path(args.edit_dir)
+    if not base.is_dir():
+        raise ValueError(f"-eD {base}: not a directory")
+    files = {t.name: path_inside(base, f"{validate_device_name(t.name)}.set") for t in targets}
+    missing = [name for name, path in files.items() if not path.is_file()]
+    if missing and not args.allow_missing:
+        raise ValueError(f"-eD {base}: no <NAME>.set for {len(missing)} of {len(targets)} device(s): "
+                         f"{listed(missing)}. Nothing was sent; --allow-missing skips them.")
+    if missing:
+        print(f"Skipping {len(missing)} device(s) without a set file: {listed(missing)}", file=sys.stderr)
+    found = {name: path for name, path in files.items() if name not in missing}
+    if not found:
+        raise ValueError(f"-eD {base}: no device has a set file; nothing to do")
+    return found
+
+
+def listed(names: Sequence[str]) -> str:
+    return ", ".join(names[:20]) + (" …" if len(names) > 20 else "")
+
+
+def edit_payloads(args: argparse.Namespace, targets: Sequence[Target]) -> dict[str, tuple[str, ...]]:
+    """Each target's configuration lines, stripped and checked by its own dialect, read before the password."""
+    dialects = target_dialects(targets)
+    if args.edit_dir:
+        sources = {name: (str(path), path.read_text(encoding="utf-8-sig")) for name, path in set_files(args, targets).items()}
+    else:
+        text = args.edit_command or Path(args.edit_file).read_text(encoding="utf-8-sig")
+        source = "-eC" if args.edit_command else f"-eB {args.edit_file}"
+        sources = {t.name: (source, text) for t in targets}
+    payloads, empty = {}, []
+    for name, (source, text) in sources.items():
+        if found := control_line(text):
+            number, line, what = found
+            raise ValueError(f"{source}: line {number} has {what} ({line!r}); a payload is plain text")
+        lines = payload_lines(text, dialects[name].comment_prefixes)
+        if not lines:
+            empty.append(source)
+            continue
+        if why := dialects[name].check_edit(list(lines)):
+            raise ValueError(f"{source}: {why}")
+        payloads[name] = lines
+    if empty:
+        raise ValueError(f"nothing but blank lines and comments in {listed(sorted(set(empty)))}. Nothing was sent")
+    return payloads
 
 
 def check_edit_args(args: argparse.Namespace, edit: EditSettings) -> None:
@@ -262,16 +328,13 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
     mode = resolve_mode(args)
     targets = resolve_targets(args)
     commands: tuple[str, ...] = ()
-    config_lines: tuple[str, ...] = ()
+    payloads: dict[str, tuple[str, ...]] = {}
     if mode in ("show", "structured"):
         commands = (args.show_command,)
     elif mode == "batch":
         commands = tuple(args.batch_commands or profiles.read_commands(Path(args.batch)))
     elif mode == "edit":
-        text = args.edit_command or Path(args.edit_file).read_text(encoding="utf-8-sig")
-        dialects = target_dialects(targets)
-        config_lines = payload_lines(text, comment_prefixes(dialects))
-        check_payload(dialects, config_lines)
+        payloads = edit_payloads(args, targets)
     edit = None
     if mode == "edit":
         edit = EditSettings(apply=args.yes, confirmed_minutes=args.commit_confirmed, comment=args.comment)
@@ -280,7 +343,7 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
     if args.safety_file:
         safety = SafetySettings(cooldown_seconds=args.cooldown, rate_limit=args.rate_limit, safety_file=args.safety_file)
     return RunSpec(
-        targets=targets, mode=mode, commands=commands, config_lines=config_lines,
+        targets=targets, mode=mode, commands=commands, payloads=payloads,
         format=args.format if mode == "structured" else None,
         credentials=resolve_credentials(args),
         timeouts=Timeouts(connect=args.connect_timeout, setup=args.session_timeout, command=args.command_timeout,

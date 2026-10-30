@@ -23,6 +23,8 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "format": ("format", str),
     "edit": ("edit_command", str),
     "edit_file": ("edit_file", str),
+    "edit_dir": ("edit_dir", str),
+    "allow_missing": ("allow_missing", bool),
     "confirm": ("confirm", bool),
     "commit_status": ("commit_status", bool),
     "yes": ("yes", bool),
@@ -56,7 +58,7 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
 CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 
 # Relative to the file, not to the shell's cwd.
-PATH_KEYS = ("devices", "batch", "edit_file", "safety_file", "store", "audit_log", "log", "save_output")
+PATH_KEYS = ("devices", "batch", "edit_file", "edit_dir", "safety_file", "store", "audit_log", "log", "save_output")
 
 
 def _normalize_key(key: Any) -> str:

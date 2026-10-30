@@ -74,8 +74,13 @@ between reports.
 
 The CLI refuses before the password is asked what the run could not go on with: a commit comment or timer the
 orchestrator's `check_comment` and `check_confirmed_minutes` reject, and a run file that applies changes
-without `commit_confirmed` (nobody watches a pipeline). An edit payload loses its blank lines and the lines
-that start with the targets' dialect comment prefixes; an inline `#` is sent as written. After an apply with
+without `commit_confirmed` (nobody watches a pipeline). An edit payload (`-eC` text, one `-eB` file for every
+target, or `-eD DIR` with one `<NAME>.set` per target, read before the password) loses its blank lines and the
+lines that start with each target's own dialect comment prefixes; an inline `#` is sent as written; a payload with
+a control character, or with nothing left after the comments, is refused naming the file and the line. With `-eD`
+a target without its file ends the run before anything is sent, unless `--allow-missing`, which skips those
+targets and says so; a set file name is the device name, checked to stay inside the directory. `--every` repeats
+reads only, never an edit. After an apply with
 a timer the CLI prints the minutes left per device and the command that confirms them, rebuilt from the run's
 own arguments. Exit codes: 0; 1 a device failed; 2 refused before anything was sent; 3 nothing failed but not
 everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exits with the worst of its runs,
@@ -260,7 +265,9 @@ for what the device did: no fault with `reached_device` false cools a device dow
 ### 5.1 RunSpec
 
 A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
-`commit_status`), the commands or configuration lines, credentials, timeouts (`connect` for the TCP connect and the
+`commit_status`), the commands or configuration lines, the per-target payloads (a target name to its own
+lines; a target not named gets the configuration lines, and when payloads are given a target in neither has no
+payload and is skipped), credentials, timeouts (`connect` for the TCP connect and the
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
 operation, `commit`),
 the worker limit, the safety
@@ -289,6 +296,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - **Apply** requires `-y`. Without it, an edit is a dry run. A diff whose data is False sends no commit: an empty
   commit could confirm someone else's pending commit-confirmed.
 - The target is marked past `COMMIT` before the commit is sent, so an interrupt waits for the reply.
+- A target's payload is its entry in the per-target payloads, else the configuration lines. When payloads are given
+  and a target has neither, it is skipped before `OPEN`, recorded as `open` `LOCAL` "no configuration for this target".
 - Before `OPEN`, the payload goes through the driver dialect's `check_edit`; a refusal fails the target as `LOCAL`
   with the dialect's text, so the rule holds for every caller, not only the CLI.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
@@ -337,14 +346,16 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 
 ```json
 {"time": "...", "run_id": 42, "user": "...", "target": "R1", "host": "192.0.2.1",
- "driver": "junos@netconf", "action": "commit", "dry_run": false,
- "confirmed_minutes": 10, "comment": "...", "diff": "...", "ok": true, "fault": null}
+ "driver": "junos@netconf", "action": "load", "payload": "set system host-name R1", "dry_run": false,
+ "confirmed_minutes": 10, "comment": "...", "diff": "", "ok": true, "fault": null}
 ```
 
 `time` is the operation's `started` timestamp. `dry_run` is the inverse of the requested
 `EditSettings.apply`; `ok` describes the operation's outcome, not whether a commit was requested.
 `fault` is null on success, otherwise an object with `kind` (the fault kind name), `detail` and
-`reached_device`. The full fault detail, comment and diff are redacted before serialization.
+`reached_device`. `payload` contains the target's submitted lines joined with newlines on a `load`
+entry, including a failed load. It is an empty string when no lines were supplied or the action is not
+`load`. The payload, full fault detail, comment and diff are redacted before serialization.
 Actions are `load`, `diff`, `commit`, `confirm`, and `probe` (a probe failure that stops an edit).
 Confirm runs use `apply=true`.
 

@@ -144,8 +144,13 @@ class Scheduler:
             self.registry.check_mode(driver, spec.mode)
         except Fault as f:
             return self._failed_before(run, target, f)
-        if spec.mode == "edit" and (why := driver.dialect.check_edit(list(spec.config_lines))):
-            return self._failed_before(run, target, Fault(FaultKind.LOCAL, why, False))
+        lines = self._lines_for(spec, target)
+        if spec.mode == "edit":
+            if lines is None:
+                return self._failed_before(run, target, Fault(FaultKind.LOCAL, "no configuration for this target", False),
+                                           "skipped")
+            if why := driver.dialect.check_edit(list(lines)):
+                return self._failed_before(run, target, Fault(FaultKind.LOCAL, why, False))
         attempt = 1
         while True:
             tried = await self._attempt(run, index, target, driver, attempt)
@@ -163,7 +168,7 @@ class Scheduler:
             self._record(run, lambda seq=seq, op=op: self.recorder.result(run.run_id, target, driver.name, seq, op))
         if spec.mode == "edit":
             self._record(run, lambda: self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit,
-                                                            spec.config_lines))
+                                                            lines or ()))
         elif spec.mode == "confirm":
             self._record(run, lambda: self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops,
                                                             dataclasses.replace(spec.edit, apply=True)))
@@ -229,11 +234,16 @@ class Scheduler:
                     for c in spec.commands]
         if spec.mode == "edit":
             edit = await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(
-                list(spec.config_lines), spec.edit, before_commit=lambda: run.past_commit.add(index))
+                list(self._lines_for(spec, target) or ()), spec.edit, before_commit=lambda: run.past_commit.add(index))
             return list(edit.operations)
         if spec.mode == "confirm":
             return await lifecycle.confirm(comm, session, spec.timeouts)
         return [await lifecycle.commit_history(comm, session, spec.timeouts)]
+
+    @staticmethod
+    def _lines_for(spec: RunSpec, target: Target) -> tuple[str, ...] | None:
+        """The target's own payload, else the configuration lines; None when payloads are given and it has neither."""
+        return spec.payloads.get(target.name) or spec.config_lines or (None if spec.payloads else ())
 
     @staticmethod
     def _interrupted_connect(ops: list[OperationResult]) -> bool:
