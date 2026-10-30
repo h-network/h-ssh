@@ -239,11 +239,12 @@ device, unless the dialect marks it as a read.
 | `TIMEOUT` before login, the banner came but setup did not finish in the setup budget (`reached_device` true) | fail | fail | n/a |
 | `AUTH`, `HOST_KEY` | fail | fail | n/a |
 | `TIMEOUT`, `SESSION_LOST` in session | retry | fail | fail, cool down |
-| `REFUSED`, `COMMIT_FAILED` | fail | fail, cool down | fail, cool down |
-| `OUTCOME_UNKNOWN` | n/a | n/a | fail, never retried, flagged for manual check |
+| `REFUSED`, `COMMIT_FAILED` | fail | fail | fail, cool down |
+| `OUTCOME_UNKNOWN` | n/a | n/a | fail, cool down, never retried or rolled back, the session discarded, flagged for manual check |
 | `UNSUPPORTED`, `LOCAL` | fail | fail | fail |
 
-The retry count, pauses and cooldown period are policy settings, not communicator settings.
+The retry count, pauses and cooldown period are policy settings, not communicator settings. A cooldown is only
+for what the device did: no fault with `reached_device` false cools a device down.
 
 ## 5. Execution model
 
@@ -277,9 +278,17 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - The probe runs before `OPEN`. An edit whose probe found a target dead stops before any device, with one audit
   entry per dead target and no run row, unless `skip_unreachable` is set, which skips those targets; a read fails them.
   An apply the operator declines gets one audit entry per target through `audit_aborted`.
-- **Apply** requires `-y`. Without it, an edit is a dry run.
+- **Apply** requires `-y`. Without it, an edit is a dry run. A diff whose data is False sends no commit: an empty
+  commit could confirm someone else's pending commit-confirmed.
+- The target is marked past `COMMIT` before the commit is sent, so an interrupt waits for the reply.
+- Before `OPEN`, the payload goes through the driver dialect's `check_edit`; a refusal fails the target as `LOCAL`
+  with the dialect's text, so the rule holds for every caller, not only the CLI.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
-  minutes left on each, from the device; the front end builds the command that confirms them.
+  minutes left on each, from the device; the front end builds the command that confirms them. A confirm run reads the
+  commit history first and sends the confirm only when its `CommitStatus` is pending; otherwise it is `REFUSED`.
+- The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
+  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
+  ends call the same helpers before asking for a password.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
   uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.
 - The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file. Before the
@@ -295,7 +304,7 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
    recorded as skipped with the reason, not failed: nothing reached it and the operator stopped the run.
 3. A second interrupt reports what is still in flight. It does not abandon records.
 4. The run is always closed in the store, with counts for ok, failed and skipped. The report also counts the
-   records that could not be kept.
+   records that could not be kept; a record that could not be written is never the target's failure or cooldown.
 
 ## 6. Data model
 

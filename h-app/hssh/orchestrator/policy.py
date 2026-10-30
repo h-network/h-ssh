@@ -70,7 +70,7 @@ def decide(fault: Fault, *, read: bool, editing: bool, operation: str, attempt: 
         if read and retries_left:
             return Verdict(Action.RETRY)
         return Verdict(Action.FAIL, cool_down=editing and fault.reached_device)
-    return Verdict(Action.FAIL, cool_down=editing)
+    return Verdict(Action.FAIL, cool_down=editing and fault.reached_device)
 
 
 class Policy:
