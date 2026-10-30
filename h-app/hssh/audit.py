@@ -71,10 +71,12 @@ def check_private_file(info: os.stat_result) -> None:
 
 
 @contextmanager
-def private_file(path: str, flags: int, *, dir_fd: int | None = None):
+def private_file(path: str, flags: int, *, dir_fd: int | None = None, allow_character: bool = False):
     fd = os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     try:
-        check_private_file(os.fstat(fd))
+        info = os.fstat(fd)
+        if not (allow_character and stat.S_ISCHR(info.st_mode)):
+            check_private_file(info)
         yield fd
     finally:
         os.close(fd)

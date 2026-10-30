@@ -1,8 +1,12 @@
-"""Private SQLite result writer; reader commands await the reader phase."""
+"""Private SQLite result writer and streaming reader."""
 
 from __future__ import annotations
 
+import csv
+import difflib
+import io
 import json
+import re
 import math
 import os
 import sqlite3
@@ -10,8 +14,8 @@ import stat
 import threading
 import time
 import weakref
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Literal
@@ -108,6 +112,32 @@ def _wal(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA busy_timeout = {int(_BUSY_TIMEOUT * 1000)}")
 
 
+_RESULT_COLUMNS = ("run_id", "seq", "target", "host", "driver", "command", "target_status", "ok",
+                   "fault", "detail", "reached_device", "output", "data", "started", "elapsed_ms")
+
+
+def _archive_state(path: Path) -> tuple[int, int, int, int] | None:
+    if os.path.lexists(str(path) + "-journal"):
+        return None
+    try:
+        if os.stat(str(path) + "-wal").st_size:
+            return None
+    except FileNotFoundError:
+        pass
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def _integer(value: int, name: str, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def _limit(value: int | None) -> tuple[str, list[int]]:
+    return ("", []) if value is None else (" LIMIT ?", [_integer(value, "limit")])
+
+
 class Store:
     def __init__(self, path: str, readonly: bool = False) -> None:
         self.path = os.fspath(path)
@@ -119,8 +149,69 @@ class Store:
         self._identity: tuple[int, int] | None = None
         self._writing = threading.RLock()
         self._closed = False
+        self._resolved: Path | None = None
+        self._archive_snapshot: tuple[int, int, int, int] | None = None
         if readonly:
-            raise NotImplementedError("read-only stores await the reader phase")
+            self._open_reader()
+
+    def _open_reader(self) -> None:
+        try:
+            self._resolved = Path(self.path).resolve(strict=True)
+            info = self._resolved.stat()
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("not a regular store file")
+            self._name = self._resolved.name
+            self._identity = (info.st_dev, info.st_ino)
+            self._directory = os.open(self._resolved.parent, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY)
+            self._release_directory = weakref.finalize(self, os.close, self._directory)
+            uri = self._resolved.as_uri() + "?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT, check_same_thread=False)
+            try:
+                self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except sqlite3.Error as error:
+                name = getattr(error, "sqlite_errorname", "")
+                if not (name.startswith("SQLITE_READONLY") or name.startswith("SQLITE_CANTOPEN")
+                        or "readonly" in str(error).lower() or "unable to open" in str(error).lower()):
+                    raise
+                self._conn.close()
+                self._conn = None
+                self._archive_snapshot = _archive_state(self._resolved)
+                if self._archive_snapshot is None:
+                    raise OSError("archive has a pending WAL or journal; copy the store with its sidecars "
+                                  "to a writable directory before reading") from error
+                self._conn = sqlite3.connect(uri + "&immutable=1", uri=True, check_same_thread=False)
+            self._conn.execute("PRAGMA query_only = ON")
+            with self._conn:
+                self._conn.execute("BEGIN")
+                if not _schema_state(self._conn):
+                    raise OSError(_INCOMPATIBLE)
+            self._conn.row_factory = sqlite3.Row
+            self._read_guard()
+        except BaseException as error:
+            self._release()
+            if isinstance(error, (OSError, sqlite3.Error)):
+                raise OSError(f"{self.path}: cannot read store: {error}") from error
+            raise
+
+    def _read_guard(self) -> None:
+        self._check_identity()
+        if self._archive_snapshot is not None and _archive_state(self._resolved) != self._archive_snapshot:
+            raise OSError("archive changed while it was read; output may be incomplete, read it again")
+
+    def _query(self, sql: str, parameters=()) -> Iterator[sqlite3.Row]:
+        with self._writing:
+            try:
+                if self._closed or self._conn is None:
+                    raise OSError("store is not open")
+                self._read_guard()
+                cursor = self._conn.execute(sql, parameters)
+                try:
+                    yield from cursor
+                finally:
+                    cursor.close()
+                    self._read_guard()
+            except (OSError, sqlite3.Error) as error:
+                raise OSError(f"{self.path}: cannot read store: {error}") from error
 
     def _check_identity(self) -> None:
         info = os.stat(self._name, dir_fd=self._directory, follow_symlinks=False)
@@ -204,6 +295,8 @@ class Store:
             try:
                 if self._closed or self._conn is None:
                     raise OSError("store is not open")
+                if self.readonly:
+                    raise OSError("store is read-only")
                 self._check_identity()
                 self._sidecars()
                 with self._conn:
@@ -280,7 +373,7 @@ class Store:
             try:
                 try:
                     if self._conn is not None:
-                        self._check_identity()
+                        self._read_guard()
                 finally:
                     self._closed = True
                     self._release()
@@ -288,13 +381,37 @@ class Store:
                 raise OSError(getattr(error, "errno", None), f"cannot close store: {error}", self.path) from error
 
     def runs(self, last: int | None = 20) -> Iterator[sqlite3.Row]:
-        raise NotImplementedError
+        limit, parameters = _limit(last)
+        return self._query("SELECT * FROM runs ORDER BY julianday(started) DESC, id DESC" + limit, parameters)
 
     def last_run_id(self) -> int | None:
-        raise NotImplementedError
+        with closing(self.runs(last=1)) as rows:
+            row = next(rows, None)
+            return row["id"] if row is not None else None
 
     def resolve_run(self, selector: int | str | None = None) -> int:
-        raise NotImplementedError
+        if selector is None:
+            found = self.last_run_id()
+            if found is None:
+                raise ValueError("the store holds no runs")
+            return found
+        if type(selector) is int:
+            _integer(selector, "run ID", 1)
+        elif not isinstance(selector, str) or not re.fullmatch(r"[0-9]+", selector):
+            raise ValueError("run selector must be a decimal ID or a literal decimal prefix")
+        text = str(selector)
+        with closing(self._query("SELECT id FROM runs WHERE CAST(id AS TEXT) = ?", (text,))) as rows:
+            exact = next(rows, None)
+        if exact is not None:
+            return exact["id"]
+        if isinstance(selector, str):
+            matches = list(self._query("SELECT id FROM runs WHERE substr(CAST(id AS TEXT), 1, length(?)) = ? "
+                                       "ORDER BY id LIMIT 2", (text, text)))
+            if len(matches) == 1:
+                return matches[0]["id"]
+            if matches:
+                raise ValueError(f"ambiguous run prefix {selector!r}")
+        raise ValueError(f"no run {selector!r}")
 
     def results(
         self, run_id: int | None = None, target: str | None = None,
@@ -303,13 +420,44 @@ class Store:
         order: Literal["sequence", "newest", "slowest"] = "sequence",
         limit: int | None = None,
     ) -> Iterator[sqlite3.Row]:
-        raise NotImplementedError
+        orders = {"sequence": "run_id, target, seq", "newest": "julianday(started) DESC, run_id, target, seq",
+                  "slowest": "elapsed_ms DESC, run_id, target, seq"}
+        if order not in orders:
+            raise ValueError(f"unknown result order {order!r}")
+        if run_id is not None:
+            _integer(run_id, "run ID", 1)
+        if seq is not None:
+            _integer(seq, "sequence")
+        if status is not None and status not in ("ok", "failed", "skipped"):
+            raise ValueError(f"invalid target status {status!r}")
+        for name, value in (("target", target), ("command", command)):
+            if value is not None and not value.strip():
+                raise ValueError(f"{name} filter is empty")
+        where, parameters = [], []
+        for column, value in (("run_id", run_id), ("target", target), ("command", command),
+                              ("ok", ok), ("target_status", status), ("seq", seq)):
+            if value is not None:
+                where.append(column + " = ?")
+                parameters.append(value)
+        sql = "SELECT * FROM results" + (" WHERE " + " AND ".join(where) if where else "")
+        tail, count = _limit(limit)
+        return self._query(sql + " ORDER BY " + orders[order] + tail, parameters + count)
 
     def output(self, run_id: int, target: str, seq: int = 0) -> sqlite3.Row:
-        raise NotImplementedError
+        with closing(self.results(run_id, target, seq=seq, limit=1)) as rows:
+            row = next(rows, None)
+        if row is None:
+            raise ValueError(f"no result for {target!r} sequence {seq} in run {run_id}")
+        return row
 
     def compare(self, before: int, after: int, target: str, seq: int = 0) -> str:
-        raise NotImplementedError
+        left, right = self.output(before, target, seq), self.output(after, target, seq)
+        for run, row in ((before, left), (after, right)):
+            if not row["ok"]:
+                raise ValueError(f"cannot compare failed operation in run {run}: {row['fault']}: {row['detail']}")
+        lines = difflib.unified_diff(left["output"].splitlines(), right["output"].splitlines(),
+                                    fromfile=f"{target} {before}", tofile=f"{target} {after}", lineterm="")
+        return "\n".join(lines)
 
     def export(
         self, run_id: int | None = None, *,
@@ -318,8 +466,22 @@ class Store:
         ok: bool | None = None, status: TargetStatus | None = None,
         seq: int | None = None,
     ) -> Iterator[str]:
-        raise NotImplementedError
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    raise NotImplementedError
+        if format not in ("jsonl", "csv"):
+            raise ValueError(f"unknown export format {format!r}")
+        with closing(self.results(run_id, target, command, ok, status=status, seq=seq)) as rows:
+            buffer = io.StringIO(newline="")
+            writer = csv.writer(buffer)
+            if format == "csv":
+                writer.writerow(_RESULT_COLUMNS)
+                yield buffer.getvalue()
+            for row in rows:
+                if format == "csv":
+                    buffer.seek(0)
+                    buffer.truncate()
+                    writer.writerow(row[column] for column in _RESULT_COLUMNS)
+                    yield buffer.getvalue()
+                else:
+                    record = dict(row)
+                    if record["data"] is not None:
+                        record["data"] = json.loads(record["data"])
+                    yield json.dumps(record, ensure_ascii=False) + "\n"
