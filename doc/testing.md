@@ -18,9 +18,9 @@ and on every pull request.
 
 | Job | Runs in | Steps |
 |---|---|---|
-| `pytest` | `python:3.10`, `3.11`, `3.12` and `3.13` containers | Install with the dev extras: `pip install -e '.[dev]'`. Run the unit suite: `python -m pytest -q` |
+| `pytest` | `python:3.10`, `3.11`, `3.12` and `3.13` containers | Install with the dev extras: `pip install -e '.[dev]'`. Run the unit suite as an unprivileged user: `python -m pytest -q` |
 | `lint` | `python:3.12` | `ruff check --select E9,F63,F7,F82,F821,F823,F811 h-app/hssh h-app/tests`: syntax errors, undefined names, redefinitions |
-| `install` | `python:3.12` | A clean `pip install .` into a new venv. Both entry points start. A refused connection ends as a failed device with exit 1 and no traceback. The installer installs and uninstalls |
+| `install` | `python:3.12` | A clean `pip install .` into a new venv. The entry point starts. A refused connection with `--no-probe` (and with the default probe) ends as a failed device with exit 1 and no traceback |
 
 Each `pytest` matrix entry runs independently, so one Python version failing does not stop the others.
 
@@ -51,25 +51,22 @@ python -m venv .venv
 # unit suite
 .venv/bin/python -m pytest -q
 
-# install check: a clean install, both entry points, a refused connection ends as a failed device
+# install check: a clean install, the entry point, a refused connection reaches the transport and ends as a failed device
 python -m venv /tmp/hssh-install && /tmp/hssh-install/bin/pip install -q .
-/tmp/hssh-install/bin/h-ssh --help >/dev/null && /tmp/hssh-install/bin/h-ssh-store --help >/dev/null
-rc=0; /tmp/hssh-install/bin/h-ssh --no-store --user u --target x:127.0.0.1:junos --session-timeout 1 \
-    --retries 0 -sC "show version" 2>/tmp/hssh-err || rc=$?
-test "$rc" -eq 1 && ! grep -q Traceback /tmp/hssh-err
-
-# installer: install from this checkout, then uninstall
-git checkout -q -B local-head
-H_SSH_REPO="file://$PWD" H_SSH_REF=local-head H_SSH_HOME=/tmp/h-ssh-home H_SSH_BIN=/tmp/h-ssh-bin sh install.sh
-H_SSH_HOME=/tmp/h-ssh-home H_SSH_BIN=/tmp/h-ssh-bin sh install.sh --uninstall
+/tmp/hssh-install/bin/h-ssh --help >/dev/null && /tmp/hssh-install/bin/h-ssh --list-profiles >/dev/null
+rc=0; /tmp/hssh-install/bin/h-ssh --no-store --no-probe --transport netconf --user u \
+    --target x:127.0.0.1:junos --session-timeout 1 --retries 0 -sC "show version" \
+    >/tmp/hssh-out 2>/tmp/hssh-err || rc=$?
+test "$rc" -eq 1 && grep -q 'x: FAIL open: UNREACHABLE .*Connection refused' /tmp/hssh-out \
+    && grep -q '^\[h-ssh\] {' /tmp/hssh-err && ! grep -q Traceback /tmp/hssh-err
 ```
 
-To match CI's Python versions exactly, run the suite in the same containers:
+To match CI's Python versions and unprivileged user exactly, run the suite in the same containers:
 
 ```sh
 for v in 3.10 3.11 3.12 3.13; do
   docker run --rm -v "$PWD":/src -w /src python:$v \
-    sh -c "pip install -q -e '.[dev]' && python -m pytest -q" || echo "FAILED on $v"
+    sh -c "pip install -q -e '.[dev]' && useradd -m t && runuser -u t -- env HOME=/home/t python -m pytest -q -o cache_dir=/tmp/pytest" || echo "FAILED on $v"
 done
 ```
 
