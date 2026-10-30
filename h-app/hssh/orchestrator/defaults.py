@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import getpass
+import sys
 import unicodedata
 
 from hssh.model import Credentials, EditSettings, HostKeyPolicy, PolicySettings, RunSpec, SafetySettings, Timeouts
@@ -24,6 +25,38 @@ DEFAULT_VENDOR = "generic"
 DEFAULT_STORE = "h-ssh.db"
 MAX_CONFIRMED_MINUTES = 65535
 MAX_COMMENT_BYTES = 512
+ALIVE_SECONDS = 5
+FDS_PER_WORKER = 6
+FDS_PER_SESSION = 4
+FDS_BASE = 32
+
+
+def open_file_limit() -> int | None:
+    """The process's soft open-file limit, raised towards the hard one first (no privilege needed); None when unlimited or unknown."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, ValueError, OSError):
+        return None
+    if soft != resource.RLIM_INFINITY and soft < hard:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+            soft = hard
+        except (ValueError, OSError):
+            pass
+    return None if soft == resource.RLIM_INFINITY else soft
+
+
+def fit_workers(workers: int) -> int:
+    """`workers`, lowered to what the open-file limit carries at FDS_PER_WORKER each beside FDS_BASE, said once on stderr when lowered."""
+    limit = open_file_limit()
+    if limit is None:
+        return workers
+    fitted = max(1, min(workers, (limit - FDS_BASE) // FDS_PER_WORKER))
+    if fitted < workers:
+        print(f"workers lowered from {workers} to {fitted}: the open-file limit is {limit}", file=sys.stderr)
+    return fitted
 
 
 def default_username() -> str:

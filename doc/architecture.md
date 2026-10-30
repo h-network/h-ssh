@@ -125,7 +125,7 @@ default port is held by its protocol, and a target's own port overrides it.
 | Scheduler | Expands targets, runs them in parallel up to the worker limit, and keeps the order of results stable |
 | Policy | Maps each `Fault` to an action: retry, fail, skip, or cool down. Applies the safety gate |
 | Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed and confirm |
-| Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature |
+| Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature: a caller (the Fleet API) hands `execute` its own manager and keeps it; the CLI's run owns and closes its own. A session is keyed by driver, host, the port the connection uses, user, host-key policy and the credential as a process-secret HMAC, so a changed secret or policy opens anew. One session per key: a second borrower waits for it instead of logging in again. A kept session is offered again only after the communicator's `reuse` vouches for it (the cheap check on every borrow, the device asked past its idle threshold) under a 5 s budget; a borrow owns it through its `release` cleanup (two command timeouts), and only then is it idle. A session in doubt (timeout, loss, unknown commit outcome, a cancelled or over-budget call still running, a failed cleanup or close) is torn down by `discard` with no cleanup and never offered again. Before an open, the least recently used idle sessions are closed while the open-file limit cannot hold them beside the workers (6 descriptors per worker, 4 per kept session, 32 base); workers are lowered to the limit once per run and said once |
 | Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, following ssh config, and skips targets reached through a proxy. Its outcome is expressed as the same fault kinds |
 | Cancellation | Handles interruption (section 5.4) |
 | Recorder | Writes every result to the store and every change to the audit log, with redaction |
@@ -320,7 +320,10 @@ The orchestrator runs on asyncio. Blocking libraries such as paramiko and PyEZ r
 the worker limit at once, so a call that never returns keeps its thread, never the interpreter's exit. Each communicator
 call gets its own timeout (`connect` plus `setup` for open, `command`, or `commit`) plus a grace period; one that has not
 returned by then is that target's `TIMEOUT` fault, and its thread is left to finish. Each target is one task. A target's operations run in order on one session. Targets
-run independently, and one target's failure does not affect another's.
+run independently, and one target's failure does not affect another's. A `TIMEOUT` on one command of a batch ends the
+use of that session before the next command: it is torn down at once, and the rest of the batch goes on under the read
+policy on a fresh session, one more login; a `REFUSED` reply continues on the same session and `SESSION_LOST` still ends
+the batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts.
 
 ### 5.3 Edit lifecycle
 
