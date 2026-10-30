@@ -38,6 +38,10 @@ _STRICT_HOST_KEY = {"accept-new": "accept-new", "strict": "yes", "off": "no"}
 
 _EXIT_GRACE = 2.0
 
+# As the ssh communicator: a kept session idle this long is asked before reuse, with this much time to answer.
+IDLE_CHECK_SECONDS = 30
+PROBE_SECONDS = 5
+
 _POLL = 0.1
 
 # Rows and columns ssh requests for the remote pty, the size paramiko's shell asks for (#166).
@@ -178,8 +182,8 @@ def _control(host: str, control_path: str, action: str, seconds: float) -> bool:
         return False
 
 
-def _wait_master(proc: subprocess.Popen, log_path: str, timeouts: Timeouts) -> None:
-    """Block until the login ssh exits: 0 once the master is up, else with its reason in the log."""
+def _wait_master(proc: subprocess.Popen, log_path: str, timeouts: Timeouts) -> float:
+    """Block until the login ssh exits: 0 once the master is up, else with its reason in the log; returns the setup deadline."""
     until = time.monotonic() + timeouts.connect + _EXIT_GRACE
     reached = False
     while proc.poll() is None:
@@ -193,6 +197,14 @@ def _wait_master(proc: subprocess.Popen, log_path: str, timeouts: Timeouts) -> N
         time.sleep(_POLL)
     if proc.returncode != 0:
         raise ConnectionError()
+    return until if reached else time.monotonic() + timeouts.setup
+
+
+def _valid_command(command: str) -> str:
+    text = command.strip()
+    if not text or any(ord(c) < 32 or 127 <= ord(c) <= 159 or 0xD800 <= ord(c) <= 0xDFFF for c in text):
+        raise Fault(FaultKind.LOCAL, "a command must be nonempty text without controls or Tab", False)
+    return text
 
 
 def _login_fault(host: str, log: str, waited: int | None = None) -> Fault:
@@ -305,7 +317,7 @@ class ProcessChannel:
 
 @dataclass
 class OpenSSHSession:
-    """One ControlMaster to the device; shows run as execs through it, edits on a shell opened at first use."""
+    """One ControlMaster to the device; shows run as execs through it, edits on a shell opened at the first edit."""
 
     target: Target
     creds: Credentials
@@ -313,7 +325,8 @@ class OpenSSHSession:
     host_key_policy: HostKeyPolicy
     control_dir: str
     control_path: str
-    idle_since: float = 0.0
+    setup_deadline: float
+    ready: bool = True
     channel: ProcessChannel | None = None
     engine: CliEngine | None = None
 
@@ -327,9 +340,9 @@ class OpenSSH:
 
     def __init__(self, dialect: Dialect):
         self.dialect = dialect
-        caps = {"show", "batch", "edit"}
+        caps = {"show", "batch"}
         if dialect.has_candidate:
-            caps |= {"commit_confirmed", "confirm", "commit_status"}
+            caps |= {"edit", "confirm", "commit_status"}
         self.capabilities = frozenset(caps)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
@@ -339,7 +352,7 @@ class OpenSSH:
         control_dir = tempfile.mkdtemp(prefix="hssh-")
         # Unix socket paths cap near 104 bytes, so the name stays short.
         session = OpenSSHSession(target, creds, timeouts, host_key_policy, control_dir,
-                                 os.path.join(control_dir, "cm"), time.monotonic())
+                                 os.path.join(control_dir, "cm"), time.monotonic() + timeouts.connect + timeouts.setup)
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
         os.close(fd)
         try:
@@ -348,7 +361,7 @@ class OpenSSH:
                 proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL, env=askpass.env)
                 try:
-                    _wait_master(proc, log_path, timeouts)
+                    session.setup_deadline = _wait_master(proc, log_path, timeouts)
                 except (ConnectionError, TimeoutError) as exc:
                     log = _read(log_path)
                     waited = (timeouts.setup if _BANNER in log else timeouts.connect) if isinstance(exc, TimeoutError) else None
@@ -361,6 +374,8 @@ class OpenSSH:
         return session
 
     def _exec(self, session: OpenSSHSession, command: str) -> Result:
+        if not session.ready:
+            raise Fault(FaultKind.SESSION_LOST, "OpenSSH session is no longer usable", True)
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
         os.close(fd)
         argv = _ssh_argv(session.target, session.creds, session.timeouts, session.host_key_policy, log_path,
@@ -370,6 +385,7 @@ class OpenSSH:
                 proc = subprocess.run(argv, capture_output=True, text=True, errors="replace",
                                       timeout=session.timeouts.command, env=_without_password())
             except subprocess.TimeoutExpired as exc:
+                self.discard(session)
                 raise Fault(FaultKind.TIMEOUT, "'%s' did not finish within %ds" % (command, session.timeouts.command),
                             True) from exc
             except OSError as exc:
@@ -379,13 +395,14 @@ class OpenSSH:
             _unlink(log_path)
         said = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug"))
         if proc.returncode == 255 and (said or not _control(session.target.host, session.control_path, "check",
-                                                              session.timeouts.command)):
+                                                              PROBE_SECONDS)):
+            self.discard(session)
             raise Fault(FaultKind.SESSION_LOST, said or "connection to %s lost before '%s' finished"
                         % (session.target.host, command), True)
         if proc.returncode != 0:
-            first = (proc.stderr.strip() or proc.stdout.strip()).split("\n", 1)[0]
+            first = (proc.stderr.strip() or proc.stdout.strip() or "no diagnostic output").split("\n", 1)[0]
             raise Fault(FaultKind.REFUSED, "exit %d from '%s': %s" % (proc.returncode, command, first), True)
-        refused = self._refusal(proc.stderr) or self._refusal(proc.stdout)
+        refused = self._refusal(proc.stdout) or self._refusal(proc.stderr)
         if refused:
             raise Fault(FaultKind.REFUSED, refused, True)
         return Result(proc.stdout)
@@ -393,15 +410,17 @@ class OpenSSH:
     def _refusal(self, text: str) -> str | None:
         for line in text.splitlines():
             line = line.strip()
-            if not line or any(p.search(line) for p in self.dialect.warning_patterns):
+            if not line or set(line) == {"^"} or any(p.search(line) for p in self.dialect.warning_patterns):
                 continue
             return line if any(p.search(line) for p in self.dialect.refusal_patterns) else None
         return None
 
     def _shell(self, session: OpenSSHSession) -> CliEngine:
-        """The edit shell, opened through the master at its first use."""
+        """The edit shell through the master, opened at the first edit within the session's setup deadline."""
         from hssh.communicators.cli_engine import CliEngine
 
+        if not session.ready:
+            raise Fault(FaultKind.SESSION_LOST, "OpenSSH session is no longer usable", True)
         if session.engine is not None:
             return session.engine
         fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
@@ -411,18 +430,22 @@ class OpenSSH:
         channel = ProcessChannel.open(argv, _without_password() | {"TERM": "vt100"}, session.target.host, log_path)
         engine = CliEngine(channel, self.dialect, session.timeouts, echoes=True)
         try:
-            engine.login(deadline=time.monotonic() + session.timeouts.setup)
+            engine.login(deadline=session.setup_deadline)
         except (ConnectionError, TimeoutError) as exc:
             log = channel.log()
+            self.discard(session)
             channel.close()
-            raise _login_fault(session.target.host, log, session.timeouts.setup if isinstance(exc, TimeoutError) else None) from exc
+            waited = session.timeouts.setup if isinstance(exc, TimeoutError) else None
+            raise _login_fault(session.target.host, log, waited) from exc
         except BaseException:
+            self.discard(session)
             channel.close()
             raise
         session.channel, session.engine = channel, engine
         return engine
 
     def _teardown(self, session: OpenSSHSession) -> None:
+        session.ready = False
         if session.channel is not None:
             session.channel.close()
         _control(session.target.host, session.control_path, "exit", _EXIT_GRACE)
@@ -433,31 +456,29 @@ class OpenSSH:
 
     def close(self, session: OpenSSHSession) -> None:
         try:
-            if session.engine is not None:
+            if session.ready and session.engine is not None:
                 session.engine.close()
         finally:
             self._teardown(session)
 
     def reuse(self, session: OpenSSHSession, timeouts: Timeouts, idle_seconds: int) -> bool:
+        if not session.ready or not _control(session.target.host, session.control_path, "check", PROBE_SECONDS):
+            return False
         session.timeouts = timeouts
         if session.engine is not None:
-            session.engine.timeouts = timeouts
-        if not _control(session.target.host, session.control_path, "check", timeouts.command):
-            return False
-        if time.monotonic() - session.idle_since < idle_seconds:
-            return True
-        if session.engine is not None:
-            return session.engine.probe(time.monotonic() + timeouts.command)
-        try:
-            self._exec(session, "")
-        except Fault:
-            return False
+            engine = session.engine
+            if session.channel.closed or session.channel.proc.poll() is not None or not engine.ready:
+                return False
+            engine.timeouts = timeouts
+            return idle_seconds < IDLE_CHECK_SECONDS or engine.probe(time.monotonic() + PROBE_SECONDS)
+        session.setup_deadline = time.monotonic() + timeouts.setup
         return True
 
     def release(self, session: OpenSSHSession) -> None:
+        if not session.ready:
+            raise Fault(FaultKind.SESSION_LOST, "OpenSSH session is no longer usable", True)
         if session.engine is not None:
             session.engine.release()
-        session.idle_since = time.monotonic()
 
     def discard(self, session: OpenSSHSession) -> None:
         try:
@@ -466,7 +487,7 @@ class OpenSSH:
             pass
 
     def show(self, session: OpenSSHSession, command: str) -> Result:
-        return self._exec(session, command)
+        return self._exec(session, _valid_command(command))
 
     def structured(self, session: OpenSSHSession, rpc: str, fmt: str) -> Result:
         raise Fault(FaultKind.UNSUPPORTED, "openssh has no structured output", reached_device=False)
