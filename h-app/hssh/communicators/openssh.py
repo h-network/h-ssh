@@ -155,6 +155,7 @@ def _ssh_argv(target: Target, creds: Credentials, timeouts: Timeouts, policy: Ho
             "-o", "ControlMaster=%s" % ("auto" if mode is _MASTER else "no"),
             "-o", "ControlPath=%s" % control_path, "-o", "ControlPersist=yes",
             "-o", "StrictHostKeyChecking=%s" % _STRICT_HOST_KEY[policy],
+            "-o", "UpdateHostKeys=no",
             "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=%d" % max(1, timeouts.connect),
             "-o", "NumberOfPasswordPrompts=1"]

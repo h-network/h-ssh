@@ -653,7 +653,9 @@ LOCAL refusal, reporting and cooldown policy; device outcomes are not rewritten 
 - **Redaction:** the recorder redacts secrets from the audit log, using patterns the dialects provide. The
   store keeps device output as received, and is created owner-only.
 - **Host keys:** each communicator uses its library's host-key verification under one policy setting:
-  `off` (default), `accept-new` or `strict`.
+  `off` (default), `accept-new` or `strict`. h-ssh never lets ssh rewrite `known_hosts`: the `openssh`
+  communicator passes `UpdateHostKeys=no` on every ssh it runs, so `accept-new` only appends an unknown
+  host's key.
 - **Files:** the store, its SQLite sidecars, the audit log, logs and saved output are made
   0600; newly created directories are 0700 and existing directory permissions are preserved.
   Recording files must be regular files owned by the current user; symlinks and FIFOs are
