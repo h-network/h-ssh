@@ -262,7 +262,9 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 
 1. On the first interrupt, the scheduler starts no new targets. Targets that have not started are recorded
    as skipped.
-2. Targets past `COMMIT` are waited for and recorded. Other in-flight targets are cancelled and recorded.
+2. Targets past `COMMIT` are waited for and recorded. Other in-flight targets are cancelled and recorded. A
+   target whose connect the interrupt cut short, or whose connect then ran out, with `reached_device` false, is
+   recorded as skipped with the reason, not failed: nothing reached it and the operator stopped the run.
 3. A second interrupt reports what is still in flight. It does not abandon records.
 4. The run is always closed in the store, with counts for ok, failed and skipped.
 
