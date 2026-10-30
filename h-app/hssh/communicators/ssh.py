@@ -352,7 +352,7 @@ class SSHCommunicator(Communicator):
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
         if dialect.has_candidate:
-            self.capabilities = self.capabilities | {"edit", "confirm", "commit_status"}
+            self.capabilities = self.capabilities | {"edit", "confirm", "commit_status", "commit_confirmed"}
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> SSHSession:
