@@ -273,10 +273,22 @@ class NetconfCommunicator(Communicator):
     def close(self, session: Session) -> None:
         """Discard uncommitted changes and unlock before closing the PyEZ device."""
         netconf = cast(NetconfSession, session)
+
+        def close_device() -> None:
+            try:
+                netconf.device.timeout = 5
+                netconf.device.close()
+            except Exception:
+                try:
+                    netconf.device._conn._session.close()
+                except Exception:
+                    pass
+                raise
+
         actions = []
         if netconf.config is not None:
             actions.extend((netconf.config.rollback, netconf.config.unlock))
-        actions.append(netconf.device.close)
+        actions.append(close_device)
         failure = None
         for action in actions:
             reached_device = bool(netconf.device.connected)

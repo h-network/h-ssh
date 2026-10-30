@@ -40,3 +40,5 @@ Running out of local file descriptors is a local fault with the OS error preserv
 it does not retry or put the target into cooldown.
 Closing a configuration session attempts candidate discard, unlock and disconnect even
 if an earlier cleanup step fails, then reports the first failure.
+The background close waits up to five seconds for close-session. If closing fails,
+it tears down the underlying transport so its reader thread does not linger.
