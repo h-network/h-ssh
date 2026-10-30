@@ -90,6 +90,7 @@ class Scheduler:
                            counts["skipped"], interrupted=run.interrupts > 0, not_kept=self.recorder.not_kept,
                            pending=self._pending(spec, results))
         self.recorder.finish(report)
+        self.recorder.close()
         if self.recorder.not_kept != report.not_kept:
             report = dataclasses.replace(report, not_kept=self.recorder.not_kept)
         return report
@@ -401,7 +402,7 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
     finally:
         await sessions.close_all()
         if gate is not None:
-            gate.close()
+            _closed_quietly("safety gate", gate.close)
 
 
 def run(spec: RunSpec) -> RunReport:
@@ -422,7 +423,15 @@ def run(spec: RunSpec) -> RunReport:
         return asyncio.run(execute(spec, registry, gate=gate, store=store))
     finally:
         if store is not None:
-            store.close()
+            _closed_quietly("store", store.close)
+
+
+def _closed_quietly(what: str, close) -> None:
+    """A close on the way out that fails is said, never the run's end: the report, or the refusal, is what reaches the caller."""
+    try:
+        close()
+    except Exception as e:  # noqa: BLE001
+        print(f"{what} not closed: {e}", file=sys.stderr)
 
 
 def _gate(spec: RunSpec) -> SafetyGate | None:
