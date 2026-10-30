@@ -5,10 +5,25 @@ from __future__ import annotations
 import asyncio
 import errno
 import socket
+from pathlib import Path
 
 from hssh.model import Fault, FaultKind, Target
 
 MAX_PROBES = 100
+SSH_CONFIG = Path.home() / ".ssh" / "config"
+
+
+def route(host: str, port: int | None, default_port: int) -> tuple[str, int] | None:
+    """Where an SSH-based connection to `host` goes, as the libraries read ~/.ssh/config: HostName and Port, the target's own port first. None when a ProxyCommand or ProxyJump carries it, which the probe cannot follow."""
+    try:
+        import paramiko
+
+        found = paramiko.SSHConfig.from_path(str(SSH_CONFIG)).lookup(host)
+    except (ImportError, OSError):
+        return host, port if port is not None else default_port
+    if found.get("proxycommand") or found.get("proxyjump"):
+        return None
+    return found.get("hostname", host), port if port is not None else int(found.get("port", default_port))
 
 
 async def attempt(host: str, port: int, banner: bytes | None, seconds: float) -> Fault | None:
@@ -37,16 +52,16 @@ async def attempt(host: str, port: int, banner: bytes | None, seconds: float) ->
         writer.close()
 
 
-async def probe_one(target: Target, port: int, banner: bytes | None, seconds: float,
+async def probe_one(host: str, port: int, banner: bytes | None, seconds: float,
                     slots: asyncio.Semaphore) -> Fault | None:
-    """The target's probe: one attempt; any retry is the policy's decision."""
+    """One attempt at one address; any retry is the policy's decision."""
     async with slots:
-        return await attempt(target.host, port, banner, seconds)
+        return await attempt(host, port, banner, seconds)
 
 
-async def probe(boxes: list[tuple[Target, int, bytes | None]], seconds: float,
+async def probe(boxes: list[tuple[Target, str, int, bytes | None]], seconds: float,
                 limit: int = MAX_PROBES) -> dict[str, Fault | None]:
-    """Every (target, port, banner) probed, at most `limit` at once: target name to None (live) or the Fault that stands for it."""
+    """Every (target, host, port, banner) probed, at most `limit` at once: target name to None (live) or the Fault that stands for it."""
     slots = asyncio.Semaphore(max(1, limit))
-    faults = await asyncio.gather(*(probe_one(t, port, banner, seconds, slots) for t, port, banner in boxes))
-    return {t.name: f for (t, _, _), f in zip(boxes, faults)}
+    faults = await asyncio.gather(*(probe_one(host, port, banner, seconds, slots) for _, host, port, banner in boxes))
+    return {t.name: f for (t, _, _, _), f in zip(boxes, faults)}
