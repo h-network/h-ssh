@@ -195,7 +195,10 @@ def _wait_master(proc: subprocess.Popen, log_path: str, timeouts: Timeouts) -> f
             proc.kill()
             proc.wait()
             raise TimeoutError()
-        time.sleep(_POLL)
+        try:
+            proc.wait(timeout=_POLL)
+        except subprocess.TimeoutExpired:
+            pass
     if proc.returncode != 0:
         raise ConnectionError()
     return until if reached else time.monotonic() + timeouts.setup
