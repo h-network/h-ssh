@@ -174,10 +174,13 @@ class Scheduler:
             verdict = self._judge(spec, driver, opened, attempt)
             self.policy.settle(target, verdict)
             return _Attempt([opened], verdict)
+        ops: list[OperationResult] = []
         try:
             ops = await self._operations(run, index, target, driver, session)
         finally:
-            await self.sessions.release(driver, target, creds)
+            stale = any(isinstance(op.outcome, Fault) and op.outcome.kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST)
+                        for op in ops)
+            await self.sessions.release(driver, target, creds, discard=stale)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
         verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
         self.policy.settle(target, verdict)
@@ -185,13 +188,13 @@ class Scheduler:
 
     async def _operations(self, run: _Run, index: int, target: Target, driver: Driver,
                           session: Session) -> list[OperationResult]:
-        """The mode's operations on an open session; a batch stops at its first fault."""
+        """The mode's operations on an open session; a batch goes on after a refused or timed-out command and ends when the session is lost."""
         spec, comm = run.spec, driver.communicator
         if spec.mode in ("show", "batch"):
             ops: list[OperationResult] = []
             for command in spec.commands:
                 ops.append(await operation(command, lambda c=command: comm.show(session, c)))
-                if isinstance(ops[-1].outcome, Fault):
+                if isinstance(ops[-1].outcome, Fault) and ops[-1].outcome.kind is FaultKind.SESSION_LOST:
                     break
             return ops
         if spec.mode == "structured":
