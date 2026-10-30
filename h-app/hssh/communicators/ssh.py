@@ -434,7 +434,7 @@ class SSHCommunicator(Communicator):
             try:
                 _remaining(guard.deadline)
                 channel = client.invoke_shell(term="vt100", width=511, height=1000)
-                stage = "CLI prompt discovery and paging setup"
+                stage = "CLI prompt discovery"
                 engine = CliEngine(ShellChannel(channel), self.dialect, ssh_session.timeouts, echoes=True)
                 engine.login(guard.deadline)
                 guard.finish()
