@@ -565,6 +565,8 @@ Exports check destination path and inode against the database and its sidecars b
 truncation, including hard-link aliases. A closed downstream pipe preserves the command's
 known verdict and produces no traceback.
 
+Saved output is one file per target in the `--save-output` directory, written by the recorder from the run's mode, never inferred from the operation count: a batch as `<name>.json`, every operation in order as `store.operation_dict` renders it; any other mode as `<name>.output`, the outputs joined. A file not written counts in `not_kept` like any record.
+
 `hssh.paths.validate_device_name(name: str) -> str` and
 `path_inside(base: Path, filename: str) -> Path` are the shared file-name helpers for `-eD`
 and saved output. The first returns the name or raises `ValueError`: only ASCII letters, digits,
