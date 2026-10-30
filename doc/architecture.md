@@ -308,6 +308,25 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
  "confirmed_minutes": 10, "comment": "...", "diff": "...", "ok": true, "fault": null}
 ```
 
+`time` is the operation's `started` timestamp. `dry_run` is the inverse of the requested
+`EditSettings.apply`; `ok` describes the operation's outcome, not whether a commit was requested.
+`fault` is null on success, otherwise an object with `kind` (the fault kind name), `detail` and
+`reached_device`. The full fault detail, comment and diff are redacted before serialization.
+Actions are `load`, `diff`, `commit`, `confirm`, `probe` (a probe failure that stops an edit), and
+`aborted` (the operator declined). Confirm runs use `apply=true`.
+
+Each entry is one JSONL line. Appends hold an exclusive file lock through all short writes, reject
+symlinks and non-regular files without blocking on FIFOs, and set the file to 0600. Newly created
+parent directories are 0700. An append failure raises an `OSError` with the recording path;
+the recorder counts it as `not_kept` without changing the device outcome.
+
+For JSON text in audit fields, the writer parses objects and lists and masks the entire value of a
+secret key, including wrapped values. A key is secret when a dialect redaction pattern matches
+`json.dumps(key) + ': "x"'`. For other text, the dialect patterns capture the keyword/prefix in
+group 1 and an optional suffix in group 3; the writer preserves those groups and masks the value.
+JSON scalar replacements retain their quotes. Patterns without capture groups mask the whole match.
+The secret vocabulary belongs to the dialect; stored device output is left unchanged.
+
 ## 7. Security
 
 - **Credentials:** an SSH agent or keys through the communicator's library, `HSSH_PASSWORD`, or an
