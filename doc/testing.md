@@ -78,39 +78,34 @@ Fleet tests run against a fleet of virtual network devices, using the whole flee
 
 ### 2.2 Workloads
 
-Fleet tests use real operator workloads, at full fleet scale:
+Every fleet pass runs the **standard** group: a three-command batch on every device, at a low and a high
+worker count, and with unreachable devices mixed into the target list. A change adds the groups it touches:
 
-| Workload | Scope |
+| Group | Scope |
 |---|---|
-| Show and batch | Every device, at low and high worker counts, on every transport the fleet supports |
-| Edit with diff, dry run | Every device |
-| Commit, and commit confirmed followed by confirm | Every device |
-| Interrupt | Ctrl-C during a commit run: every commit that landed is recorded |
-| Unreachable devices | Dead ports and stopped devices mixed into the target list |
-| Records | The store, the audit log, saved output and logs, checked against what the devices report |
-| Repeated runs | `--every` over a sustained period |
-| Library | The Fleet API running the same workloads as the CLI |
+| edits | Dry run, apply with a comment, commit confirmed and confirm, commit status, refusals, two runs on one device |
+| edits-dir | Per-device payload files, missing files, an interrupted commit |
+| store | Stored results against the raw output, concurrent writers, audit log and file permissions, recording failures |
+| gate | Cooldown, a held fleet, expiry, local refusals, the login budget |
+| reader | Every `h-ssh-store` command, export round trips, read watches |
+| pooling | Session reuse across calls on one Fleet |
 
-Each test runs on the branch under test and on the baseline, `develop`, against the same devices, so the
-results can be compared directly.
+Waits on commit-confirmed timers run only when a change touches commit-confirmed or confirm behaviour.
+
+Each group runs on the branch under test and on the baseline, `develop`, against the same devices.
 
 ### 2.3 Procedure
 
-1. **Record the starting state** of every device the test changes: its running configuration.
-2. **Run the workload on the baseline,** and check the outcome on the devices themselves, for example the
-   commit history and the configuration, not only in h-ssh's report.
-3. **Restore every device** to its starting state, and verify the restore.
-4. **Run the workload on the branch,** and check the outcome on the devices in the same way.
-5. **Restore every device** again, and verify the restore.
-6. **Report** the results with the change.
+Every pass runs the same fleet script, with the groups the change touches. The script installs the branch and
+the baseline side by side, then:
 
-A device is restored when its running configuration matches the recorded starting configuration. Commit
-history entries added by the test remain.
+1. records every device's starting state;
+2. runs each workload on both sides;
+3. checks each outcome on the devices themselves, not only in h-ssh's report;
+4. restores each device and verifies the restore.
 
-The baseline and branch runs each use their own installation, result store, audit log and output
-directory, so every record can be attributed to one run.
-
-Runs are unattended. Credentials come from keys or the environment, never from an interactive prompt.
+The baseline and the branch each use their own installation, result store, audit log and output directory.
+Runs are unattended: credentials come from keys or the environment, never from an interactive prompt.
 
 ### 2.4 Verdict
 
@@ -122,14 +117,5 @@ workload the change affects.
 
 ### 2.5 Report
 
-```
-Branch:     <branch> @ <commit>        Baseline: <branch> @ <commit>
-Verdict:    PASS | FAIL
-
-Workload            Devices  Branch result            Baseline result
-<name>              <n>      <ok/failed/skipped>      <ok/failed/skipped>
-
-Improvement: <speed or function, measured on branch against baseline>
-Failures:    <device, what happened, evidence>
-Restored:    <yes, how it was verified>
-```
+The report is the script's output: one row per check (group, check, side, PASS or FAIL, the key number or
+wall time), then the verdict line. One more line only for a failure or something unexpected.
