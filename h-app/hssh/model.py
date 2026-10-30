@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Literal, Sequence
+from types import MappingProxyType
+from typing import Literal, Mapping, Sequence
 
 Mode = Literal["show", "batch", "structured", "edit", "confirm", "commit_status"]
 
@@ -88,6 +89,7 @@ class RunSpec:
     mode: Mode
     commands: tuple[str, ...] = ()
     config_lines: tuple[str, ...] = ()
+    payloads: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     format: str | None = None
     credentials: Credentials | None = None
     timeouts: Timeouts | None = None
@@ -99,6 +101,9 @@ class RunSpec:
     policy: PolicySettings | None = None
     safety: SafetySettings | None = None
     recording: RecordSettings | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payloads", MappingProxyType(dict(self.payloads)))
 
 
 @dataclass(frozen=True)
