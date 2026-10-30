@@ -38,6 +38,7 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "commit_timeout": ("commit_timeout", int),
     "host_key_policy": ("host_key_policy", str),
     "probe": ("probe", bool),
+    "skip_unreachable": ("skip_unreachable", bool),
     "cooldown": ("cooldown", int),
     "rate_limit": ("rate_limit", int),
     "safety_file": ("safety_file", str),

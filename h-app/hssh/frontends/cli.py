@@ -25,6 +25,7 @@ from hssh.model import (
 )
 from hssh.orchestrator import (
     DEFAULT_CONFIRMED_MINUTES, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SAFETY,
+    DEFAULT_SKIP_UNREACHABLE,
     DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, default_username,
 )
 
@@ -38,6 +39,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "connect_timeout": DEFAULT_TIMEOUTS.connect, "session_timeout": DEFAULT_TIMEOUTS.setup,
     "command_timeout": DEFAULT_TIMEOUTS.command, "commit_timeout": DEFAULT_TIMEOUTS.commit, "retries": DEFAULT_POLICY.retries,
     "retry_pause": DEFAULT_POLICY.retry_pause, "host_key_policy": DEFAULT_HOST_KEY_POLICY, "probe": DEFAULT_PROBE,
+    "skip_unreachable": DEFAULT_SKIP_UNREACHABLE,
     "cooldown": DEFAULT_SAFETY.cooldown_seconds, "rate_limit": DEFAULT_SAFETY.rate_limit,
     "store": None, "audit_log": None, "safety_file": None,
 }
@@ -120,6 +122,8 @@ def build_parser() -> _Parser:
     behaviour.add_argument("--host-key-policy", choices=HOST_KEY_CHOICES)
     behaviour.add_argument("--probe", dest="probe", action="store_const", const=True, default=None, help="reachability check before the run")
     behaviour.add_argument("--no-probe", dest="probe", action="store_const", const=False)
+    behaviour.add_argument("--skip-unreachable", action="store_const", const=True, default=None,
+                           help="edits: go on without the devices the probe found dead; they are skipped")
     behaviour.add_argument("--cooldown", type=int, metavar="SECONDS")
     behaviour.add_argument("--rate-limit", type=int, metavar="PER_MINUTE")
     behaviour.add_argument("--safety-file", metavar="FILE")
@@ -178,6 +182,8 @@ def resolve_mode(args: argparse.Namespace) -> Mode:
                                  ("commit_status", args.commit_status)) if given]
     if len(chosen) != 1:
         raise ValueError("give exactly one of -sC, --batch/--profile, -eC/-eB, --confirm, --commit-status")
+    if args.skip_unreachable and chosen[0] != "edit":
+        raise ValueError("--skip-unreachable goes with an edit (-eC, -eB)")
     if chosen[0] == "show" and args.format not in (None, "text"):
         return "structured"
     return chosen[0]
@@ -215,7 +221,8 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         credentials=resolve_credentials(args),
         timeouts=Timeouts(connect=args.connect_timeout, setup=args.session_timeout, command=args.command_timeout,
                           commit=args.commit_timeout),
-        workers=args.workers, host_key_policy=args.host_key_policy, probe=args.probe, edit=edit,
+        workers=args.workers, host_key_policy=args.host_key_policy, probe=args.probe,
+        skip_unreachable=args.skip_unreachable, edit=edit,
         policy=PolicySettings(retries=args.retries, retry_pause=args.retry_pause),
         safety=safety,
         recording=RecordSettings(store_path=None if args.no_store else (args.store or DEFAULT_STORE),
