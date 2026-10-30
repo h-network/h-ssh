@@ -401,11 +401,11 @@ def test_the_run_is_recorded_from_begin_to_finish_with_a_row_per_operation():
         def __init__(self):
             self.rows, self.finished = [], None
 
-        def start_run(self, spec, started):
+        def start_run(self, spec, started, *, user):
             return 7
 
-        def add(self, run_id, target, driver, seq, op):
-            self.rows.append((run_id, target.name, driver, seq, op.command))
+        def add(self, run_id, target, driver, seq, op, *, status):
+            self.rows.append((run_id, target.name, driver, seq, op.command, status))
 
         def finish_run(self, report):
             self.finished = report
@@ -416,5 +416,5 @@ def test_the_run_is_recorded_from_begin_to_finish_with_a_row_per_operation():
     store = Store()
     spec = RunSpec((T1,), "batch", commands=("show a", "show b"), probe=False)
     report = run(spec, FakeNetconf(), store=store)
-    assert store.rows == [(7, "r1", "junos@netconf", 0, "show a"), (7, "r1", "junos@netconf", 1, "show b")]
+    assert store.rows == [(7, "r1", "junos@netconf", 0, "show a", "ok"), (7, "r1", "junos@netconf", 1, "show b", "ok")]
     assert store.finished is report and report.run_id == 7
