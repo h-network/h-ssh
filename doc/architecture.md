@@ -260,7 +260,9 @@ for what the device did: no fault with `reached_device` false cools a device dow
 ### 5.1 RunSpec
 
 A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
-`commit_status`), the commands or configuration lines, credentials, timeouts (`connect` for the TCP connect and the
+`commit_status`), the commands or configuration lines, the per-target payloads (a target name to its own
+lines; a target not named gets the configuration lines, and when payloads are given a target in neither has no
+payload and is skipped), credentials, timeouts (`connect` for the TCP connect and the
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
 operation, `commit`),
 the worker limit, the safety
