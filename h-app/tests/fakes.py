@@ -13,6 +13,7 @@ T2 = Target("r2", "127.0.0.2", "junos", "netconf")
 class FakeNetconf:
     default_port = 830
     banner = b"SSH-"
+    ssh_config = "paramiko"
     capabilities = frozenset({"show", "batch", "edit", "commit_confirmed", "confirm", "commit_status"})
 
     def __init__(self, dialect=junos.DIALECT, *, changed=True, pending=False, open_fault=None, commit_fault=None):

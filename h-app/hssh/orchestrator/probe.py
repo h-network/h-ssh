@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import os
 import socket
+import subprocess
 from pathlib import Path
 
 from hssh.model import Fault, FaultKind, Target
@@ -13,19 +15,63 @@ MAX_PROBES = 100
 MAX_LINE = 255
 MAX_LINES = 100
 SSH_CONFIG = Path.home() / ".ssh" / "config"
+SSH_G = ("ssh", "-G")
+SSH_G_AT_ONCE = 8
+
+Route = tuple[str, int] | None
 
 
-def route(host: str, port: int | None, default_port: int) -> tuple[str, int] | None:
-    """Where an SSH-based connection to `host` goes, as the libraries read ~/.ssh/config: HostName and Port, the target's own port first. None when a ProxyCommand or ProxyJump carries it, which the probe cannot follow."""
+def route(host: str, port: int | None, default_port: int) -> Route:
+    """Where a paramiko-based connection to `host` goes, as PyEZ and ncclient read ~/.ssh/config: HostName and Port, the target's own port first. None when a ProxyCommand carries it, which the probe cannot follow; ProxyJump is not read by those libraries."""
     try:
         import paramiko
 
         found = paramiko.SSHConfig.from_path(str(SSH_CONFIG)).lookup(host)
     except (ImportError, OSError):
         return host, port if port is not None else default_port
-    if found.get("proxycommand") or found.get("proxyjump"):
+    if found.get("proxycommand"):
         return None
     return found.get("hostname", host), port if port is not None else int(found.get("port", default_port))
+
+
+def openssh_route(host: str, port: int | None, default_port: int, user: str | None, seconds: float) -> Route:
+    """Where the OpenSSH client connects for `host`, as `ssh -G` prints it with the run's user and the target's own port: None behind a ProxyJump or ProxyCommand. Without an ssh binary, `host` as it is. Fault(LOCAL) when ssh -G cannot say."""
+    argv = [*SSH_G, *(["-p", str(port)] if port else []), "--", f"{user}@{host}" if user else host]
+    env = {k: v for k, v in os.environ.items() if k != "HSSH_PASSWORD"}
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=seconds, env=env, check=False)
+    except FileNotFoundError:
+        return host, port if port is not None else default_port
+    except subprocess.TimeoutExpired:
+        raise Fault(FaultKind.LOCAL, f"ssh -G {host} did not answer within {seconds:g}s", False) from None
+    except OSError as e:
+        raise Fault(FaultKind.LOCAL, f"ssh -G could not run: {e.strerror or e}", False) from e
+    said: dict[str, str] = {}
+    for line in done.stdout.decode("utf-8", "replace").splitlines():
+        key, _, value = line.strip().partition(" ")
+        said.setdefault(key.lower(), value.strip())
+    if done.returncode != 0 or not said.get("hostname") or not said.get("port", "22").isdigit():
+        complaint = next((ln.strip() for ln in done.stderr.decode("utf-8", "replace").splitlines()
+                          if ln.strip() and not ln.startswith("Pseudo-terminal")), f"exit {done.returncode}")
+        raise Fault(FaultKind.LOCAL, f"ssh -G {host}: {complaint}", False)
+    if any(said.get(key, "none").lower() != "none" for key in ("proxyjump", "proxycommand")):
+        return None
+    return said["hostname"], int(said.get("port", port if port is not None else default_port))
+
+
+async def where(target: Target, reader: str | None, default_port: int, user: str | None, seconds: float,
+                ssh_g: asyncio.Semaphore) -> Route:
+    """Where the transport that reads the ssh client's configuration as `reader` says ("paramiko", "openssh", None) connects for `target`; ssh -G runs on a thread, SSH_G_AT_ONCE at once."""
+    if reader == "paramiko":
+        return route(target.host, target.port, default_port)
+    if reader == "openssh":
+        async with ssh_g:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(openssh_route, target.host, target.port, default_port, user, seconds), seconds + 1)
+            except asyncio.TimeoutError:
+                raise Fault(FaultKind.LOCAL, f"ssh -G {target.host} did not answer within {seconds:g}s", False) from None
+    return target.host, target.port if target.port is not None else default_port
 
 
 async def identification(reader: asyncio.StreamReader, banner: bytes, seen: list[bytes]) -> bytes | None:

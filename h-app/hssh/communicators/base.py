@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Literal, Protocol
 
 from hssh.dialects.base import Dialect
 from hssh.model import Credentials, HostKeyPolicy, Result, Target, Timeouts
@@ -19,6 +19,7 @@ class Communicator(Protocol):
     dialect: Dialect
     default_port: int
     banner: bytes | None
+    ssh_config: Literal["paramiko", "openssh"] | None
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts, host_key_policy: HostKeyPolicy) -> Session: ...
 

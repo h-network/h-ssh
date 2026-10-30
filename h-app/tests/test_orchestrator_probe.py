@@ -126,9 +126,9 @@ def test_the_targets_own_port_wins_over_ssh_config(ssh_config):
     assert probe.route("r1", 830, 22) == ("r1", 830)
 
 
-def test_a_proxied_box_is_not_probed(ssh_config):
+def test_a_proxycommand_box_is_not_probed_and_a_proxyjump_one_is_since_paramiko_ignores_it(ssh_config):
     ssh_config.write_text("Host r1\n  ProxyJump bastion\nHost r2\n  ProxyCommand nc %h %p\n")
-    assert probe.route("r1", None, 22) is None and probe.route("r2", None, 22) is None
+    assert probe.route("r1", None, 22) == ("r1", 22) and probe.route("r2", None, 22) is None
 
 
 def test_without_an_ssh_config_the_box_is_probed_at_its_address_and_the_transports_port(ssh_config):

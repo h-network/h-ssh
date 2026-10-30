@@ -120,7 +120,8 @@ class Scheduler:
 
     async def _probe(self, spec: RunSpec, held: dict[str, str]) -> dict[str, Fault | None]:
         """Dead targets by name, asked where the connection will go; a target the gate holds, whose driver is unknown, or reached through a proxy is not probed."""
-        boxes = []
+        boxes, unknown = [], {}
+        ssh_g = asyncio.Semaphore(probe.SSH_G_AT_ONCE)
         for target in spec.targets:
             if target.name in held:
                 continue
@@ -128,17 +129,20 @@ class Scheduler:
                 comm = self.registry.resolve(target).communicator
             except Fault:
                 continue
-            if comm.banner is None:
-                boxes.append((target, target.host, target.port if target.port is not None else comm.default_port, None))
+            reader = comm.ssh_config if comm.banner is not None else None
+            try:
+                where = await probe.where(target, reader, comm.default_port, spec.credentials.username,
+                                          spec.timeouts.connect, ssh_g)
+            except Fault as f:
+                unknown[target.name] = f
                 continue
-            where = probe.route(target.host, target.port, comm.default_port)
             if where is not None:
                 boxes.append((target, where[0], where[1], comm.banner))
         wanted = min(probe.MAX_PROBES, len(boxes))
         probes = await self.sessions.room(wanted * FDS_PER_PROBE) // FDS_PER_PROBE
         if probes < wanted:
             self._say(f"probing {max(1, probes)} at a time, not {wanted}: the open-file limit is {open_file_limit()}")
-        return await probe.probe(boxes, spec.timeouts.connect, limit=probes)
+        return {**unknown, **await probe.probe(boxes, spec.timeouts.connect, limit=probes)}
 
     def _say(self, note: str | None) -> None:
         """A limit note on stderr once per session manager, so a Fleet hears it once, not on every call."""

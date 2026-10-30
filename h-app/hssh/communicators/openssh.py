@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import pty
 import re
 import select
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
+import termios
+import time
+import tty
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -32,7 +38,22 @@ _STRICT_HOST_KEY = {"accept-new": "accept-new", "strict": "yes", "off": "no"}
 
 _EXIT_GRACE = 2.0
 
-_SESSION_UP = ("Authenticated to ", "Entering interactive session")
+_POLL = 0.1
+
+# Rows and columns ssh requests for the remote pty, the size paramiko's shell asks for (#166).
+_PTY_SIZE = (1000, 511)
+
+_BANNER = "Remote protocol version"
+
+_SESSION_UP = ("Authenticated to ", "Entering interactive session", "master session id")
+
+# The ssh that logs in (-N as the ControlMaster, backgrounded once up), one exec per show, and the edit shell.
+_MASTER = ["-N", "-n"]
+_EXEC = ["-n"]
+_SHELL = ["-tt", "-e", "none"]
+
+_HOST_KEY = ("Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED",
+             "REVOKED HOST KEY", "marked as revoked")
 
 _CLOSED = ("Connection closed by", "Connection reset", "kex_exchange_identification")
 
@@ -124,9 +145,11 @@ def _unlink(path: str) -> None:
 
 
 def _ssh_argv(target: Target, creds: Credentials, timeouts: Timeouts, policy: HostKeyPolicy,
-              log_path: str) -> list[str]:
-    """The ssh command line for one pty session; -v to the -E log is how failures are read afterwards."""
-    argv = ["ssh", "-tt", "-e", "none", "-v", "-E", log_path,
+              log_path: str, control_path: str, mode: list[str]) -> list[str]:
+    """One ssh command line through the session's ControlMaster; -v to the -E log is how failures are read."""
+    argv = ["ssh", *mode, "-v", "-E", log_path,
+            "-o", "ControlMaster=%s" % ("auto" if mode is _MASTER else "no"),
+            "-o", "ControlPath=%s" % control_path, "-o", "ControlPersist=yes",
             "-o", "StrictHostKeyChecking=%s" % _STRICT_HOST_KEY[policy],
             "-o", "LogLevel=ERROR",
             "-o", "ConnectTimeout=%d" % max(1, timeouts.connect),
@@ -144,13 +167,41 @@ def _ssh_argv(target: Target, creds: Credentials, timeouts: Timeouts, policy: Ho
     return argv + ["--", "%s@%s" % (creds.username, target.host)]
 
 
-def _login_fault(host: str, log: str, setup: int | None = None) -> Fault:
-    """Classify a failed login from ssh's own log; `setup` is the engine's wait that ran out, when it did."""
+def _control(host: str, control_path: str, action: str, seconds: float) -> bool:
+    """Ask the master to `check` or `exit`; True when it answered."""
+    if not os.path.exists(control_path):
+        return False
+    try:
+        return subprocess.run(["ssh", "-O", action, "-o", "ControlPath=%s" % control_path, "--", host],
+                              capture_output=True, timeout=seconds, env=_without_password()).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _wait_master(proc: subprocess.Popen, log_path: str, timeouts: Timeouts) -> None:
+    """Block until the login ssh exits: 0 once the master is up, else with its reason in the log."""
+    until = time.monotonic() + timeouts.connect + _EXIT_GRACE
+    reached = False
+    while proc.poll() is None:
+        if not reached and _BANNER in _read(log_path):
+            reached = True
+            until = time.monotonic() + timeouts.setup
+        if time.monotonic() >= until:
+            proc.kill()
+            proc.wait()
+            raise TimeoutError()
+        time.sleep(_POLL)
+    if proc.returncode != 0:
+        raise ConnectionError()
+
+
+def _login_fault(host: str, log: str, waited: int | None = None) -> Fault:
+    """Classify a failed login from ssh's own log; `waited` is the wait that ran out, in seconds, when one did."""
     detail = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug"))
-    reached = "Remote protocol version" in log
+    reached = _BANNER in log
     if "Permission denied" in detail or "Authentication failed" in detail:
         return Fault(FaultKind.AUTH, detail, reached)
-    if "Host key verification failed" in detail or "REMOTE HOST IDENTIFICATION HAS CHANGED" in detail:
+    if any(marker in detail for marker in _HOST_KEY):
         return Fault(FaultKind.HOST_KEY, detail, reached)
     if "timed out" in detail:
         return Fault(FaultKind.TIMEOUT, detail, reached)
@@ -159,40 +210,50 @@ def _login_fault(host: str, log: str, setup: int | None = None) -> Fault:
         return Fault(FaultKind.AUTH, detail, reached)
     if any(marker in detail for marker in _CLOSED) or any(marker in log for marker in _SESSION_UP):
         return Fault(FaultKind.SESSION_LOST, detail, True)
-    if setup is not None:
+    if waited is not None:
         if reached:
-            return Fault(FaultKind.TIMEOUT, "the banner came, but key exchange did not finish within %ds" % setup, True)
-        return Fault(FaultKind.TIMEOUT, "no SSH banner within %ds" % setup, False)
+            return Fault(FaultKind.TIMEOUT, "the banner came, but key exchange did not finish within %ds" % waited, True)
+        return Fault(FaultKind.TIMEOUT, "no SSH banner within %ds" % waited, False)
     return Fault(FaultKind.UNREACHABLE, detail, reached)
 
 
 class ProcessChannel:
-    """The ssh process's pipes as the CLI engine's channel: recv(n, timeout), send(data), close()."""
+    """The ssh process on a local pty as the CLI engine's channel: recv(n, timeout), send(data), close()."""
 
-    def __init__(self, proc: subprocess.Popen, host: str, log_path: str):
+    def __init__(self, proc: subprocess.Popen, master: int, host: str, log_path: str):
         self.proc = proc
+        self.master = master
         self.host = host
         self.log_path = log_path
         self.closed = False
 
     @classmethod
     def open(cls, argv: list[str], env: dict[str, str], host: str, log_path: str) -> ProcessChannel:
+        master, slave = pty.openpty()
         try:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, env=env, bufsize=0)
+            tty.setraw(slave)
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", *_PTY_SIZE, 0, 0))
+            proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=subprocess.DEVNULL,
+                                    env=env, start_new_session=True)
         except OSError as exc:
+            os.close(master)
+            os.close(slave)
             _unlink(log_path)
             raise Fault(FaultKind.LOCAL, str(exc), reached_device=False) from exc
-        return cls(proc, host, log_path)
+        os.close(slave)
+        return cls(proc, master, host, log_path)
 
     def recv(self, n: int, timeout: float) -> bytes:
         try:
-            ready, _, _ = select.select([self.proc.stdout], [], [], max(0.0, timeout))
+            ready, _, _ = select.select([self.master], [], [], max(0.0, timeout))
         except (OSError, ValueError) as exc:
             raise ConnectionError("connection lost: %s" % exc) from exc
         if not ready:
             raise TimeoutError("nothing from %s within %.1fs" % (self.host, timeout))
-        data = os.read(self.proc.stdout.fileno(), n)
+        try:
+            data = os.read(self.master, n)
+        except OSError:
+            data = b""
         if not data and self._ended():
             raise ConnectionError(self.log())
         return data
@@ -204,12 +265,18 @@ class ProcessChannel:
             return False
         return True
 
-    def send(self, data: bytes) -> None:
-        try:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
-        except (OSError, ValueError) as exc:
-            raise ConnectionError("connection lost: %s" % exc) from exc
+    def send(self, data: bytes, deadline: float) -> None:
+        view = memoryview(data)
+        while view:
+            remaining = deadline - time.monotonic()
+            try:
+                _, ready, _ = select.select([], [self.master], [], max(0.0, remaining))
+                if ready:
+                    view = view[os.write(self.master, view):]
+            except (OSError, ValueError) as exc:
+                raise ConnectionError("connection lost: %s" % exc) from exc
+            if not ready:
+                raise TimeoutError("write to %s not finished by its deadline" % self.host)
 
     def log(self) -> str:
         return _read(self.log_path)
@@ -220,7 +287,7 @@ class ProcessChannel:
         self.closed = True
         proc = self.proc
         try:
-            proc.stdin.close()
+            os.close(self.master)
         except OSError:
             pass
         if proc.poll() is None:
@@ -238,12 +305,17 @@ class ProcessChannel:
 
 @dataclass
 class OpenSSHSession:
-    """One ssh process at the device's prompt, with the CLI engine that types at it."""
+    """One ControlMaster to the device; shows run as execs through it, edits on a shell opened at first use."""
 
     target: Target
-    channel: ProcessChannel
-    engine: CliEngine
+    creds: Credentials
     timeouts: Timeouts
+    host_key_policy: HostKeyPolicy
+    control_dir: str
+    control_path: str
+    idle_since: float = 0.0
+    channel: ProcessChannel | None = None
+    engine: CliEngine | None = None
 
 
 class OpenSSH:
@@ -251,6 +323,7 @@ class OpenSSH:
 
     default_port = 22
     banner = b"SSH-"
+    ssh_config = "openssh"
 
     def __init__(self, dialect: Dialect):
         self.dialect = dialect
@@ -261,63 +334,154 @@ class OpenSSH:
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> OpenSSHSession:
-        from hssh.communicators.cli_engine import CliEngine
-
         if not AVAILABLE:
             raise Fault(FaultKind.LOCAL, "no 'ssh' binary found on PATH", reached_device=False)
-        with _AskPass(creds.password) as askpass:
-            fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
-            os.close(fd)
-            argv = _ssh_argv(target, creds, timeouts, host_key_policy, log_path)
-            channel = ProcessChannel.open(argv, askpass.env, target.host, log_path)
-            engine = CliEngine(channel, self.dialect, timeouts, echoes=True)
+        control_dir = tempfile.mkdtemp(prefix="hssh-")
+        # Unix socket paths cap near 104 bytes, so the name stays short.
+        session = OpenSSHSession(target, creds, timeouts, host_key_policy, control_dir,
+                                 os.path.join(control_dir, "cm"), time.monotonic())
+        fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
+        os.close(fd)
+        try:
+            with _AskPass(creds.password) as askpass:
+                argv = _ssh_argv(target, creds, timeouts, host_key_policy, log_path, session.control_path, _MASTER)
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, env=askpass.env)
+                try:
+                    _wait_master(proc, log_path, timeouts)
+                except (ConnectionError, TimeoutError) as exc:
+                    log = _read(log_path)
+                    waited = (timeouts.setup if _BANNER in log else timeouts.connect) if isinstance(exc, TimeoutError) else None
+                    raise _login_fault(target.host, log, waited) from exc
+        except BaseException:
+            self.discard(session)
+            raise
+        finally:
+            _unlink(log_path)
+        return session
+
+    def _exec(self, session: OpenSSHSession, command: str) -> Result:
+        fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
+        os.close(fd)
+        argv = _ssh_argv(session.target, session.creds, session.timeouts, session.host_key_policy, log_path,
+                         session.control_path, _EXEC) + [command]
+        try:
             try:
-                engine.login()
-            except (ConnectionError, TimeoutError) as exc:
-                log = channel.log()
-                channel.close()
-                setup = timeouts.setup if isinstance(exc, TimeoutError) else None
-                raise _login_fault(target.host, log, setup) from exc
-            except BaseException:
-                channel.close()
-                raise
-        return OpenSSHSession(target, channel, engine, timeouts)
+                proc = subprocess.run(argv, capture_output=True, text=True, errors="replace",
+                                      timeout=session.timeouts.command, env=_without_password())
+            except subprocess.TimeoutExpired as exc:
+                raise Fault(FaultKind.TIMEOUT, "'%s' did not finish within %ds" % (command, session.timeouts.command),
+                            True) from exc
+            except OSError as exc:
+                raise Fault(FaultKind.LOCAL, str(exc), False) from exc
+            log = _read(log_path)
+        finally:
+            _unlink(log_path)
+        said = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug"))
+        if proc.returncode == 255 and (said or not _control(session.target.host, session.control_path, "check",
+                                                              session.timeouts.command)):
+            raise Fault(FaultKind.SESSION_LOST, said or "connection to %s lost before '%s' finished"
+                        % (session.target.host, command), True)
+        if proc.returncode != 0:
+            first = (proc.stderr.strip() or proc.stdout.strip()).split("\n", 1)[0]
+            raise Fault(FaultKind.REFUSED, "exit %d from '%s': %s" % (proc.returncode, command, first), True)
+        refused = self._refusal(proc.stderr) or self._refusal(proc.stdout)
+        if refused:
+            raise Fault(FaultKind.REFUSED, refused, True)
+        return Result(proc.stdout)
+
+    def _refusal(self, text: str) -> str | None:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or any(p.search(line) for p in self.dialect.warning_patterns):
+                continue
+            return line if any(p.search(line) for p in self.dialect.refusal_patterns) else None
+        return None
+
+    def _shell(self, session: OpenSSHSession) -> CliEngine:
+        """The edit shell, opened through the master at its first use."""
+        from hssh.communicators.cli_engine import CliEngine
+
+        if session.engine is not None:
+            return session.engine
+        fd, log_path = tempfile.mkstemp(prefix="hssh-ssh-", suffix=".log")
+        os.close(fd)
+        argv = _ssh_argv(session.target, session.creds, session.timeouts, session.host_key_policy, log_path,
+                         session.control_path, _SHELL)
+        channel = ProcessChannel.open(argv, _without_password() | {"TERM": "vt100"}, session.target.host, log_path)
+        engine = CliEngine(channel, self.dialect, session.timeouts, echoes=True)
+        try:
+            engine.login(deadline=time.monotonic() + session.timeouts.setup)
+        except (ConnectionError, TimeoutError) as exc:
+            log = channel.log()
+            channel.close()
+            raise _login_fault(session.target.host, log, session.timeouts.setup if isinstance(exc, TimeoutError) else None) from exc
+        except BaseException:
+            channel.close()
+            raise
+        session.channel, session.engine = channel, engine
+        return engine
+
+    def _teardown(self, session: OpenSSHSession) -> None:
+        if session.channel is not None:
+            session.channel.close()
+        _control(session.target.host, session.control_path, "exit", _EXIT_GRACE)
+        try:
+            os.rmdir(session.control_dir)
+        except OSError:
+            pass
 
     def close(self, session: OpenSSHSession) -> None:
         try:
-            session.engine.close()
+            if session.engine is not None:
+                session.engine.close()
         finally:
-            session.channel.close()
+            self._teardown(session)
 
     def reuse(self, session: OpenSSHSession, timeouts: Timeouts, idle_seconds: int) -> bool:
-        return False
+        session.timeouts = timeouts
+        if session.engine is not None:
+            session.engine.timeouts = timeouts
+        if not _control(session.target.host, session.control_path, "check", timeouts.command):
+            return False
+        if time.monotonic() - session.idle_since < idle_seconds:
+            return True
+        if session.engine is not None:
+            return session.engine.probe(time.monotonic() + timeouts.command)
+        try:
+            self._exec(session, "")
+        except Fault:
+            return False
+        return True
 
     def release(self, session: OpenSSHSession) -> None:
-        self.close(session)
+        if session.engine is not None:
+            session.engine.release()
+        session.idle_since = time.monotonic()
 
     def discard(self, session: OpenSSHSession) -> None:
         try:
-            self.close(session)
+            self._teardown(session)
         except Exception:  # noqa: BLE001 - a session in doubt is torn down, never reported
             pass
 
     def show(self, session: OpenSSHSession, command: str) -> Result:
-        return session.engine.show(command)
+        return self._exec(session, command)
 
     def structured(self, session: OpenSSHSession, rpc: str, fmt: str) -> Result:
         raise Fault(FaultKind.UNSUPPORTED, "openssh has no structured output", reached_device=False)
 
     def load(self, session: OpenSSHSession, lines: list[str]) -> Result:
-        return session.engine.load(lines)
+        return self._shell(session).load(lines)
 
     def diff(self, session: OpenSSHSession) -> Result:
-        return session.engine.diff()
+        return self._shell(session).diff()
 
     def commit(self, session: OpenSSHSession, confirmed_minutes: int | None, comment: str | None) -> Result:
-        return session.engine.commit(confirmed_minutes, comment)
+        return self._shell(session).commit(confirmed_minutes, comment)
 
     def confirm(self, session: OpenSSHSession) -> Result:
-        return session.engine.confirm()
+        return self._shell(session).confirm()
 
     def commit_history(self, session: OpenSSHSession) -> Result:
-        return session.engine.commit_history()
+        return self._shell(session).commit_history()

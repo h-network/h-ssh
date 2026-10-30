@@ -135,7 +135,7 @@ default port is held by its protocol, and a target's own port overrides it.
 | Policy | Maps each `Fault` to an action: retry, fail, skip, or cool down. Applies the safety gate |
 | Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed and confirm |
 | Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature: a caller (the Fleet API) hands `run` or `execute` its own manager and keeps it, across event loops, and closes it with `close_all(timeout)`, which still joins the closes when the interpreter is shutting down; the CLI's run owns and closes its own. `run` refuses to start inside a running event loop and names `execute` instead. A session is keyed by driver, host, the port the connection uses, user, host-key policy and the credential as a process-secret HMAC, so a changed secret or policy opens anew. One session per key: a second borrower waits for it instead of logging in again. A kept session is offered again only after the communicator's `reuse` vouches for it (the cheap check on every borrow, the device asked past its idle threshold) under a 5 s budget; a borrow owns it through its `release` cleanup (two command timeouts), and only then is it idle. A session in doubt (timeout, loss, unknown commit outcome, a cancelled or over-budget call still running, a failed cleanup or close) is torn down by `discard` with no cleanup and never offered again. The kept sessions live inside the open-file budget (6 descriptors per worker, 4 per kept session, 1 per probe, 32 base): when a session goes idle and before every open or probe, the least recently used idle sessions are closed while the limit cannot hold the kept ones beside what is about to run, a close still running counted as held until its thread ends; before an open or the probe the manager waits for those closes (1 s in all) so the descriptors are really free, and the probe runs no more at once than the budget still has. Workers are lowered to the limit per run and said once per session manager, so a Fleet hears it once, not on every call; a lowered probe concurrency is said the same way |
-| Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, following ssh config, and skips targets reached through a proxy. Its outcome is expressed as the same fault kinds |
+| Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, asked the way each transport's library reads the ssh client's configuration (`Communicator.ssh_config`): NETCONF as PyEZ and ncclient read `~/.ssh/config` (HostName, Port, ProxyCommand), the OpenSSH transport as `ssh -G` prints it for the run's user (HostName, Port, ProxyJump, ProxyCommand; eight at once, on threads, under the connect timeout), paramiko SSH and telnet the target's host and port directly. A target reached through a proxy is not probed; one whose route `ssh -G` cannot tell is that target's `LOCAL` failure before any login. Its outcome is expressed as the same fault kinds |
 | Cancellation | Handles interruption (section 5.4) |
 | Recorder | Writes every result to the store and every change to the audit log, with redaction |
 
@@ -172,16 +172,36 @@ A communicator does not retry, apply policy, write records, or keep state outsid
 
 CLI-driven communicators (`ssh`, `openssh`, `telnet`) share one **CLI engine**. The engine drives an
 interactive channel: login, prompt detection, paging, command execution and line-by-line configuration.
+The channel's `send(data, deadline)` and the engine's `login(deadline)` take absolute `time.monotonic()`
+deadlines; each adapter holds one deadline across the whole write. Login takes no credentials: SSH and
+OpenSSH sessions arrive authenticated.
 It reads vendor behaviour from the dialect.
+
+For CLI reads, login learns a whole-line prompt and disables paging within the remaining setup deadline.
+Junos uses `set cli screen-length 0`; the echoed command also separates any delayed banner from replies.
+Each command's write, reply and prompt settling share one command deadline. The reader decodes UTF-8
+incrementally, handles terminal redraws and recognises pager markers only on the current terminal line.
+It removes command echoes, prompt context and terminal control sequences, without redacting or formatting
+the reply. A refusal at the start of a reply is `REFUSED`; an error-looking line later in output stays output.
+Commands containing controls, Tab or invalid Unicode are refused before typing; Junos's encoder quotes
+literal `?` for the line editor.
+
+A timeout or disconnect makes the engine unready, so that session is discarded and a later batch command
+uses a fresh login. Pooling asks the transport's cheap liveness check first; an idle probe sends one empty
+line and waits for the learned prompt under its absolute deadline. Releasing a read session requires it
+to remain synchronized. Close and discard end the channel without sending configuration commands.
 
 ### 3.5 Dialects
 
 A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
-- the prompt pattern and paging control
+- the prompt pattern, the anchored prompt name and tail the engine learns the device's own prompt from, and the
+  context lines the CLI prints with its prompt
+- paging control: the command that turns the pager off, the pager marker as a whole line, and the reply to it
 - the refusal and warning patterns
-- how to enter and leave configuration mode, how to commit, and how to discard uncommitted changes, if the
-  vendor has a candidate model
+- how to enter and leave configuration mode, how to commit (`build_commit`), diff and read the commit history
+  (`parse_commit_history`), and how to discard uncommitted changes, if the vendor has a candidate model
+- how a validated line is typed (`encode_line`: bytes, newline included; Junos escapes a literal `?`)
 - the read-command rule, deciding which commands are safe to retry
 - a shortcut library of named commands
 
@@ -231,6 +251,7 @@ class Communicator(Protocol):
     capabilities: frozenset[str]          # e.g. {"show", "batch", "edit", "commit_confirmed"}
     default_port: int                     # e.g. 830 for netconf
     banner: bytes | None                  # what the port sends first, for the probe; None: a connect is enough
+    ssh_config: Literal["paramiko", "openssh"] | None   # whose ssh client config the transport reads, so the probe asks where the connection really goes: "paramiko" (~/.ssh/config: HostName, Port, ProxyCommand), "openssh" (as `ssh -G` prints it, ProxyJump too), None (reads none)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...
@@ -334,7 +355,7 @@ use of that session before the next command: it is torn down at once, and the re
 policy on a fresh session, one more login; a `REFUSED` reply continues on the same session and `SESSION_LOST` still ends
 the batch. Every open that is not a borrow's first (that fresh session, or an open after a kept session fails its reuse
 check) is counted by the safety gate's `count_login` first: a full window refuses it as a `LOCAL` fault, "safety gate: …",
-which skips the target at the start of a borrow and fails it mid-batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts.
+which skips the target at the start of a borrow and fails it mid-batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts. A candidate loaded in one `load` call has a command timeout per line and one for the lock, since a CLI types it line by line; `diff` has two, `commit` the commit timeout. A CLI transport's timed-out command ends its session the same way: no resynchronisation, the late reply dies with the session.
 
 ### 5.3 Edit lifecycle
 
