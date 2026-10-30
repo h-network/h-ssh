@@ -85,7 +85,11 @@ reads only, never an edit. After an apply with
 a timer the CLI prints the minutes left per device and the command that confirms them, rebuilt from the run's
 own arguments. Exit codes: 0; 1 a device failed; 2 refused before anything was sent; 3 nothing failed but not
 everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exits with the worst of its runs,
-in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run.
+in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run. `--json`
+renders each `Result.data` through the store's `json_data`, so the file and the store hold the same shapes.
+The run's provenance in `RecordSettings` is the front end's: `origin` is `h-ssh` from the CLI and `fleet` from
+the library (unless the caller set one), `version` is the installed package version from `importlib.metadata`,
+None when h-ssh runs from source. Set-file names and containment (`-eD`) use the shared `hssh.paths` helpers.
 
 ### 3.2 Orchestrator
 

@@ -10,6 +10,8 @@ The library reads no environment variable and no config file: what it is given i
 
 from __future__ import annotations
 
+import dataclasses
+import importlib.metadata
 import logging
 import os
 import re
@@ -31,6 +33,14 @@ from hssh.orchestrator import (
 Runner = Callable[[RunSpec], RunReport]
 
 LIBRARY_LOGGERS = ("paramiko", "ncclient")
+
+
+def package_version() -> str | None:
+    """The installed h-ssh version for the run's provenance; None when running from source."""
+    try:
+        return importlib.metadata.version("h-ssh")
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
 
 def quiet_library_logs() -> None:
@@ -173,6 +183,9 @@ class Fleet:
         self.host_key_policy = host_key_policy
         self.probe = probe
         self.safety = safety
+        if recording is not None:
+            recording = dataclasses.replace(recording, origin=recording.origin or "fleet",
+                                            version=recording.version or package_version())
         self.recording = recording
         self._runner = runner
 
