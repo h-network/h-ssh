@@ -65,14 +65,16 @@ class EditLifecycle:
         self.timeouts = timeouts
 
     async def load(self, lines: list[str]) -> tuple[list[OperationResult], int]:
-        """The candidate loaded in one call, under a command timeout per line and one for the lock, since a CLI types it line by line; without a candidate model, line by line here, so the lines applied are known."""
+        """The candidate loaded in one call, under a command timeout per line and one for the lock, since a CLI types it line by line; without a candidate model, line by line here, so the lines applied are known. The first call is the session's first operation, so it has the setup timeout too: a transport may start its shell there."""
         if self.dialect.has_candidate:
             op = await operation("load", lambda: self.communicator.load(self.session, lines),
-                                 max(2, len(lines) + 1) * self.timeouts.command)
+                                 max(2, len(lines) + 1) * self.timeouts.command + self.timeouts.setup)
             return [op], 0 if failed(op) else len(lines)
         ops: list[OperationResult] = []
         for line in lines:
-            ops.append(await operation(line, lambda: self.communicator.load(self.session, [line]), self.timeouts.command))
+            first = self.timeouts.setup if not ops else 0
+            ops.append(await operation(line, lambda: self.communicator.load(self.session, [line]),
+                                       self.timeouts.command + first))
             if failed(ops[-1]):
                 break
         return ops, len(ops) - (1 if ops and failed(ops[-1]) else 0)
@@ -115,4 +117,6 @@ async def confirm(communicator: Communicator, session: Session, timeouts: Timeou
 
 
 async def commit_history(communicator: Communicator, session: Session, timeouts: Timeouts) -> OperationResult:
-    return await operation("commit_history", lambda: communicator.commit_history(session), timeouts.command)
+    """The session's first operation in confirm and commit_status, so it has the setup timeout too."""
+    return await operation("commit_history", lambda: communicator.commit_history(session),
+                           timeouts.command + timeouts.setup)

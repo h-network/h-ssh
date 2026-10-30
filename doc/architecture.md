@@ -355,7 +355,7 @@ use of that session before the next command: it is torn down at once, and the re
 policy on a fresh session, one more login; a `REFUSED` reply continues on the same session and `SESSION_LOST` still ends
 the batch. Every open that is not a borrow's first (that fresh session, or an open after a kept session fails its reuse
 check) is counted by the safety gate's `count_login` first: a full window refuses it as a `LOCAL` fault, "safety gate: …",
-which skips the target at the start of a borrow and fails it mid-batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts. A candidate loaded in one `load` call has a command timeout per line and one for the lock, since a CLI types it line by line; `diff` has two, `commit` the commit timeout. A CLI transport's timed-out command ends its session the same way: no resynchronisation, the late reply dies with the session.
+which skips the target at the start of a borrow and fails it mid-batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts. A candidate loaded in one `load` call has a command timeout per line and one for the lock, since a CLI types it line by line, and the setup timeout on top, as has the first `load` line without a candidate and `commit_history`: a target's first operation may start the transport's shell inside the setup deadline the communicator keeps; `diff` has two, `commit` the commit timeout. A CLI transport's timed-out command ends its session the same way: no resynchronisation, the late reply dies with the session.
 
 ### 5.3 Edit lifecycle
 
