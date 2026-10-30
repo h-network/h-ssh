@@ -271,7 +271,7 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
   minutes left on each, from the device; the front end builds the command that confirms them. A confirm run reads the
   commit history first and sends the confirm only when its `CommitStatus` is pending; otherwise it is `REFUSED`.
 - The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
-  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters, no quotes); front
+  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
   ends call the same helpers before asking for a password.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
   uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.

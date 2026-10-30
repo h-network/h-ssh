@@ -42,7 +42,7 @@ def check_confirmed_minutes(minutes: int) -> str | None:
 
 
 def check_comment(comment: str) -> str | None:
-    """Why `comment` cannot go on a commit, or None: one non-empty line of at most MAX_COMMENT_BYTES UTF-8 bytes, no control characters, no quotes."""
+    """Why `comment` cannot go on a commit, or None: one non-empty line of at most MAX_COMMENT_BYTES UTF-8 bytes with no control characters."""
     if not comment.strip():
         return "the commit comment is empty"
     if len(comment.encode("utf-8", "surrogatepass")) > MAX_COMMENT_BYTES:
@@ -50,8 +50,6 @@ def check_comment(comment: str) -> str | None:
     for ch in comment:
         if unicodedata.category(ch) in ("Cc", "Cs"):
             return f"the commit comment has a control character (U+{ord(ch):04X}); it must be one line of plain text"
-        if ch in "\"'":
-            return "the commit comment has a quote character"
     return None
 
 
