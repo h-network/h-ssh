@@ -351,6 +351,8 @@ def run(spec: RunSpec) -> RunReport:
     spec = complete(spec)
     registry = Registry()
     registry.load_entry_points()
+    if spec.safety is not None:
+        _plan_logins(spec, registry)
     try:
         gate = _gate(spec)
         store = _store(spec)
