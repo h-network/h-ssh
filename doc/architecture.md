@@ -136,6 +136,22 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 Dialects contain no I/O and no policy.
 
+`comment_prefixes` identifies full-line comments after leading whitespace: `#` for Junos and generic,
+and `#` or `!` for IOS, NX-OS and EOS. Inline `#` remains part of the command.
+`check_edit(lines)` returns refusal text, or `None`, without changing the supplied lines. Every dialect
+refuses an empty or comment-only payload. Junos additionally requires lowercase set-style verbs:
+`set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect`, `unprotect`.
+It refuses commit commands (including `commit;` and unique abbreviations starting at `com`), control
+characters and Tab in non-comment lines, and reports the original line number. Commit and confirm
+are separate operations, never configuration payloads.
+
+Junos and generic `redaction_patterns` identify credential text and secret XML/JSON names for the audit
+writer. Junos also recognises `## SECRET-DATA` and trap-group communities. Quoted values include escaped
+quotes; a key identifier alone does not consume the following line. The writer replaces whole matches.
+For valid JSON text, the writer parses first and detects secret keys by searching these patterns against
+`json.dumps(key) + ': "x"'` (without braces). A matching key's entire value is masked, including objects
+and lists. IOS, NX-OS and EOS redaction patterns wait for the CLI transport phase.
+
 ### 3.6 Result store
 
 One SQLite database, `./h-ssh.db` by default. The recorder writes. `h-ssh-store` reads: it lists
