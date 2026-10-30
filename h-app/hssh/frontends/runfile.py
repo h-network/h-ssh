@@ -33,6 +33,7 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "retry_pause": ("retry_pause", int),
     "workers": ("workers", int),
     "connect_timeout": ("connect_timeout", int),
+    "session_timeout": ("session_timeout", int),
     "command_timeout": ("command_timeout", int),
     "commit_timeout": ("commit_timeout", int),
     "host_key_policy": ("host_key_policy", str),

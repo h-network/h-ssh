@@ -35,8 +35,8 @@ FORMAT_CHOICES = ("text", "json", "xml")
 # Config-file keys with the orchestrator's default; None means "no value".
 CONFIG_DEFAULTS: dict[str, Any] = {
     "transport": DEFAULT_TRANSPORT, "vendor": DEFAULT_VENDOR, "user": None, "workers": DEFAULT_WORKERS,
-    "connect_timeout": DEFAULT_TIMEOUTS.connect, "command_timeout": DEFAULT_TIMEOUTS.command,
-    "commit_timeout": DEFAULT_TIMEOUTS.commit, "retries": DEFAULT_POLICY.retries,
+    "connect_timeout": DEFAULT_TIMEOUTS.connect, "session_timeout": DEFAULT_TIMEOUTS.setup,
+    "command_timeout": DEFAULT_TIMEOUTS.command, "commit_timeout": DEFAULT_TIMEOUTS.commit, "retries": DEFAULT_POLICY.retries,
     "retry_pause": DEFAULT_POLICY.retry_pause, "host_key_policy": DEFAULT_HOST_KEY_POLICY, "probe": DEFAULT_PROBE,
     "cooldown": DEFAULT_SAFETY.cooldown_seconds, "rate_limit": DEFAULT_SAFETY.rate_limit,
     "store": None, "audit_log": None, "safety_file": None,
@@ -113,6 +113,8 @@ def build_parser() -> _Parser:
     behaviour.add_argument("--retries", type=int)
     behaviour.add_argument("--retry-pause", type=int, metavar="SECONDS")
     behaviour.add_argument("--connect-timeout", type=int, metavar="SECONDS")
+    behaviour.add_argument("--session-timeout", type=int, metavar="SECONDS",
+                           help="seconds for the session setup after the TCP connect: key exchange, login, NETCONF hello")
     behaviour.add_argument("--command-timeout", type=int, metavar="SECONDS")
     behaviour.add_argument("--commit-timeout", type=int, metavar="SECONDS")
     behaviour.add_argument("--host-key-policy", choices=HOST_KEY_CHOICES)
@@ -211,7 +213,8 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         targets=resolve_targets(args), mode=mode, commands=commands, config_lines=config_lines,
         format=args.format if mode == "structured" else None,
         credentials=resolve_credentials(args),
-        timeouts=Timeouts(connect=args.connect_timeout, command=args.command_timeout, commit=args.commit_timeout),
+        timeouts=Timeouts(connect=args.connect_timeout, setup=args.session_timeout, command=args.command_timeout,
+                          commit=args.commit_timeout),
         workers=args.workers, host_key_policy=args.host_key_policy, probe=args.probe, edit=edit,
         policy=PolicySettings(retries=args.retries, retry_pause=args.retry_pause),
         safety=safety,
