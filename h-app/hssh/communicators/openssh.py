@@ -34,6 +34,11 @@ _EXIT_GRACE = 2.0
 
 _SESSION_UP = ("Authenticated to ", "Entering interactive session")
 
+_CLOSED = ("Connection closed by", "Connection reset", "kex_exchange_identification")
+
+_PASSWORD_OFFERED = ("requested to askpass", "Next authentication method: password",
+                     "Next authentication method: keyboard-interactive")
+
 
 def _without_password() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k != "HSSH_PASSWORD"}
@@ -139,8 +144,8 @@ def _ssh_argv(target: Target, creds: Credentials, timeouts: Timeouts, policy: Ho
     return argv + ["--", "%s@%s" % (creds.username, target.host)]
 
 
-def _login_fault(host: str, log: str) -> Fault:
-    """Classify a failed login from ssh's own log; the device was reached once its banner is in it."""
+def _login_fault(host: str, log: str, setup: int | None = None) -> Fault:
+    """Classify a failed login from ssh's own log; `setup` is the engine's wait that ran out, when it did."""
     detail = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug"))
     reached = "Remote protocol version" in log
     if "Permission denied" in detail or "Authentication failed" in detail:
@@ -148,9 +153,16 @@ def _login_fault(host: str, log: str) -> Fault:
     if "Host key verification failed" in detail or "REMOTE HOST IDENTIFICATION HAS CHANGED" in detail:
         return Fault(FaultKind.HOST_KEY, detail, reached)
     if "timed out" in detail:
-        return Fault(FaultKind.TIMEOUT if reached else FaultKind.UNREACHABLE, detail, reached)
-    if any(marker in log for marker in _SESSION_UP):
+        return Fault(FaultKind.TIMEOUT, detail, reached)
+    # Junos sshd drops the connection after a refused password instead of saying "Permission denied".
+    if "Connection closed by" in detail and any(marker in log for marker in _PASSWORD_OFFERED):
+        return Fault(FaultKind.AUTH, detail, reached)
+    if any(marker in detail for marker in _CLOSED) or any(marker in log for marker in _SESSION_UP):
         return Fault(FaultKind.SESSION_LOST, detail, True)
+    if setup is not None:
+        if reached:
+            return Fault(FaultKind.TIMEOUT, "the banner came, but key exchange did not finish within %ds" % setup, True)
+        return Fault(FaultKind.TIMEOUT, "no SSH banner within %ds" % setup, False)
     return Fault(FaultKind.UNREACHABLE, detail, reached)
 
 
@@ -264,7 +276,8 @@ class OpenSSH:
             except (ConnectionError, TimeoutError) as exc:
                 log = channel.log()
                 channel.close()
-                raise _login_fault(target.host, log) from exc
+                setup = timeouts.setup if isinstance(exc, TimeoutError) else None
+                raise _login_fault(target.host, log, setup) from exc
             except BaseException:
                 channel.close()
                 raise
