@@ -496,6 +496,10 @@ value, not serialized text: dataclass instances become dictionaries with `asdict
 bool, None, dict and list are accepted. Nested values must be JSON values with string keys
 and finite numbers. Unsupported values raise `ValueError`. The recorder and front end use
 this same converter for structured output; raw output is never parsed to populate `data`.
+`hssh.store.operation_dict(operation)` is the shared per-operation JSON representation for
+saved batches and CLI JSON: `command`, `started`, `elapsed_ms` and `ok`, followed by
+`output` and `data` on success, or `fault` (the kind name), `detail` and `reached_device`
+on failure. Structured data uses `json_data`; output and fault detail stay unmodified.
 If `add` cannot convert unsupported `Result.data`, it still writes the row with `data` NULL,
 preserving raw output and the operation outcome, then raises a contextual `OSError` naming
 the unsupported type. The recorder counts this incomplete record as `not_kept`; the

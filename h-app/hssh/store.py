@@ -83,6 +83,17 @@ def json_data(value: object) -> bool | None | dict[str, object] | list[object]:
     return value
 
 
+def operation_dict(operation: OperationResult) -> dict[str, object]:
+    result = {"command": operation.command, "started": operation.started,
+              "elapsed_ms": operation.elapsed_ms, "ok": not isinstance(operation.outcome, Fault)}
+    if isinstance(operation.outcome, Fault):
+        result.update(fault=operation.outcome.kind.name, detail=operation.outcome.detail,
+                      reached_device=operation.outcome.reached_device)
+    else:
+        result.update(output=operation.outcome.output, data=json_data(operation.outcome.data))
+    return result
+
+
 def _schema_state(conn: sqlite3.Connection) -> bool:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     tables = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' ORDER BY name").fetchall()
