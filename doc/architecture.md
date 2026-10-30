@@ -72,6 +72,15 @@ through the same `RunSpec`.
 `--every` is a front-end loop. It submits the same `RunSpec` at an interval and renders the differences
 between reports.
 
+The CLI refuses before the password is asked what the run could not go on with: a commit comment or timer the
+orchestrator's `check_comment` and `check_confirmed_minutes` reject, and a run file that applies changes
+without `commit_confirmed` (nobody watches a pipeline). An edit payload loses its blank lines and the lines
+that start with the targets' dialect comment prefixes; an inline `#` is sent as written. After an apply with
+a timer the CLI prints the minutes left per device and the command that confirms them, rebuilt from the run's
+own arguments. Exit codes: 0; 1 a device failed; 2 refused before anything was sent; 3 nothing failed but not
+everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exits with the worst of its runs,
+in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run.
+
 ### 3.2 Orchestrator
 
 The orchestrator executes a `RunSpec` and owns all policy. It defines the default of every `RunSpec`
