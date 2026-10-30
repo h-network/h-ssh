@@ -7,7 +7,6 @@ The password is HSSH_PASSWORD or the prompt; there is no --password flag and no 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import getpass
 import json
 import logging
@@ -24,7 +23,8 @@ from hssh.dialects.base import Dialect
 from hssh.drivers import Registry
 from hssh.frontends import profiles
 from hssh.frontends.fleet import (
-    LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, parse_target, quiet_library_logs, run_spec,
+    LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, package_version, parse_target, quiet_library_logs,
+    run_spec,
 )
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
@@ -37,6 +37,8 @@ from hssh.orchestrator import (
     DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, check_comment,
     check_confirmed_minutes, default_username,
 )
+from hssh.paths import path_inside, validate_device_name
+from hssh.store import json_data
 
 TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
 HOST_KEY_CHOICES = ("accept-new", "strict", "off")
@@ -242,8 +244,6 @@ def payload_lines(text: str, prefixes: Sequence[str]) -> tuple[str, ...]:
 # C0 controls but Tab, DEL and C1 controls; a payload keeps its line breaks, nothing else of these.
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _CONTROL_NAMES = {"\r": "a carriage return", "\x00": "a NUL", "\x1b": "an ESC", "\x7f": "a DEL"}
-_DEVICE_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]*")
-
 
 def control_line(text: str) -> tuple[int, str, str] | None:
     """(line number, the line, what) for the first control character in a payload, or None."""
@@ -251,20 +251,6 @@ def control_line(text: str) -> tuple[int, str, str] | None:
         if m := _CONTROL.search(line.rstrip("\r")):
             return number, line, _CONTROL_NAMES.get(m.group(), f"a control character {m.group()!r}")
     return None
-
-
-def validate_device_name(name: str) -> str:
-    """A target name as it may appear in a file name: no separator, no leading '-' or '.'."""
-    if not _DEVICE_NAME.fullmatch(name):
-        raise ValueError(f"invalid device name {name!r}: letters, digits, '_', '.', ':' and '-' only, not starting with '-' or '.'")
-    return name
-
-
-def path_inside(base: Path, filename: str) -> Path:
-    """`base/filename`, refused unless it stays inside `base` once resolved."""
-    if (base.resolve() / filename).resolve().parent != base.resolve():
-        raise ValueError(f"{filename!r} does not stay inside {base}")
-    return base / filename
 
 
 def set_files(args: argparse.Namespace, targets: Sequence[Target]) -> dict[str, Path]:
@@ -356,7 +342,8 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         safety=safety,
         recording=RecordSettings(store_path=None if args.no_store else (args.store or DEFAULT_STORE),
                                  audit_log_path=args.audit_log, log_path=args.log,
-                                 save_output_path=args.save_output, argv=tuple(argv)),
+                                 save_output_path=args.save_output, argv=tuple(argv),
+                                 origin="h-ssh", version=package_version()),
     )
 
 
@@ -418,10 +405,7 @@ def report_dict(report: RunReport) -> dict[str, Any]:
     def outcome(op) -> dict[str, Any]:
         if isinstance(op.outcome, Fault):
             return {"ok": False, "fault": op.outcome.kind.name, "detail": op.outcome.detail}
-        data = op.outcome.data
-        if dataclasses.is_dataclass(data) and not isinstance(data, type):
-            data = dataclasses.asdict(data)
-        return {"ok": True, "output": op.outcome.output, "data": data}
+        return {"ok": True, "output": op.outcome.output, "data": json_data(op.outcome.data)}
 
     return {
         "run_id": report.run_id, "mode": report.mode, "started": report.started, "finished": report.finished,
