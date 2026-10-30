@@ -177,6 +177,20 @@ deadlines; each adapter holds one deadline across the whole write. Login takes n
 OpenSSH sessions arrive authenticated.
 It reads vendor behaviour from the dialect.
 
+For CLI reads, login learns a whole-line prompt and disables paging within the remaining setup deadline.
+Junos uses `set cli screen-length 0`; the echoed command also separates any delayed banner from replies.
+Each command's write, reply and prompt settling share one command deadline. The reader decodes UTF-8
+incrementally, handles terminal redraws and recognises pager markers only on the current terminal line.
+It removes command echoes, prompt context and terminal control sequences, without redacting or formatting
+the reply. A refusal at the start of a reply is `REFUSED`; an error-looking line later in output stays output.
+Commands containing controls, Tab or invalid Unicode are refused before typing; Junos's encoder quotes
+literal `?` for the line editor.
+
+A timeout or disconnect makes the engine unready, so that session is discarded and a later batch command
+uses a fresh login. Pooling asks the transport's cheap liveness check first; an idle probe sends one empty
+line and waits for the learned prompt under its absolute deadline. Releasing a read session requires it
+to remain synchronized. Close and discard end the channel without sending configuration commands.
+
 ### 3.5 Dialects
 
 A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
