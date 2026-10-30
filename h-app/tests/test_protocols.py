@@ -15,12 +15,19 @@ DIALECT_MEMBERS = {"prompt_pattern", "paging_off_command", "refusal_patterns", "
                    "has_candidate", "redaction_patterns", "comment_prefixes", "is_read", "check_edit"}
 
 
+def members_of(protocol) -> set[str]:
+    """The public attributes and methods the protocol class declares itself."""
+    own = vars(protocol)
+    return {n for n in own.get("__annotations__", {}) if not n.startswith("_")} | {
+        n for n, v in own.items() if callable(v) and not n.startswith("_")}
+
+
 def test_the_communicator_protocol_is_section_4_1_with_no_rollback():
-    assert set(Communicator.__protocol_attrs__) == COMMUNICATOR_MEMBERS
+    assert members_of(Communicator) == COMMUNICATOR_MEMBERS
 
 
 def test_the_dialect_protocol_is_section_3_5_plus_the_edit_hooks():
-    assert set(Dialect.__protocol_attrs__) == DIALECT_MEMBERS
+    assert members_of(Dialect) == DIALECT_MEMBERS
 
 
 @pytest.mark.parametrize("make", [NetconfCommunicator, OpenSSH, SSHCommunicator, TelnetCommunicator])
