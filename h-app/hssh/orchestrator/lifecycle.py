@@ -83,11 +83,14 @@ class EditLifecycle:
         return await operation("commit", lambda: self.communicator.commit(self.session, edit.confirmed_minutes, edit.comment),
                                self.timeouts.commit)
 
-    async def run(self, lines: list[str], edit: EditSettings, before_commit: Callable[[], None] = lambda: None) -> EditOutcome:
-        """The state machine from LOAD; the caller has opened the session and closes it after. A diff whose data is False ends it: nothing to commit. `before_commit` runs once the commit is about to be sent, so an interrupt waits for it."""
+    async def run(self, lines: list[str], edit: EditSettings, before_commit: Callable[[], None] = lambda: None,
+                  on_step: Callable[[str], None] = lambda name: None) -> EditOutcome:
+        """The state machine from LOAD; the caller has opened the session and closes it after. A diff whose data is False ends it: nothing to commit. `on_step` names each step as it starts; `before_commit` runs once the commit is about to be sent, so an interrupt waits for it."""
+        on_step("load")
         ops, applied = await self.load(lines)
         if failed(ops[-1]):
             return EditOutcome(tuple(ops), Stage.LOAD, applied)
+        on_step("diff")
         ops.append(await self.diff())
         if failed(ops[-1]) or not edit.apply or ops[-1].outcome.data is False:
             return EditOutcome(tuple(ops), Stage.DIFF, applied)
