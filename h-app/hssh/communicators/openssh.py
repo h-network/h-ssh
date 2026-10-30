@@ -246,11 +246,12 @@ class ProcessChannel:
             remaining = deadline - time.monotonic()
             try:
                 _, ready, _ = select.select([], [self.master], [], max(0.0, remaining))
-                if not ready:
-                    raise TimeoutError("write to %s not finished by its deadline" % self.host)
-                view = view[os.write(self.master, view):]
+                if ready:
+                    view = view[os.write(self.master, view):]
             except (OSError, ValueError) as exc:
                 raise ConnectionError("connection lost: %s" % exc) from exc
+            if not ready:
+                raise TimeoutError("write to %s not finished by its deadline" % self.host)
 
     def log(self) -> str:
         return _read(self.log_path)
