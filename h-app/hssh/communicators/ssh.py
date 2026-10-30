@@ -51,8 +51,7 @@ class SSHCommunicator(Communicator):
     banner: bytes | None = b"SSH-"
     ssh_config = None
 
-    # Advertise operations once connection setup is implemented.
-    capabilities: frozenset[str] = frozenset()
+    capabilities: frozenset[str] = frozenset({"show", "batch"})
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
