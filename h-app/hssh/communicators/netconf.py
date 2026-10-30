@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import socket
 from threading import RLock
+from time import monotonic, sleep
 from typing import TYPE_CHECKING, cast
 
 from hssh.communicators.base import Communicator, Session
@@ -35,6 +36,7 @@ else:
 
 _HOST_KEYS_LOCK = RLock()
 _HOST_KEYS: dict[Path, list[tuple[str | tuple[bytes, bytes], PKey]]] = {}
+_REVOKED: dict[Path, set[bytes]] = {}
 _RESOLVED: dict[tuple[Path, str, int], dict[str, dict[str, PKey]]] = {}
 _HOST_KEY_PORT: ContextVar[int | None] = ContextVar("netconf_host_key_port", default=None)
 _HOST_KEY_LOADER_INSTALLED = False
@@ -47,16 +49,30 @@ def _known_keys(path: Path, host: str, port: int) -> dict[str, dict[str, PKey]]:
     with _HOST_KEYS_LOCK:
         if path not in _HOST_KEYS:
             entries = []
-            lines = path.read_text().split("\n") if path.exists() else ()
-            for line in lines:
+            revoked = set()
+            lines = path.read_text(encoding="utf-8", errors="surrogateescape").split("\n") if path.exists() else ()
+            for number, line in enumerate(lines, 1):
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
+                marker = line.split(None, 1)[0] if line.startswith("@") else ""
+                if marker not in ("", "@revoked"):
+                    continue
                 try:
-                    entry = HostKeyEntry.from_line(line)
-                except SSHException:
+                    fields = line[len(marker):].split()
+                    if marker and len(fields) < 3:
+                        raise ValueError("invalid revoked key")
+                    entry = HostKeyEntry.from_line(" ".join(fields[:3]))
+                except (SSHException, ValueError) as error:
+                    if marker:
+                        raise ValueError(f"{path}: invalid @revoked entry at line {number}: {error}") from error
+                    if not isinstance(error, SSHException):
+                        raise
                     continue
                 if entry is None:
+                    continue
+                if marker:
+                    revoked.add(entry.key.asbytes())
                     continue
                 for name in entry.hostnames:
                     pattern = name
@@ -67,6 +83,7 @@ def _known_keys(path: Path, host: str, port: int) -> dict[str, dict[str, PKey]]:
                             raise ValueError("invalid known-hosts hash salt")
                     entries.append((pattern, entry.key))
             _HOST_KEYS[path] = entries
+            _REVOKED[path] = revoked
         cache_key = (path, host, port)
         if cache_key not in _RESOLVED:
             resolved = {host: {}, f"[{host}]:{port}": {}}
@@ -96,6 +113,7 @@ class _SessionKeys:
 
     def check(self, name: str, key: PKey) -> bool:
         known = (self.lookup(name) or {}).get(key.get_name())
+        _reject_revoked(self.path, key)
         return known is not None and known.asbytes() == key.asbytes()
 
 
@@ -114,6 +132,19 @@ class _SocketForNcclient:
                 # ncclient catches OSError and replaces it with an unreachable-host error.
                 raise Fault(FaultKind.LOCAL, str(error), False) from error
             raise
+
+
+def _reject_revoked(path: Path, key: PKey) -> None:
+    if key.asbytes() in _REVOKED.get(path, ()):
+        raise Fault(FaultKind.HOST_KEY, f"server key is marked @revoked in {path}", False)
+
+
+def _forget_host_keys(path: Path) -> None:
+    _HOST_KEYS.pop(path, None)
+    _REVOKED.pop(path, None)
+    for cached in list(_RESOLVED):
+        if cached[0] == path:
+            del _RESOLVED[cached]
 
 
 def _install_host_key_loader() -> None:
@@ -152,26 +183,34 @@ def _accept_new(host: str, port: int, timeout: int) -> None:
             transport.start_client(timeout=timeout)
             key = transport.get_remote_server_key()
     with _HOST_KEYS_LOCK:
-        resolved = _known_keys(path, host, port)
-        current = resolved[host] or resolved[f"[{host}]:{port}"]
-        if current:
-            expected = current.get(key.get_name())
-            if expected != key:
-                raise paramiko.BadHostKeyException(host, key, expected or next(iter(current.values())))
-        else:
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
-            with os.fdopen(fd, "a") as known_hosts:
-                fcntl.flock(known_hosts, fcntl.LOCK_EX)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as known_hosts:
+            deadline = monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(known_hosts, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if monotonic() >= deadline:
+                        raise Fault(FaultKind.LOCAL, f"{path}: known_hosts lock timed out after {timeout}s", False)
+                    sleep(min(0.05, max(0, deadline - monotonic())))
+            # Another process may have pinned or revoked this key while we connected.
+            _forget_host_keys(path)
+            resolved = _known_keys(path, host, port)
+            _reject_revoked(path, key)
+            current = resolved[host] or resolved[f"[{host}]:{port}"]
+            if current:
+                expected = current.get(key.get_name())
+                if expected != key:
+                    raise paramiko.BadHostKeyException(host, key, expected or next(iter(current.values())))
+            else:
                 size = os.fstat(fd).st_size
                 if size and os.pread(fd, 1, size - 1) != b"\n":
                     known_hosts.write("\n")
                 known_hosts.write(f"{name} {key.get_name()} {key.get_base64()}\n")
                 known_hosts.flush()
-                del _HOST_KEYS[path]
-                for cached in list(_RESOLVED):
-                    if cached[0] == path:
-                        del _RESOLVED[cached]
+                _forget_host_keys(path)
                 _known_keys(path, host, port)
 
 
@@ -189,6 +228,8 @@ def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> 
     errors = []
     cause = error
     while isinstance(cause, BaseException) and cause not in errors:
+        if isinstance(cause, Fault):
+            return cause
         errors.append(cause)
         cause = getattr(cause, "_orig", None) or cause.__cause__ or cause.__context__
     detail = str(errors[-1])

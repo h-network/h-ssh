@@ -33,6 +33,11 @@ applies only while this communicator opens a PyEZ device; other ncclient session
 keep their normal loader. New entries start on their own line and are appended under a file lock, preserving
 the file's existing content, then refreshing the file cache and its resolutions.
 A new process reads external changes to known-hosts files.
+With `strict` or `accept-new`, revoked keys are refused even if a normal entry
+matches; certificate-authority entries are skipped. Before pinning, accept-new
+re-reads the file under its lock and checks any key pinned by another process.
+Waiting for that lock is limited to the connect timeout and fails as a local fault.
+Appending preserves existing bytes, including comments that are not UTF-8.
 
 Library failures become `Fault` with the library's message and whether the
 operation may have reached the device. The communicator does not retry.
