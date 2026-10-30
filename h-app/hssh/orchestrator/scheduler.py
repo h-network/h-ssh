@@ -61,9 +61,11 @@ class Scheduler:
         loop = asyncio.get_running_loop()
         loop.set_default_executor(_DaemonThreads(spec.workers, thread_name_prefix="hssh"))
         run = _Run(spec, 0, now())
-        run.run_id = self.recorder.begin(spec, run.started)
         slots = asyncio.Semaphore(spec.workers)
         dead = await self._probe(spec) if spec.probe else {}
+        if spec.mode == "edit" and any(dead.values()):
+            self._dead_edit(spec, dead)
+        run.run_id = self.recorder.begin(spec, run.started)
         run.tasks = [asyncio.create_task(self._bounded(run, i, t, slots, dead.get(t.name)))
                      for i, t in enumerate(spec.targets)]
         with _on_interrupt(loop, lambda: self._interrupt(run)):
@@ -100,7 +102,8 @@ class Scheduler:
         async with slots:
             run.begun.add(index)
             if dead is not None:
-                return self._failed_before(run, target, dead)
+                skipped = run.spec.mode == "edit" and run.spec.skip_unreachable
+                return self._failed_before(run, target, dead, "skipped" if skipped else "failed")
             try:
                 result = await self._run_target(run, index, target)
             except asyncio.CancelledError:
@@ -241,11 +244,29 @@ class Scheduler:
         self.recorder.result(run.run_id, result.target, driver, len(result.operations), op)
         return dataclasses.replace(result, operations=(*result.operations, op))
 
-    def _failed_before(self, run: _Run, target: Target, fault: Fault) -> TargetResult:
-        """A target that failed before any operation: one operation named 'open', recorded without a driver."""
+    def _failed_before(self, run: _Run, target: Target, fault: Fault, status: TargetStatus = "failed") -> TargetResult:
+        """A target that failed, or was skipped, before any operation: one operation named 'open', recorded without a driver."""
         op = OperationResult(OPEN, fault, now(), 0)
         self.recorder.result(run.run_id, target, "", 0, op)
-        return TargetResult(target, "failed", (op,))
+        return TargetResult(target, status, (op,))
+
+    def _dead_edit(self, spec: RunSpec, dead: dict[str, Fault | None]) -> None:
+        """An edit whose probe found a target dead: skipped when the spec says so, else the run stops before any device, one audit entry per dead target and no run row."""
+        if spec.skip_unreachable:
+            return
+        names = [t.name for t in spec.targets if dead.get(t.name) is not None]
+        for target in spec.targets:
+            if dead.get(target.name) is None:
+                continue
+            try:
+                driver = self.registry.resolve(target)
+            except Fault:
+                continue
+            op = OperationResult(OPEN, dead[target.name], now(), 0)
+            self.recorder.change(0, target, driver.name, driver.dialect, "probe", op, spec.edit)
+        reachable = len(spec.targets) - len(names)
+        raise Fault(FaultKind.LOCAL, f"{len(names)} device(s) unreachable: {', '.join(names)}; aborting to prevent a "
+                    f"partial deployment; skip_unreachable goes on with the {reachable} reachable", False)
 
     @staticmethod
     def _pending(spec: RunSpec, results: list[TargetResult]) -> dict[str, str]:
@@ -340,6 +361,23 @@ def run(spec: RunSpec) -> RunReport:
     finally:
         if store is not None:
             store.close()
+
+
+def audit_aborted(spec: RunSpec, reason: str) -> None:
+    """One audit entry per target when the operator declines to apply an edit: action 'aborted' with the reason, no run row."""
+    from hssh.drivers import Registry
+
+    spec = complete(spec)
+    registry = Registry()
+    registry.load_entry_points()
+    recorder = Recorder(spec.recording)
+    op = OperationResult("aborted", Fault(FaultKind.LOCAL, reason, False), now(), 0)
+    for target in spec.targets:
+        try:
+            driver = registry.resolve(target)
+        except Fault:
+            continue
+        recorder.change(0, target, driver.name, driver.dialect, "aborted", op, spec.edit)
 
 
 def _gate(spec: RunSpec) -> SafetyGate | None:
