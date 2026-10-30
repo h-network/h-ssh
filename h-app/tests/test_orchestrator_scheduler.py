@@ -116,7 +116,7 @@ def test_a_device_the_gate_holds_is_not_opened():
     comm, gate = FakeNetconf(), Gate(held={"r1"})
     report = run(show_spec(T1, T2), comm, gate=gate)
     assert opens(comm) == [("open", "r2")]
-    assert report.results[0].status == "failed" and "safety gate" in fault_of(report.results[0].operations[0]).detail
+    assert report.results[0].status == "skipped" and "safety gate" in fault_of(report.results[0].operations[0]).detail
     assert ("close",) in gate.calls
 
 

@@ -326,6 +326,13 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file. Before the
   run starts, the policy counts the logins the run may make to one device (retries + 1 per listing) against the rate
   limit and refuses the run when it would pass it, so the gate never turns a device away half-way.
+- The gate keys a device by host and the port the connection uses: the orchestrator fills a target's port from the
+  transport's default before every gate call, so the gate holds no default-port table. A target the gate holds is
+  not probed and is skipped before `OPEN` with the reason, as is one the gate turns away at login, so a held fleet
+  ends with skipped targets (exit 3), not failures. Gate state that cannot be used (an unreadable or corrupt safety
+  file) refuses the run before the probe; found at a target's login it is that target's `LOCAL` failure; a cooldown
+  or release that cannot be persisted is said once and the verdict stands. A local refusal or a recording failure
+  never cools a device down.
 
 ### 5.4 Cancellation
 
