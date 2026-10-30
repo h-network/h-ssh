@@ -7,6 +7,7 @@ The password is HSSH_PASSWORD or the prompt; there is no --password flag and no 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import json
 import logging
@@ -351,7 +352,10 @@ def report_dict(report: RunReport) -> dict[str, Any]:
     def outcome(op) -> dict[str, Any]:
         if isinstance(op.outcome, Fault):
             return {"ok": False, "fault": op.outcome.kind.name, "detail": op.outcome.detail}
-        return {"ok": True, "output": op.outcome.output, "data": op.outcome.data}
+        data = op.outcome.data
+        if dataclasses.is_dataclass(data) and not isinstance(data, type):
+            data = dataclasses.asdict(data)
+        return {"ok": True, "output": op.outcome.output, "data": data}
 
     return {
         "run_id": report.run_id, "mode": report.mode, "started": report.started, "finished": report.finished,
