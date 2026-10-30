@@ -291,6 +291,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - **Apply** requires `-y`. Without it, an edit is a dry run. A diff whose data is False sends no commit: an empty
   commit could confirm someone else's pending commit-confirmed.
 - The target is marked past `COMMIT` before the commit is sent, so an interrupt waits for the reply.
+- A target's payload is its entry in the per-target payloads, else the configuration lines. When payloads are given
+  and a target has neither, it is skipped before `OPEN`, recorded as `open` `LOCAL` "no configuration for this target".
 - Before `OPEN`, the payload goes through the driver dialect's `check_edit`; a refusal fails the target as `LOCAL`
   with the dialect's text, so the rule holds for every caller, not only the CLI.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
