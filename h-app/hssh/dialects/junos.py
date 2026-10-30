@@ -14,9 +14,11 @@ _PENDING = re.compile(r"commit confirmed, rollback in (\d+) minutes?", re.I)
 
 
 class JunosDialect(GenericDialect):
-    prompt_pattern = re.compile(r'[\w\-\.]+@[\w\-\.]+[>%#]\s*$')
+    prompt_pattern = re.compile(r'^[\w\-\.]+@[\w\-\.]+[>%#]\s*$')
     prompt_name_pattern = re.compile(r'^([\w\-\.]+@[\w\-\.]+)')
     prompt_tail_pattern = re.compile(r'[>%#]\s*$')
+    paging_off_command = "set cli screen-length 0"
+    pager_pattern = re.compile(r'^\s*---?\(more(?: \d+%)?\)---?\s*$', re.I)
     context_pattern = re.compile(r'^\s*(?:(?:\{\w+(?::\w+)?\})?\[edit[^\]]*\]|# commit confirmed will be rolled back in \d+ minutes?)\s*$')
     refusal_patterns = (
         re.compile(
