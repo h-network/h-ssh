@@ -110,6 +110,9 @@ class CliEngine:
         self.ready = False
         self._closed = False
         self._synchronized = False
+        self._configured = False
+        self._dirty = False
+        self._commit_sent = False
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._terminal = _Terminal()
 
@@ -241,18 +244,31 @@ class CliEngine:
             self.show(self.dialect.paging_off_command)
 
     def show(self, command: str) -> Result:
+        return Result(self._command(command))
+
+    def _command(self, command: str, timeout: int | None = None, *, edit: bool = False) -> str:
         if not command.strip() or _CONTROL.search(command):
             raise Fault(FaultKind.LOCAL, "a CLI command must be nonempty text without controls or Tab", False)
         if not self.ready:
             raise Fault(FaultKind.SESSION_LOST, "CLI session is not synchronized", True)
         try:
-            return Result(self._exchange(command.strip(), time.monotonic() + self.timeouts.command))
+            output = self._exchange(command.strip(), time.monotonic() + (self.timeouts.command if timeout is None else timeout))
+            if edit:
+                for line in output.splitlines():
+                    if refusal := self._refusal([line]):
+                        raise Fault(FaultKind.REFUSED, refusal, True)
+            return output
         except TimeoutError as error:
             self.ready = False
             raise Fault(FaultKind.TIMEOUT, str(error), True) from error
         except (ConnectionError, OSError) as error:
             self.ready = False
             raise Fault(FaultKind.SESSION_LOST, str(error), True) from error
+        except Fault:
+            raise
+        except BaseException:
+            self.ready = False
+            raise
 
     def probe(self, deadline: float) -> bool:
         if not self.ready:
@@ -265,32 +281,102 @@ class CliEngine:
             return False
 
     def release(self) -> None:
-        if not self.ready:
+        if not self.ready or self._commit_sent:
+            self.discard()
             raise Fault(FaultKind.SESSION_LOST, "CLI session is not synchronized", True)
+        try:
+            if self._configured:
+                if self._dirty:
+                    for command in self.dialect.discard_commands:
+                        self._command(command, edit=True)
+                    self._dirty = False
+                self._command(self.dialect.config_exit_command, edit=True)
+                self._configured = False
+        except BaseException:
+            self.discard()
+            raise
 
     def close(self) -> None:
+        try:
+            if self.ready and not self._commit_sent:
+                self.release()
+        finally:
+            self.discard()
+
+    def discard(self) -> None:
         self.ready = False
         if not self._closed:
             self._closed = True
-            self.channel.close()
+            try:
+                self.channel.close()
+            except Exception:
+                pass
 
-    def discard(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
+    def _enter(self) -> None:
+        if not self.dialect.has_candidate or not self.dialect.config_enter_command or not self.dialect.config_exit_command:
+            raise Fault(FaultKind.UNSUPPORTED, "this dialect has no candidate configuration", False)
+        if not self._configured:
+            self._command(self.dialect.config_enter_command, edit=True)
+            self._configured = True
 
     def load(self, lines: list[str]) -> Result:
-        raise NotImplementedError("Line-by-line configuration")
+        if refusal := self.dialect.check_edit(lines):
+            raise Fault(FaultKind.LOCAL, refusal, False)
+        self._enter()
+        replies = []
+        for number, raw in enumerate(lines, 1):
+            line = raw.strip()
+            if not line or line.startswith(self.dialect.comment_prefixes):
+                continue
+            self._dirty = True
+            try:
+                output = self._command(line, edit=True)
+            except Fault as error:
+                raise Fault(error.kind, f"line {number} {line!r}: {error.detail}", error.reached_device) from error
+            if output.strip():
+                replies.append(f"{line!r}: {output}")
+        return Result("\n".join(replies))
 
     def diff(self) -> Result:
-        raise NotImplementedError("Dialect diff command")
+        if self.dialect.diff_command is None:
+            raise Fault(FaultKind.UNSUPPORTED, "this dialect has no candidate diff", False)
+        self._enter()
+        output = self._command(self.dialect.diff_command)
+        changed = bool(output.strip())
+        return Result(output if changed else "", data=changed)
 
     def commit(self, confirmed_minutes: int | None, comment: str | None) -> Result:
-        raise NotImplementedError("Dialect commit command")
+        command = self.dialect.build_commit(confirmed_minutes, comment)
+        self._enter()
+        if not self.ready:
+            raise Fault(FaultKind.SESSION_LOST, "CLI session is not synchronized", True)
+        # A partial write can commit; only an explicit refusal permits rollback.
+        self._commit_sent = True
+        try:
+            output = self._command(command, self.timeouts.commit, edit=True)
+        except Fault as error:
+            if error.kind is FaultKind.REFUSED:
+                self._commit_sent = False
+                raise Fault(FaultKind.COMMIT_FAILED, error.detail, True) from error
+            self.ready = False
+            raise Fault(FaultKind.OUTCOME_UNKNOWN, error.detail, True) from error
+        except BaseException as error:
+            self.ready = False
+            if isinstance(error, Exception):
+                raise Fault(FaultKind.OUTCOME_UNKNOWN, str(error), True) from error
+            raise
+        self._dirty = self._commit_sent = False
+        return Result(output)
 
     def confirm(self) -> Result:
-        raise NotImplementedError("Dialect confirm command")
+        self._enter()
+        if not self.commit_history().data.pending:
+            raise Fault(FaultKind.REFUSED, "nothing to confirm", True)
+        return self.commit(None, None)
 
     def commit_history(self) -> Result:
-        raise NotImplementedError("Dialect commit-history command")
+        command = self.dialect.config_history_command if self._configured else self.dialect.history_command
+        if command is None:
+            raise Fault(FaultKind.UNSUPPORTED, "this dialect has no commit history command in this mode", False)
+        output = self._command(command)
+        return Result(output, data=self.dialect.parse_commit_history(output))

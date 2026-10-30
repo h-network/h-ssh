@@ -2,7 +2,7 @@ import re
 
 from hssh.dialects.base import Dialect
 from hssh.dialects.generic import GenericDialect, _VALUE
-from hssh.model import CommitStatus
+from hssh.model import CommitStatus, Fault, FaultKind
 
 
 SET_PREFIX_VERBS = (
@@ -10,7 +10,7 @@ SET_PREFIX_VERBS = (
     "rename ", "copy ", "annotate ", "protect ", "unprotect ",
 )
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
-_PENDING = re.compile(r"commit confirmed, rollback in (\d+) minutes?", re.I)
+_PENDING = re.compile(r"\bcommit confirmed, rollback in (\d+)\s*min(?:ute)?s?\b", re.I)
 
 
 class JunosDialect(GenericDialect):
@@ -26,11 +26,13 @@ class JunosDialect(GenericDialect):
             re.M | re.I,
         ),
     )
+    warning_patterns = (re.compile(r'^\s*warning:\s*statement not found\b', re.M | re.I),)
     config_enter_command = "configure exclusive"
     config_exit_command = "exit"
     commit_command = "commit"
     diff_command = "show | compare"
     history_command = "show system commit"
+    config_history_command = "run show system commit"
     # Discard only this session's uncommitted candidate on close.
     discard_commands = ("rollback 0",)
     has_candidate = True
@@ -59,19 +61,24 @@ class JunosDialect(GenericDialect):
                 return f"line {number}: invalid Junos set command: {line!r}"
         return None
 
-
     def build_commit(self, confirmed_minutes: int | None, comment: str | None) -> str:
         line = "commit"
-        if confirmed_minutes:
+        if confirmed_minutes is not None:
+            if type(confirmed_minutes) is not int or not 1 <= confirmed_minutes <= 65535:
+                raise Fault(FaultKind.LOCAL, "commit-confirmed minutes must be an integer from 1 to 65535", False)
             line += f" confirmed {confirmed_minutes}"
-        if comment:
+        if comment is not None:
+            if not comment.strip() or _CONTROL.search(comment) or '"' in comment:
+                raise Fault(FaultKind.LOCAL, "a CLI commit comment must be nonempty text without controls, Tab or double quotes", False)
+            if len(comment.encode("utf-8")) > 512:
+                raise Fault(FaultKind.LOCAL, "the commit comment is over 512 UTF-8 bytes", False)
+            comment = comment.replace("\\", "\\\\")
             line += f' comment "{comment}"'
         return line
 
     def parse_commit_history(self, output: str) -> CommitStatus:
-        lines = [ln for ln in output.splitlines() if ln.strip()]
-        newest = lines[0].strip() if lines else ""
-        pending = _PENDING.search(newest) or (_PENDING.search(lines[1]) if len(lines) > 1 else None)
+        newest = next((line.strip() for line in output.splitlines() if re.match(r"^\s*0\s+", line)), "")
+        pending = _PENDING.search(newest)
         return CommitStatus(pending is not None, int(pending.group(1)) if pending else None, newest)
 
     def encode_line(self, text: str) -> bytes:

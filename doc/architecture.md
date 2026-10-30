@@ -189,7 +189,25 @@ literal `?` for the line editor.
 A timeout or disconnect makes the engine unready, so that session is discarded and a later batch command
 uses a fresh login. Pooling asks the transport's cheap liveness check first; an idle probe sends one empty
 line and waits for the learned prompt under its absolute deadline. Releasing a read session requires it
-to remain synchronized. Close and discard end the channel without sending configuration commands.
+to remain synchronized.
+
+Candidate edits acquire exclusive configuration before loading any line. The whole payload is validated
+first; full-line comments and blank lines are skipped. Each line has one command deadline, and a refused
+line stops the load immediately with its line number and device complaint. Accepted warnings remain in
+the load result. A diff returns `data=bool changed`; prompt context and blank output never make an empty
+diff into a change. The orchestrator decides whether to commit.
+
+Commit uses the dialect's `build_commit` and one commit deadline. The engine marks it as sent before the
+write: a partial write or lost reply is `OUTCOME_UNKNOWN`, and no later cleanup sends rollback or exit.
+An explicit device refusal is `COMMIT_FAILED`, leaving the owned candidate available for cleanup.
+Release rolls back only an acquired, uncommitted candidate, then exits configuration; the synchronized
+shell remains reusable. Close performs the same cleanup before ending the channel. Discard only closes
+the channel and never sends CLI commands. A timeout or disconnect also prevents graceful cleanup.
+
+Confirm acquires exclusive configuration and rechecks the newest commit before its one plain commit;
+no pending timer is `REFUSED`. Junos history parses only sequence zero, including the device's `5mins`
+timer format, and ignores timers on older entries. Junos commit comments reject controls, Tab and double
+quotes, quote backslashes, and retain the 512 UTF-8 byte limit; literal `?` uses the line-editor encoder.
 
 ### 3.5 Dialects
 
@@ -201,6 +219,8 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 - the refusal and warning patterns
 - how to enter and leave configuration mode, how to commit (`build_commit`), diff and read the commit history
   (`parse_commit_history`), and how to discard uncommitted changes, if the vendor has a candidate model
+- `config_history_command`: the history command while configuration is held, or `None` when unsupported;
+  Junos uses `run show system commit`, alongside operational `history_command` (`show system commit`)
 - how a validated line is typed (`encode_line`: bytes, newline included; Junos escapes a literal `?`)
 - the read-command rule, deciding which commands are safe to retry
 - a shortcut library of named commands
