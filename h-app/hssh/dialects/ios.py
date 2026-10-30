@@ -6,6 +6,7 @@ from hssh.dialects.generic import GenericDialect
 
 class IosDialect(GenericDialect):
     comment_prefixes = ("#", "!")
+    redaction_patterns: tuple[re.Pattern[str], ...] = ()
     refusal_patterns = (
         re.compile(r"^\s*(% |%(?![A-Z0-9_]+(?:-[A-Z0-9_]+)*-\d+-[A-Z0-9_]+:)\S|ERROR:)", re.M),
     )

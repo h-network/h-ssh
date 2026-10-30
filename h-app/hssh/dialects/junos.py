@@ -1,7 +1,7 @@
 import re
 
 from hssh.dialects.base import Dialect
-from hssh.dialects.generic import GenericDialect
+from hssh.dialects.generic import GenericDialect, _VALUE
 
 
 SET_PREFIX_VERBS = (
@@ -25,6 +25,11 @@ class JunosDialect(GenericDialect):
     # Discard only this session's uncommitted candidate on close.
     discard_commands = ("rollback 0",)
     has_candidate = True
+    redaction_patterns = (
+        re.compile(r'^([^\n]*?)' + _VALUE + r'(;?[ \t]*## SECRET-DATA)', re.MULTILINE),
+    ) + GenericDialect.redaction_patterns + (
+        re.compile(r'(\btrap-group[ \t]+)' + _VALUE, re.IGNORECASE),
+    )
 
     def check_edit(self, lines: list[str]) -> str | None:
         refusal = super().check_edit(lines)
