@@ -25,6 +25,7 @@ class Dialect(Protocol):
     commit_command: str | None
     diff_command: str | None
     history_command: str | None
+    config_history_command: str | None
     discard_commands: tuple[str, ...]
     has_candidate: bool
     redaction_patterns: tuple[re.Pattern[str], ...]
