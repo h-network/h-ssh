@@ -45,6 +45,7 @@ class TelnetChannel:
 class TelnetCommunicator:
     default_port: int = 23
     banner: bytes | None = None
+    ssh_config = None
     capabilities: frozenset[str] = frozenset()
 
     def __init__(self, dialect: Dialect) -> None:

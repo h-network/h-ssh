@@ -259,6 +259,7 @@ class OpenSSH:
 
     default_port = 22
     banner = b"SSH-"
+    ssh_config = "openssh"
 
     def __init__(self, dialect: Dialect):
         self.dialect = dialect

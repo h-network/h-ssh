@@ -8,7 +8,7 @@ from hssh.communicators.telnet import TelnetCommunicator
 from hssh.dialects import generic, junos
 from hssh.dialects.base import Dialect
 
-COMMUNICATOR_MEMBERS = {"capabilities", "dialect", "default_port", "banner", "open", "close", "reuse", "release",
+COMMUNICATOR_MEMBERS = {"capabilities", "dialect", "default_port", "banner", "ssh_config", "open", "close", "reuse", "release",
                         "discard", "show", "structured", "load", "diff", "commit", "confirm", "commit_history"}
 DIALECT_MEMBERS = {"prompt_pattern", "prompt_name_pattern", "prompt_tail_pattern", "context_pattern",
                    "paging_off_command", "pager_pattern", "pager_reply", "refusal_patterns", "warning_patterns",

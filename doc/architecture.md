@@ -237,6 +237,7 @@ class Communicator(Protocol):
     capabilities: frozenset[str]          # e.g. {"show", "batch", "edit", "commit_confirmed"}
     default_port: int                     # e.g. 830 for netconf
     banner: bytes | None                  # what the port sends first, for the probe; None: a connect is enough
+    ssh_config: Literal["paramiko", "openssh"] | None   # whose ssh client config the transport reads, so the probe asks where the connection really goes: "paramiko" (~/.ssh/config: HostName, Port, ProxyCommand), "openssh" (as `ssh -G` prints it, ProxyJump too), None (reads none)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...
