@@ -272,7 +272,8 @@ payload and is skipped), credentials, timeouts (`connect` for the TCP connect an
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
 operation, `commit`),
 the worker limit, the safety
-settings, and the recording settings.
+settings, and the recording settings (the record paths, and the run row's provenance: `argv`, `origin` and
+`version`, supplied by the front end, all optional).
 
 ### 5.2 Concurrency
 

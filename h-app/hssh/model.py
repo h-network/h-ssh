@@ -55,13 +55,15 @@ class SafetySettings:
 
 @dataclass(frozen=True)
 class RecordSettings:
-    """Where the run is recorded: store, audit log, log and saved output, each optional."""
+    """Where the run is recorded: store, audit log, log and saved output, each optional; argv, origin and version are the run row's provenance, supplied by the front end."""
 
     store_path: str | None = None
     audit_log_path: str | None = None
     log_path: str | None = None
     save_output_path: str | None = None
     argv: tuple[str, ...] | None = None
+    origin: str | None = None
+    version: str | None = None
 
 
 @dataclass(frozen=True)
