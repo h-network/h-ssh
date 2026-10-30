@@ -499,6 +499,47 @@ group 1 and an optional suffix in group 3; the writer preserves those groups and
 JSON scalar replacements retain their quotes. Patterns without capture groups mask the whole match.
 The secret vocabulary belongs to the dialect; stored device output is left unchanged.
 
+### 6.3 Safety gate
+
+`SafetyGate(settings)` consumes `SafetySettings`; it defines no run defaults or fault policy.
+The orchestrator supplies each target's effective port. State keys are `host|port`, so two
+ports on one host are independent. A legacy host-only cooldown holds every port of that
+host. A caller supplying no port queries the host as a whole, including its port-specific
+cooldowns; the gate does not guess a transport port.
+
+`check_device(target, login=True)` checks cooldown, active reservation and login budget under
+one in-process lock, and reserves the device before returning `(True, "ok")`. A refusal
+returns `(False, reason)` without a reservation or login count. The sliding window counts
+admitted logins in the last 60 seconds using monotonic time. `login=False` still checks
+cooldowns and active reservations but neither checks nor consumes the login budget.
+`release_device` removes the reservation. `holds(targets)` returns cooldown reasons by
+target name without reserving devices or counting logins, so the orchestrator can exclude
+held targets before probing. Active reservations and login history are local to the gate
+instance; only cooldowns are shared between processes.
+
+`set_cooldown` releases the reservation and records the later of the existing expiry and
+wall-clock time plus `cooldown_seconds`. Both settings are finite, non-negative integers;
+a zero cooldown adds no hold, and a zero login budget admits no new login. With no safety
+file the gate stays in memory. With a file, construction proves persistence usable before
+any device work. Construction, cooldown changes and close acquire an exclusive flock on
+`<safety_file>.lock`, read and validate disk state, merge disk and memory using the later
+expiry, prune expired entries, and write through a temporary file in the same directory.
+The temporary file is flushed and fsynced before replacement, then the directory is
+fsynced. Admission and `holds` refresh under the same file lock. The state and lock files
+are regular owner-only 0600 files, symlinks and FIFOs are refused, and newly created parent
+directories are 0700. Temporary files and descriptors are released on failure.
+
+The file is a JSON object mapping keys to finite Unix expiry timestamps. A missing or
+empty file is initially empty; legacy null expiries mean no hold. Invalid JSON, a non-object
+root, or a non-numeric/non-finite expiry is preserved by moving the file to
+`<safety_file>.corrupt`. That marker prevents further use; inspect and repair the state and
+remove the marker before starting a new gate. Existing `.corrupt` evidence is not overwritten.
+State, lock, and persistence errors raise contextual `OSError`; there is no unlocked or
+in-memory fallback. After such an error, the instance stays unavailable for new admissions
+until it is replaced. Close prunes and persists healthy state, always clears in-memory active
+reservations and login history, and is idempotent. The orchestrator owns the resulting
+LOCAL refusal, reporting and cooldown policy; device outcomes are not rewritten by the gate.
+
 ## 7. Security
 
 - **Credentials:** an SSH agent or keys through the communicator's library, `HSSH_PASSWORD`, or an
