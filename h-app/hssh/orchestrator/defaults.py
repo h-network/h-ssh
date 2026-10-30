@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import getpass
-import sys
 import unicodedata
 
 from hssh.model import Credentials, EditSettings, HostKeyPolicy, PolicySettings, RunSpec, SafetySettings, Timeouts
@@ -28,6 +27,7 @@ MAX_COMMENT_BYTES = 512
 ALIVE_SECONDS = 5
 FDS_PER_WORKER = 6
 FDS_PER_SESSION = 4
+FDS_PER_PROBE = 1
 FDS_BASE = 32
 
 
@@ -48,15 +48,15 @@ def open_file_limit() -> int | None:
     return None if soft == resource.RLIM_INFINITY else soft
 
 
-def fit_workers(workers: int) -> int:
-    """`workers`, lowered to what the open-file limit carries at FDS_PER_WORKER each beside FDS_BASE, said once on stderr when lowered."""
+def fit_workers(workers: int) -> tuple[int, str | None]:
+    """`workers`, lowered to what the open-file limit carries at FDS_PER_WORKER each beside FDS_BASE, with the note for stderr when lowered."""
     limit = open_file_limit()
     if limit is None:
-        return workers
+        return workers, None
     fitted = max(1, min(workers, (limit - FDS_BASE) // FDS_PER_WORKER))
     if fitted < workers:
-        print(f"workers lowered from {workers} to {fitted}: the open-file limit is {limit}", file=sys.stderr)
-    return fitted
+        return fitted, f"workers lowered from {workers} to {fitted}: the open-file limit is {limit}"
+    return fitted, None
 
 
 def default_username() -> str:

@@ -60,6 +60,7 @@ class SessionManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._waiting = asyncio.Condition()
         self._closes: list[_Close] = []
+        self.said: set[str] = set()
 
     def _cond(self) -> asyncio.Condition:
         """The borrowers' condition for the running loop: a manager kept across asyncio.run() calls gets a fresh one per loop, the old loop's waiters being gone with it."""
@@ -94,7 +95,7 @@ class SessionManager:
             if (reason := login()) is not None:
                 await self._drop(key)
                 raise LoginRefused(reason)
-        await self._make_room()
+        await self.room(self.workers * FDS_PER_WORKER)
         try:
             entry.session = await asyncio.to_thread(comm.open, target, creds, timeouts, host_key_policy)
         except BaseException:
@@ -130,6 +131,7 @@ class SessionManager:
             entry.in_use = False
             entry.idle_since = time.monotonic()
             self._cond().notify_all()
+        await self.room(self.workers * FDS_PER_WORKER, wait=False)
 
     async def _drop(self, key: Hashable) -> None:
         async with self._cond():
@@ -166,17 +168,35 @@ class SessionManager:
                 close.thread.join(max(0.0, deadline - time.monotonic()))
         return {c.target: (c.driver, c.fault) for c in closes if c.fault is not None}
 
-    async def _make_room(self) -> None:
-        """Before an open: the least recently used idle sessions closed while the open-file limit cannot hold every kept one beside the workers."""
+    def _kept_fds(self) -> int:
+        """Descriptors the kept idle sessions hold, a close still running counted until its thread ends."""
+        idle = sum(1 for e in self._entries.values() if not e.in_use and e.session is not None)
+        closing = sum(1 for c in self._closes if c.thread is not None and c.thread.is_alive())
+        return (idle + closing) * FDS_PER_SESSION
+
+    async def room(self, fds: int, wait: bool = True) -> int:
+        """How many of `fds` more descriptors the open-file limit has beside the kept sessions, the least recently used idle ones closed while it is short; `wait` joins those closes (CLOSE_WAIT in all) before counting, a release-time trim does not."""
         limit = open_file_limit()
         if limit is None:
-            return
-        allowed = max(0, (limit - FDS_BASE - self.workers * FDS_PER_WORKER) // FDS_PER_SESSION)
+            return fds
         async with self._cond():
             idle = sorted(((e.idle_since, k) for k, e in self._entries.items() if not e.in_use and e.session is not None))
-            for _, key in idle[:max(0, len(idle) - allowed)]:
+            short = fds - (limit - FDS_BASE - self._kept_fds())
+            for _, key in idle:
+                if short <= 0:
+                    break
                 entry = self._entries.pop(key)
                 self._start(_Close("", ""), entry.communicator.close, entry.session)
+                short -= FDS_PER_SESSION
+        if wait and any(c.thread is not None for c in self._closes):
+            await asyncio.to_thread(self._join, CLOSE_WAIT)
+        return max(0, min(fds, limit - FDS_BASE - self._kept_fds()))
+
+    def _join(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        for close in list(self._closes):
+            if close.thread is not None:
+                close.thread.join(max(0.0, deadline - time.monotonic()))
 
     async def close_all(self, timeout: float = CLOSE_WAIT) -> None:
         """Close every kept session, side by side, and wait `timeout` in all; one in use is torn down. Faults are not the run's."""
