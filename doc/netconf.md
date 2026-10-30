@@ -1,6 +1,6 @@
 # NETCONF
 
-The `junos@netconf` driver supports `show`, `batch`, candidate edits, confirm and commit history through PyEZ. Connections use
+The `junos@netconf` driver supports `show`, `batch`, library structured reads, candidate edits, confirm and commit history through PyEZ. Connections use
 port 830 unless the target specifies another port. The connect timeout is passed
 to PyEZ, and the command timeout applies to operations on the open session.
 TCP connect and the SSH banner share the connect timeout; after the banner, key exchange, login and NETCONF hello share one setup timeout.
@@ -49,6 +49,20 @@ disconnecting. A cleanup failure discards the transport and reports the fault;
 no further cleanup RPC is sent on that session.
 The background close waits up to five seconds for close-session. If closing fails,
 it tears down the underlying transport so its reader thread does not linger.
+
+## Library structured reads
+
+Call `fleet.structured("show version", "json")` or
+`fleet.structured("show version", "xml")` on a Fleet using `junos@netconf`.
+The format is required, and each call runs one show command through
+PyEZ's `Device.cli(command, format=fmt, warning=False)`.
+
+The returned dictionary is serialized as JSON text, an XML element as an XML
+string, and returned text is kept as text. This becomes `Result.output` and the
+store's output column; `Result.data` stays `None`. The representation comes from
+PyEZ, with no field extraction or interpretation by h-ssh. The call uses the
+Fleet's existing command timeout and pooled session, with the same fault handling
+as other NETCONF operations.
 
 ## Candidate edits
 

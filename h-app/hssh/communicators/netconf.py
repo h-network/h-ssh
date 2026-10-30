@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import errno
 import fcntl
 import hmac
+import json
 import os
 import re
 from pathlib import Path
@@ -427,7 +428,7 @@ class NetconfSession(Session):
 class NetconfCommunicator(Communicator):
     default_port: int = 830
     banner: bytes | None = b"SSH-"
-    capabilities: frozenset[str] = frozenset({"show", "batch", "edit", "commit_confirmed", "confirm", "commit_status"})
+    capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "edit", "commit_confirmed", "confirm", "commit_status"})
     ssh_config = "paramiko"
 
     def __init__(self, dialect: Dialect) -> None:
@@ -567,8 +568,22 @@ class NetconfCommunicator(Communicator):
         except Exception as error:
             raise _fault(error, reached_device) from error
 
-    def structured(self, session: Session, rpc: str, fmt: str) -> Result:
-        raise NotImplementedError
+    def structured(self, session: Session, command: str, fmt: str) -> Result:
+        from lxml import etree
+
+        device = cast(NetconfSession, session).device
+        reached_device = bool(device.connected)
+        try:
+            reply = device.cli(command, format=fmt, warning=False)
+            if isinstance(reply, dict):
+                output = json.dumps(reply)
+            elif isinstance(reply, str):
+                output = reply
+            else:
+                output = etree.tostring(reply, encoding="unicode")
+            return Result(output=output)
+        except Exception as error:
+            raise _fault(error, reached_device) from error
 
     def _lock(self, netconf: NetconfSession) -> Config:
         try:
