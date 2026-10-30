@@ -94,6 +94,7 @@ class RunSpec:
     workers: int | None = None
     host_key_policy: HostKeyPolicy | None = None
     probe: bool | None = None
+    skip_unreachable: bool | None = None
     edit: EditSettings | None = None
     policy: PolicySettings | None = None
     safety: SafetySettings | None = None
