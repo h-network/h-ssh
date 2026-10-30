@@ -24,6 +24,7 @@ from hssh.model import (
     Credentials, EditSettings, Fault, HostKeyPolicy, Mode, PolicySettings, RecordSettings, RunReport,
     RunSpec, SafetySettings, Target, Timeouts,
 )
+from hssh.paths import validate_device_name
 from hssh.orchestrator import (
     DEFAULT_EDIT, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SKIP_UNREACHABLE, DEFAULT_TIMEOUTS,
     DEFAULT_TRANSPORT,
@@ -127,6 +128,8 @@ def as_targets(specs: Iterable[TargetLike] | TargetLike, transport: str, vendor:
             out.extend(load_devices_csv(os.fspath(item), transport, vendor))
         else:
             out.append(parse_target(item, transport, vendor))
+    for target in out:
+        validate_device_name(target.name)
     check_unique(out)
     return tuple(out)
 
