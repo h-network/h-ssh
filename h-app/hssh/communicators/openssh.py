@@ -286,6 +286,7 @@ class OpenSSHSession:
     channel: ProcessChannel
     engine: CliEngine
     timeouts: Timeouts
+    idle_since: float = 0.0
 
 
 class OpenSSH:
@@ -326,7 +327,7 @@ class OpenSSH:
             except BaseException:
                 channel.close()
                 raise
-        return OpenSSHSession(target, channel, engine, timeouts)
+        return OpenSSHSession(target, channel, engine, timeouts, time.monotonic())
 
     def close(self, session: OpenSSHSession) -> None:
         try:
@@ -335,10 +336,18 @@ class OpenSSH:
             session.channel.close()
 
     def reuse(self, session: OpenSSHSession, timeouts: Timeouts, idle_seconds: int) -> bool:
-        return False
+        session.timeouts = timeouts
+        session.engine.timeouts = timeouts
+        channel = session.channel
+        if channel.closed or channel.proc.poll() is not None or not session.engine.ready:
+            return False
+        if time.monotonic() - session.idle_since < idle_seconds:
+            return True
+        return session.engine.probe(time.monotonic() + timeouts.command)
 
     def release(self, session: OpenSSHSession) -> None:
-        self.close(session)
+        session.engine.release()
+        session.idle_since = time.monotonic()
 
     def discard(self, session: OpenSSHSession) -> None:
         session.channel.close()
