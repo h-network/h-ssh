@@ -5,7 +5,9 @@ port 830 unless the target specifies another port. The connect timeout is passed
 to PyEZ, and the command timeout applies to operations on the open session.
 Port 23 is rejected before any connection; NETCONF never falls back to telnet.
 Show output has leading and trailing newlines removed.
-A reply beginning with a Junos refusal is reported as a failed command.
+A reply beginning with a Junos refusal is reported as a failed command. Plain-text
+RPC diagnostics are checked across lines; ordinary command output is checked only
+at the start, so later `error:` lines in logs are preserved as output.
 Loading the NETCONF communicator sets ncclient's send-queue tick to 10 ms for the whole process.
 
 For example, with a key available through SSH key discovery or the SSH agent:
