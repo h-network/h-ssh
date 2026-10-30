@@ -17,8 +17,9 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Callable, Union
 
+from hssh.drivers import Registry
 from hssh.model import (
-    Credentials, EditSettings, HostKeyPolicy, Mode, PolicySettings, RecordSettings, RunReport,
+    Credentials, EditSettings, Fault, HostKeyPolicy, Mode, PolicySettings, RecordSettings, RunReport,
     RunSpec, SafetySettings, Target, Timeouts,
 )
 from hssh.orchestrator import (
@@ -116,7 +117,40 @@ def as_targets(specs: Iterable[TargetLike] | TargetLike, transport: str, vendor:
             out.extend(load_devices_csv(os.fspath(item), transport, vendor))
         else:
             out.append(parse_target(item, transport, vendor))
+    check_unique(out)
     return tuple(out)
+
+
+def port_in_use(target: Target, registry: Registry) -> int:
+    """The target's port, else its communicator's default; 22 when no driver matches."""
+    if target.port is not None:
+        return target.port
+    try:
+        return registry.resolve(target).communicator.default_port
+    except Fault:
+        return 22
+
+
+def check_unique(targets: Sequence[Target]) -> None:
+    """One name is one device and one device is one name, a device being its host and the port in use; a repeated row is refused too."""
+    registry = Registry()
+    registry.load_entry_points()
+    by_name: dict[str, tuple[tuple[str, int], str]] = {}
+    by_host: dict[tuple[str, int], str] = {}
+    for t in targets:
+        where = (t.host, port_in_use(t, registry))
+        typed = f"{t.host}:{t.port}" if t.port else t.host
+        if t.name in by_name and by_name[t.name][0] != where:
+            other, other_typed = by_name[t.name]
+            if other_typed == typed:
+                other_typed, typed = f"{other[0]}:{other[1]}", f"{where[0]}:{where[1]}"
+            raise ValueError(f"device name {t.name!r} is used for two hosts: {other_typed} and {typed}")
+        if where in by_host and by_host[where] != t.name:
+            raise ValueError(f"host {typed} is listed under two names: {by_host[where]!r} and {t.name!r}")
+        if t.name in by_name:
+            raise ValueError(f"device {t.name!r} ({t.host}) is listed twice")
+        by_name[t.name] = (where, typed)
+        by_host[where] = t.name
 
 
 class Fleet:

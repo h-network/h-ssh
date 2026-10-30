@@ -17,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 from hssh.frontends import profiles
-from hssh.frontends.fleet import LIBRARY_LOGGERS, Runner, load_devices_csv, parse_target, quiet_library_logs, run_spec
+from hssh.frontends.fleet import (
+    LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, parse_target, quiet_library_logs, run_spec,
+)
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
     Credentials, EditSettings, Fault, Mode, PolicySettings, RecordSettings, RunReport, RunSpec,
@@ -172,8 +174,11 @@ def apply_config_defaults(args: argparse.Namespace, config: dict[str, str]) -> N
 
 def resolve_targets(args: argparse.Namespace) -> tuple[Target, ...]:
     if args.target:
-        return tuple(parse_target(s, args.transport, args.vendor) for s in args.target)
-    return tuple(load_devices_csv(args.devices or default_devices_path(), args.transport, args.vendor))
+        targets = [parse_target(s, args.transport, args.vendor) for s in args.target]
+    else:
+        targets = load_devices_csv(args.devices or default_devices_path(), args.transport, args.vendor)
+    check_unique(targets)
+    return tuple(targets)
 
 
 def resolve_mode(args: argparse.Namespace) -> Mode:
