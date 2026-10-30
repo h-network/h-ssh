@@ -10,6 +10,8 @@ from pathlib import Path
 from hssh.model import Fault, FaultKind, Target
 
 MAX_PROBES = 100
+MAX_LINE = 255
+MAX_LINES = 100
 SSH_CONFIG = Path.home() / ".ssh" / "config"
 
 
@@ -26,8 +28,22 @@ def route(host: str, port: int | None, default_port: int) -> tuple[str, int] | N
     return found.get("hostname", host), port if port is not None else int(found.get("port", default_port))
 
 
+async def identification(reader: asyncio.StreamReader, banner: bytes, seen: list[bytes]) -> bytes | None:
+    """The identification line, or None. RFC 4253 lets a server send lines before it, so up to MAX_LINES lines of MAX_LINE bytes are read, as paramiko and OpenSSH read them; every line read goes to `seen`."""
+    for _ in range(MAX_LINES):
+        line = (await reader.readline()).rstrip(b"\r\n")
+        if not line and reader.at_eof():
+            break
+        seen.append(line)
+        if line.startswith(banner):
+            return line
+        if len(line) > MAX_LINE:
+            break
+    return None
+
+
 async def attempt(host: str, port: int, banner: bytes | None, seconds: float) -> Fault | None:
-    """One try: TCP connect, then the server's first line when the protocol sends one (`banner`). None when the box is live."""
+    """One try: TCP connect, then the server's identification when the protocol sends one (`banner`). None when the box is live."""
     at = f"{host}:{port}"
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), seconds)
@@ -42,14 +58,17 @@ async def attempt(host: str, port: int, banner: bytes | None, seconds: float) ->
     try:
         if banner is None:
             return None
-        line = await asyncio.wait_for(reader.readline(), seconds)
-        if line.startswith(banner):
+        seen: list[bytes] = []
+        if await asyncio.wait_for(identification(reader, banner, seen), seconds) is not None:
             return None
-        return Fault(FaultKind.UNREACHABLE, f"{at} answered {line[:40]!r}, not {banner!r}", True)
     except (asyncio.TimeoutError, OSError):
-        return Fault(FaultKind.UNREACHABLE, f"nothing from {at} within {seconds:g}s", True)
+        if not seen:
+            return Fault(FaultKind.UNREACHABLE, f"no {banner!r} line from {at} within {seconds:g}s", True)
     finally:
         writer.close()
+    if not seen:
+        return Fault(FaultKind.UNREACHABLE, f"{at} closed without a {banner!r} line", True)
+    return Fault(FaultKind.UNREACHABLE, f"{at} answered {seen[0][:40]!r}, not {banner!r}", True)
 
 
 async def probe_one(host: str, port: int, banner: bytes | None, seconds: float,
