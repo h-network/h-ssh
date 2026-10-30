@@ -114,6 +114,15 @@ The run's provenance in `RecordSettings` is the front end's: `origin` is `h-ssh`
 the library (unless the caller set one), `version` is the installed package version from `importlib.metadata`,
 None when h-ssh runs from source. Set-file names and containment (`-eD`) use the shared `hssh.paths` helpers.
 
+The Fleet keeps its sessions. It owns a pooled `SessionManager` for its lifetime and hands it to every
+`run(spec, sessions=…)`, so a device is logged in once per Fleet: `show()`, `batch()` and
+`edit()` on the same Fleet reuse the session the first call opened (a changed credential or policy opens anew,
+section 3.2). One run at a time: a call while another is in flight raises `RuntimeError`, and so does a call on a
+closed Fleet. `close(wait=0)` closes the kept sessions, giving the devices `wait` seconds in all to acknowledge,
+and `with Fleet(...) as fleet:` does it on the way out; a Fleet dropped without `close()` closes its sessions
+when it is collected or at interpreter exit (`weakref.finalize`), so no session outlives the script. The CLI
+stays one session per run: its `run()` owns a manager without pooling and closes it when the run ends.
+
 ### 3.2 Orchestrator
 
 The orchestrator executes a `RunSpec` and owns all policy. It defines the default of every `RunSpec`
