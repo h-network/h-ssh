@@ -265,12 +265,29 @@ class NetconfCommunicator(Communicator):
         netconf.locked = netconf.dirty = False
 
     def show(self, session: Session, command: str) -> Result:
+        from lxml import etree
+
         device = cast(NetconfSession, session).device
         reached_device = bool(device.connected)
         try:
             if command.rstrip().endswith("| no-more"):
                 command = command.rstrip()[:-len("| no-more")].rstrip()
-            return Result(output=(device.cli(command, warning=False) or "").strip("\r\n"))
+            reply = device.rpc.cli(command, format="text")
+            if reply is True:
+                return Result(output="")
+            # Childless rpc-reply text is a diagnostic, not normal CLI output.
+            diagnostic = reply.tag == "rpc-reply" and len(reply) == 0
+            if reply.tag == "configuration-information":
+                output = reply.findtext("configuration-output") or ""
+            else:
+                if reply.tag == "output" and reply.getparent() is not None:
+                    reply = reply.getparent()
+                output = etree.tostring(reply, method="text", with_tail=False, encoding="unicode")
+            output = output.strip("\r\n")
+            if any(pattern.search(output) if diagnostic else pattern.match(output)
+                   for pattern in self.dialect.refusal_patterns):
+                raise Fault(FaultKind.REFUSED, output, reached_device)
+            return Result(output=output)
         except Exception as error:
             raise _fault(error, reached_device) from error
 
