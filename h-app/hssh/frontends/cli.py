@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import logging
 import os
 import sys
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from hssh.frontends import profiles
-from hssh.frontends.fleet import Runner, load_devices_csv, parse_target, run_spec
+from hssh.frontends.fleet import LIBRARY_LOGGERS, Runner, load_devices_csv, parse_target, quiet_library_logs, run_spec
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
     Credentials, EditSettings, Fault, Mode, PolicySettings, RecordSettings, RunReport, RunSpec,
@@ -290,6 +291,10 @@ def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
     typed = typed_dests(parser, argv)
     args.target = (list(args.hosts) + list(args.target or [])) or None
     args.batch_commands = None
+    if not args.verbose:
+        quiet_library_logs()
+        for name in LIBRARY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.CRITICAL)
     try:
         if args.list_profiles:
             print("\n".join(profiles.listing_lines()))

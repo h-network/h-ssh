@@ -10,6 +10,7 @@ The library reads no environment variable and no config file: what it is given i
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections.abc import Iterable, Sequence
@@ -26,6 +27,16 @@ from hssh.orchestrator import (
 )
 
 Runner = Callable[[RunSpec], RunReport]
+
+LIBRARY_LOGGERS = ("paramiko", "ncclient")
+
+
+def quiet_library_logs() -> None:
+    """A NullHandler on each library logger, so paramiko's handshake tracebacks don't reach stderr through Python's last-resort handler; levels are left to the caller."""
+    for name in LIBRARY_LOGGERS:
+        lg = logging.getLogger(name)
+        if not lg.handlers:
+            lg.addHandler(logging.NullHandler())
 
 TargetLike = Union[str, Target, os.PathLike]
 
@@ -116,6 +127,7 @@ class Fleet:
                  policy: PolicySettings = DEFAULT_POLICY, host_key_policy: HostKeyPolicy = DEFAULT_HOST_KEY_POLICY,
                  probe: bool = DEFAULT_PROBE, safety: SafetySettings | None = None,
                  recording: RecordSettings | None = None, runner: Runner = run_spec):
+        quiet_library_logs()
         self.targets = as_targets(targets, transport, vendor)
         if not self.targets:
             raise ValueError("no targets")
