@@ -56,7 +56,7 @@ def failed(op: OperationResult) -> bool:
 
 
 class EditLifecycle:
-    """OPEN → LOAD → DIFF → (dry run) CLOSE, or (apply) COMMIT → PENDING → CLOSE. Faults after LOAD end at CLOSE, which discards."""
+    """OPEN → LOAD → DIFF → (dry run) CLOSE, or (apply) COMMIT → PENDING → CLOSE. Faults after LOAD end at CLOSE, which discards. Budgets allow two device calls per step (lock then load; diff then commit-check) and lock, history read and commit for a confirm."""
 
     def __init__(self, communicator: Communicator, dialect: Dialect, session: Session, timeouts: Timeouts) -> None:
         self.communicator = communicator
@@ -67,7 +67,7 @@ class EditLifecycle:
     async def load(self, lines: list[str]) -> tuple[list[OperationResult], int]:
         """The candidate loaded in one call; without a candidate model, line by line, so the lines applied are known."""
         if self.dialect.has_candidate:
-            op = await operation("load", lambda: self.communicator.load(self.session, lines), self.timeouts.command)
+            op = await operation("load", lambda: self.communicator.load(self.session, lines), 2 * self.timeouts.command)
             return [op], 0 if failed(op) else len(lines)
         ops: list[OperationResult] = []
         for line in lines:
@@ -77,7 +77,7 @@ class EditLifecycle:
         return ops, len(ops) - (1 if ops and failed(ops[-1]) else 0)
 
     async def diff(self) -> OperationResult:
-        return await operation("diff", lambda: self.communicator.diff(self.session), self.timeouts.command)
+        return await operation("diff", lambda: self.communicator.diff(self.session), 2 * self.timeouts.command)
 
     async def commit(self, edit: EditSettings) -> OperationResult:
         return await operation("commit", lambda: self.communicator.commit(self.session, edit.confirmed_minutes, edit.comment),
@@ -106,7 +106,8 @@ async def confirm(communicator: Communicator, session: Session, timeouts: Timeou
     if not isinstance(status, CommitStatus) or not status.pending:
         refused = Fault(FaultKind.REFUSED, "nothing to confirm: no commit-confirmed is pending", True)
         return [history, OperationResult("confirm", refused, now(), 0)]
-    return [history, await operation("confirm", lambda: communicator.confirm(session), timeouts.command)]
+    return [history, await operation("confirm", lambda: communicator.confirm(session),
+                                     2 * timeouts.command + timeouts.commit)]
 
 
 async def commit_history(communicator: Communicator, session: Session, timeouts: Timeouts) -> OperationResult:
