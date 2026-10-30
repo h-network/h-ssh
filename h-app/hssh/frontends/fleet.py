@@ -22,7 +22,8 @@ from hssh.model import (
     RunSpec, SafetySettings, Target, Timeouts,
 )
 from hssh.orchestrator import (
-    DEFAULT_EDIT, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT,
+    DEFAULT_EDIT, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SKIP_UNREACHABLE, DEFAULT_TIMEOUTS,
+    DEFAULT_TRANSPORT,
     DEFAULT_VENDOR, DEFAULT_WORKERS, default_username, run,
 )
 
@@ -142,12 +143,13 @@ class Fleet:
         self._runner = runner
 
     def spec(self, mode: Mode, commands: Sequence[str] = (), config_lines: Sequence[str] = (),
-             format: str | None = None, edit: EditSettings | None = None) -> RunSpec:
+             format: str | None = None, edit: EditSettings | None = None,
+             skip_unreachable: bool | None = None) -> RunSpec:
         return RunSpec(targets=self.targets, mode=mode, commands=tuple(commands),
                        config_lines=tuple(config_lines), format=format, credentials=self.credentials,
                        timeouts=self.timeouts, workers=self.workers, host_key_policy=self.host_key_policy,
-                       probe=self.probe, edit=edit, policy=self.policy, safety=self.safety,
-                       recording=self.recording)
+                       probe=self.probe, skip_unreachable=skip_unreachable, edit=edit, policy=self.policy,
+                       safety=self.safety, recording=self.recording)
 
     def show(self, command: str) -> RunReport:
         return self._runner(self.spec("show", commands=[command]))
@@ -159,10 +161,10 @@ class Fleet:
         return self._runner(self.spec("structured", commands=[rpc], format=fmt))
 
     def edit(self, lines: Iterable[str], apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None,
-             comment: str | None = None) -> RunReport:
-        """Dry run unless `apply`; `confirmed_minutes` leaves a pending commit for confirm()."""
+             comment: str | None = None, skip_unreachable: bool = DEFAULT_SKIP_UNREACHABLE) -> RunReport:
+        """Dry run unless `apply`; `confirmed_minutes` leaves a pending commit for confirm(); `skip_unreachable` goes on without the devices the probe found dead."""
         edit = EditSettings(apply=apply, confirmed_minutes=confirmed_minutes, comment=comment)
-        return self._runner(self.spec("edit", config_lines=list(lines), edit=edit))
+        return self._runner(self.spec("edit", config_lines=list(lines), edit=edit, skip_unreachable=skip_unreachable))
 
     def confirm(self) -> RunReport:
         return self._runner(self.spec("confirm"))
