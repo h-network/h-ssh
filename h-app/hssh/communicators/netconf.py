@@ -23,6 +23,15 @@ if TYPE_CHECKING:
     from paramiko import PKey
 
 
+try:
+    from ncclient.transport import session as _ncclient_session
+except ImportError:
+    pass
+else:
+    # Poll queued NETCONF sends every 10 ms to reduce request and close latency.
+    _ncclient_session.TICK = 0.01
+
+
 _HOST_KEYS_LOCK = RLock()
 _HOST_KEYS: dict[Path, list[tuple[str | tuple[bytes, bytes], PKey]]] = {}
 _RESOLVED: dict[tuple[Path, str, int], dict[str, dict[str, PKey]]] = {}
