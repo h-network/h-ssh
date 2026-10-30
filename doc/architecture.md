@@ -136,6 +136,15 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 Dialects contain no I/O and no policy.
 
+`comment_prefixes` identifies full-line comments after leading whitespace: `#` for Junos and generic,
+and `#` or `!` for IOS, NX-OS and EOS. Inline `#` remains part of the command.
+`check_edit(lines)` returns refusal text, or `None`, without changing the supplied lines. Every dialect
+refuses an empty or comment-only payload. Junos additionally requires lowercase set-style verbs:
+`set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect`, `unprotect`.
+It refuses commit commands (including `commit;` and unique abbreviations starting at `com`), control
+characters and Tab in non-comment lines, and reports the original line number. Commit and confirm
+are separate operations, never configuration payloads.
+
 ### 3.6 Result store
 
 One SQLite database, `./h-ssh.db` by default. The recorder writes. `h-ssh-store` reads: it lists

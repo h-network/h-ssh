@@ -14,6 +14,12 @@ class GenericDialect(Dialect):
     discard_commands: tuple[str, ...] = ()
     has_candidate: bool = False
     redaction_patterns: tuple[re.Pattern[str], ...] = ()
+    comment_prefixes: tuple[str, ...] = ("#",)
+
+    def check_edit(self, lines: list[str]) -> str | None:
+        if not any(line.strip() and not line.lstrip().startswith(self.comment_prefixes) for line in lines):
+            return "configuration payload contains no commands"
+        return None
 
     def is_read(self, command: str) -> bool:
         text = command.strip().lower()
