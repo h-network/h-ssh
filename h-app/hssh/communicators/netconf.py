@@ -270,7 +270,10 @@ class NetconfCommunicator(Communicator):
         try:
             if command.rstrip().endswith("| no-more"):
                 command = command.rstrip()[:-len("| no-more")].rstrip()
-            return Result(output=(device.cli(command, warning=False) or "").strip("\r\n"))
+            output = (device.cli(command, warning=False) or "").strip("\r\n")
+            if any(pattern.match(output) for pattern in self.dialect.refusal_patterns):
+                raise Fault(FaultKind.REFUSED, output, reached_device)
+            return Result(output=output)
         except Exception as error:
             raise _fault(error, reached_device) from error
 
