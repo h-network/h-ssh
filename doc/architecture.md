@@ -181,7 +181,7 @@ append, the saved-output directory by a private temporary file. The store is ope
 written after the probe and before the first target. A failure in either refuses the run as `LOCAL` before any
 device is contacted. Once targets run, every record is attempted on its own: each store row, each audit entry,
 the saved-output file, the log line, the run row's finish and the store's close. One that cannot be written is
-counted once in `RunReport.not_kept` and said on stderr; the device outcome stands, no cooldown follows, and the
+counted once in `RunReport.not_kept`; each destination's failure is said once on stderr, with its first error; the device outcome stands, no cooldown follows, and the
 report still reaches the caller, so a store that vanished mid-run ends in exit 4, not a traceback. Every operation row carries the target's final
 status. Saved output is named through `hssh.paths` inside its directory.
 
@@ -326,6 +326,13 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file. Before the
   run starts, the policy counts the logins the run may make to one device (retries + 1 per listing) against the rate
   limit and refuses the run when it would pass it, so the gate never turns a device away half-way.
+- The gate keys a device by host and the port the connection uses: the orchestrator fills a target's port from the
+  transport's default before every gate call, so the gate holds no default-port table. A target the gate holds is
+  not probed and is skipped before `OPEN` with the reason, as is one the gate turns away at login, so a held fleet
+  ends with skipped targets (exit 3), not failures. Gate state that cannot be used (an unreadable or corrupt safety
+  file) refuses the run before the probe; found at a target's login it is that target's `LOCAL` failure; a cooldown
+  or release that cannot be persisted is said once and the verdict stands. A local refusal or a recording failure
+  never cools a device down.
 
 ### 5.4 Cancellation
 
