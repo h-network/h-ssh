@@ -186,10 +186,10 @@ class Result:
 
 ```python
 class FaultKind(Enum):
-    UNREACHABLE      # no connection, or no response before login
+    UNREACHABLE      # the connect was refused or cannot be attempted: nothing listening, no route, no such name
     AUTH             # credentials rejected
     HOST_KEY         # host key rejected by the communicator's library
-    TIMEOUT          # no response within the timeout during a session
+    TIMEOUT          # nothing answered in time: at open, no TCP answer or no SSH banner within the connect timeout (reached_device false), or the banner came and setup did not finish within the setup budget (true); in session, no reply
     SESSION_LOST     # the session closed unexpectedly
     REFUSED          # the device rejected the command or configuration
     COMMIT_FAILED    # the commit was rejected; nothing was committed
@@ -211,7 +211,10 @@ device, unless the dialect marks it as a read.
 
 | Fault | Read | Edit, nothing reached the device | Edit, reached the device |
 |---|---|---|---|
-| `UNREACHABLE`, `TIMEOUT` before login | retry, then fail | retry, then fail | n/a |
+| `UNREACHABLE` before login | fail | fail | n/a |
+| `TIMEOUT` before login, no TCP answer or no SSH banner (`reached_device` false) | retry after 0.5 s, then 1 s, then fail | retry after 0.5 s, then 1 s, then fail | n/a |
+| `SESSION_LOST` before login, the device dropped the connection during setup | retry after 0.5 s, then 1 s, then fail | retry after 0.5 s, then 1 s, then fail | n/a |
+| `TIMEOUT` before login, the banner came but setup did not finish in the setup budget (`reached_device` true) | fail | fail | n/a |
 | `AUTH`, `HOST_KEY` | fail | fail | n/a |
 | `TIMEOUT`, `SESSION_LOST` in session | retry | fail | fail, cool down |
 | `REFUSED`, `COMMIT_FAILED` | fail | fail, cool down | fail, cool down |
@@ -225,7 +228,10 @@ The retry count, pauses and cooldown period are policy settings, not communicato
 ### 5.1 RunSpec
 
 A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
-`commit_status`), the commands or configuration lines, credentials, timeouts, the worker limit, the safety
+`commit_status`), the commands or configuration lines, credentials, timeouts (`connect` for the TCP connect and the
+SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
+operation, `commit`),
+the worker limit, the safety
 settings, and the recording settings.
 
 ### 5.2 Concurrency
