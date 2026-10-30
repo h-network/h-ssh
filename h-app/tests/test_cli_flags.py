@@ -94,7 +94,7 @@ def test_recording_carries_the_store_and_argv(cli_run):
     argv = [R1, "-sC", "x", *NETCONF]
     _, specs, _, _ = cli_run(*argv)
     assert specs[0].recording.store_path == cli.DEFAULT_STORE and specs[0].recording.argv == tuple(argv)
-    _, specs, _, _ = cli_run(*argv, "--no-store", "--store", "ignored.db")
+    _, specs, _, _ = cli_run(*argv, "--no-store")
     assert specs[0].recording.store_path is None
 
 

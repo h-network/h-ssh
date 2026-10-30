@@ -7,6 +7,7 @@ The password is HSSH_PASSWORD or the prompt; there is no --password flag and no 
 from __future__ import annotations
 
 import argparse
+import difflib
 import getpass
 import json
 import logging
@@ -17,7 +18,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from hssh.dialects.base import Dialect
 from hssh.drivers import Registry
@@ -38,7 +39,8 @@ from hssh.orchestrator import (
     check_confirmed_minutes, default_username,
 )
 from hssh.paths import path_inside, validate_device_name
-from hssh.store import json_data
+from hssh.screen import is_terminal, terminal_safe
+from hssh.store import Store, json_data
 
 TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
 HOST_KEY_CHOICES = ("accept-new", "strict", "off")
@@ -58,11 +60,11 @@ CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_SKIPPED, EXIT_INCOMPLETE, EXIT_INTERRUPTED = 0, 1, 2, 3, 4, 130
 # Worst first, for the exit code of a --every watch.
 EXIT_ORDER = (EXIT_INTERRUPTED, EXIT_INCOMPLETE, EXIT_USAGE, EXIT_FAILED, EXIT_SKIPPED, EXIT_OK)
+MAX_EVERY_SECONDS = 86400
 
 
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
-        self.print_usage(sys.stderr)
         raise SystemExit(f"ERROR: {message}")
 
 
@@ -93,6 +95,27 @@ def load_config(path: str | None = None) -> dict[str, str]:
             raise ValueError(f"{p}: line {n}: '{key}' is not allowed, a config file never carries a credential")
         config[key] = value.strip().strip('"').strip("'")
     return config
+
+
+def seconds_arg(text: str) -> float:
+    """--every: one second to a day."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"takes seconds, not {text!r}") from None
+    if not 1 <= value <= MAX_EVERY_SECONDS:
+        raise argparse.ArgumentTypeError(f"takes 1 to {MAX_EVERY_SECONDS} seconds (a day), not {text}")
+    return value
+
+
+def count_arg(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"takes a whole number, not {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"takes 1 or more, not {text}")
+    return value
 
 
 def build_parser() -> _Parser:
@@ -141,8 +164,9 @@ def build_parser() -> _Parser:
     behaviour.add_argument("--cooldown", type=int, metavar="SECONDS")
     behaviour.add_argument("--rate-limit", type=int, metavar="PER_MINUTE")
     behaviour.add_argument("--safety-file", metavar="FILE", help="safety gate state (or HSSH_SAFETY_FILE); off without one")
-    behaviour.add_argument("--every", type=float, metavar="SECONDS", help="repeat the run and print what changed")
-    behaviour.add_argument("--times", type=int, help="with --every: stop after this many runs")
+    behaviour.add_argument("--every", type=seconds_arg, metavar="SECONDS",
+                           help="watch: run the reads again every SECONDS and print, per tick, what changed since the last kept run")
+    behaviour.add_argument("--times", type=count_arg, metavar="N", help="with --every: stop after N ticks")
 
     out = p.add_argument_group("output")
     out.add_argument("--json", action="store_true", help="the report as JSON")
@@ -195,6 +219,8 @@ def resolve_targets(args: argparse.Namespace) -> tuple[Target, ...]:
         targets = [parse_target(s, args.transport, args.vendor) for s in args.target]
     else:
         targets = load_devices_csv(args.devices or default_devices_path(), args.transport, args.vendor)
+    for target in targets:
+        validate_device_name(target.name)
     check_unique(targets)
     return tuple(targets)
 
@@ -211,11 +237,54 @@ def resolve_mode(args: argparse.Namespace) -> Mode:
         raise ValueError("--allow-missing goes with -eD: it skips the targets that have no <NAME>.set")
     if args.skip_unreachable and chosen[0] != "edit":
         raise ValueError("--skip-unreachable goes with an edit (-eC, -eB, -eD)")
+    if chosen[0] != "edit":
+        for flag, given in (("-y", args.yes), ("--comment", args.comment is not None),
+                            ("--commit-confirmed", args.commit_confirmed is not None)):
+            if given:
+                raise ValueError(f"{flag} goes with an edit (-eC, -eB, -eD); it would do nothing here")
+    if "format" in args.typed and chosen[0] != "show":
+        raise ValueError("--format goes with -sC: a batch, an edit, a confirm or the commit status has no format")
     if args.every is not None and chosen[0] not in ("show", "batch"):
         raise ValueError("--every repeats reads (-sC, --batch, --profile), not edits, confirms or the commit status")
     if chosen[0] == "show" and args.format not in (None, "text"):
         return "structured"
     return chosen[0]
+
+
+def check_flags(args: argparse.Namespace) -> None:
+    """Pairings that would make a flag do nothing, or the output unreadable, refused before anything runs."""
+    if args.times is not None and args.every is None:
+        raise ValueError("--times goes with --every")
+    if args.every is not None and args.no_store:
+        raise ValueError("--every compares every tick with the last kept run through the store; drop --no-store")
+    if args.every is not None and (args.json or args.raw):
+        raise ValueError("--every prints one line per tick and what changed, not --json or --raw output; "
+                         "every tick is in the store for h-ssh-store")
+    if args.no_store and "store" in args.typed:
+        raise ValueError("--no-store and --store contradict each other")
+    if args.raw and args.json:
+        raise ValueError("--raw and --json are mutually exclusive")
+    if args.raw and args.verbose:
+        raise ValueError("--raw and -v are mutually exclusive")
+    if args.save_output and Path(args.save_output).exists() and not Path(args.save_output).is_dir():
+        raise ValueError(f"--save-output {args.save_output} exists and is not a directory")
+    if args.user and (why := plain_line(args.user)):
+        raise ValueError(f"the username has {why}; a username is plain text")
+
+
+def check_commands(commands: Sequence[str], source: str) -> None:
+    """Each command is one line of plain text: a line break would run two commands, a NUL or an ESC is not text."""
+    for command in commands:
+        if why := plain_line(command):
+            raise ValueError(f"{source}: {command!r} has {why}; a command is one line of plain text")
+
+
+def plain_line(text: str) -> str | None:
+    """What keeps `text` from being one line of plain text, named, or None."""
+    if "\n" in text or "\r" in text:
+        return "a line break"
+    found = control_line(text)
+    return found[2] if found else None
 
 
 def resolve_credentials(args: argparse.Namespace) -> Credentials:
@@ -243,15 +312,18 @@ def payload_lines(text: str, prefixes: Sequence[str]) -> tuple[str, ...]:
     return tuple(line for line in lines if line.strip() and not line.lstrip().startswith(tuple(prefixes)))
 
 
-# C0 controls but Tab, DEL and C1 controls; a payload keeps its line breaks, nothing else of these.
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# C0 controls but Tab, DEL, C1 controls and lone surrogates; a payload keeps its line breaks, nothing else of these.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
 _CONTROL_NAMES = {"\r": "a carriage return", "\x00": "a NUL", "\x1b": "an ESC", "\x7f": "a DEL"}
 
 def control_line(text: str) -> tuple[int, str, str] | None:
-    """(line number, the line, what) for the first control character in a payload, or None."""
+    """(line number, the line, what) for the first control character in a payload, or None; a lone surrogate is a byte that was not UTF-8."""
     for number, line in enumerate(text.split("\n"), 1):
         if m := _CONTROL.search(line.rstrip("\r")):
-            return number, line, _CONTROL_NAMES.get(m.group(), f"a control character {m.group()!r}")
+            ch = m.group()
+            if "\ud800" <= ch <= "\udfff":
+                return number, line, f"a byte that is not UTF-8 {ch!r}"
+            return number, line, _CONTROL_NAMES.get(ch, f"a control character {ch!r}")
     return None
 
 
@@ -316,13 +388,16 @@ def check_edit_args(args: argparse.Namespace, edit: EditSettings) -> None:
 
 def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
     mode = resolve_mode(args)
+    check_flags(args)
     targets = resolve_targets(args)
     commands: tuple[str, ...] = ()
     payloads: dict[str, tuple[str, ...]] = {}
     if mode in ("show", "structured"):
         commands = (args.show_command,)
+        check_commands(commands, "-sC")
     elif mode == "batch":
         commands = tuple(args.batch_commands or profiles.read_commands(Path(args.batch)))
+        check_commands(commands, f"--batch {args.batch}" if args.batch else "commands")
     elif mode == "edit":
         payloads = edit_payloads(args, targets)
     edit = None
@@ -353,27 +428,48 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
     if args.json:
         print(json.dumps(report_dict(report), indent=2), file=out)
         return
+    safe = terminal_safe if is_terminal(out) else (lambda text: text)
     for tr in report.results:
         if tr.status == "skipped":
             faults = [op.outcome.detail for op in tr.operations if isinstance(op.outcome, Fault)]
-            print(f"{tr.target.name}: SKIPPED" + (f": {faults[0]}" if faults else ""), file=out)
+            print(f"{tr.target.name}: SKIPPED" + (f": {safe(faults[0])}" if faults else ""), file=out)
             continue
         for op in tr.operations:
             if isinstance(op.outcome, Fault) and op.command == "close":
                 print(f"WARNING: {tr.target.name}: close failed: {op.outcome.detail}", file=sys.stderr)
                 continue
             if isinstance(op.outcome, Fault):
-                print(f"{tr.target.name}: FAIL {op.command}: {op.outcome.kind.name} {op.outcome.detail}", file=out)
+                print(f"{tr.target.name}: FAIL {op.command}: {op.outcome.kind.name} {safe(op.outcome.detail)}", file=out)
                 continue
             if not args.raw:
                 print(f"=== {tr.target.name} ({tr.target.host}) {op.command} [{op.elapsed_ms} ms]", file=out)
-            print(op.outcome.output, file=out)
+            print(safe(op.outcome.output), file=out)
+    if report.interrupted:
+        print(f"Interrupted. Completed {report.ok + report.failed} of {len(report.results)} device(s).", file=sys.stderr)
     if not args.raw:
-        print(f"run {report.run_id}: {report.ok} ok, {report.failed} failed, {report.skipped} skipped", file=out)
+        print(verdict(report), file=out)
         for name, minutes in report.pending.items():
             print(f"pending commit on {name}: rolls back in {minutes} minutes", file=out)
         if report.pending:
             print(f"confirm with: {confirm_command(args)}", file=out)
+    elif report.failed or report.skipped or report.not_kept:
+        print(verdict(report), file=sys.stderr)
+
+
+def verdict(report: RunReport) -> str:
+    """The run's counts; what was skipped is named by reason, and a record not kept is said, so a run that did not reach every device never reads as all OK."""
+    line = f"run {report.run_id}: {report.ok} ok, {report.failed} failed, {report.skipped} skipped"
+    reasons: dict[str, int] = {}
+    for tr in report.results:
+        if tr.status == "skipped":
+            faults = [op.outcome.detail for op in tr.operations if isinstance(op.outcome, Fault)]
+            reason = faults[0] if faults else "not started"
+            reasons[reason] = reasons.get(reason, 0) + 1
+    if reasons:
+        line += " (" + ", ".join(f"{n} {reason}" for reason, n in reasons.items()) + ")"
+    if report.not_kept:
+        line += f"; {report.not_kept} record(s) not kept"
+    return line
 
 
 def confirm_command(args: argparse.Namespace) -> str:
@@ -435,18 +531,70 @@ def worst(a: int, b: int) -> int:
     return min(a, b, key=EXIT_ORDER.index)
 
 
-def changed_lines(previous: RunReport | None, current: RunReport) -> list[str]:
-    """What differs per target and command since the previous report, for --every."""
+Rows = dict[tuple[str, int], dict[str, Any]]
+
+
+def read_rows(store_path: str, run_id: int) -> Rows:
+    """A kept run's operation rows by (target, seq), through the store's reader."""
+    store = Store(store_path, readonly=True)
+    try:
+        return {(row["target"], row["seq"]): dict(row) for row in store.results(run_id=run_id)}
+    finally:
+        store.close()
+
+
+def watch_tick(tick: int, report: RunReport, rows: Rows, previous: Rows | None, out=sys.stdout) -> None:
+    """One line per tick and, for every device whose reply changed since the last kept run, a unified diff."""
+    safe = terminal_safe if is_terminal(out) else (lambda text: text)
+    stamp = time.strftime("%H:%M:%S")
+    counts = f"{report.ok} OK, {report.failed} failed" + (f", {report.skipped} skipped" if report.skipped else "")
+    kept = f"run {report.run_id}" + (f", {report.not_kept} record(s) not kept" if report.not_kept else "")
     if previous is None:
-        return []
-    before = {(tr.target.name, op.command): op.outcome for tr in previous.results for op in tr.operations}
-    lines = []
-    for tr in current.results:
-        for op in tr.operations:
-            old = before.get((tr.target.name, op.command))
-            if old != op.outcome:
-                lines.append(f"{tr.target.name} {op.command}: changed")
-    return lines
+        print(f"tick {tick} {stamp}: {counts}; baseline {kept}", file=out, flush=True)
+        return
+    changed = [(rows[key], previous.get(key)) for key in sorted(rows)
+               if key not in previous or any(previous[key][c] != rows[key][c] for c in ("ok", "output", "fault", "detail"))]
+    print(f"tick {tick} {stamp}: {counts}, {len(changed)} changed; {kept}", file=out, flush=True)
+    for row, before in changed:
+        head = f"--- {row['target']}: {(row['command'] or '').splitlines()[0][:60] if row['command'] else ''}"
+        if before is None:
+            print(safe(head + ": new"), file=out)
+            continue
+        if row["ok"] != before["ok"]:
+            detail = (row["detail"] or "").splitlines()[0] if row["detail"] else ""
+            head += f": {'OK' if before['ok'] else 'FAIL'} -> {'OK' if row['ok'] else 'FAIL'}" + (f" ({detail})" if detail else "")
+        print(safe(head), file=out)
+        diff = difflib.unified_diff((before["output"] or "").splitlines(), (row["output"] or "").splitlines(),
+                                    fromfile=before["started"][:19], tofile=row["started"][:19], lineterm="", n=1)
+        for line in diff:
+            print("  " + safe(line), file=out)
+
+
+def watch(args: argparse.Namespace, spec: RunSpec, runner: Runner, reader: Callable[[str, int], Rows] | None = None) -> int:
+    """--every: a run per tick, each compared with the last kept run through the store; the exit code is the worst tick's."""
+    reader = reader or read_rows
+    code, previous, kept = EXIT_OK, None, 0
+    try:
+        for tick in range(1, (args.times or sys.maxsize) + 1):
+            if tick > 1:
+                time.sleep(args.every)
+            report = runner(spec)
+            try:
+                rows = reader(args.store, report.run_id)
+            except OSError as e:
+                print(f"ERROR: --every: store {args.store}: {e}; a watch keeps all its ticks in one store, so it stops here",
+                      file=sys.stderr)
+                return worst(code, EXIT_USAGE)
+            watch_tick(tick, report, rows, previous)
+            print(summary_line(report), file=sys.stderr)
+            code, previous = worst(code, exit_code(report)), rows
+            kept += not report.not_kept
+            if report.interrupted:
+                break
+        return code
+    except KeyboardInterrupt:
+        print(f"\nInterrupted. {kept} tick(s) kept in the store.", file=sys.stderr)
+        return EXIT_INTERRUPTED
 
 
 def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
@@ -475,32 +623,34 @@ def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return EXIT_USAGE
     try:
-        if args.every is None:
-            report = runner(spec)
-            render(report, args)
-            print(summary_line(report), file=sys.stderr)
-            return exit_code(report)
-        previous = None
-        code = EXIT_OK
-        for tick in range(args.times or sys.maxsize):
-            if tick:
-                time.sleep(args.every)
-            report = runner(spec)
-            print("\n".join(changed_lines(previous, report)) if previous else "", end="")
-            render(report, args)
-            print(summary_line(report), file=sys.stderr)
-            code = worst(code, exit_code(report))
-            previous = report
-            if report.interrupted:
-                break
-        return code
+        if args.every is not None:
+            return watch(args, spec, runner)
+        report = runner(spec)
+        render(report, args)
+        print(summary_line(report), file=sys.stderr)
+        return exit_code(report)
     except Fault as e:
         print(f"ERROR: {e.kind.name}: {e.detail}", file=sys.stderr)
         return EXIT_USAGE
 
 
+def stdout_gone() -> None:
+    """The reader of our output left (`| head`): park both streams on /dev/null so the interpreter's last flush has nothing to say."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        for stream in (sys.stdout, sys.stderr):
+            os.dup2(devnull, stream.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def main_sync() -> None:
     try:
-        raise SystemExit(main())
+        code = main()
+        sys.stdout.flush()
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        code = EXIT_INTERRUPTED
+    except BrokenPipeError:
+        stdout_gone()
+        code = EXIT_OK
+    raise SystemExit(code)
