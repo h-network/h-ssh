@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from types import MappingProxyType
-from typing import Literal, Mapping, Sequence
+from typing import ClassVar, Literal, Mapping, Protocol, Sequence
 
 Mode = Literal["show", "batch", "structured", "edit", "confirm", "commit_status"]
 
@@ -55,13 +55,15 @@ class SafetySettings:
 
 @dataclass(frozen=True)
 class RecordSettings:
-    """Where the run is recorded: store, audit log, log and saved output, each optional."""
+    """Where the run is recorded: store, audit log, log and saved output, each optional; argv, origin and version are the run row's provenance, supplied by the front end."""
 
     store_path: str | None = None
     audit_log_path: str | None = None
     log_path: str | None = None
     save_output_path: str | None = None
     argv: tuple[str, ...] | None = None
+    origin: str | None = None
+    version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,12 +108,19 @@ class RunSpec:
         object.__setattr__(self, "payloads", MappingProxyType(dict(self.payloads)))
 
 
+class DataclassLike(Protocol):
+    __dataclass_fields__: ClassVar[dict[str, object]]
+
+
+ResultData = bool | dict | list | DataclassLike | None
+
+
 @dataclass(frozen=True)
 class Result:
-    """Output of one successful operation (section 4.2)."""
+    """Output of one successful operation (section 4.2); data is one of the shapes the store keeps as JSON."""
 
     output: str
-    data: object | None = None
+    data: ResultData = None
 
 
 @dataclass(frozen=True)

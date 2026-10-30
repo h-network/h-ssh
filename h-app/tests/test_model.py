@@ -62,7 +62,13 @@ def test_policy_retries_and_pause_have_no_defaults():
 
 def test_safety_file_and_every_record_path_are_optional():
     assert SafetySettings(300, 6).safety_file is None
-    assert dataclasses.astuple(RecordSettings()) == (None, None, None, None, None)
+    assert dataclasses.astuple(RecordSettings()) == (None, None, None, None, None, None, None)
+
+
+def test_record_provenance_is_optional_and_kept_as_given():
+    assert (RecordSettings().origin, RecordSettings().version) == (None, None)
+    given = RecordSettings(origin="cli", version="0.0.0")
+    assert (given.origin, given.version) == ("cli", "0.0.0")
 
 
 def test_a_run_spec_needs_targets_and_mode_and_nothing_else():
