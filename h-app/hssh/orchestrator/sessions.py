@@ -57,8 +57,16 @@ class SessionManager:
         self.pool = pool
         self.workers = 0
         self._entries: dict[Hashable, _Entry] = {}
-        self._cond = asyncio.Condition()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._waiting = asyncio.Condition()
         self._closes: list[_Close] = []
+
+    def _cond(self) -> asyncio.Condition:
+        """The borrowers' condition for the running loop: a manager kept across asyncio.run() calls gets a fresh one per loop, the old loop's waiters being gone with it."""
+        loop = asyncio.get_running_loop()
+        if loop is not self._loop:
+            self._loop, self._waiting = loop, asyncio.Condition()
+        return self._waiting
 
     def pooled(self, driver: Driver, target: Target, creds: Credentials, host_key_policy: HostKeyPolicy = "off") -> bool:
         """Whether an idle session to `target` is waiting, so the next acquire() is no login."""
@@ -70,9 +78,9 @@ class SessionManager:
         """A session to `target`: a kept idle one once reuse() vouches for it, else communicator.open() on the thread pool; a key in use is waited for. `login` is asked before an open that replaces a kept session: a reason refuses it (LoginRefused)."""
         key = session_key(driver, target, creds, host_key_policy)
         comm = driver.communicator
-        async with self._cond:
+        async with self._cond():
             while (entry := self._entries.get(key)) is not None and entry.in_use:
-                await self._cond.wait()
+                await self._cond().wait()
             if entry is None:
                 entry = self._entries[key] = _Entry(comm)
             entry.in_use = True
@@ -118,15 +126,15 @@ class SessionManager:
             close.fault = cleaned
             self._start(close, entry.communicator.discard, entry.session)
             return
-        async with self._cond:
+        async with self._cond():
             entry.in_use = False
             entry.idle_since = time.monotonic()
-            self._cond.notify_all()
+            self._cond().notify_all()
 
     async def _drop(self, key: Hashable) -> None:
-        async with self._cond:
+        async with self._cond():
             self._entries.pop(key, None)
-            self._cond.notify_all()
+            self._cond().notify_all()
 
     def _start(self, close: _Close, how: Callable[[Session], None], session: Session) -> None:
         self._closes.append(close)
@@ -164,7 +172,7 @@ class SessionManager:
         if limit is None:
             return
         allowed = max(0, (limit - FDS_BASE - self.workers * FDS_PER_WORKER) // FDS_PER_SESSION)
-        async with self._cond:
+        async with self._cond():
             idle = sorted(((e.idle_since, k) for k, e in self._entries.items() if not e.in_use and e.session is not None))
             for _, key in idle[:max(0, len(idle) - allowed)]:
                 entry = self._entries.pop(key)
@@ -172,9 +180,9 @@ class SessionManager:
 
     async def close_all(self, timeout: float = CLOSE_WAIT) -> None:
         """Close every kept session, side by side, and wait `timeout` in all; one in use is torn down. Faults are not the run's."""
-        async with self._cond:
+        async with self._cond():
             entries, self._entries = list(self._entries.values()), {}
-            self._cond.notify_all()
+            self._cond().notify_all()
         for entry in entries:
             if entry.session is not None:
                 how = entry.communicator.discard if entry.in_use else entry.communicator.close

@@ -471,8 +471,8 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
             _closed_quietly("safety gate", gate.close)
 
 
-def run(spec: RunSpec) -> RunReport:
-    """The entry point the front ends call: one RunSpec executed, its RunReport returned. Per-target failures are in the report; a local refusal before any device is contacted raises Fault(LOCAL)."""
+def run(spec: RunSpec, *, sessions: SessionManager | None = None) -> RunReport:
+    """The entry point the front ends call: one RunSpec executed, its RunReport returned. Per-target failures are in the report; a local refusal before any device is contacted raises Fault(LOCAL). A caller's `sessions` is used and left open, as with execute()."""
     from hssh.drivers import Registry
 
     spec = complete(spec)
@@ -486,7 +486,7 @@ def run(spec: RunSpec) -> RunReport:
     except OSError as e:
         raise Fault(FaultKind.LOCAL, str(e), False) from e
     try:
-        return asyncio.run(execute(spec, registry, gate=gate, store=store))
+        return asyncio.run(execute(spec, registry, gate=gate, store=store, sessions=sessions))
     finally:
         if store is not None:
             _closed_quietly("store", store.close)
