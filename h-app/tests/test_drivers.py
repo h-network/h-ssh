@@ -46,12 +46,13 @@ def test_a_name_without_both_halves_is_refused(name):
         split_name(name)
 
 
-def test_the_built_ins_are_junos_over_netconf_and_ssh_each_sharing_one_dialect():
-    assert [d.name for d in BUILTIN] == ["junos@netconf", "junos@ssh"]
+def test_the_built_ins_are_junos_over_netconf_ssh_and_openssh_each_sharing_one_dialect():
+    assert [d.name for d in BUILTIN] == ["junos@netconf", "junos@ssh", "junos@openssh"]
     assert isinstance(BUILTIN[0].communicator, NetconfCommunicator) and isinstance(BUILTIN[1].communicator, SSHCommunicator)
+    assert isinstance(BUILTIN[2].communicator, OpenSSH)
     for driver in BUILTIN:
         assert driver.dialect is junos.DIALECT and driver.communicator.dialect is driver.dialect
-    assert BUILTIN[1].communicator.capabilities == {"show", "batch", "edit", "confirm", "commit_status"}
+    assert BUILTIN[1].communicator.capabilities == {"show", "batch", "edit", "confirm", "commit_status", "commit_confirmed"}
 
 
 def test_a_new_registry_holds_the_built_ins_and_nothing_else():
@@ -62,7 +63,7 @@ def test_a_new_registry_holds_the_built_ins_and_nothing_else():
 def test_registries_are_independent_instances():
     one, two = Registry(), Registry()
     one.register(DUMMY)
-    assert [d.name for d in two] == ["junos@netconf", "junos@ssh"]
+    assert [d.name for d in two] == ["junos@netconf", "junos@ssh", "junos@openssh"]
 
 
 def test_register_keeps_order_and_refuses_a_name_already_taken():
@@ -90,7 +91,7 @@ def test_an_unknown_name_is_a_local_fault_listing_what_is_available():
         registry.get("ios@ssh")
     fault = caught.value
     assert (fault.kind, fault.reached_device) == (FaultKind.LOCAL, False)
-    assert fault.detail == "unknown driver 'ios@ssh'; available: dummy@openssh, junos@netconf, junos@ssh"
+    assert fault.detail == "unknown driver 'ios@ssh'; available: dummy@openssh, junos@netconf, junos@openssh, junos@ssh"
 
 
 def test_an_empty_registry_says_none_is_available():
@@ -132,14 +133,14 @@ def test_an_entry_point_may_hand_over_one_driver(entry_points):
     entry_points.append(ep("one", "tests.fixtures.hssh_dummy:ONE"))
     registry = Registry()
     registry.load_entry_points()
-    assert [d.name for d in registry] == ["junos@netconf", "junos@ssh", "dummy@openssh"] and registry.broken == {}
+    assert [d.name for d in registry] == ["junos@netconf", "junos@ssh", "junos@openssh", "dummy@openssh"] and registry.broken == {}
 
 
 def test_an_entry_point_may_hand_over_a_list_of_drivers(entry_points):
     entry_points.append(ep("many", "tests.fixtures.hssh_dummy:DRIVERS"))
     registry = Registry()
     registry.load_entry_points()
-    assert [d.name for d in registry] == ["junos@netconf", "junos@ssh", "dummy@openssh", "other@openssh"]
+    assert [d.name for d in registry] == ["junos@netconf", "junos@ssh", "junos@openssh", "dummy@openssh", "other@openssh"]
 
 
 def test_a_broken_entry_point_is_reported_by_name_and_the_rest_still_load(entry_points):
@@ -161,7 +162,7 @@ def test_what_an_entry_point_may_not_hand_over_is_listed_with_the_reason(entry_p
     registry = Registry()
     registry.load_entry_points()
     assert list(registry.broken) == ["odd"] and re.fullmatch(why, registry.broken["odd"], re.S)
-    assert [d.name for d in registry] == ["junos@netconf", "junos@ssh"]
+    assert [d.name for d in registry] == ["junos@netconf", "junos@ssh", "junos@openssh"]
 
 
 def test_an_entry_point_claiming_a_registered_name_is_broken_and_the_built_in_stays(entry_points):

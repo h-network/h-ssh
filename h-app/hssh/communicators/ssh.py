@@ -352,7 +352,7 @@ class SSHCommunicator(Communicator):
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
         if dialect.has_candidate:
-            self.capabilities = self.capabilities | {"edit", "confirm", "commit_status"}
+            self.capabilities = self.capabilities | {"edit", "confirm", "commit_status", "commit_confirmed"}
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> SSHSession:
@@ -434,7 +434,7 @@ class SSHCommunicator(Communicator):
             try:
                 _remaining(guard.deadline)
                 channel = client.invoke_shell(term="vt100", width=511, height=1000)
-                stage = "CLI prompt discovery and paging setup"
+                stage = "CLI prompt discovery"
                 engine = CliEngine(ShellChannel(channel), self.dialect, ssh_session.timeouts, echoes=True)
                 engine.login(guard.deadline)
                 guard.finish()

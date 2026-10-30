@@ -8,6 +8,7 @@ from typing import Iterable, Iterator, Protocol, Union
 
 from hssh.communicators.base import Communicator
 from hssh.communicators.netconf import NetconfCommunicator
+from hssh.communicators.openssh import OpenSSH
 from hssh.communicators.ssh import SSHCommunicator
 from hssh.dialects import junos
 from hssh.dialects.base import Dialect
@@ -63,6 +64,7 @@ class DriverRegistry(Protocol):
 BUILTIN: tuple[Driver, ...] = (
     Driver("junos@netconf", junos.DIALECT, NetconfCommunicator(junos.DIALECT)),
     Driver("junos@ssh", junos.DIALECT, SSHCommunicator(junos.DIALECT)),
+    Driver("junos@openssh", junos.DIALECT, OpenSSH(junos.DIALECT)),
 )
 
 
