@@ -35,9 +35,10 @@ class Credentials:
 
 @dataclass(frozen=True)
 class Timeouts:
-    """Seconds allowed before login, for each operation in a session, and for a commit."""
+    """Seconds for the TCP connect, for the session setup after it (key exchange, login, NETCONF hello) as one deadline, for each operation in a session, and for a commit."""
 
     connect: int
+    setup: int
     command: int
     commit: int
 
