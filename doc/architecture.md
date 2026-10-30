@@ -210,7 +210,7 @@ A refused or timed-out command does not stop the batch; a lost session does.
 @dataclass(frozen=True)
 class Result:
     output: str                  # device output as received
-    data: object | None = None   # parsed structure, when the operation returns one
+    data: ResultData = None      # None, bool, dict, list or a dataclass: what the store keeps as JSON
 
 @dataclass(frozen=True)
 class CommitStatus:              # commit_history's data, from the newest history entry
