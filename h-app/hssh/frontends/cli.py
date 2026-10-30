@@ -210,15 +210,15 @@ def resolve_credentials(args: argparse.Namespace) -> Credentials:
 
 
 def comment_prefixes(targets: Sequence[Target]) -> tuple[str, ...]:
-    """What starts a full-line comment for every target's dialect; "#" where a dialect says nothing."""
+    """What starts a full-line comment for every target's dialect; a target without a driver is left to run() to refuse."""
     registry = Registry()
     registry.load_entry_points()
     common: set[str] | None = None
     for target in targets:
         try:
-            prefixes = set(getattr(registry.resolve(target).dialect, "comment_prefixes", ("#",)))
+            prefixes = set(registry.resolve(target).dialect.comment_prefixes)
         except Fault:
-            prefixes = {"#"}
+            continue
         common = prefixes if common is None else common & prefixes
     return tuple(sorted(common or ()))
 
