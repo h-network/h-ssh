@@ -96,10 +96,10 @@ def test_an_edit_spec_failing_the_checks_is_refused_before_anything_is_sent():
 
 def test_a_failed_record_write_is_counted_and_never_the_targets_failure():
     class FailingStore:
-        def start_run(self, spec, started):
+        def start_run(self, spec, started, *, user):
             return 1
 
-        def add(self, *args):
+        def add(self, *args, **kw):
             raise OSError("disk full")
 
         def finish_run(self, report):

@@ -38,7 +38,7 @@ class _Run:
     steps: dict[int, str] = field(default_factory=dict)
     past_commit: set[int] = field(default_factory=set)
     interrupts: int = 0
-    not_kept: int = 0
+    probing: asyncio.Task | None = None
     stopping: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -60,27 +60,50 @@ class Scheduler:
         self.recorder = recorder
 
     async def run(self, spec: RunSpec) -> RunReport:
-        """The whole run: probe, every target under the worker limit, the report, always closed in the store."""
+        """The whole run: the record destinations proved, the probe, the run row, every target under the worker limit, the report, the run row closed. A refusal before the first device is Fault(LOCAL)."""
         loop = asyncio.get_running_loop()
         loop.set_default_executor(_DaemonThreads(spec.workers, thread_name_prefix="hssh"))
         run = _Run(spec, 0, now())
         slots = asyncio.Semaphore(spec.workers)
-        dead = await self._probe(spec) if spec.probe else {}
-        if spec.mode == "edit" and any(dead.values()):
-            self._dead_edit(spec, dead)
-        run.run_id = self.recorder.begin(spec, run.started)
-        run.tasks = [asyncio.create_task(self._bounded(run, i, t, slots, dead.get(t.name)))
-                     for i, t in enumerate(spec.targets)]
         with _on_interrupt(loop, lambda: self._interrupt(run)):
-            results = await self._gather(run)
+            try:
+                self.recorder.preflight()
+                dead = await self._probed(run) if spec.probe else {}
+                if run.stopping.is_set() and spec.mode == "edit":
+                    raise Fault(FaultKind.LOCAL, "interrupted during the probe; nothing was sent", False)
+                if spec.mode == "edit" and any(dead.values()):
+                    self._dead_edit(spec, dead)
+                run.run_id = self.recorder.begin(spec, run.started)
+            except OSError as e:
+                raise Fault(FaultKind.LOCAL, f"{e}; nothing was sent", False) from e
+            if run.stopping.is_set():
+                stopped = Fault(FaultKind.LOCAL, "interrupted during the probe", False)
+                results = [self._failed_before(run, t, stopped, "skipped") for t in spec.targets]
+            else:
+                run.tasks = [asyncio.create_task(self._bounded(run, i, t, slots, dead.get(t.name)))
+                             for i, t in enumerate(spec.targets)]
+                results = await self._gather(run)
             late = await asyncio.to_thread(self.sessions.wait_for_closes)
         results = [self._with_close(run, r, late[r.target.name]) if r.target.name in late else r for r in results]
         counts = {status: sum(r.status == status for r in results) for status in ("ok", "failed", "skipped")}
         report = RunReport(run.run_id, spec.mode, run.started, now(), results, counts["ok"], counts["failed"],
-                           counts["skipped"], interrupted=run.interrupts > 0, not_kept=run.not_kept,
+                           counts["skipped"], interrupted=run.interrupts > 0, not_kept=self.recorder.not_kept,
                            pending=self._pending(spec, results))
         self.recorder.finish(report)
+        self.recorder.close()
+        if self.recorder.not_kept != report.not_kept:
+            report = dataclasses.replace(report, not_kept=self.recorder.not_kept)
         return report
+
+    async def _probed(self, run: _Run) -> dict[str, Fault | None]:
+        """The probe as a task the first interrupt can cancel; cancelled, it found nothing dead."""
+        run.probing = asyncio.create_task(self._probe(run.spec))
+        try:
+            return await run.probing
+        except asyncio.CancelledError:
+            return {}
+        finally:
+            run.probing = None
 
     async def _probe(self, spec: RunSpec) -> dict[str, Fault | None]:
         """Dead targets by name, asked where the connection will go; a target the gate holds, whose driver is unknown, or reached through a proxy is not probed."""
@@ -117,7 +140,7 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001 - one communicator bug is this target's failure, not the run's end
                 self.policy.settle(target, None)
                 result = self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{type(e).__name__}: {e}", True))
-            self._record(run, lambda: self.recorder.log(result))
+            self.recorder.log(result)
             return result
 
     async def _gather(self, run: _Run) -> list[TargetResult]:
@@ -135,6 +158,8 @@ class Scheduler:
                   file=sys.stderr)
             return
         run.stopping.set()
+        if run.probing is not None:
+            run.probing.cancel()
         for i, task in enumerate(run.tasks):
             if i not in run.begun or (i in in_flight and i not in run.past_commit):
                 task.cancel()
@@ -171,24 +196,14 @@ class Scheduler:
         if run.stopping.is_set() and self._interrupted_connect(ops):
             status = "skipped"
         for seq, op in enumerate(ops):
-            self._record(run, lambda seq=seq, op=op: self.recorder.result(run.run_id, target, driver.name, seq, op))
+            self.recorder.result(run.run_id, target, driver.name, seq, op, status)
         if spec.mode == "edit":
-            self._record(run, lambda: self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit,
-                                                            lines or ()))
+            self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit, lines or ())
         elif spec.mode == "confirm":
-            self._record(run, lambda: self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops,
-                                                            dataclasses.replace(spec.edit, apply=True)))
-        self._record(run, lambda: self.recorder.save_output(target, ops))
+            self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops,
+                                  dataclasses.replace(spec.edit, apply=True))
+        self.recorder.save_output(target, ops)
         return TargetResult(target, status, tuple(ops))
-
-    @staticmethod
-    def _record(run: _Run, write) -> None:
-        """One record written; a failure is counted and said, never the target's failure or cooldown."""
-        try:
-            write()
-        except OSError as e:
-            run.not_kept += 1
-            print(f"record not kept: {e}", file=sys.stderr)
 
     async def _attempt(self, run: _Run, index: int, target: Target, driver: Driver, attempt: int) -> _Attempt:
         """One login under the safety gate, the mode's operations in order on that session, the close started beside the work, the gate settled."""
@@ -283,14 +298,14 @@ class Scheduler:
     def _with_close(self, run: _Run, result: TargetResult, late: tuple[str, OperationResult]) -> TargetResult:
         """The close fault appended as the trailing operation and recorded; status untouched."""
         driver, op = late
-        self._record(run, lambda: self.recorder.result(run.run_id, result.target, driver, len(result.operations), op))
+        self.recorder.result(run.run_id, result.target, driver, len(result.operations), op, result.status)
         return dataclasses.replace(result, operations=(*result.operations, op))
 
     def _failed_before(self, run: _Run, target: Target, fault: Fault, status: TargetStatus = "failed",
                        command: str = OPEN) -> TargetResult:
         """A target that failed, or was skipped, with no operation completed: one operation, 'open' or the step the interrupt cut, recorded without a driver."""
         op = OperationResult(command, fault, now(), 0)
-        self._record(run, lambda: self.recorder.result(run.run_id, target, "", 0, op))
+        self.recorder.result(run.run_id, target, "", 0, op, status)
         return TargetResult(target, status, (op,))
 
     def _dead_edit(self, spec: RunSpec, dead: dict[str, Fault | None]) -> None:
@@ -387,7 +402,7 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
     finally:
         await sessions.close_all()
         if gate is not None:
-            gate.close()
+            _closed_quietly("safety gate", gate.close)
 
 
 def run(spec: RunSpec) -> RunReport:
@@ -408,7 +423,15 @@ def run(spec: RunSpec) -> RunReport:
         return asyncio.run(execute(spec, registry, gate=gate, store=store))
     finally:
         if store is not None:
-            store.close()
+            _closed_quietly("store", store.close)
+
+
+def _closed_quietly(what: str, close) -> None:
+    """A close on the way out that fails is said, never the run's end: the report, or the refusal, is what reaches the caller."""
+    try:
+        close()
+    except Exception as e:  # noqa: BLE001
+        print(f"{what} not closed: {e}", file=sys.stderr)
 
 
 def _gate(spec: RunSpec) -> SafetyGate | None:

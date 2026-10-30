@@ -7,6 +7,8 @@ import json
 import os
 import re
 import stat
+import tempfile
+from contextlib import contextmanager
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -61,33 +63,72 @@ def redact_secrets(text: str, dialect: Dialect) -> str:
     return json.dumps(_redact_value(value, dialect))
 
 
-def secure_append(path: str, text: str) -> None:
+def check_private_file(info: os.stat_result) -> None:
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("not a regular file")
+    if info.st_uid != os.geteuid():
+        raise OSError("file is owned by another user")
+
+
+@contextmanager
+def private_file(path: str, flags: int, *, dir_fd: int | None = None):
+    fd = os.open(path, flags | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        check_private_file(os.fstat(fd))
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, text: str) -> None:
     data = memoryview(text.encode("utf-8"))
+    while data:
+        written = os.write(fd, data)
+        if written <= 0:
+            raise OSError("write made no progress")
+        data = data[written:]
+
+
+def _write_recording(path: str, text: str, *, append: bool) -> None:
+    action = "append" if append else "write"
     try:
         private_dir(Path(path).parent)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError("not a regular file")
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else 0)
+        with private_file(path, flags) as fd:
             fcntl.flock(fd, fcntl.LOCK_EX)
             os.fchmod(fd, 0o600)
-            while data:
-                written = os.write(fd, data)
-                if written <= 0:
-                    raise OSError("append made no progress")
-                data = data[written:]
-        finally:
-            os.close(fd)
-    except OSError as error:
-        raise OSError(error.errno, f"cannot append recording: {error.strerror or error}", path) from error
+            if not append:
+                os.ftruncate(fd, 0)
+            _write_all(fd, text)
+    except (OSError, UnicodeError) as error:
+        raise OSError(getattr(error, "errno", None), f"cannot {action} recording: {error}", path) from error
+
+
+def secure_append(path: str, text: str) -> None:
+    _write_recording(path, text, append=True)
 
 
 def probe_append(path: str) -> None:
-    raise NotImplementedError
+    secure_append(path, "")
+
+
+def probe_output_dir(path: str) -> None:
+    try:
+        private_dir(path)
+        fd, name = tempfile.mkstemp(prefix=".hssh-probe-", dir=path)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+        finally:
+            os.unlink(name)
+    except OSError as error:
+        raise OSError(error.errno, f"cannot record saved output: {error}", path) from error
 
 
 def secure_write(path: str, text: str) -> None:
-    raise NotImplementedError
+    _write_recording(path, text, append=False)
 
 
 def write_audit_entry(

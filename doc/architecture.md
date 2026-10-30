@@ -85,7 +85,11 @@ reads only, never an edit. After an apply with
 a timer the CLI prints the minutes left per device and the command that confirms them, rebuilt from the run's
 own arguments. Exit codes: 0; 1 a device failed; 2 refused before anything was sent; 3 nothing failed but not
 everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exits with the worst of its runs,
-in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run.
+in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run. `--json`
+renders each `Result.data` through the store's `json_data`, so the file and the store hold the same shapes.
+The run's provenance in `RecordSettings` is the front end's: `origin` is `h-ssh` from the CLI and `fleet` from
+the library (unless the caller set one), `version` is the installed package version from `importlib.metadata`,
+None when h-ssh runs from source. Set-file names and containment (`-eD`) use the shared `hssh.paths` helpers.
 
 ### 3.2 Orchestrator
 
@@ -172,6 +176,15 @@ and lists. IOS, NX-OS and EOS redaction patterns wait for the CLI transport phas
 One SQLite database, `./h-ssh.db` by default. The recorder writes. `h-ssh-store` reads: it lists
 runs, shows output, compares results and exports. The schema is in section 6.
 
+The recorder proves every record destination before the probe: the audit log and the run log by a no-content
+append, the saved-output directory by a private temporary file. The store is opened and created by the run row,
+written after the probe and before the first target. A failure in either refuses the run as `LOCAL` before any
+device is contacted. Once targets run, every record is attempted on its own: each store row, each audit entry,
+the saved-output file, the log line, the run row's finish and the store's close. One that cannot be written is
+counted once in `RunReport.not_kept` and said on stderr; the device outcome stands, no cooldown follows, and the
+report still reaches the caller, so a store that vanished mid-run ends in exit 4, not a traceback. Every operation row carries the target's final
+status. Saved output is named through `hssh.paths` inside its directory.
+
 ### 3.7 Audit log
 
 An append-only JSONL file. One entry per action that changed or could change a device, including dry
@@ -210,7 +223,7 @@ A refused or timed-out command does not stop the batch; a lost session does.
 @dataclass(frozen=True)
 class Result:
     output: str                  # device output as received
-    data: object | None = None   # parsed structure, when the operation returns one
+    data: ResultData = None      # None, bool, dict, list or a dataclass: what the store keeps as JSON
 
 @dataclass(frozen=True)
 class CommitStatus:              # commit_history's data, from the newest history entry
@@ -272,7 +285,8 @@ payload and is skipped), credentials, timeouts (`connect` for the TCP connect an
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
 operation, `commit`),
 the worker limit, the safety
-settings, and the recording settings.
+settings, and the recording settings (the record paths, and the run row's provenance: `argv`, `origin` and
+`version`, supplied by the front end, all optional).
 
 ### 5.2 Concurrency
 
@@ -316,7 +330,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 ### 5.4 Cancellation
 
 1. On the first interrupt, the scheduler starts no new targets. Targets that have not started are recorded
-   as skipped.
+   as skipped. An interrupt during the probe cancels it: a read is still recorded as a run, every target skipped
+   "interrupted during the probe"; an edit stopped there is refused as `LOCAL` and leaves no run row.
 2. Targets past `COMMIT` are waited for and recorded. Other in-flight targets are cancelled and recorded as
    skipped, not failed, with the step the interrupt cut as their one operation: `open` for a connect in flight,
    `load`, `diff` or the command for a session in flight, whose close still discards and unlocks what was acquired.
@@ -331,20 +346,119 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 
 ### 6.1 Store
 
+The schema version is `PRAGMA user_version = 1`. A new, empty database gets this schema;
+readers and writers refuse other versions or a mismatched table layout before changing the
+file. An unversioned database with tables is incompatible, not an empty database. The error
+is an `OSError` containing the path and: "incompatible store schema; use develop's h-ssh-store
+to read old stores, or choose a new store path". There is no migration or legacy adapter.
+
 ```sql
-runs(
-  id INTEGER PRIMARY KEY, started TEXT, finished TEXT, mode TEXT, argv TEXT,
-  targets INTEGER, ok INTEGER, failed INTEGER, skipped INTEGER
-)
-results(
-  run_id INTEGER REFERENCES runs(id), seq INTEGER, target TEXT, host TEXT,
-  driver TEXT, command TEXT, ok INTEGER, fault TEXT, detail TEXT,
-  output TEXT, started TEXT, elapsed_ms INTEGER,
+CREATE TABLE runs (
+  id INTEGER PRIMARY KEY,
+  started TEXT NOT NULL, finished TEXT,
+  mode TEXT NOT NULL, argv TEXT, user TEXT NOT NULL,
+  format TEXT, origin TEXT, version TEXT,
+  targets INTEGER NOT NULL,
+  ok INTEGER, failed INTEGER, skipped INTEGER,
+  interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1)),
+  not_kept INTEGER NOT NULL DEFAULT 0 CHECK (not_kept >= 0)
+);
+CREATE TABLE results (
+  run_id INTEGER NOT NULL REFERENCES runs(id),
+  seq INTEGER NOT NULL CHECK (seq >= 0), target TEXT NOT NULL, host TEXT NOT NULL,
+  driver TEXT NOT NULL, command TEXT NOT NULL,
+  target_status TEXT NOT NULL CHECK (target_status IN ('ok', 'failed', 'skipped')),
+  ok INTEGER NOT NULL CHECK (ok IN (0, 1)),
+  fault TEXT, detail TEXT, reached_device INTEGER CHECK (reached_device IN (0, 1)),
+  output TEXT, data TEXT,
+  started TEXT NOT NULL, elapsed_ms INTEGER NOT NULL,
   PRIMARY KEY (run_id, target, seq)
-)
+);
 ```
 
-SQLite runs in WAL mode with a busy timeout. Each run writes in its own transactions.
+`start_run(spec, started, *, user: str)` assigns an integer ID in SQLite. The recorder
+passes its local invoking user for `runs.user`; the store does not discover a second user
+or use the device login. `argv` is a JSON array from `RecordSettings.argv`, or SQL NULL
+when absent. Payload files are not copied into this row; an inline `-eC` payload is already
+part of argv. `format` is the requested `RunSpec.format`, or NULL when unspecified. `origin` and
+`version` are optional strings from `RecordSettings`, supplied by the front end; the store
+does not discover them. `targets` is the number requested. Until `finish_run(report)`,
+`finished` and the three outcome counts are NULL; finalization copies the report's finished
+time, counts, interrupted flag and not-kept count. Counts describe target outcomes, not how
+many rows survived a recording failure. A missing `finished` means the run was not finalized.
+
+`add(run_id, target, driver, seq, operation, *, status: TargetStatus)` replaces the row at the
+same `(run_id, target, seq)`. Sequence numbers follow the target's operation order, starting
+at zero. `target_status` is the final target status supplied by the orchestrator on every
+operation row; `ok` describes that operation alone. A skipped LOCAL `open` can therefore be
+distinguished from a failed LOCAL `open`, and an earlier successful load remains successful
+when a later commit fails. `driver` is empty if resolution failed before a driver was known.
+`started` and `elapsed_ms` come from the operation, without recomputing either timestamp.
+
+On success, `output` is `Result.output` verbatim, including any `MODE:` prefix, and `data`
+is separate JSON text from `Result.data`, or SQL NULL for None. Fault columns are NULL.
+On failure, `fault` is `FaultKind.name`, `detail` is the full fault detail, and
+`reached_device` is the fault's boolean; `output` and `data` are NULL. No store field is
+redacted. The shared pure `hssh.store.json_data(value)` returns a JSON-compatible Python
+value, not serialized text: dataclass instances become dictionaries with `asdict`, and
+bool, None, dict and list are accepted. Nested values must be JSON values with string keys
+and finite numbers. Unsupported values raise `ValueError`. The recorder and front end use
+this same converter for structured output; raw output is never parsed to populate `data`.
+If `add` cannot convert unsupported `Result.data`, it still writes the row with `data` NULL,
+preserving raw output and the operation outcome, then raises a contextual `OSError` naming
+the unsupported type. The recorder counts this incomplete record as `not_kept`; the
+conversion error never changes the target outcome or escapes from `add` as `ValueError`.
+
+`Store(path, readonly=False)` requires an explicit path. The orchestrator supplies it from
+`RecordSettings`; the store imports no orchestrator defaults. The `h-ssh-store` front end
+will obtain the default from the orchestrator in slice 3. Writable construction defers
+opening and creation to `start_run`, before any device work.
+Read-only construction opens an existing compatible store without creating it. SQLite runs
+in WAL mode with a 10-second busy timeout, a separate bounded 5-second first-open WAL
+wait, `synchronous=NORMAL` and serialized write transactions. Each operation row is committed
+in one transaction. NORMAL protects against a process crash; a power loss can lose recent
+commits. Store creation/opening failures close every acquired resource. Construction alone
+creates no files, and close is idempotent. The writer never deletes a database to undo a
+refused run.
+`finish_run` and `close` complete the writer interface; SQLite and file failures are exposed
+as contextual `OSError`, so the recorder can count lost records without failing the device.
+The writer checks the database identity before and after writes and when closing, using a
+held directory so a working-directory change or directory rename does not look like a lost
+store. A deleted or replaced database is reported even if SQLite could still write its open
+file. The writer is implemented in slice 1; read-only construction and reader methods remain
+stubs until slice 3.
+
+The reader interfaces in `store.py` return stored column names unchanged:
+
+- `runs(last=20)` streams run rows newest first by timestamp, then ID; None means all,
+  zero means no rows, and negative limits are invalid. `last_run_id()` returns the newest
+  run's integer ID, or None for an empty store.
+- `resolve_run(selector=None)` accepts an integer ID, its exact decimal string, a literal
+  unambiguous decimal prefix, or None for the latest run. Exact matches win over prefixes;
+  missing, empty, ambiguous and wildcard selectors raise `ValueError`.
+- `results(run_id=None, target=None, command=None, ok=None, *, status=None, seq=None,
+  order="sequence", limit=None)` streams operation rows. None leaves a filter unrestricted;
+  target and command match exactly, and status selects `target_status`. Order is one of
+  `sequence` (run ID, target, sequence), `newest` (operation timestamp descending), or
+  `slowest` (elapsed milliseconds descending); ties use run ID, target and sequence.
+  Timestamps are compared as instants. Limit follows the same rules as `runs`.
+- `output(run_id, target, seq=0)` returns one row or raises `ValueError` if absent.
+  `compare(before, after, target, seq=0)` returns a logical-line unified diff; a missing or
+  failed operation raises `ValueError`, not an empty diff.
+- `export(run_id=None, *, format="jsonl", target=None, command=None, ok=None, status=None,
+  seq=None)` streams serialized strings in sequence order, one JSONL record or CSV record
+  at a time, with a CSV header. It exports every `results` column in schema order; CSV
+  retains JSON text in `data`, while JSONL decodes that column to its JSON value. Text and
+  newlines are preserved. None selects all runs; callers resolve the latest run explicitly.
+  Destination safety checks and terminal rendering belong to the reader command, not this
+  serializer. `results` supplies the failed, grep, field, history and slowest commands.
+
+`hssh.paths.validate_device_name(name: str) -> str` and
+`path_inside(base: Path, filename: str) -> Path` are the shared file-name helpers for `-eD`
+and saved output. The first returns the name or raises `ValueError`: only ASCII letters, digits,
+underscore, dot, colon and hyphen, starting with a letter, digit or underscore. The second returns
+`base / filename` or raises `ValueError` unless its resolved parent is the resolved base.
+Their bodies and the front-end caller move land in slice 1; slice 0 declares signatures only.
 
 ### 6.2 Audit entry
 
@@ -368,6 +482,16 @@ symlinks and non-regular files without blocking on FIFOs, and set the file to 06
 parent directories are 0700. An append failure raises an `OSError` with the recording path;
 the recorder counts it as `not_kept` without changing the device outcome.
 
+Before device work, `probe_append(path)` exercises the same open and lock path with no
+content, preserving an existing log. `probe_output_dir(path)` creates private parents,
+creates and closes a temporary 0600 file in that directory, then removes it. Neither probe
+promises that a later write cannot fail. Both raise contextual `OSError` on failure.
+`secure_write(path, text)` saves raw UTF-8 output: it checks a regular file owned by the
+current user, locks it and sets 0600 before truncating, then completes all short writes.
+It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
+The recorder validates the target name and containment through `hssh.paths` before calling
+it. Saved output stays one file per target, including batches.
+
 For JSON text in audit fields, the writer parses objects and lists and masks the entire value of a
 secret key, including wrapped values. A key is secret when a dialect redaction pattern matches
 `json.dumps(key) + ': "x"'`. For other text, the dialect patterns capture the keyword/prefix in
@@ -384,8 +508,11 @@ The secret vocabulary belongs to the dialect; stored device output is left uncha
   store keeps device output as received, and is created owner-only.
 - **Host keys:** each communicator uses its library's host-key verification under one policy setting:
   `off` (default), `accept-new` or `strict`.
-- **Files:** the store, the audit log, logs and saved output are created with mode 0600, in directories
-  created with mode 0700.
+- **Files:** the store, its SQLite sidecars, the audit log, logs and saved output are made
+  0600; newly created directories are 0700 and existing directory permissions are preserved.
+  Recording files must be regular files owned by the current user; symlinks and FIFOs are
+  refused. The store directory must also belong to that user and must not be writable by
+  others unless it has the sticky bit, because SQLite reopens the path itself.
 
 ## 8. Extensibility
 
@@ -420,5 +547,6 @@ h-app/hssh/
 ├── model.py        Target, RunSpec, Result, Fault, RunReport
 ├── store.py        writer, and the h-ssh-store reader
 ├── audit.py
+├── paths.py        shared target file names and containment
 └── safety.py       safety gate state
 ```
