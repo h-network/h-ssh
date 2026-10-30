@@ -171,6 +171,7 @@ class Communicator(Protocol):
 ```
 
 Batch execution is the orchestrator calling `show` repeatedly on one session.
+A refused or timed-out command does not stop the batch; a lost session does.
 
 ### 4.2 Result
 
