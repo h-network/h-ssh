@@ -140,9 +140,12 @@ def _accept_new(host: str, port: int, timeout: int) -> None:
                 raise paramiko.BadHostKeyException(host, key, expected or next(iter(current.values())))
         else:
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
             with os.fdopen(fd, "a") as known_hosts:
                 fcntl.flock(known_hosts, fcntl.LOCK_EX)
+                size = os.fstat(fd).st_size
+                if size and os.pread(fd, 1, size - 1) != b"\n":
+                    known_hosts.write("\n")
                 known_hosts.write(f"{name} {key.get_name()} {key.get_base64()}\n")
                 known_hosts.flush()
                 del _HOST_KEYS[path]

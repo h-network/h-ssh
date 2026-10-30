@@ -30,7 +30,7 @@ each host and port are resolved once and cached. Hashed names use Python's HMAC
 and constant-time comparison. Each NETCONF session receives its own resolved key
 mappings, retaining bare-host and port-specific verification. The cached loader
 applies only while this communicator opens a PyEZ device; other ncclient sessions
-keep their normal loader. New entries are appended under a file lock, preserving
+keep their normal loader. New entries start on their own line and are appended under a file lock, preserving
 the file's existing content, then refreshing the file cache and its resolutions.
 A new process reads external changes to known-hosts files.
 
