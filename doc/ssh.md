@@ -55,7 +55,9 @@ pre-banner failure.
 
 An interactive operation initializes the shell only when it first needs one,
 using the remaining setup deadline. It uses a vt100 PTY, 511 columns by 1000 rows,
-and the shared engine for echo, prompt, paging and reply handling. Every shell
+and the shared engine for echo, prompt, paging and reply handling. Login sends
+no paging-disable command; the first command synchronizes through its echo and
+learns the whole-line prompt. Empty command replies skip settling. Every shell
 write observes one absolute deadline across partial writes and rekey waits. A
 disconnected channel raises `ConnectionError`; expiry raises `TimeoutError`.
 Shell setup failures are reported as `TIMEOUT` or `SESSION_LOST` with the failing
