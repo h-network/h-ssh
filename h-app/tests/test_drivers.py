@@ -52,7 +52,7 @@ def test_the_built_ins_are_junos_over_netconf_ssh_and_openssh_each_sharing_one_d
     assert isinstance(BUILTIN[2].communicator, OpenSSH)
     for driver in BUILTIN:
         assert driver.dialect is junos.DIALECT and driver.communicator.dialect is driver.dialect
-    assert BUILTIN[1].communicator.capabilities == {"show", "batch", "edit", "confirm", "commit_status"}
+    assert BUILTIN[1].communicator.capabilities == {"show", "batch", "edit", "confirm", "commit_status", "commit_confirmed"}
 
 
 def test_a_new_registry_holds_the_built_ins_and_nothing_else():
