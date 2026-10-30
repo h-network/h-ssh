@@ -66,12 +66,19 @@ def test_hssh_user_beats_the_login_name(cli_run, monkeypatch):
     assert specs[0].credentials.username == "env"
 
 
-@pytest.mark.xfail(strict=True, reason="config 'user' is filled into args.user before HSSH_USER is read, so the file beats the variable")
 def test_hssh_user_beats_the_config_file(cli_run, files, monkeypatch):
     _, config = files
     monkeypatch.setenv("HSSH_USER", "env")
     _, specs, _, _ = cli_run(R1, *BASE, "--config", config)
     assert specs[0].credentials.username == "env"
+
+
+def test_a_run_file_user_beats_hssh_user(cli_run, tmp_path, monkeypatch):
+    run = tmp_path / "run.yaml"
+    run.write_text("user: file\n")
+    monkeypatch.setenv("HSSH_USER", "env")
+    _, specs, _, _ = cli_run(R1, *BASE, "--run", str(run))
+    assert specs[0].credentials.username == "file"
 
 
 def test_the_password_is_hssh_password_and_never_prompted_off_a_terminal(cli_run, monkeypatch):

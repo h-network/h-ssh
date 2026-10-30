@@ -170,6 +170,8 @@ def typed_dests(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
 
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, str]) -> None:
     """Fill options the command line and run file left unset: config file, then the built-in default."""
+    if args.user is None:
+        args.user = os.environ.get("HSSH_USER") or None
     for key, fallback in CONFIG_DEFAULTS.items():
         if getattr(args, key, None) is not None:
             continue
@@ -213,8 +215,8 @@ def resolve_mode(args: argparse.Namespace) -> Mode:
 
 
 def resolve_credentials(args: argparse.Namespace) -> Credentials:
-    """The user from flags or config, else the login name; the password from HSSH_PASSWORD or a terminal prompt."""
-    user = args.user or os.environ.get("HSSH_USER") or default_username()
+    """The user as resolved (flag, run file, HSSH_USER, config), else the login name; the password from HSSH_PASSWORD or a prompt."""
+    user = args.user or default_username()
     password = os.environ.get("HSSH_PASSWORD")
     if password is None and sys.stdin.isatty():
         password = getpass.getpass(f"Password for {user}: ") or None
