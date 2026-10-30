@@ -149,6 +149,8 @@ class Scheduler:
             attempt += 1
         status: TargetStatus = "ok" if tried.verdict is None else "failed"
         ops = tried.operations
+        if run.stopping.is_set() and self._interrupted_connect(ops):
+            status = "skipped"
         try:
             for seq, op in enumerate(ops):
                 self.recorder.result(run.run_id, target, driver.name, seq, op)
@@ -175,8 +177,13 @@ class Scheduler:
         try:
             session = await asyncio.wait_for(self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy),
                                              timeouts.connect + timeouts.setup + GRACE_SECONDS)
-        except (Fault, asyncio.TimeoutError) as e:
-            f = e if isinstance(e, Fault) else Fault(FaultKind.TIMEOUT, "open has not returned within its budget", True)
+        except (Fault, asyncio.TimeoutError, asyncio.CancelledError) as e:
+            if isinstance(e, Fault):
+                f = e
+            elif isinstance(e, asyncio.TimeoutError):
+                f = Fault(FaultKind.TIMEOUT, "open has not returned within its budget", True)
+            else:
+                f = Fault(FaultKind.LOCAL, "interrupted while connecting", False)
             opened = OperationResult(OPEN, f, started, int((time.monotonic() - t0) * 1000))
             verdict = self._judge(spec, driver, opened, attempt)
             self.policy.settle(target, verdict)
@@ -215,6 +222,11 @@ class Scheduler:
         if spec.mode == "confirm":
             return [await lifecycle.confirm(comm, session, spec.timeouts)]
         return [await lifecycle.commit_history(comm, session, spec.timeouts)]
+
+    @staticmethod
+    def _interrupted_connect(ops: list[OperationResult]) -> bool:
+        """A connect the interrupt cut short: the only operation is an open fault that reached nothing (never message text)."""
+        return len(ops) == 1 and ops[0].command == OPEN and isinstance(ops[0].outcome, Fault) and not ops[0].outcome.reached_device
 
     def _judge(self, spec: RunSpec, driver: Driver, op: OperationResult, attempt: int) -> Verdict:
         """The policy's verdict on a failed operation; a run reads when its mode and every command do."""
