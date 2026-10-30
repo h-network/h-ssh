@@ -560,6 +560,11 @@ one in-process lock, and reserves the device before returning `(True, "ok")`. A 
 returns `(False, reason)` without a reservation or login count. The sliding window counts
 admitted logins in the last 60 seconds using monotonic time. `login=False` still checks
 cooldowns and active reservations but neither checks nor consumes the login budget.
+`count_login(target)` accounts for a further login inside an existing borrow, using the
+same window and `(allowed, reason)` result as admission. It never changes the active
+reservation or rechecks cooldowns; a full window refuses the login without counting it.
+It raises `OSError` when the gate is closed or has latched an unavailable state. The
+orchestrator calls it immediately before reopening a session within the borrow.
 `release_device` removes the reservation. `holds(targets)` returns cooldown reasons by
 target name without reserving devices or counting logins, so the orchestrator can exclude
 held targets before probing. Active reservations and login history are local to the gate

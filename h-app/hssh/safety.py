@@ -78,13 +78,23 @@ class SafetyGate:
             if key in self._active:
                 return False, "active connection"
             if login:
-                now = time.monotonic()
-                attempts = [when for when in self._attempts.get(key, []) if now - when < 60]
-                self._attempts[key] = attempts
-                if len(attempts) >= self.settings.rate_limit:
-                    return False, f"rate limited {len(attempts)}/{self.settings.rate_limit}"
-                attempts.append(now)
+                allowed, reason = self.count_login(target)
+                if not allowed:
+                    return False, reason
             self._active.add(key)
+            return True, "ok"
+
+    def count_login(self, target: Target) -> tuple[bool, str]:
+        """Count a login within an existing borrow without changing its reservation."""
+        with self._lock:
+            self._ready()
+            key = _key(target)
+            now = time.monotonic()
+            attempts = [when for when in self._attempts.get(key, []) if now - when < 60]
+            self._attempts[key] = attempts
+            if len(attempts) >= self.settings.rate_limit:
+                return False, f"rate limited {len(attempts)}/{self.settings.rate_limit}"
+            attempts.append(now)
             return True, "ok"
 
     def holds(self, targets: Sequence[Target]) -> dict[str, str]:
