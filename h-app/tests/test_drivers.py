@@ -169,7 +169,6 @@ def test_an_entry_point_claiming_a_registered_name_is_broken_and_the_built_in_st
     assert registry.get("junos@netconf") is BUILTIN[0]
 
 
-@pytest.mark.xfail(strict=True, reason="defect: a list is registered driver by driver, so the clean ones before a taken name stay registered")
 def test_an_entry_point_is_taken_whole_or_not_at_all(entry_points):
     entry_points.append(ep("taken", "tests.fixtures.hssh_dummy:TAKEN"))
     registry = Registry()
