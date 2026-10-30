@@ -21,6 +21,10 @@ CLOSE_WAIT = 1.0
 _SECRET = secrets.token_bytes(32)
 
 
+class LoginRefused(Exception):
+    """The gate refused a further login inside a borrow; the reason is the message."""
+
+
 def session_key(driver: Driver, target: Target, creds: Credentials, host_key_policy: HostKeyPolicy = "off") -> Hashable:
     """One session is its driver, host, the port the connection uses, user, host-key policy and credential; the credential as a process-secret HMAC, so the key never holds it."""
     port = target.port if target.port is not None else driver.communicator.default_port
@@ -62,8 +66,8 @@ class SessionManager:
         return entry is not None and not entry.in_use and entry.session is not None
 
     async def acquire(self, driver: Driver, target: Target, creds: Credentials, timeouts: Timeouts,
-                      host_key_policy: HostKeyPolicy) -> Session:
-        """A session to `target`: a kept idle one once reuse() vouches for it, else communicator.open() on the thread pool; a key in use is waited for."""
+                      host_key_policy: HostKeyPolicy, login: Callable[[], str | None] = lambda: None) -> Session:
+        """A session to `target`: a kept idle one once reuse() vouches for it, else communicator.open() on the thread pool; a key in use is waited for. `login` is asked before an open that replaces a kept session: a reason refuses it (LoginRefused)."""
         key = session_key(driver, target, creds, host_key_policy)
         comm = driver.communicator
         async with self._cond:
@@ -79,6 +83,9 @@ class SessionManager:
                 return entry.session
             self._start(_Close(target.name, driver.name), comm.discard, entry.session)
             entry.session = None
+            if (reason := login()) is not None:
+                await self._drop(key)
+                raise LoginRefused(reason)
         await self._make_room()
         try:
             entry.session = await asyncio.to_thread(comm.open, target, creds, timeouts, host_key_policy)

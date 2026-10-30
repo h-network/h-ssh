@@ -20,7 +20,7 @@ from hssh.orchestrator.defaults import GRACE_SECONDS, check_edit, complete, fit_
 from hssh.orchestrator.lifecycle import EditLifecycle, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
-from hssh.orchestrator.sessions import SessionManager, session_key
+from hssh.orchestrator.sessions import LoginRefused, SessionManager, session_key
 
 READ_MODES = ("show", "batch", "structured", "commit_status")
 DISCARDING = (FaultKind.TIMEOUT, FaultKind.SESSION_LOST, FaultKind.OUTCOME_UNKNOWN)
@@ -234,8 +234,13 @@ class Scheduler:
             return _Attempt([opened], Verdict(Action.SKIP))
         run.steps[index] = OPEN
         try:
-            session = await asyncio.wait_for(self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy),
-                                             timeouts.connect + timeouts.setup + GRACE_SECONDS)
+            session = await asyncio.wait_for(
+                self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy, lambda: self.policy.login(device)),
+                timeouts.connect + timeouts.setup + GRACE_SECONDS)
+        except LoginRefused as e:
+            opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate: {e}", False), started, 0)
+            self.policy.settle(device, None)
+            return _Attempt([opened], Verdict(Action.SKIP))
         except (Fault, asyncio.TimeoutError, asyncio.CancelledError) as e:
             if isinstance(e, Fault):
                 f = e
@@ -327,6 +332,8 @@ class Scheduler:
                                     host_key_policy=spec.host_key_policy)
         borrow.session = None
         run.steps[index] = OPEN
+        if (reason := self.policy.login(self._device(target, driver))) is not None:
+            raise Fault(FaultKind.LOCAL, f"safety gate: {reason}", False)
         try:
             borrow.session = await asyncio.wait_for(
                 self.sessions.acquire(driver, target, spec.credentials, spec.timeouts, spec.host_key_policy),

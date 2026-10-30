@@ -323,7 +323,9 @@ returned by then is that target's `TIMEOUT` fault, and its thread is left to fin
 run independently, and one target's failure does not affect another's. A `TIMEOUT` on one command of a batch ends the
 use of that session before the next command: it is torn down at once, and the rest of the batch goes on under the read
 policy on a fresh session, one more login; a `REFUSED` reply continues on the same session and `SESSION_LOST` still ends
-the batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts.
+the batch. Every open that is not a borrow's first (that fresh session, or an open after a kept session fails its reuse
+check) is counted by the safety gate's `count_login` first: a full window refuses it as a `LOCAL` fault, "safety gate: …",
+which skips the target at the start of a borrow and fails it mid-batch. The session manager's reuse check runs under a 5 s budget and its release cleanup under two command timeouts.
 
 ### 5.3 Edit lifecycle
 
