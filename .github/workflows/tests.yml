@@ -1,0 +1,93 @@
+name: tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Each job runs in a plain python:<version> container and checks out with git.
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    container: python:${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - name: Check out ${{ github.ref }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git init -q .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+          git remote remove origin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install with the dev extras
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install -q -e '.[dev]'
+      - name: Unit suite (no devices needed)
+        run: |
+          useradd -m t
+          chown -R t "$PWD"
+          runuser -u t -- env HOME=/home/t python -m pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    container: python:3.12
+    steps:
+      - name: Check out ${{ github.ref }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git init -q .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+          git remote remove origin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Undefined names, redefinitions, syntax errors
+        run: |
+          pip install -q ruff
+          ruff check --select E9,F63,F7,F82,F821,F823,F811 h-app/hssh h-app/tests
+
+  install:
+    runs-on: ubuntu-latest
+    container: python:3.12
+    steps:
+      - name: Check out ${{ github.ref }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git init -q .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+          git remote remove origin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: A clean install, as pip gives it
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q .
+          /tmp/venv/bin/h-ssh --help >/dev/null
+          /tmp/venv/bin/h-ssh --list-profiles
+          rc=0
+          /tmp/venv/bin/h-ssh --no-store --no-probe --transport netconf --user u --target x:127.0.0.1:junos \
+              --session-timeout 1 --retries 0 -sC "show version" >/tmp/out 2>/tmp/err || rc=$?
+          test "$rc" -eq 1
+          grep -q 'x: FAIL open: UNREACHABLE .*Connection refused' /tmp/out
+          grep -q '^\[h-ssh\] {' /tmp/err
+          ! grep -q Traceback /tmp/err
+          rc=0
+          /tmp/venv/bin/h-ssh --no-store --transport netconf --user u --target x:127.0.0.1:junos \
+              --session-timeout 1 --retries 0 -sC "show version" >/tmp/out 2>/tmp/err || rc=$?
+          test "$rc" -eq 1
+          grep -q 'x: FAIL open: UNREACHABLE 127\.0\.0\.1:830: Connect call failed' /tmp/out
+          grep -q '^\[h-ssh\] {' /tmp/err
+          ! grep -q Traceback /tmp/err

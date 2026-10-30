@@ -9,8 +9,15 @@ description = "Operational commands and configuration changes across fleets of n
 requires-python = ">=3.10"
 dependencies = ["junos-eznc"]
 
+[project.optional-dependencies]
+dev = ["pytest"]
+
 [project.scripts]
 h-ssh = "hssh.frontends.cli:main_sync"
 
 [tool.setuptools.packages.find]
 where = ["h-app"]
+include = ["hssh*"]
+
+[tool.pytest.ini_options]
+testpaths = ["h-app/tests"]
