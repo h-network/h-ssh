@@ -1,60 +1,26 @@
-# Python virtual environment
-.venv/
-.Venv/
-venv/
-env/
-ENV/
-
-# Python cache
+# Byte-compiled / cached
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
 
-# Distribution / packaging
-.Python
+# Packaging
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
 *.egg
 
-# PyCharm
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors
 .idea/
-
-# VS Code
 .vscode/
-
-# macOS
-.DS_Store
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# =============================================================================
-# PROJECT-SPECIFIC: Protect sensitive network data
-# =============================================================================
-
-# Claude Code local state (agent worktrees, local settings)
-.claude/
-
-# Local scripts and data of whoever uses h-ssh from a checkout (not part of the tool)
-scripts/
-
-# the result store a run leaves in the directory it ran from
-h-ssh.db
-h-ssh.db-wal
-h-ssh.db-shm
+*.swp

@@ -1,3 +1,0 @@
-{
-  "whoami": {"command": "show dummy identity", "description": "who the dummy thinks it is"}
-}

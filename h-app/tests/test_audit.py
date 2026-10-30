@@ -1,496 +1,324 @@
-"""Tests for hssh.audit module."""
-
+import errno
+import fcntl
 import json
+import multiprocessing
 import os
-import tempfile
-import threading
-import time
-from pathlib import Path
+import re
+import stat
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
-from hssh.audit import write_audit_entry, redact_secrets, redact_values, secure_append, secure_write, probe_append
+from hssh import audit
+from hssh.dialects.junos import DIALECT
+from hssh.model import EditSettings, Fault, FaultKind, OperationResult, Result, Target
 
 
-def test_write_audit_entry_basic():
-    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
-        tmp = f.name
-
-    try:
-        ok = write_audit_entry(
-            path=tmp,
-            device="R1",
-            host="10.0.1.1",
-            vendor="junos",
-            mode="edit-cmd",
-            payload="set system host-name R1",
-            ok=True,
-            diff="[edit]\n+ host-name R1;",
-            commit_confirmed=10,
+@pytest.fixture
+def write_entry(tmp_path):
+    def write(**overrides):
+        arguments = dict(
+            path=str(tmp_path / "audit.jsonl"), run_id=42, user="operator",
+            target=Target("R1", "192.0.2.1", "junos", "netconf"), driver="junos@netconf",
+            dialect=DIALECT, action="commit", edit=EditSettings(True, 2, "maintenance"),
+            operation=OperationResult("commit", Result("complete"), "2026-10-30T00:00:00+00:00", 17),
+            diff="+ host-name R1;",
         )
-        assert ok is True
-
-        # Check file contents
-        with open(tmp, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        assert len(lines) == 1
-        record = json.loads(lines[0])
-        assert record["device"] == "R1"
-        assert record["host"] == "10.0.1.1"
-        assert record["vendor"] == "junos"
-        assert record["mode"] == "edit-cmd"
-        assert record["payload"] == "set system host-name R1"
-        assert record["ok"] is True
-        assert record["diff"] == "[edit]\n+ host-name R1;"
-        assert record["commit_confirmed"] == 10
-        assert "timestamp" in record
-
-        # Check permissions
-        mode = os.stat(tmp).st_mode & 0o777
-        assert mode == 0o600
-    finally:
-        Path(tmp).unlink(missing_ok=True)
+        arguments.update(overrides)
+        audit.write_audit_entry(**arguments)
+        return json.loads((tmp_path / "audit.jsonl").read_text().splitlines()[-1])
+    return write
 
 
-def test_audit_secret_redaction():
-    secret_text = 'set system root-authentication encrypted-password "$9$secret123" secret 5 $1$foobar'
-    redacted = redact_secrets(secret_text)
-    assert "$9$secret123" not in redacted
-    assert "$1$foobar" not in redacted
-    assert "[REDACTED]" in redacted
-
-    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
-        tmp = f.name
-    try:
-        write_audit_entry(
-            path=tmp,
-            device="R1",
-            host="10.0.1.1",
-            vendor="junos",
-            mode="edit-cmd",
-            payload='password: "supersecretpassword"',
-            ok=True,
-            diff='encrypted-password "$9$something"',
-        )
-        with open(tmp, "r", encoding="utf-8") as f:
-            record = json.loads(f.readline())
-        assert "supersecretpassword" not in record["payload"]
-        assert "$9$something" not in record["diff"]
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-
-def test_write_audit_concurrent_locking():
-    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
-        tmp = f.name
-
-    try:
-        def worker(idx):
-            for i in range(20):
-                write_audit_entry(
-                    path=tmp,
-                    device=f"R{idx}",
-                    host=f"10.0.1.{idx}",
-                    vendor="junos",
-                    mode="edit-cmd",
-                    payload=f"step {i}",
-                    ok=True,
-                )
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        with open(tmp, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        assert len(lines) == 100
-        # Every line must be valid JSON
-        for line in lines:
-            rec = json.loads(line)
-            assert "device" in rec
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-
-def test_audit_graceful_failure(tmp_path):
-    # Attempting to write to an invalid path should return False without raising.
-    # The parent is a regular file, so this fails for root too (CI runs as root).
-    (tmp_path / "not_a_dir").write_text("")
-    ok = write_audit_entry(
-        path=str(tmp_path / "not_a_dir" / "audit.jsonl"),
-        device="R1",
-        host="10.0.1.1",
-        vendor="junos",
-        mode="show",
-        payload="show version",
-        ok=True,
-    )
-    assert ok is False
-
-
-def test_audit_extended_secret_redaction():
-    """M3: Audit redacts community, pre-shared-key, ascii-text, hex keys, and error messages."""
-    text_samples = [
-        ('set snmp community public authorization read-only', 'public'),
-        ('snmp-server community secret123 RO', 'secret123'),
-        ('pre-shared-key ascii-text "$9$secret"', '$9$secret'),
-        ('pre-shared-key hexadecimal 1234abcd', '1234abcd'),
-        ('pre-shared-key rawsecret', 'rawsecret'),
-        ('ascii-text plainsecret', 'plainsecret'),
-        ('hex-key deadbeef1234', 'deadbeef1234'),
-        ('hexadecimal abcd5678', 'abcd5678'),
-    ]
-    for sample, secret in text_samples:
-        redacted = redact_secrets(sample)
-        assert secret not in redacted, f"Failed to redact {secret} from {sample}"
-        assert "[REDACTED]" in redacted
-
-    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
-        tmp = f.name
-    try:
-        write_audit_entry(
-            path=tmp,
-            device="R1",
-            host="10.0.1.1",
-            vendor="junos",
-            mode="edit-cmd",
-            payload='set snmp community secretcomm',
-            ok=False,
-            error='failed on pre-shared-key ascii-text "$9$badpass"',
-        )
-        with open(tmp, "r", encoding="utf-8") as f:
-            record = json.loads(f.readline())
-        assert "secretcomm" not in record["payload"]
-        assert "$9$badpass" not in record["error"]
-        assert "[REDACTED]" in record["payload"]
-        assert "[REDACTED]" in record["error"]
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-
-def test_redact_values_keeps_the_shape_and_loses_the_secrets():
-    """A --log record: strings get redact_secrets(), a reply carried as data
-    loses the whole value under a secret-named key, the rest is untouched."""
-    record = {
-        "command": "set snmp community public authorization read-only",
-        "output": {"configuration": {"system": {"root-authentication": {
-            "encrypted-password": [{"data": "$9$hash"}]}}}},
-        "commands": [{"ok": True, "output": 'pre-shared-key ascii-text "$9$psk"'},
-                     {"ok": False, "error": "password: hunter2 rejected"}],
-        "ok": True, "duration_ms": 3, "dry_run": False,
-    }
-    out = redact_values(record)
-    assert out["command"] == "set snmp community [REDACTED] authorization read-only"
-    assert out["output"]["configuration"]["system"]["root-authentication"]["encrypted-password"] == "[REDACTED]"
-    assert out["commands"][0]["output"] == "pre-shared-key ascii-text [REDACTED]"
-    assert out["commands"][1]["error"] == "password: [REDACTED] rejected"
-    assert (out["ok"], out["duration_ms"], out["dry_run"]) == (True, 3, False)
-    for secret in ("public", "$9$hash", "$9$psk", "hunter2"):
-        assert secret not in json.dumps(out)
-
-
-def test_every_directory_made_for_a_log_is_private_whatever_the_umask(tmp_path):
-    """The parents made for the audit log, --log and a --save-output file
-    were the umask's, 0777 under umask 000 (#149): each one made is 0700."""
-    old = os.umask(0o000)
-    try:
-        secure_append(str(tmp_path / "a" / "b" / "audit.jsonl"), "{}\n")
-        secure_write(str(tmp_path / "c" / "d" / "R1.output"), "x")
-        probe_append(str(tmp_path / "e" / "f" / "run.jsonl"))
-    finally:
-        os.umask(old)
-    made = ("a", "a/b", "c", "c/d", "e", "e/f")
-    assert [os.stat(tmp_path / d).st_mode & 0o777 for d in made] == [0o700] * 6
-    assert [os.stat(tmp_path / f).st_mode & 0o777 for f in ("a/b/audit.jsonl", "c/d/R1.output", "e/f/run.jsonl")] == [0o600] * 3
-
-
-def test_secure_append_is_0600_whatever_the_umask(tmp_path):
-    old = os.umask(0o022)
-    try:
-        path = tmp_path / "logs" / "run.jsonl"
-        secure_append(str(path), '{"a": 1}\n')
-        secure_append(str(path), '{"b": 2}\n')
-    finally:
-        os.umask(old)
-    assert os.stat(path).st_mode & 0o777 == 0o600
-    assert path.read_text() == '{"a": 1}\n{"b": 2}\n'
-
-
-def test_audit_show_diff_suppressed():
-    """M3: Show operations do not record diff."""
-    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
-        tmp = f.name
-    try:
-        write_audit_entry(
-            path=tmp,
-            device="R1",
-            host="10.0.1.1",
-            vendor="junos",
-            mode="show",
-            payload="show version",
-            ok=True,
-            diff=None,
-        )
-        with open(tmp, "r", encoding="utf-8") as f:
-            record = json.loads(f.readline())
-        assert "diff" not in record
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-
-
-# --- #41: the log file must be a plain file of our own --------------------------
-
-def test_secure_append_refuses_a_planted_symlink(tmp_path):
-    """A symlink at the --audit-log/--log path once redirected the trail into,
-    and chmod'ed 0600, whatever it pointed at."""
-    victim = tmp_path / "victim.txt"
-    victim.write_text("victim content\n")
-    os.chmod(victim, 0o644)
-    link = tmp_path / "audit.jsonl"
-    link.symlink_to(victim)
-    with pytest.raises(OSError, match="not a plain file"):
-        secure_append(str(link), '{"written": "through the symlink"}\n')
-    assert victim.read_text() == "victim content\n"
-    assert oct(victim.stat().st_mode & 0o777) == "0o644"
-
-
-def test_secure_append_refuses_a_planted_fifo_without_blocking(tmp_path):
-    """A FIFO at the log path once blocked the whole fleet run at open()."""
-    fifo = tmp_path / "audit.jsonl"
-    os.mkfifo(fifo)
-    t0 = time.monotonic()
-    with pytest.raises(OSError):
-        secure_append(str(fifo), "x\n")
-    assert time.monotonic() - t0 < 2
-
-
-def test_secure_append_finishes_a_short_write(tmp_path, monkeypatch):
+def _append_worker(path, worker, barrier):
     real_write = os.write
-    calls = []
-
-    def short_write(fd, data):
-        calls.append(len(data))
-        return real_write(fd, data[:5])     # the kernel wrote less than asked
-    monkeypatch.setattr(os, "write", short_write)
-    path = tmp_path / "run.jsonl"
-    secure_append(str(path), "0123456789abcdef\n")
-    assert path.read_text() == "0123456789abcdef\n" and len(calls) > 1
-
-# --- #42: the forms that leaked -------------------------------------------------
-
-LEAKED_FORMS = [
-    'set system login user bob authentication plain-text-password-value hunter2',
-    'set protocols ospf area 0.0.0.0 interface ge-0/0/0 authentication md5 1 key mykey',
-    'set system ntp authentication-key 1 value "$9$NTPKEY"',
-    '    authentication-key 1 type md5 value "$9$NTPKEY"; ## SECRET-DATA',
-    '    md5 1 key "$9$OSPFKEY"; ## SECRET-DATA',
-    '+   authentication-key "$9$DIFFKEY"; ## SECRET-DATA',
-    'set snmp v3 usm local-engine user u privacy-aes128 privacy-key "$9$V3PRIV"',
-    'username admin secret sha512 $6$EOSHASH',
-    'enable password sha512 $6$ENHASH',
-    'tacacs-server key 7 0F1A2B',
-    'tacacs-server host 1.1.1.1 key MYKEY',
-    'radius-server host 1.1.1.1 key 7 ABCD',
-    'ntp authentication-key 1 md5 7 DEAD',
-    'ip ospf message-digest-key 1 md5 7 BEEF',
-    'key-string 7 CAFE',
-    'crypto isakmp key MYPSK address 1.2.3.4',
-]
-SECRETS = ["hunter2", "mykey", "$9$NTPKEY", "$9$OSPFKEY", "$9$DIFFKEY", "$9$V3PRIV", "$6$EOSHASH", "$6$ENHASH",
-           "0F1A2B", "MYKEY", "ABCD", "DEAD", "BEEF", "CAFE", "MYPSK"]
+    barrier.wait(timeout=5)
+    with patch.object(audit.os, "write", side_effect=lambda fd, data: real_write(fd, data[:97])):
+        for sequence in range(20):
+            text = json.dumps({"worker": worker, "seq": sequence, "text": "é☃" * 512}, ensure_ascii=False)
+            audit.secure_append(path, text + "\n")
 
 
-@pytest.mark.parametrize("line", LEAKED_FORMS)
-def test_every_form_that_leaked_is_redacted(line):
-    out = redact_secrets(line)
-    assert "[REDACTED]" in out and not any(s in out for s in SECRETS), out
+def _try_append(path, result):
+    try:
+        audit.secure_append(path, "{}\n")
+    except OSError as error:
+        result.send(str(error))
+    else:
+        result.send(None)
+    finally:
+        result.close()
 
 
-def test_the_type_words_stay_and_only_the_value_goes():
-    assert redact_secrets('ntp authentication-key 1 md5 7 DEAD') == 'ntp authentication-key 1 md5 7 [REDACTED]'
-    assert redact_secrets('ip ospf message-digest-key 1 md5 7 BEEF') == 'ip ospf message-digest-key 1 md5 7 [REDACTED]'
-    assert redact_secrets('    md5 1 key "$9$X"; ## SECRET-DATA') == '    md5 1 key [REDACTED]; ## SECRET-DATA'
-
-
-def test_descriptions_with_the_word_key_are_left_alone():
-    line = 'set interfaces ge-0/0/0 description "key customer uplink"'
-    assert redact_secrets(line) == line
-    assert redact_secrets("set system host-name R1") == "set system host-name R1"
-
-
-def test_format_xml_replies_are_redacted_element_by_element():
-    xml = ("<rpc-reply><configuration><system><root-authentication><encrypted-password>$6$ROOTHASH"
-           "</encrypted-password></root-authentication><tacplus-server><secret>$9$TACSEC</secret></tacplus-server>"
-           "<login><user><authentication><plain-text-password-value>hunter2</plain-text-password-value>"
-           "</authentication></user></login></system><snmp><community><name>public</name><authorization>read-only"
-           "</authorization></community></snmp><protocols><ospf><md5><name>1</name><key>$9$K</key></md5></ospf>"
-           "</protocols></configuration></rpc-reply>")
-    out = redact_secrets(xml)
-    assert out.count("[REDACTED]") == 5
-    for secret in ("$6$ROOTHASH", "$9$TACSEC", "hunter2", "public", "$9$K"):
-        assert secret not in out
-    assert "<authorization>read-only</authorization>" in out and "<name>1</name>" in out
-
-
-def test_json_replies_lose_the_keys_that_carry_secrets():
-    data = {"configuration": {"protocols": {"ospf": {"md5": [{"name": 1, "key": "$9$X"}]}},
-                              "snmp": {"v3": {"privacy-key": "$9$Y"}},
-                              "login": {"plain-text-password-value": "hunter2"},
-                              "interfaces": {"description": "key customer uplink"}}}
-    out = redact_values(data)
-    assert out["configuration"]["protocols"]["ospf"]["md5"][0] == {"name": 1, "key": "[REDACTED]"}
-    assert out["configuration"]["snmp"]["v3"]["privacy-key"] == "[REDACTED]"
-    assert out["configuration"]["login"]["plain-text-password-value"] == "[REDACTED]"
-    assert out["configuration"]["interfaces"]["description"] == "key customer uplink"
-
-
-# --- #151: what the review's corpus found ---------------------------------------------
-
-LEAKED_TOO = [
-    # IOS SNMPv3 user: the auth and the priv passwords
-    ('snmp-server user admin netops v3 auth sha AUTHPASS priv aes 128 PRIVPASS', ["AUTHPASS", "PRIVPASS"]),
-    ('snmp-server user admin netops v3 auth md5 AUTHPASS', ["AUTHPASS"]),
-    # IOS trap and inform hosts: the community after the version words
-    ('snmp-server host 10.0.0.1 version 2c C0MMUNITY', ["C0MMUNITY"]),
-    ('snmp-server host 10.0.0.1 traps version 2c C0MMUNITY udp-port 1162', ["C0MMUNITY"]),
-    ('snmp-server host 10.0.0.1 C0MMUNITY', ["C0MMUNITY"]),
-    # IOS wireless pre-shared key
-    ('wpa-psk ascii 7 0822455D0A16', ["0822455D0A16"]),
-    ('wpa-psk ascii 0 plainpsk', ["plainpsk"]),
-    # Junos: a trap group's name is its community
-    ('set snmp trap-group TRAPGRP targets 10.0.0.1', ["TRAPGRP"]),
-    ('    trap-group TRAPGRP {', ["TRAPGRP"]),
-    # an escaped quote inside the value: the tail after it leaked
-    ('password "abc\\"def"', ["abc", "def"]),
-    ('    secret "ab\\"cd"; ## SECRET-DATA', ["ab", "cd"]),
-]
-
-
-@pytest.mark.parametrize("line, secrets", LEAKED_TOO, ids=[line[:40] for line, _ in LEAKED_TOO])
-def test_the_forms_the_review_found_are_redacted(line, secrets):
-    out = redact_secrets(line)
-    assert "[REDACTED]" in out and not any(s in out for s in secrets), out
-
-
-def test_xml_and_json_names_ending_in_a_secret_word_are_redacted():
-    """--format xml and json replies of `show configuration` kept the type 9
-    values of hello-authentication-key, simple-password and chap-secret: the
-    XML and JSON patterns matched exact names, while the text form of the
-    same config was redacted. A tag or a key is known by its last word."""
-    xml = ("<interface><hello-authentication-key>$9$OSPF</hello-authentication-key></interface>"
-           "<rip><simple-password>$9$RIP</simple-password></rip><ppp><chap-secret>$9$CHAP</chap-secret></ppp>"
-           "<description>key customer uplink</description><keyboard>qwerty</keyboard>")
-    out = redact_secrets(xml)
-    assert out.count("[REDACTED]") == 3 and "$9$" not in out, out
-    assert "<description>key customer uplink</description>" in out and "<keyboard>qwerty</keyboard>" in out
-    data = {"hello-authentication-key": "$9$OSPF", "simple-password": "$9$RIP", "chap-secret": "$9$CHAP",
-            "keyboard": "qwerty", "description": "key customer uplink"}
-    assert redact_values(data) == {"hello-authentication-key": "[REDACTED]", "simple-password": "[REDACTED]",
-                                   "chap-secret": "[REDACTED]", "keyboard": "qwerty",
-                                   "description": "key customer uplink"}
-
-
-def test_a_json_reply_carried_as_text_is_redacted_like_parsed_data():
-    """`show configuration | display json` on junos@ssh and openssh comes
-    back as JSON text, not data, and --log kept the five secrets the tester
-    planted on a cRPD: the key's closing quote put `"encrypted-password" :
-    "$6$…"` out of the `password:` pattern's reach, and redact_values only
-    sees parsed data. A quoted key is known by the last-word rule
-    redact_values uses and its scalar goes, so the text reads as the parsed
-    reply would; the names and key-ids beside the secrets stay."""
-    text = json.dumps({"configuration": {
-        "system": {"login": {"user": [{"name": "t151", "authentication": {"encrypted-password": "$6$ROOT"}}]}},
-        "protocols": {
-            "bgp": {"group": [{"name": "peers", "authentication-key": "$9$BGP"}]},
-            "ospf": {"area": [{"name": "0.0.0.0", "interface": [{"name": "ge-0/0/0.0", "authentication": {
-                "md5": [{"name": 1, "key": "$9$MD5"}], "simple-password": "$9$OSPF"}}]}]},
-            "isis": {"interface": [{"name": "ge-0/0/0.0", "hello-authentication-key": "$9$ISIS"}]}}}},
-        indent=4, separators=(",", " : "))
-    out = redact_secrets(text)
-    for secret in ("$6$ROOT", "$9$BGP", "$9$MD5", "$9$OSPF", "$9$ISIS"):
-        assert secret not in out, out
-    assert json.loads(out) == redact_values(json.loads(text))
-    assert '"name" : "t151"' in out and '"name" : 1' in out and out.count('"[REDACTED]"') == 5
-    compact = '{"password":"x","api_token":123,"keyboard":"qwerty","key":null,"key-chain":"K"}'
-    assert redact_secrets(compact) == ('{"password":"[REDACTED]","api_token":"[REDACTED]","keyboard":"qwerty",'
-                                       '"key":"[REDACTED]","key-chain":"K"}')
-
-
-def test_what_is_not_a_secret_stays():
-    """Over-redaction the review found: a `key N` line took the next line's
-    first word for its value (a key-string keyword, a cryptographic-algorithm),
-    a BGP community's name went, and a quoted command lost its closing
-    quote. SNMP communities still go, in every form they are written. A
-    description with the word password in it still loses the word after
-    it: sparing it opened leaks (a secret whose value has the word
-    description in it), and a log that says too little beats one that
-    says a secret."""
-    chain = ("key chain K\n key 1\n  key-string 7 0822455D0A16\n  cryptographic-algorithm hmac-sha-256\n"
-             " key 2\n  key-string 7 0822455D0A17")
-    assert redact_secrets(chain) == ("key chain K\n key 1\n  key-string 7 [REDACTED]\n  cryptographic-algorithm hmac-sha-256\n"
-                                     " key 2\n  key-string 7 [REDACTED]")
-    for line in ("set policy-options community CUST members 65000:100",
-                 "    community CUST members [ 65000:100 65000:200 ];"):
-        assert redact_secrets(line) == line
-    assert redact_secrets("'show password X'") == "'show password [REDACTED]'"
-    assert redact_secrets('set interfaces ge-0/0/0 description "password reset portal"') == \
-        'set interfaces ge-0/0/0 description "password [REDACTED] portal"'
-    assert redact_secrets("set snmp community public authorization read-only") == \
-        "set snmp community [REDACTED] authorization read-only"
-    assert redact_secrets("    community public {") == "    community [REDACTED] {"
-    assert redact_secrets("snmp-server community C0MM RO") == "snmp-server community [REDACTED] RO"
-
-
-def test_a_quoted_credential_command_is_redacted_and_a_description_spares_no_secret():
-    """#151 review: the openssh transport repeats a refused command in
-    quotes in its error, and a credential in it must still go, the closing
-    quote kept. Sparing a description's words opened leaks (a secret whose
-    value has the word description in it), so none is spared: the keyword
-    patterns apply wherever the keyword is, a description included."""
-    assert redact_secrets("'password hunter2' was refused by the device: bad command") == \
-        "'password [REDACTED]' was refused by the device: bad command"
-    assert redact_secrets('"set system login user bob authentication plain-text-password-value hunter2" was refused') == \
-        '"set system login user bob authentication plain-text-password-value [REDACTED]" was refused'
-    assert redact_secrets('    description "customer password reset portal";\n    encrypted-password "$9$x";') == \
-        '    description "customer password [REDACTED] portal";\n    encrypted-password [REDACTED];'
-    assert redact_values({"description": "customer password reset portal", "password": "x"}) == \
-        {"description": "customer password [REDACTED] portal", "password": "[REDACTED]"}
-    assert redact_secrets('password "description hunter2"') == 'password [REDACTED]'
-    assert redact_secrets('encrypted-password "has description words";') == 'encrypted-password [REDACTED];'
-    assert redact_secrets('<password>description hunter2</password>') == '<password>[REDACTED]</password>'
-    assert redact_secrets('snmp-server user admin netops v3 auth sha description priv aes 128 PRIVPASS') == \
-        'snmp-server user admin netops v3 auth sha [REDACTED] priv aes 128 [REDACTED]'
-    assert redact_secrets('    secret "description hunter2"; ## SECRET-DATA') == '    secret [REDACTED]; ## SECRET-DATA'
-    assert redact_secrets('encrypted-password "has description words";') == 'encrypted-password [REDACTED];'
-    assert redact_secrets('<password>description hunter2</password>') == '<password>[REDACTED]</password>'
-    assert redact_secrets('snmp-server user admin netops v3 auth sha description priv aes 128 PRIVPASS') == \
-        'snmp-server user admin netops v3 auth sha [REDACTED] priv aes 128 [REDACTED]'
-    assert redact_secrets('    secret "description hunter2"; ## SECRET-DATA') == '    secret [REDACTED]; ## SECRET-DATA'
-
-
-def test_the_comment_is_redacted_too(tmp_path):
-    """An entry's `comment` was written as given, where every other text of
-    the entry is redacted; a comment can quote the secret it rotated."""
+def test_appends_preserve_existing_json_lines(tmp_path):
     path = tmp_path / "audit.jsonl"
-    write_audit_entry(path=str(path), device="R1", host="10.0.1.1", vendor="junos", mode="edit-cmd",
-                      payload="set system host-name R1", ok=True, comment="rotated: password hunter2")
-    record = json.loads(path.read_text())
-    assert record["comment"] == "rotated: password [REDACTED]" and "hunter2" not in path.read_text()
+    path.write_text('{"before": true}\n')
+    audit.secure_append(str(path), '{"after": true}\n')
+    assert path.read_text() == '{"before": true}\n{"after": true}\n'
 
 
-def test_secure_write_is_0600_and_refuses_a_symlink(tmp_path):
-    from hssh.audit import secure_write
-    os.umask(0o022)
-    path = tmp_path / "R1.output"
-    secure_write(str(path), "show configuration\n")
-    assert oct(path.stat().st_mode & 0o777) == "0o600" and path.read_text() == "show configuration\n"
-    secure_write(str(path), "again\n")
-    assert path.read_text() == "again\n"
-    victim = tmp_path / "victim"; victim.write_text("keep")
-    link = tmp_path / "R2.output"; link.symlink_to(victim)
-    with pytest.raises(OSError):
-        secure_write(str(link), "x")
-    assert victim.read_text() == "keep"
+def test_short_writes_finish_utf8_text(tmp_path, monkeypatch):
+    path = tmp_path / "audit.jsonl"
+    text = '{"text": "é☃"}\n'
+    real_write = os.write
+    monkeypatch.setattr(audit.os, "write", lambda fd, data: real_write(fd, data[:1]))
+    audit.secure_append(str(path), text)
+    assert path.read_bytes() == text.encode("utf-8")
+
+
+def test_lock_covers_every_short_write_and_is_released(tmp_path, monkeypatch):
+    path = tmp_path / "audit.jsonl"
+    rival = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    real_write = os.write
+
+    def write(fd, data):
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(rival, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return real_write(fd, data[:3])
+
+    monkeypatch.setattr(audit.os, "write", write)
+    try:
+        audit.secure_append(str(path), '{"complete": true}\n')
+        fcntl.flock(rival, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(rival)
+    assert path.read_text() == '{"complete": true}\n'
+
+
+def test_concurrent_processes_append_complete_json_records(tmp_path):
+    path = tmp_path / "audit.jsonl"
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(4)
+    workers = [context.Process(target=_append_worker, args=(str(path), worker, barrier)) for worker in range(4)]
+    try:
+        for process in workers:
+            process.start()
+        for process in workers:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+    finally:
+        for process in workers:
+            if process.is_alive():
+                process.kill()
+            if process.pid is not None:
+                process.join(timeout=2)
+                process.close()
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 80
+    assert {(row["worker"], row["seq"]) for row in rows} == {(w, s) for w in range(4) for s in range(20)}
+    assert all(row["text"] == "é☃" * 512 for row in rows)
+
+
+def test_symlink_refusal_leaves_destination_and_mode_untouched(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep\n")
+    victim.chmod(0o644)
+    path = tmp_path / "audit.jsonl"
+    path.symlink_to(victim)
+    with pytest.raises(OSError) as caught:
+        audit.secure_append(str(path), "{}\n")
+    assert str(path) in str(caught.value)
+    assert victim.read_text() == "keep\n"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("with_reader", [False, True])
+def test_fifo_is_refused_without_blocking(tmp_path, with_reader):
+    path = tmp_path / "audit.fifo"
+    os.mkfifo(path)
+    reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK) if with_reader else None
+    context = multiprocessing.get_context("fork")
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(target=_try_append, args=(str(path), send))
+    try:
+        process.start()
+        send.close()
+        assert receive.poll(2), "append blocked on a FIFO"
+        error = receive.recv()
+        process.join(timeout=2)
+        assert process.exitcode == 0
+        assert error is not None and str(path) in error
+        if reader is not None:
+            assert os.read(reader, 1024) == b""
+    finally:
+        if process.is_alive():
+            process.kill()
+        if process.pid is not None:
+            process.join(timeout=2)
+            process.close()
+        receive.close()
+        send.close()
+        if reader is not None:
+            os.close(reader)
+
+
+def test_new_files_are_private_with_permissive_umask(tmp_path):
+    path = tmp_path / "audit.jsonl"
+    previous = os.umask(0)
+    try:
+        audit.secure_append(str(path), "{}\n")
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_existing_file_is_made_private(tmp_path):
+    path = tmp_path / "audit.jsonl"
+    path.write_text("{}\n")
+    path.chmod(0o666)
+    audit.secure_append(str(path), "{}\n")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_private_dir_creates_each_parent_0700(tmp_path):
+    path = tmp_path / "parent" / "child"
+    previous = os.umask(0)
+    try:
+        audit.private_dir(path)
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_existing_parent_permissions_are_unchanged(tmp_path):
+    parent = tmp_path / "existing"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    audit.secure_append(str(parent / "new" / "audit.jsonl"), "{}\n")
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE((parent / "new").stat().st_mode) == 0o700
+
+
+def test_entry_matches_the_audit_schema(write_entry):
+    assert write_entry() == {
+        "time": "2026-10-30T00:00:00+00:00", "run_id": 42, "user": "operator",
+        "target": "R1", "host": "192.0.2.1", "driver": "junos@netconf", "action": "commit",
+        "payload": "", "dry_run": False, "confirmed_minutes": 2, "comment": "maintenance",
+        "diff": "+ host-name R1;", "ok": True, "fault": None,
+    }
+
+
+def test_entry_is_one_json_line_with_embedded_newlines_and_unicode(tmp_path, write_entry):
+    diff = '+ announcement "é☃";\n- announcement "old";\n'
+    assert write_entry(diff=diff)["diff"] == diff
+    data = (tmp_path / "audit.jsonl").read_bytes()
+    assert data.endswith(b"\n") and data.count(b"\n") == 1
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_dry_run_follows_requested_apply_even_on_failure(write_entry, apply):
+    fault = Fault(FaultKind.REFUSED, "refused", True)
+    operation = OperationResult("load", fault, "2026-10-30T00:00:00+00:00", 1)
+    assert write_entry(operation=operation, edit=EditSettings(apply))["dry_run"] is not apply
+
+
+def test_absent_edit_options_are_null(write_entry):
+    row = write_entry(edit=EditSettings(True), diff="")
+    assert row["confirmed_minutes"] is None
+    assert row["comment"] is None
+    assert row["diff"] == ""
+
+
+def test_fault_keeps_kind_reachability_and_full_detail(write_entry):
+    detail = "first diagnostic\nsecond diagnostic"
+    operation = OperationResult("open", Fault(FaultKind.UNREACHABLE, detail, False), "2026-10-30T01:02:03+00:00", 9)
+    row = write_entry(action="probe", operation=operation)
+    assert row["action"] == "probe" and row["time"] == operation.started
+    assert row["ok"] is False
+    assert row["fault"] == {"kind": "UNREACHABLE", "detail": detail, "reached_device": False}
+
+
+def test_diff_redaction_keeps_keyword_and_secret_data_suffix(write_entry):
+    diff = '+ custom-credential "abc\\"tail"; ## SECRET-DATA'
+    row = write_entry(diff=diff)
+    assert row["diff"] == '+ custom-credential [REDACTED]; ## SECRET-DATA'
+
+
+def test_comment_redacts_quoted_credentials(write_entry):
+    edit = EditSettings(True, comment="rotated: 'password hunter2'")
+    row = write_entry(edit=edit)
+    assert row["comment"] == "rotated: 'password [REDACTED]'"
+    assert edit.comment == "rotated: 'password hunter2'"
+
+
+def test_fault_redaction_keeps_surrounding_diagnostic(write_entry):
+    fault = Fault(FaultKind.COMMIT_FAILED, "'password hunter2' was refused\ncheck configuration", True)
+    row = write_entry(operation=OperationResult("commit", fault, "2026-10-30T00:00:00+00:00", 1))
+    assert row["fault"]["detail"] == "'password [REDACTED]' was refused\ncheck configuration"
+    assert fault.detail == "'password hunter2' was refused\ncheck configuration"
+
+
+@pytest.mark.parametrize("field", ["diff", "comment", "fault"])
+def test_json_secret_values_are_masked_in_each_written_field(write_entry, field):
+    text = json.dumps([{"encrypted-password": [{"data": "LISTSECRET"}],
+                        "chap-secret": {"data": "OBJECTSECRET"}, "name": "keep", "enabled": True,
+                        "count": 3, "optional": None, "note": "password WORDSECRET"}])
+    argument = {"diff": {"diff": text}, "comment": {"edit": EditSettings(True, comment=text)},
+                "fault": {"operation": OperationResult("load", Fault(FaultKind.REFUSED, text, True), "start", 1)}}[field]
+    row = write_entry(**argument)
+    redacted = row["fault"]["detail"] if field == "fault" else row[field]
+    assert json.loads(redacted) == [{"encrypted-password": "[REDACTED]", "chap-secret": "[REDACTED]",
+                                     "name": "keep", "enabled": True, "count": 3, "optional": None,
+                                     "note": "password [REDACTED]"}]
+
+
+def test_writer_uses_supplied_dialect_patterns(write_entry):
+    dialect = SimpleNamespace(redaction_patterns=(re.compile(r"(opaque=)(\w+)"),))
+    row = write_entry(dialect=dialect, diff="opaque=PRIVATE; name=keep")
+    assert row["diff"] == "opaque=[REDACTED]; name=keep"
+
+
+def test_failed_open_raises_with_path_instead_of_returning_false(tmp_path, write_entry):
+    parent = tmp_path / "not-a-directory"
+    parent.write_text("keep")
+    path = parent / "audit.jsonl"
+    with pytest.raises(OSError) as caught:
+        write_entry(path=str(path))
+    assert str(path) in str(caught.value)
+    assert "cannot append recording" in str(caught.value)
+    assert parent.read_text() == "keep"
+
+
+def test_disk_full_raises_with_cause_and_releases_lock(tmp_path, monkeypatch, write_entry):
+    def disk_full(fd, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(audit.os, "write", disk_full)
+    with pytest.raises(OSError) as caught:
+        write_entry()
+    path = tmp_path / "audit.jsonl"
+    assert caught.value.errno == errno.ENOSPC
+    assert str(path) in str(caught.value) and "No space left" in str(caught.value)
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
+def test_zero_length_write_raises_instead_of_looping(tmp_path, monkeypatch, write_entry):
+    writes = iter([0, OSError("repeated write after no progress")])
+
+    def no_progress(fd, data):
+        result = next(writes)
+        if isinstance(result, OSError):
+            raise result
+        return result
+
+    monkeypatch.setattr(audit.os, "write", no_progress)
+    with pytest.raises(OSError, match="no progress") as caught:
+        write_entry()
+    assert str(tmp_path / "audit.jsonl") in str(caught.value)
+    assert next(writes).args == ("repeated write after no progress",)
+
+
+def test_lock_failure_is_reported_without_writing(tmp_path, monkeypatch, write_entry):
+    def no_lock(fd, operation):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(audit.fcntl, "flock", no_lock)
+    with pytest.raises(OSError, match="No locks available"):
+        write_entry()
+    assert (tmp_path / "audit.jsonl").read_bytes() == b""

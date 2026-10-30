@@ -1,9 +1,9 @@
-"""Arista EOS: an IOS-shaped CLI with its own shortcut library (eos.json,
-the former commands/arista.json). Structured reads via `| json` come with
-the eos@ssh driver (#83)."""
+from hssh.dialects.base import Dialect
+from hssh.dialects.ios import IosDialect
 
-from .base import Dialect
-from .ios import CLI, COMMENTS, INFORMATIONAL, REFUSED
 
-DIALECT = Dialect("eos", "EOS", "Arista EOS", shortcuts="eos", refused=REFUSED, informational=INFORMATIONAL, cli=CLI,
-                  comments=COMMENTS)
+class EosDialect(IosDialect):
+    pass
+
+
+DIALECT: Dialect = EosDialect()

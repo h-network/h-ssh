@@ -1,6 +1,0 @@
-{
-  "uptime": {
-    "command": "uptime",
-    "description": "System uptime"
-  }
-}
