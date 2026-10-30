@@ -236,8 +236,10 @@ settings, and the recording settings.
 
 ### 5.2 Concurrency
 
-The orchestrator runs on asyncio. Blocking libraries such as paramiko and PyEZ run in a thread pool sized
-to the worker limit. Each target is one task. A target's operations run in order on one session. Targets
+The orchestrator runs on asyncio. Blocking libraries such as paramiko and PyEZ run on daemon worker threads, at most
+the worker limit at once, so a call that never returns keeps its thread, never the interpreter's exit. Each communicator
+call gets its own timeout (`connect` plus `setup` for open, `command`, or `commit`) plus a grace period; one that has not
+returned by then is that target's `TIMEOUT` fault, and its thread is left to finish. Each target is one task. A target's operations run in order on one session. Targets
 run independently, and one target's failure does not affect another's.
 
 ### 5.3 Edit lifecycle

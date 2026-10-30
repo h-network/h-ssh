@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import threading
 import signal
 import sys
 import dataclasses
@@ -14,7 +15,7 @@ from hssh.communicators.base import Session
 from hssh.drivers import Driver, DriverRegistry
 from hssh.model import (Fault, FaultKind, OperationResult, RunReport, RunSpec, Target, TargetResult, TargetStatus)
 from hssh.orchestrator import lifecycle, probe
-from hssh.orchestrator.defaults import complete
+from hssh.orchestrator.defaults import GRACE_SECONDS, complete
 from hssh.orchestrator.lifecycle import EditLifecycle, Stage, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
@@ -57,7 +58,7 @@ class Scheduler:
     async def run(self, spec: RunSpec) -> RunReport:
         """The whole run: probe, every target under the worker limit, the report, always closed in the store."""
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(spec.workers, thread_name_prefix="hssh"))
+        loop.set_default_executor(_DaemonThreads(spec.workers, thread_name_prefix="hssh"))
         run = _Run(spec, 0, now())
         run.run_id = self.recorder.begin(spec, run.started)
         slots = asyncio.Semaphore(spec.workers)
@@ -172,8 +173,10 @@ class Scheduler:
             opened = OperationResult(OPEN, Fault(FaultKind.LOCAL, f"safety gate: {held}", False), started, 0)
             return _Attempt([opened], Verdict(Action.FAIL))
         try:
-            session = await self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy)
-        except Fault as f:
+            session = await asyncio.wait_for(self.sessions.acquire(driver, target, creds, timeouts, spec.host_key_policy),
+                                             timeouts.connect + timeouts.setup + GRACE_SECONDS)
+        except (Fault, asyncio.TimeoutError) as e:
+            f = e if isinstance(e, Fault) else Fault(FaultKind.TIMEOUT, "open has not returned within its budget", True)
             opened = OperationResult(OPEN, f, started, int((time.monotonic() - t0) * 1000))
             verdict = self._judge(spec, driver, opened, attempt)
             self.policy.settle(target, verdict)
@@ -197,20 +200,21 @@ class Scheduler:
         if spec.mode in ("show", "batch"):
             ops: list[OperationResult] = []
             for command in spec.commands:
-                ops.append(await operation(command, lambda c=command: comm.show(session, c)))
+                ops.append(await operation(command, lambda c=command: comm.show(session, c), spec.timeouts.command))
                 if isinstance(ops[-1].outcome, Fault) and ops[-1].outcome.kind is FaultKind.SESSION_LOST:
                     break
             return ops
         if spec.mode == "structured":
-            return [await operation(c, lambda c=c: comm.structured(session, c, spec.format)) for c in spec.commands]
+            return [await operation(c, lambda c=c: comm.structured(session, c, spec.format), spec.timeouts.command)
+                    for c in spec.commands]
         if spec.mode == "edit":
-            edit = await EditLifecycle(comm, driver.dialect, session).run(list(spec.config_lines), spec.edit)
+            edit = await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(list(spec.config_lines), spec.edit)
             if edit.stage in (Stage.COMMIT, Stage.PENDING, Stage.CLOSE):
                 run.past_commit.add(index)
             return list(edit.operations)
         if spec.mode == "confirm":
-            return [await lifecycle.confirm(comm, session)]
-        return [await lifecycle.commit_history(comm, session)]
+            return [await lifecycle.confirm(comm, session, spec.timeouts)]
+        return [await lifecycle.commit_history(comm, session, spec.timeouts)]
 
     def _judge(self, spec: RunSpec, driver: Driver, op: OperationResult, attempt: int) -> Verdict:
         """The policy's verdict on a failed operation; a run reads when its mode and every command do."""
@@ -237,6 +241,24 @@ class Scheduler:
         if spec.mode != "edit" or edit is None or not edit.apply or not edit.confirmed_minutes:
             return {}
         return {r.target.name: lifecycle.confirm_command(r.target) for r in results if r.status == "ok"}
+
+
+class _DaemonThreads(concurrent.futures.ThreadPoolExecutor):
+    """Communicator calls on daemon threads, one per call: a call that never returns keeps its thread, never the interpreter's exit."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        future: concurrent.futures.Future = concurrent.futures.Future()
+
+        def run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as e:  # noqa: BLE001 - handed to the awaiting task
+                future.set_exception(e)
+
+        threading.Thread(target=run, name=self._thread_name_prefix, daemon=True).start()
+        return future
 
 
 class _on_interrupt:
