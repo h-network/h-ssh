@@ -151,7 +151,9 @@ class Scheduler:
             tried = await self._attempt(run, index, target, driver, attempt)
             if tried.verdict is None or tried.verdict.action is not Action.RETRY or run.stopping.is_set():
                 break
-            await self.policy.pause(attempt, tried.operations[-1].command == OPEN)
+            last = tried.operations[-1]
+            unanswered = last.command == OPEN and last.outcome.kind is FaultKind.TIMEOUT and not last.outcome.reached_device
+            await self.policy.pause(attempt, unanswered)
             attempt += 1
         status: TargetStatus = "ok" if tried.verdict is None else "failed"
         ops = tried.operations
@@ -372,23 +374,6 @@ def run(spec: RunSpec) -> RunReport:
     finally:
         if store is not None:
             store.close()
-
-
-def audit_aborted(spec: RunSpec, reason: str) -> None:
-    """One audit entry per target when the operator declines to apply an edit: action 'aborted' with the reason, no run row."""
-    from hssh.drivers import Registry
-
-    spec = complete(spec)
-    registry = Registry()
-    registry.load_entry_points()
-    recorder = Recorder(spec.recording)
-    op = OperationResult("aborted", Fault(FaultKind.LOCAL, reason, False), now(), 0)
-    for target in spec.targets:
-        try:
-            driver = registry.resolve(target)
-        except Fault:
-            continue
-        recorder.change(0, target, driver.name, driver.dialect, "aborted", op, spec.edit)
 
 
 def _gate(spec: RunSpec) -> SafetyGate | None:

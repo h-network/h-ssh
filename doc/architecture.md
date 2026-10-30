@@ -244,7 +244,7 @@ device, unless the dialect marks it as a read.
 |---|---|---|---|
 | `UNREACHABLE` before login | fail | fail | n/a |
 | `TIMEOUT` before login, no TCP answer or no SSH banner (`reached_device` false) | retry after 0.5 s, then 1 s, then fail | retry after 0.5 s, then 1 s, then fail | n/a |
-| `SESSION_LOST` before login, the device dropped the connection during setup | retry after 0.5 s, then 1 s, then fail | retry after 0.5 s, then 1 s, then fail | n/a |
+| `SESSION_LOST` before login, the device dropped the connection during setup | retry after the retry pause (2 s), then fail | retry after the retry pause (2 s), then fail | n/a |
 | `TIMEOUT` before login, the banner came but setup did not finish in the setup budget (`reached_device` true) | fail | fail | n/a |
 | `AUTH`, `HOST_KEY` | fail | fail | n/a |
 | `TIMEOUT`, `SESSION_LOST` in session | retry | fail | fail, cool down |
@@ -286,7 +286,6 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - **Dry run** is the default: load, diff, close. Closing discards the candidate, so nothing is committed.
 - The probe runs before `OPEN`. An edit whose probe found a target dead stops before any device, with one audit
   entry per dead target and no run row, unless `skip_unreachable` is set, which skips those targets; a read fails them.
-  An apply the operator declines gets one audit entry per target through `audit_aborted`.
 - **Apply** requires `-y`. Without it, an edit is a dry run. A diff whose data is False sends no commit: an empty
   commit could confirm someone else's pending commit-confirmed.
 - The target is marked past `COMMIT` before the commit is sent, so an interrupt waits for the reply.
