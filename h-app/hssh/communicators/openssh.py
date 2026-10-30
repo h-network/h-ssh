@@ -342,7 +342,7 @@ class OpenSSH:
         self.dialect = dialect
         caps = {"show", "batch"}
         if dialect.has_candidate:
-            caps |= {"edit", "confirm", "commit_status"}
+            caps |= {"edit", "confirm", "commit_status", "commit_confirmed"}
         self.capabilities = frozenset(caps)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
