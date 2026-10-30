@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import getpass
+import json
 import sys
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
 from hssh.dialects.base import Dialect
 from hssh.orchestrator.lifecycle import now
-from hssh.model import (EditSettings, Fault, OperationResult, RecordSettings, Result, RunReport, RunSpec, Target,
+from hssh.model import (EditSettings, Fault, Mode, OperationResult, RecordSettings, Result, RunReport, RunSpec, Target,
                         TargetResult, TargetStatus)
 
 AUDITED = ("load", "diff", "commit", "confirm")
@@ -94,15 +95,22 @@ class Recorder:
                 lines = ((op.command,) if line_by_line else tuple(config_lines)) if action == "load" else ()
                 self.change(run_id, target, driver, dialect, action, op, edit, diff, lines)
 
-    def save_output(self, target: Target, ops: Sequence[OperationResult]) -> None:
-        """The target's device output, one file per target, named inside the saved-output directory."""
+    def save_output(self, target: Target, ops: Sequence[OperationResult], *, mode: Mode) -> None:
+        """The target's device output, one file per target inside the saved-output directory: a batch as <name>.json, every operation in order; any other mode as <name>.output, the outputs joined."""
         if self.settings.save_output_path is None:
             return
         from hssh.audit import secure_write
         from hssh.paths import path_inside, validate_device_name
 
         def write() -> None:
-            path = path_inside(Path(self.settings.save_output_path), f"{validate_device_name(target.name)}.output")
+            name = validate_device_name(target.name)
+            if mode == "batch":
+                from hssh.store import operation_dict
+
+                text = json.dumps([operation_dict(op) for op in ops], ensure_ascii=False, indent=1)
+                secure_write(str(path_inside(Path(self.settings.save_output_path), f"{name}.json")), text)
+                return
+            path = path_inside(Path(self.settings.save_output_path), f"{name}.output")
             secure_write(str(path), "\n".join(op.outcome.output for op in ops if isinstance(op.outcome, Result)))
 
         self._kept("saved output", write)

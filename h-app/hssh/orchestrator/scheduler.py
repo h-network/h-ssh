@@ -80,7 +80,7 @@ class Scheduler:
         with _on_interrupt(loop, lambda: self._interrupt(run)):
             try:
                 self.recorder.preflight()
-                held = self.policy.held([self._device(t) for t in spec.targets])
+                held = self.policy.held([d for d in map(self._device, spec.targets) if d.port is not None])
                 dead = await self._probed(run, held) if spec.probe else {}
                 if run.stopping.is_set() and spec.mode == "edit":
                     raise Fault(FaultKind.LOCAL, "interrupted during the probe; nothing was sent", False)
@@ -166,7 +166,8 @@ class Scheduler:
                 fault = Fault(FaultKind.LOCAL, f"interrupted during {step}", step != OPEN)
                 result = self._failed_before(run, target, fault, "skipped", step)
             except Exception as e:  # noqa: BLE001 - one communicator bug is this target's failure, not the run's end
-                self.policy.settle(self._device(target), None)
+                if (device := self._device(target)).port is not None:
+                    self.policy.settle(device, None)
                 result = self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{type(e).__name__}: {e}", True))
             self.recorder.log(result)
             return result
@@ -230,7 +231,7 @@ class Scheduler:
         elif spec.mode == "confirm":
             self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops,
                                   dataclasses.replace(spec.edit, apply=True))
-        self.recorder.save_output(target, ops)
+        self.recorder.save_output(target, ops, mode=spec.mode)
         return TargetResult(target, status, tuple(ops))
 
     async def _attempt(self, run: _Run, index: int, target: Target, driver: Driver, attempt: int) -> _Attempt:
@@ -286,7 +287,7 @@ class Scheduler:
         return _Attempt(ops, verdict)
 
     def _device(self, target: Target, driver: Driver | None = None) -> Target:
-        """The target as the safety gate keys it: with the port the connection uses, the transport's default when none is given."""
+        """The target as the safety gate keys it: with the port the connection uses, the transport's default when none is given. A target whose driver is unknown keeps port None and is kept away from the gate."""
         if target.port is not None:
             return target
         try:
