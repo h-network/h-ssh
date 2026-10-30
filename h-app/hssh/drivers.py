@@ -81,10 +81,13 @@ class Registry:
         for driver in drivers:
             self.register(driver)
 
-    def register(self, driver: Driver) -> None:
+    def _free(self, driver: Driver) -> None:
         split_name(driver.name)
         if driver.name in self._drivers:
             raise ValueError(f"driver {driver.name!r} is already registered")
+
+    def register(self, driver: Driver) -> None:
+        self._free(driver)
         self._drivers[driver.name] = driver
 
     def load_entry_points(self, group: str = ENTRY_POINT_GROUP) -> None:
@@ -93,6 +96,8 @@ class Registry:
                 found = _drivers_in(ep.load())
                 if len({d.name for d in found}) != len(found):
                     raise ValueError("a driver name is listed twice")
+                for driver in found:
+                    self._free(driver)
                 for driver in found:
                     self.register(driver)
             except Exception as e:  # noqa: BLE001 - one bad package must not take the registry down

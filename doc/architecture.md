@@ -109,7 +109,7 @@ A driver is a pair: a dialect and a communicator, named `dialect@transport`, for
 or `ios@ssh`. The registry:
 
 - holds the built-in drivers
-- loads third-party drivers from the `hssh.drivers` entry point group
+- loads third-party drivers from the `hssh.drivers` entry point group, each entry point taken whole or not at all
 - maps each target's vendor and transport to a driver
 - refuses a mode the driver's capabilities don't include, before anything is sent
 
