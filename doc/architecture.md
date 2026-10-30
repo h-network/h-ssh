@@ -251,6 +251,9 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 ```
 
 - **Dry run** is the default: load, diff, close. Closing discards the candidate, so nothing is committed.
+- The probe runs before `OPEN`. An edit whose probe found a target dead stops before any device, with one audit
+  entry per dead target and no run row, unless `skip_unreachable` is set, which skips those targets; a read fails them.
+  An apply the operator declines gets one audit entry per target through `audit_aborted`.
 - **Apply** requires `-y`. Without it, an edit is a dry run.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
   command that confirms them.
