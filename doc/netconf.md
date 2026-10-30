@@ -44,8 +44,9 @@ Library failures become `Fault` with the library's message and whether the
 operation may have reached the device. The communicator does not retry.
 Running out of local file descriptors is a local fault with the OS error preserved;
 it does not retry or put the target into cooldown.
-Closing a configuration session attempts its required candidate discard, unlock and
-disconnect even if an earlier cleanup step fails, then reports the first failure.
+Closing a clean configuration session releases its candidate and lock before
+disconnecting. A cleanup failure discards the transport and reports the fault;
+no further cleanup RPC is sent on that session.
 The background close waits up to five seconds for close-session. If closing fails,
 it tears down the underlying transport so its reader thread does not linger.
 
@@ -74,3 +75,18 @@ plain commit. With nothing pending it returns a refusal. Commit history returns
 the device's XML and `CommitStatus` from sequence zero only, including the
 remaining minutes reported by the device; older confirmed entries do not count
 as pending.
+
+## Session reuse
+
+Before each reuse, the communicator applies the current borrow's command and
+commit timeouts and checks the library's connected flag. After at least 30 seconds
+idle, it also sends an uptime RPC with a five-second timeout. A device refusal is
+proof of a live session; a timeout or transport failure makes it unusable. The
+normal command timeout is restored after the check.
+
+Release discards an uncommitted candidate and unlocks only this session's lock,
+then drops its configuration object while keeping the connection open. A known
+commit rejection can be reused after successful cleanup. A failed cleanup or an
+uncertain operation instead discards the transport without rollback or unlock,
+interrupting any outstanding call; that session cannot be reused. Release can
+use two command timeouts, separate from the five-second close-session bound.
