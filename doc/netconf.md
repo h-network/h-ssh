@@ -55,7 +55,9 @@ Edits use PyEZ's exclusive candidate lock. Loading selects set format only when
 all nonblank, noncomment lines are set-style commands; other configuration text
 is preserved. Only full-line `#` comments are removed from set input. A delete's
 “statement not found” warning is allowed; other load warnings and errors fail.
-The Junos dialect checks the payload before the communicator takes the lock.
+The Junos dialect supplies the set verbs and comment prefixes and checks the payload
+before the communicator takes the lock. A refused payload is a local fault;
+no configuration RPC is sent.
 
 Diff returns the device's compare unchanged and a boolean indicating changes.
 A nonempty candidate passes commit-check even for a dry run. Closing discards

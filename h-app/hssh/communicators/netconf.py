@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, cast
 
 from hssh.communicators.base import Communicator, Session
 from hssh.dialects.base import Dialect
+from hssh.dialects.junos import SET_PREFIX_VERBS
 from hssh.model import CommitStatus, Credentials, Fault, FaultKind, HostKeyPolicy, Result, Target, Timeouts
 
 if TYPE_CHECKING:
@@ -565,11 +566,10 @@ class NetconfCommunicator(Communicator):
         try:
             refusal = self.dialect.check_edit(lines)
             if refusal:
-                raise Fault(FaultKind.REFUSED, refusal, False)
-            meaningful = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
-            verbs = {"set", "delete", "activate", "deactivate", "insert", "rename",
-                     "copy", "annotate", "protect", "unprotect"}
-            set_style = bool(meaningful) and all(line.split()[0] in verbs for line in meaningful)
+                raise Fault(FaultKind.LOCAL, refusal, False)
+            meaningful = [line for line in lines if line.strip()
+                          and not line.lstrip().startswith(self.dialect.comment_prefixes)]
+            set_style = bool(meaningful) and all(line.lstrip().startswith(SET_PREFIX_VERBS) for line in meaningful)
             config = self._lock(netconf)
             netconf.dirty = True
             config.load("\n".join(meaningful if set_style else lines),
