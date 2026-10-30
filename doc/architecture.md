@@ -339,14 +339,16 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 
 ```json
 {"time": "...", "run_id": 42, "user": "...", "target": "R1", "host": "192.0.2.1",
- "driver": "junos@netconf", "action": "commit", "dry_run": false,
- "confirmed_minutes": 10, "comment": "...", "diff": "...", "ok": true, "fault": null}
+ "driver": "junos@netconf", "action": "load", "payload": "set system host-name R1", "dry_run": false,
+ "confirmed_minutes": 10, "comment": "...", "diff": "", "ok": true, "fault": null}
 ```
 
 `time` is the operation's `started` timestamp. `dry_run` is the inverse of the requested
 `EditSettings.apply`; `ok` describes the operation's outcome, not whether a commit was requested.
 `fault` is null on success, otherwise an object with `kind` (the fault kind name), `detail` and
-`reached_device`. The full fault detail, comment and diff are redacted before serialization.
+`reached_device`. `payload` contains the target's submitted lines joined with newlines on a `load`
+entry, including a failed load. It is an empty string when no lines were supplied or the action is not
+`load`. The payload, full fault detail, comment and diff are redacted before serialization.
 Actions are `load`, `diff`, `commit`, `confirm`, and `probe` (a probe failure that stops an edit).
 Confirm runs use `apply=true`.
 
