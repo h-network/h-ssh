@@ -62,16 +62,33 @@ The CLI, the Fleet library API, run files and profiles are front ends. Each one:
 
 - parses its input
 - resolves configuration precedence: flags, then run file, then profile, then `~/.h-ssh/config`, then
-  the orchestrator's defaults; the user alone has an environment step: `--user`, run file, `HSSH_USER`,
-  config `user`, then the login name
+  the orchestrator's defaults; four settings have an environment step between the run file and the
+  config: the user (`HSSH_USER`, then the login name) and the three paths `HSSH_STORE`, `HSSH_AUDIT_LOG`,
+  `HSSH_SAFETY_FILE`, resolved in `frontends/settings.py` for the CLI and `h-ssh-store` alike, so both
+  find the same store; an explicitly empty path is refused, not taken for the flag left out
 - builds a `RunSpec`
 - passes the `RunSpec` to the orchestrator and renders the `RunReport` it returns
 
 Front ends make no decisions about devices. A behaviour available in the CLI is available in the library
 through the same `RunSpec`.
 
-`--every` is a front-end loop. It submits the same `RunSpec` at an interval and renders the differences
-between reports.
+`--every SECONDS` (1 to 86400) is a front-end loop: one run per tick with the same `RunSpec`, every tick
+kept in the store, and each tick's rows compared with the last kept run's through the store's reader
+(`Store.results(run_id=…)`), so `h-ssh-store` can go back to any two ticks. It prints one line per tick
+(`tick N HH:MM:SS: a OK, b failed[, c skipped], d changed; run ID`) and, per device whose reply, outcome or
+fault changed, a header (`--- NAME: command`, `OK -> FAIL (reason)` or `new`) and a unified diff of the output.
+A store the reader cannot open ends the watch (exit 2); Ctrl-C between ticks says how many ticks were kept and
+exits 130. A watch is reads only, needs the store (`--no-store` is refused) and prints neither `--json` nor
+`--raw`; `--times N` stops after N ticks and goes only with `--every`.
+
+Before anything runs the CLI refuses the flags that would do nothing or contradict each other, in one line and
+exit 2: a second mode, `-y`/`--comment`/`--commit-confirmed` without an edit, `--format` without `-sC`,
+`--no-store` with `--store`, `--raw` with `--json` or `-v`, a `--save-output` path that exists and is not a
+directory, and a parser error is the message alone, not the usage block. Input is plain text: a `-sC` or batch
+command is one line (a line break would run two commands), and the username, from whichever source, carries no
+control character; both are checked before the password. Every target name, typed or from an inventory, is a
+safe file name (`hssh.paths.validate_device_name`), in the CLI and the library alike, since the name becomes
+a saved-output and set-file name.
 
 The CLI refuses before the password is asked what the run could not go on with: a commit comment or timer the
 orchestrator's `check_comment` and `check_confirmed_minutes` reject, and a run file that applies changes
@@ -85,7 +102,13 @@ reads only, never an edit. After an apply with
 a timer the CLI prints the minutes left per device and the command that confirms them, rebuilt from the run's
 own arguments. Exit codes: 0; 1 a device failed; 2 refused before anything was sent; 3 nothing failed but not
 everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exits with the worst of its runs,
-in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run. `--json`
+in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run. The verdict
+line (`run ID: a ok, b failed, c skipped (n reason, …); k record(s) not kept`) names what was skipped by
+reason, so a run the gate or the probe kept from every device never reads as all OK; under `--raw` stdout is
+device output only and the verdict goes to stderr when something failed, was skipped or was not kept, as does
+`Interrupted. Completed a of n device(s).` Device text shown on a terminal goes through `hssh.screen.terminal_safe`
+(control sequences stripped); a pipe, a file and the store get it as it came. A reader that leaves (`| head`)
+ends the program quietly with exit 0: the record is the store, the screen is best effort. `--json`
 renders each `Result.data` through the store's `json_data`, so the file and the store hold the same shapes.
 The run's provenance in `RecordSettings` is the front end's: `origin` is `h-ssh` from the CLI and `fleet` from
 the library (unless the caller set one), `version` is the installed package version from `importlib.metadata`,
@@ -432,8 +455,11 @@ as contextual `OSError`, so the recorder can count lost records without failing 
 The writer checks the database identity before and after writes and when closing, using a
 held directory so a working-directory change or directory rename does not look like a lost
 store. A deleted or replaced database is reported even if SQLite could still write its open
-file. The writer is implemented in slice 1; read-only construction and reader methods remain
-stubs until slice 3.
+file. Each streamed query uses a SQLite snapshot; a later query can see newly committed runs.
+Read-only readers never initialize or migrate a store.
+An archive that cannot create SQLite sidecars may be read as immutable only with no pending
+WAL or journal; changes to its identity, size, modification time or pending sidecars invalidate
+the read and are reported at the query boundary and close. Pending WAL data is never skipped.
 
 The reader interfaces in `store.py` return stored column names unchanged:
 
@@ -460,12 +486,21 @@ The reader interfaces in `store.py` return stored column names unchanged:
   Destination safety checks and terminal rendering belong to the reader command, not this
   serializer. `results` supplies the failed, grep, field, history and slowest commands.
 
+The `h-ssh-store` entry point is `hssh.frontends.store:main_sync`; parsing, rendering,
+configuration and default resolution belong to that front end. `store.py` imports no
+front-end modules. The reader shares `frontends.settings.store_path` with the writer.
+[Reader usage](store.md) covers the commands and exit codes. Display tables stream rows,
+and sanitize terminal-bound metadata before shortening; files and pipes retain raw text.
+Exports check destination path and inode against the database and its sidecars before
+truncation, including hard-link aliases. A closed downstream pipe preserves the command's
+known verdict and produces no traceback.
+
 `hssh.paths.validate_device_name(name: str) -> str` and
 `path_inside(base: Path, filename: str) -> Path` are the shared file-name helpers for `-eD`
 and saved output. The first returns the name or raises `ValueError`: only ASCII letters, digits,
 underscore, dot, colon and hyphen, starting with a letter, digit or underscore. The second returns
 `base / filename` or raises `ValueError` unless its resolved parent is the resolved base.
-Their bodies and the front-end caller move land in slice 1; slice 0 declares signatures only.
+Both the payload-file and saved-output callers use these shared helpers.
 
 ### 6.2 Audit entry
 
@@ -591,9 +626,10 @@ h-app/hssh/
 ├── communicators/  base.py  netconf.py  ssh.py  openssh.py  telnet.py  cli_engine.py
 ├── dialects/       base.py  junos.py  ios.py  nxos.py  eos.py  generic.py
 ├── drivers.py      registry and entry points
-├── frontends/      cli.py  fleet.py  runfile.py  profiles.py
+├── frontends/      cli.py  fleet.py  runfile.py  profiles.py  store.py  settings.py
 ├── model.py        Target, RunSpec, Result, Fault, RunReport
-├── store.py        writer, and the h-ssh-store reader
+├── store.py        writer, streaming queries and read-only archives
+├── screen.py       terminal-only rendering helpers
 ├── audit.py
 ├── paths.py        shared target file names and containment
 └── safety.py       safety gate state

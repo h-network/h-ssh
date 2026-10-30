@@ -14,6 +14,7 @@ dev = ["pytest"]
 
 [project.scripts]
 h-ssh = "hssh.frontends.cli:main_sync"
+h-ssh-store = "hssh.frontends.store:main_sync"
 
 [tool.setuptools.packages.find]
 where = ["h-app"]

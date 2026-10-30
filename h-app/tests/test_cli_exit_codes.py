@@ -29,24 +29,32 @@ def test_worst_follows_the_order_130_4_2_1_3_0(a, b, expected):
     assert cli.worst(a, b) == expected == cli.worst(b, a)
 
 
-def test_a_watch_exits_with_its_worst_tick_not_its_last(cli_run, monkeypatch):
+WATCH = ["-sC", "show version", "--transport", "netconf", "--every", "1", "--times", "3"]
+
+
+@pytest.fixture
+def no_store_rows(monkeypatch):
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    monkeypatch.setattr(cli, "read_rows", lambda path, run_id: {})
+
+
+def test_a_watch_exits_with_its_worst_tick_not_its_last(cli_run, no_store_rows):
     ticks = [report(skipped=1), report(failed=1), report(ok=1)]
-    rc, specs, _, _ = cli_run(R1, *BASE, "--every", "1", "--times", "3", reports=ticks)
+    rc, specs, _, _ = cli_run(R1, *WATCH, reports=ticks)
     assert rc == 1 and len(specs) == 3
 
 
-def test_a_watch_stops_at_an_interrupted_tick(cli_run, monkeypatch):
-    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+def test_a_watch_stops_at_an_interrupted_tick(cli_run, no_store_rows):
     ticks = [report(ok=1), report(skipped=1, interrupted=True), report(ok=1)]
-    rc, specs, _, _ = cli_run(R1, *BASE, "--every", "1", "--times", "3", reports=ticks)
+    rc, specs, _, _ = cli_run(R1, *WATCH, reports=ticks)
     assert rc == 130 and len(specs) == 2
 
 
 def test_a_watch_sleeps_between_ticks_not_before_the_first(cli_run, monkeypatch):
     slept = []
     monkeypatch.setattr(cli.time, "sleep", slept.append)
-    cli_run(R1, *BASE, "--every", "2.5", "--times", "3")
+    monkeypatch.setattr(cli, "read_rows", lambda path, run_id: {})
+    cli_run(R1, *WATCH[:-4], "--every", "2.5", "--times", "3")
     assert slept == [2.5, 2.5]
 
 
