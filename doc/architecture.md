@@ -345,8 +345,8 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
 `EditSettings.apply`; `ok` describes the operation's outcome, not whether a commit was requested.
 `fault` is null on success, otherwise an object with `kind` (the fault kind name), `detail` and
 `reached_device`. The full fault detail, comment and diff are redacted before serialization.
-Actions are `load`, `diff`, `commit`, `confirm`, `probe` (a probe failure that stops an edit), and
-`aborted` (the operator declined). Confirm runs use `apply=true`.
+Actions are `load`, `diff`, `commit`, `confirm`, and `probe` (a probe failure that stops an edit).
+Confirm runs use `apply=true`.
 
 Each entry is one JSONL line. Appends hold an exclusive file lock through all short writes, reject
 symlinks and non-regular files without blocking on FIFOs, and set the file to 0600. Newly created
