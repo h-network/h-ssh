@@ -1,6 +1,6 @@
 # NETCONF
 
-The `junos@netconf` driver supports `show` and `batch` through PyEZ. Connections use
+The `junos@netconf` driver supports `show`, `batch`, candidate edits, confirm and commit history through PyEZ. Connections use
 port 830 unless the target specifies another port. The connect timeout is passed
 to PyEZ, and the command timeout applies to operations on the open session.
 TCP connect and the SSH banner share the connect timeout; after the banner, key exchange, login and NETCONF hello share one setup timeout.
@@ -44,7 +44,31 @@ Library failures become `Fault` with the library's message and whether the
 operation may have reached the device. The communicator does not retry.
 Running out of local file descriptors is a local fault with the OS error preserved;
 it does not retry or put the target into cooldown.
-Closing a configuration session attempts candidate discard, unlock and disconnect even
-if an earlier cleanup step fails, then reports the first failure.
+Closing a configuration session attempts its required candidate discard, unlock and
+disconnect even if an earlier cleanup step fails, then reports the first failure.
 The background close waits up to five seconds for close-session. If closing fails,
 it tears down the underlying transport so its reader thread does not linger.
+
+## Candidate edits
+
+Edits use PyEZ's exclusive candidate lock. Loading selects set format only when
+all nonblank, noncomment lines are set-style commands; other configuration text
+is preserved. Only full-line `#` comments are removed from set input. A delete's
+“statement not found” warning is allowed; other load warnings and errors fail.
+The Junos dialect checks the payload before the communicator takes the lock.
+
+Diff returns the device's compare unchanged and a boolean indicating changes.
+A nonempty candidate passes commit-check even for a dry run. Closing discards
+uncommitted changes and unlocks only a lock this session acquired. A failed lock
+never sends unlock; a dead or timed-out lock session is discarded.
+
+Commit uses the commit timeout and supports a comment and a confirmed timer.
+An unanswered commit has an unknown outcome: the transport is discarded without
+rollback or replay. Verify the device before trying again. A successful commit
+leaves only unlock and disconnect for cleanup.
+
+Confirm takes the exclusive lock and rechecks commit history before sending a
+plain commit. With nothing pending it returns a refusal. Commit history returns
+the device's XML and `CommitStatus` from sequence zero only, including the
+remaining minutes reported by the device; older confirmed entries do not count
+as pending.

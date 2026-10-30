@@ -1,4 +1,4 @@
-"""NETCONF show and batch sessions through PyEZ; edit and structured RPCs are stubs."""
+"""NETCONF operational commands and candidate edits through PyEZ."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import errno
 import fcntl
 import hmac
 import os
+import re
 from pathlib import Path
 import socket
 from threading import RLock, Timer
@@ -18,7 +19,7 @@ from typing import TYPE_CHECKING, cast
 
 from hssh.communicators.base import Communicator, Session
 from hssh.dialects.base import Dialect
-from hssh.model import Credentials, Fault, FaultKind, HostKeyPolicy, Result, Target, Timeouts
+from hssh.model import CommitStatus, Credentials, Fault, FaultKind, HostKeyPolicy, Result, Target, Timeouts
 
 if TYPE_CHECKING:
     from jnpr.junos import Device
@@ -414,12 +415,13 @@ class NetconfSession(Session):
     config: Config | None = None
     locked: bool = False
     dirty: bool = False
+    committing: bool = False
 
 
 class NetconfCommunicator(Communicator):
     default_port: int = 830
     banner: bytes | None = b"SSH-"
-    capabilities: frozenset[str] = frozenset({"show", "batch"})
+    capabilities: frozenset[str] = frozenset({"show", "batch", "edit", "commit_confirmed", "confirm", "commit_status"})
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
@@ -469,6 +471,9 @@ class NetconfCommunicator(Communicator):
     def close(self, session: Session) -> None:
         """Discard uncommitted changes and unlock before closing the PyEZ device."""
         netconf = cast(NetconfSession, session)
+        if netconf.committing:
+            self._discard(netconf)
+            return
 
         def close_device() -> None:
             try:
@@ -482,8 +487,10 @@ class NetconfCommunicator(Communicator):
                 raise
 
         actions = []
-        if netconf.config is not None:
-            actions.extend((netconf.config.rollback, netconf.config.unlock))
+        if netconf.locked:
+            if netconf.dirty:
+                actions.append(netconf.config.rollback)
+            actions.append(netconf.config.unlock)
         actions.append(close_device)
         failure = None
         for action in actions:
@@ -493,10 +500,10 @@ class NetconfCommunicator(Communicator):
             except Exception as error:
                 if failure is None:
                     failure = _fault(error, reached_device)
-        if failure is not None:
-            raise failure
         netconf.config = None
         netconf.locked = netconf.dirty = False
+        if failure is not None:
+            raise failure
 
     def show(self, session: Session, command: str) -> Result:
         from lxml import etree
@@ -528,11 +535,60 @@ class NetconfCommunicator(Communicator):
     def structured(self, session: Session, rpc: str, fmt: str) -> Result:
         raise NotImplementedError
 
+    def _lock(self, netconf: NetconfSession) -> Config:
+        try:
+            from jnpr.junos.utils.config import Config
+
+            if netconf.config is None:
+                netconf.config = Config(netconf.device)
+            if not netconf.locked:
+                netconf.config.lock()
+                netconf.locked = True
+            return netconf.config
+        except Exception as error:
+            fault = _fault(error.__context__ or error, True)
+            if fault.kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST) or not netconf.device.connected:
+                self._discard(netconf)
+            raise fault from error
+
+    @staticmethod
+    def _discard(netconf: NetconfSession) -> None:
+        netconf.locked = netconf.dirty = False
+        try:
+            netconf.device._conn._session.close()
+        except Exception:
+            pass
+        netconf.device.connected = False
+
     def load(self, session: Session, lines: list[str]) -> Result:
-        raise NotImplementedError
+        netconf = cast(NetconfSession, session)
+        try:
+            refusal = self.dialect.check_edit(lines)
+            if refusal:
+                raise Fault(FaultKind.REFUSED, refusal, False)
+            meaningful = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+            verbs = {"set", "delete", "activate", "deactivate", "insert", "rename",
+                     "copy", "annotate", "protect", "unprotect"}
+            set_style = bool(meaningful) and all(line.split()[0] in verbs for line in meaningful)
+            config = self._lock(netconf)
+            netconf.dirty = True
+            config.load("\n".join(meaningful if set_style else lines),
+                        format="set" if set_style else "text", ignore_warning="statement not found")
+            return Result(output="load complete")
+        except Exception as error:
+            raise _fault(error, True) from error
 
     def diff(self, session: Session) -> Result:
-        raise NotImplementedError
+        netconf = cast(NetconfSession, session)
+        try:
+            config = self._lock(netconf)
+            output = config.diff() or ""
+            changed = bool(output.strip())
+            if changed:
+                config.commit_check(timeout=netconf.timeouts.command)
+            return Result(output=output, data=changed)
+        except Exception as error:
+            raise _fault(error, True) from error
 
     def commit(
         self,
@@ -540,10 +596,45 @@ class NetconfCommunicator(Communicator):
         confirmed_minutes: int | None,
         comment: str | None,
     ) -> Result:
-        raise NotImplementedError
+        from jnpr.junos.exception import CommitError
+
+        netconf = cast(NetconfSession, session)
+        config = self._lock(netconf)
+        netconf.committing = True
+        try:
+            config.commit(timeout=netconf.timeouts.commit, confirm=confirmed_minutes, comment=comment)
+        except CommitError as error:
+            raise Fault(FaultKind.COMMIT_FAILED, str(error), True) from error
+        except Exception as error:
+            # An unanswered commit must never trigger rollback or replay.
+            self._discard(netconf)
+            raise Fault(FaultKind.OUTCOME_UNKNOWN, _fault(error, True).detail, True) from error
+        finally:
+            netconf.committing = False
+        netconf.dirty = False
+        return Result(output="commit complete")
 
     def confirm(self, session: Session) -> Result:
-        raise NotImplementedError
+        netconf = cast(NetconfSession, session)
+        self._lock(netconf)
+        status = cast(CommitStatus, self.commit_history(netconf).data)
+        if not status.pending:
+            raise Fault(FaultKind.REFUSED, "nothing to confirm", True)
+        return self.commit(netconf, None, None)
 
     def commit_history(self, session: Session) -> Result:
-        raise NotImplementedError
+        from lxml import etree
+
+        netconf = cast(NetconfSession, session)
+        try:
+            reply = netconf.device.rpc.get_commit_information()
+            output = etree.tostring(reply, encoding="unicode", with_tail=False)
+            newest = next((entry for entry in reply.findall("commit-history")
+                           if entry.findtext("sequence-number") == "0"), None)
+            text = etree.tostring(newest, encoding="unicode", with_tail=False) if newest is not None else ""
+            note = newest.findtext("comment", "") if newest is not None else ""
+            pending = re.search(r"rollback in (\d+)\s*min", note, re.I)
+            status = CommitStatus(bool(pending), int(pending[1]) if pending else None, text)
+            return Result(output=output, data=status)
+        except Exception as error:
+            raise _fault(error, True) from error
