@@ -84,7 +84,7 @@ default port is held by its protocol, and a target's own port overrides it.
 | Policy | Maps each `Fault` to an action: retry, fail, skip, or cool down. Applies the safety gate |
 | Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed and confirm |
 | Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature |
-| Probe | Pre-flight reachability check per target, on by default and turned off per run. Its outcome is expressed as the same fault kinds |
+| Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, following ssh config, and skips targets reached through a proxy. Its outcome is expressed as the same fault kinds |
 | Cancellation | Handles interruption (section 5.4) |
 | Recorder | Writes every result to the store and every change to the audit log, with redaction |
 

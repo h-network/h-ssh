@@ -75,7 +75,7 @@ class Scheduler:
         return report
 
     async def _probe(self, spec: RunSpec) -> dict[str, Fault | None]:
-        """Dead targets by name, asked at the port the target names or its transport's default; a target the gate holds or whose driver is unknown is not probed."""
+        """Dead targets by name, asked where the connection will go; a target the gate holds, whose driver is unknown, or reached through a proxy is not probed."""
         held = self.policy.held(spec.targets)
         boxes = []
         for target in spec.targets:
@@ -85,8 +85,12 @@ class Scheduler:
                 comm = self.registry.resolve(target).communicator
             except Fault:
                 continue
-            port = target.port if target.port is not None else comm.default_port
-            boxes.append((target, port, comm.banner))
+            if comm.banner is None:
+                boxes.append((target, target.host, target.port if target.port is not None else comm.default_port, None))
+                continue
+            where = probe.route(target.host, target.port, comm.default_port)
+            if where is not None:
+                boxes.append((target, where[0], where[1], comm.banner))
         return await probe.probe(boxes, spec.timeouts.connect)
 
     async def _bounded(self, run: _Run, index: int, target: Target, slots: asyncio.Semaphore,
