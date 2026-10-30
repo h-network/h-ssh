@@ -37,6 +37,10 @@ else:
     _ncclient_session.TICK = 0.01
 
 
+IDLE_CHECK_SECONDS = 30
+PROBE_SECONDS = 5
+
+
 _HOST_KEYS_LOCK = RLock()
 _HOST_KEYS: dict[Path, list[tuple[str | tuple[bytes, bytes], PKey]]] = {}
 _REVOKED: dict[Path, set[bytes]] = {}
@@ -417,6 +421,7 @@ class NetconfSession(Session):
     locked: bool = False
     dirty: bool = False
     committing: bool = False
+    doubtful: bool = False
 
 
 class NetconfCommunicator(Communicator):
@@ -470,47 +475,66 @@ class NetconfCommunicator(Communicator):
             raise _fault(error, False, opening=True) from error
 
     def close(self, session: Session) -> None:
-        """Discard uncommitted changes and unlock before closing the PyEZ device."""
+        """Release a clean session, then bound close-session to five seconds."""
         netconf = cast(NetconfSession, session)
-        if netconf.committing:
-            self._discard(netconf)
+        if netconf.committing or netconf.doubtful:
+            self.discard(netconf)
             return
-
-        def close_device() -> None:
-            try:
-                netconf.device.timeout = 5
-                netconf.device.close()
-            except Exception:
-                try:
-                    netconf.device._conn._session.close()
-                except Exception:
-                    pass
-                raise
-
-        actions = []
-        if netconf.locked:
-            if netconf.dirty:
-                actions.append(netconf.config.rollback)
-            actions.append(netconf.config.unlock)
-        actions.append(close_device)
-        failure = None
-        for action in actions:
-            reached_device = bool(netconf.device.connected)
-            try:
-                action()
-            except Exception as error:
-                if failure is None:
-                    failure = _fault(error, reached_device)
-        netconf.config = None
-        netconf.locked = netconf.dirty = False
-        if failure is not None:
-            raise failure
+        self.release(netconf)
+        reached_device = bool(netconf.device.connected)
+        try:
+            netconf.device.timeout = 5
+            netconf.device.close()
+        except Exception as error:
+            self.discard(netconf)
+            raise _fault(error, reached_device) from error
 
     def reuse(self, session: Session, timeouts: Timeouts, idle_seconds: int) -> bool:
-        return False
+        from jnpr.junos.exception import RpcError, RpcTimeoutError
+
+        netconf = cast(NetconfSession, session)
+        netconf.timeouts = timeouts
+        device = netconf.device
+        try:
+            device.timeout = timeouts.command
+            if netconf.doubtful or netconf.committing or not device.connected:
+                return False
+            if idle_seconds >= IDLE_CHECK_SECONDS:
+                try:
+                    device.rpc.get_system_uptime_information(dev_timeout=PROBE_SECONDS)
+                except RpcTimeoutError:
+                    netconf.doubtful = True
+                    return False
+                except RpcError:
+                    return True
+            return True
+        except Exception as error:
+            fault = _fault(error, bool(device.connected))
+            if fault.kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST):
+                netconf.doubtful = True
+                return False
+            raise fault from error
+        finally:
+            device.timeout = timeouts.command
 
     def release(self, session: Session) -> None:
-        self.close(session)
+        netconf = cast(NetconfSession, session)
+        if netconf.committing or netconf.doubtful:
+            self.discard(netconf)
+            raise Fault(FaultKind.SESSION_LOST, "NETCONF session is in doubt", True)
+        config = netconf.config
+        reached_device = bool(netconf.device.connected)
+        try:
+            if netconf.locked:
+                if netconf.dirty:
+                    config.rollback()
+                config.unlock()
+        except Exception as error:
+            self.discard(netconf)
+            raise _fault(error, reached_device) from error
+        finally:
+            netconf.config = None
+            netconf.locked = netconf.dirty = False
 
     def discard(self, session: Session) -> None:
         self._discard(cast(NetconfSession, session))
@@ -563,12 +587,14 @@ class NetconfCommunicator(Communicator):
 
     @staticmethod
     def _discard(netconf: NetconfSession) -> None:
+        netconf.doubtful = True
+        netconf.config = None
         netconf.locked = netconf.dirty = False
         try:
+            netconf.device.connected = False
             netconf.device._conn._session.close()
         except Exception:
             pass
-        netconf.device.connected = False
 
     def load(self, session: Session, lines: list[str]) -> Result:
         netconf = cast(NetconfSession, session)

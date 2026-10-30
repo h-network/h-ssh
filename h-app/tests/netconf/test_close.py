@@ -39,14 +39,14 @@ def test_close_timeout_tears_down_transport_and_keeps_first_fault(communicator, 
     assert wire.closed
 
 
-def test_cleanup_continues_after_discard_failure(communicator, loaded, rpc_error):
+def test_cleanup_failure_discards_without_more_rpcs(communicator, loaded, rpc_error):
     session, wire = loaded
     wire.errors['load-configuration'] = rpc_error('rollback denied')
-    wire.errors['close-session'] = TimeoutExpiredError('no close answer')
     with pytest.raises(Fault) as caught:
         communicator.close(session)
     assert caught.value.kind == FaultKind.REFUSED and 'rollback denied' in caught.value.detail
-    assert wire.names[-2:] == ['unlock-configuration', 'close-session']
+    assert wire.names[-1] == 'load-configuration'
+    assert 'unlock-configuration' not in wire.names and 'close-session' not in wire.names
     assert wire.closed and session.config is None and not session.locked and not session.dirty
 
 
@@ -57,4 +57,5 @@ def test_unlock_failure_after_commit_never_rolls_back(communicator, loaded, rpc_
     with pytest.raises(Fault) as caught:
         communicator.close(session)
     assert caught.value.kind == FaultKind.REFUSED
-    assert wire.names.count('load-configuration') == 1 and wire.names[-1] == 'close-session'
+    assert wire.names.count('load-configuration') == 1 and wire.names[-1] == 'unlock-configuration'
+    assert wire.closed and 'close-session' not in wire.names
