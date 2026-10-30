@@ -100,7 +100,7 @@ class Policy:
         else:
             self.gate.release_device(target)
 
-    async def pause(self, attempt: int, opening: bool) -> None:
-        """Before attempt + 1: the connect backoff after a failed open, else the settings' retry pause."""
-        backoff = CONNECT_BACKOFF[min(attempt, len(CONNECT_BACKOFF)) - 1] if opening else self.settings.retry_pause
+    async def pause(self, attempt: int, unanswered: bool) -> None:
+        """Before attempt + 1: the connect backoff after a connect nothing answered, else the settings' retry pause, which also lets a device that dropped the setup recover."""
+        backoff = CONNECT_BACKOFF[min(attempt, len(CONNECT_BACKOFF)) - 1] if unanswered else self.settings.retry_pause
         await asyncio.sleep(backoff)

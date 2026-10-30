@@ -154,14 +154,15 @@ def build_parser() -> _Parser:
 
 
 def typed_dests(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
-    """Destinations the command line gave, whatever their value, so a typed flag wins over a run file."""
-    typed = set()
-    for action in parser._actions:
-        if any(opt in argv or any(a.startswith(opt + "=") for a in argv) for opt in action.option_strings):
-            typed.add(action.dest)
-    if any(not a.startswith("-") for a in argv):
-        typed.add("hosts")
-    return typed
+    """Destinations the command line gave, whatever their value, so a typed flag wins over a run file: argv parsed again with every default suppressed."""
+    saved = [(action, action.default) for action in parser._actions]
+    try:
+        for action, _ in saved:
+            action.default = argparse.SUPPRESS
+        return set(vars(parser.parse_intermixed_args(argv)))
+    finally:
+        for action, default in saved:
+            action.default = default
 
 
 def apply_config_defaults(args: argparse.Namespace, config: dict[str, str]) -> None:
