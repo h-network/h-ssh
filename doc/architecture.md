@@ -507,15 +507,17 @@ conversion error never changes the target outcome or escapes from `add` as `Valu
 
 `Store(path, readonly=False)` requires an explicit path. The orchestrator supplies it from
 `RecordSettings`; the store imports no orchestrator defaults. The `h-ssh-store` front end
-will obtain the default from the orchestrator in slice 3. Writable construction defers
+obtains the default from the orchestrator. Writable construction defers
 opening and creation to `start_run`, before any device work.
 Read-only construction opens an existing compatible store without creating it. SQLite runs
 in WAL mode with a 10-second busy timeout, a separate bounded 5-second first-open WAL
 wait, `synchronous=NORMAL` and serialized write transactions. Each operation row is committed
 in one transaction. NORMAL protects against a process crash; a power loss can lose recent
 commits. Store creation/opening failures close every acquired resource. Construction alone
-creates no files, and close is idempotent. The writer never deletes a database to undo a
-refused run.
+creates no files, and close is idempotent. If the first open fails, the writer removes the
+database only when that open created it with `O_EXCL`; a pre-existing file stays. Cleanup
+is deliberately simple and does not coordinate with another process opening the new file
+at the same time. A successfully opened store is retained.
 `finish_run` and `close` complete the writer interface; SQLite and file failures are exposed
 as contextual `OSError`, so the recorder can count lost records without failing the device.
 The writer checks the database identity before and after writes and when closing, using a
@@ -555,8 +557,10 @@ The reader interfaces in `store.py` return stored column names unchanged:
 The `h-ssh-store` entry point is `hssh.frontends.store:main_sync`; parsing, rendering,
 configuration and default resolution belong to that front end. `store.py` imports no
 front-end modules. The reader shares `frontends.settings.store_path` with the writer.
-[Reader usage](store.md) covers the commands and exit codes. Display tables stream rows,
-and sanitize terminal-bound metadata before shortening; files and pipes retain raw text.
+[Reader usage](store.md) covers the commands and exit codes. Display tables stream rows.
+On a terminal, runs/failed/history/slowest use declared column widths, right-aligned numeric
+cells and visibly shortened long cells, with metadata sanitized before measuring. Pipes and
+files retain tab-separated rows without terminal padding or filtering.
 Exports check destination path and inode against the database and its sidecars before
 truncation, including hard-link aliases. A closed downstream pipe preserves the command's
 known verdict and produces no traceback.
@@ -598,7 +602,10 @@ promises that a later write cannot fail. Both raise contextual `OSError` on fail
 current user, locks it and sets 0600 before truncating, then completes all short writes.
 It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
 The recorder validates the target name and containment through `hssh.paths` before calling
-it. Saved output stays one file per target, including batches.
+it. Saved output stays one file per target: batch mode writes `<name>.json`, an ordered
+array of every recorded operation using `operation_dict`, including failed operations.
+Other modes keep `<name>.output`. The recorder uses the explicit run mode, not the number
+of operations, to select the format; conversion or write failures count as `not_kept`.
 
 For JSON text in audit fields, the writer parses objects and lists and masks the entire value of a
 secret key, including wrapped values. A key is secret when a dialect redaction pattern matches
@@ -611,9 +618,9 @@ The secret vocabulary belongs to the dialect; stored device output is left uncha
 
 `SafetyGate(settings)` consumes `SafetySettings`; it defines no run defaults or fault policy.
 The orchestrator supplies each target's effective port. State keys are `host|port`, so two
-ports on one host are independent. A legacy host-only cooldown holds every port of that
-host. A caller supplying no port queries the host as a whole, including its port-specific
-cooldowns; the gate does not guess a transport port.
+ports on one host are independent. A target without an effective port raises `OSError`;
+the gate does not guess a transport port. The orchestrator excludes targets whose driver
+cannot be resolved from gate calls and reports their resolution failure separately.
 
 `check_device(target, login=True)` checks cooldown, active reservation and login budget under
 one in-process lock, and reserves the device before returning `(True, "ok")`. A refusal
@@ -642,9 +649,10 @@ fsynced. Admission and `holds` refresh under the same file lock. The state and l
 are regular owner-only 0600 files, symlinks and FIFOs are refused, and newly created parent
 directories are 0700. Temporary files and descriptors are released on failure.
 
-The file is a JSON object mapping keys to finite Unix expiry timestamps. A missing or
-empty file is initially empty; legacy null expiries mean no hold. Invalid JSON, a non-object
-root, or a non-numeric/non-finite expiry is preserved by moving the file to
+The file is a JSON object mapping `host|port` keys to finite Unix expiry timestamps;
+ports are decimal integers from 1 to 65535. A missing or empty file is initially empty.
+Invalid JSON, unsupported keys, a non-object root, or a null/non-numeric/non-finite expiry
+is preserved by moving the file to
 `<safety_file>.corrupt`. That marker prevents further use; inspect and repair the state and
 remove the marker before starting a new gate. Existing `.corrupt` evidence is not overwritten.
 State, lock, and persistence errors raise contextual `OSError`; there is no unlocked or

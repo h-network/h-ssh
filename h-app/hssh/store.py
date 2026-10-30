@@ -15,7 +15,7 @@ import threading
 import time
 import weakref
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Literal
@@ -50,7 +50,7 @@ CREATE TABLE results (
   PRIMARY KEY (run_id, target, seq)
 );
 """
-_INCOMPATIBLE = "incompatible store schema; use develop's h-ssh-store to read old stores, or choose a new store path"
+_INCOMPATIBLE = "incompatible store schema; choose a new store path"
 
 
 def _json_value(value: object) -> None:
@@ -251,6 +251,7 @@ class Store:
                 release_directory()
 
     def _open(self) -> None:
+        created = False
         directory = os.path.dirname(self.path) or "."
         private_dir(directory)
         self._directory = os.open(directory, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY)
@@ -261,7 +262,7 @@ class Store:
                 raise OSError("store directory must be owned by this user and not writable by others unless sticky")
             try:
                 with private_file(self._name, os.O_RDWR | os.O_CREAT | os.O_EXCL, dir_fd=self._directory):
-                    pass
+                    created = True
             except FileExistsError:
                 pass
             info = os.stat(self._name, dir_fd=self._directory, follow_symlinks=False)
@@ -297,7 +298,15 @@ class Store:
             self._check_identity()
             self._conn.row_factory = sqlite3.Row
         except BaseException:
-            self._release()
+            try:
+                conn, self._conn = self._conn, None
+                if conn is not None:
+                    conn.close()
+                if created:
+                    with suppress(FileNotFoundError):
+                        os.unlink(self._name, dir_fd=self._directory)
+            finally:
+                self._release()
             raise
 
     @contextmanager

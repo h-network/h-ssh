@@ -27,7 +27,7 @@ def _shown(text: object, stream=None) -> str:
 
 
 def _short(text: object, width: int = 48) -> str:
-    lines = _shown(text or "").strip().splitlines()
+    lines = _shown("" if text is None else text).strip().splitlines()
     value = lines[0] if lines else ""
     if len(lines) > 1:
         value += f" (+{len(lines) - 1} lines)"
@@ -39,10 +39,17 @@ def _write(stream, text: str) -> None:
         stream.write(text)
 
 
-def _table(head, rows) -> None:
-    _write(sys.stdout, "\t".join(head) + "\n")
-    for row in rows:
-        _write(sys.stdout, "\t".join(_shown(cell) for cell in row) + "\n")
+def _table(head, rows, *, widths: tuple[int, ...], numeric: tuple[int, ...] = ()) -> None:
+    terminal = is_terminal(sys.stdout)
+    for row in itertools.chain((head,), rows):
+        if terminal:
+            cells = (_short(cell, width).replace("\t", " ") for cell, width in zip(row, widths))
+            cells = (cell.rjust(width) if i in numeric else cell.ljust(width)
+                     for i, (cell, width) in enumerate(zip(cells, widths)))
+            line = "  ".join(cells).rstrip()
+        else:
+            line = "\t".join(str(cell) for cell in row)
+        _write(sys.stdout, line + "\n")
 
 
 def _run_filter(store: Store, value: str | None) -> int | None:
@@ -59,7 +66,8 @@ def _runs(store: Store, args) -> int:
                  "/".join(str(r[key]) if r[key] is not None else "?" for key in ("targets", "ok", "failed", "skipped")),
                  r["not_kept"], "interrupted" if r["interrupted"] else "", _short(r["argv"], 60))
                 for r in records)
-        _table(("run", "started", "mode", "user", "targets/ok/failed/skipped", "not_kept", "state", "argv"), rows)
+        _table(("run", "started", "mode", "user", "targets/ok/failed/skipped", "not_kept", "state", "argv"), rows,
+               widths=(6, 32, 13, 12, 23, 8, 11, 60), numeric=(0, 4, 5))
     return 0
 
 
@@ -71,7 +79,8 @@ def _failed(store: Store, args) -> int:
         selected = itertools.chain((first,), rows) if first is not None else ()
         _write(sys.stdout, f"run {run}: failed operations\n")
         _table(("target", "seq", "command", "fault", "detail"),
-               ((r["target"], r["seq"], _short(r["command"]), r["fault"], _short(r["detail"], 80)) for r in selected))
+               ((r["target"], r["seq"], _short(r["command"]), r["fault"], _short(r["detail"], 80)) for r in selected),
+               widths=(24, 5, 48, 15, 80), numeric=(1,))
     return args.verdict
 
 
@@ -141,7 +150,8 @@ def _history(store: Store, args) -> int:
     with closing(store.results(order="newest", limit=args.last, **_filters(args))) as rows:
         _table(("started", "run", "seq", "command", "ok", "status", "ms"),
                ((_short(r["started"], 32), r["run_id"], r["seq"], _short(r["command"]),
-                 "OK" if r["ok"] else "FAIL", r["target_status"], r["elapsed_ms"]) for r in rows))
+                 "OK" if r["ok"] else "FAIL", r["target_status"], r["elapsed_ms"]) for r in rows),
+               widths=(32, 6, 5, 48, 4, 7, 9), numeric=(1, 2, 6))
     return 0
 
 
@@ -149,7 +159,8 @@ def _slowest(store: Store, args) -> int:
     with closing(store.results(_run_filter(store, args.run), order="slowest", limit=args.last, **_filters(args))) as rows:
         _table(("ms", "target", "run", "seq", "command", "ok", "status"),
                ((r["elapsed_ms"], r["target"], r["run_id"], r["seq"], _short(r["command"]),
-                 "OK" if r["ok"] else "FAIL", r["target_status"]) for r in rows))
+                 "OK" if r["ok"] else "FAIL", r["target_status"]) for r in rows),
+               widths=(9, 24, 6, 5, 48, 4, 7), numeric=(0, 2, 3))
     return 0
 
 
