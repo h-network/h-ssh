@@ -23,6 +23,7 @@ from typing import Any, Callable, Sequence
 from hssh.dialects.base import Dialect
 from hssh.drivers import Registry
 from hssh.frontends import profiles, settings
+from hssh.frontends.settings import CREDENTIAL_KEYS, load_config  # noqa: F401
 from hssh.frontends.fleet import (
     LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, package_version, parse_target, quiet_library_logs,
     run_spec,
@@ -55,8 +56,6 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "skip_unreachable": DEFAULT_SKIP_UNREACHABLE,
     "cooldown": DEFAULT_SAFETY.cooldown_seconds, "rate_limit": DEFAULT_SAFETY.rate_limit,
 }
-CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
-
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_SKIPPED, EXIT_INCOMPLETE, EXIT_INTERRUPTED = 0, 1, 2, 3, 4, 130
 # Worst first, for the exit code of a --every watch.
 EXIT_ORDER = (EXIT_INTERRUPTED, EXIT_INCOMPLETE, EXIT_USAGE, EXIT_FAILED, EXIT_SKIPPED, EXIT_OK)
@@ -68,33 +67,9 @@ class _Parser(argparse.ArgumentParser):
         raise SystemExit(f"ERROR: {message}")
 
 
-def config_path() -> Path:
-    return Path.home() / ".h-ssh" / "config"
-
-
 def default_devices_path() -> str:
     home = Path.home() / ".h-ssh" / "devices.csv"
     return str(home) if home.exists() else "devices.csv"
-
-
-def load_config(path: str | None = None) -> dict[str, str]:
-    """`key = value` lines with `#` comments; a missing file is empty, a credential key is refused."""
-    p = Path(path) if path else config_path()
-    if not p.is_file():
-        return {}
-    config: dict[str, str] = {}
-    for n, line in enumerate(p.read_text(encoding="utf-8-sig").splitlines(), start=1):
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if "=" not in line:
-            raise ValueError(f"{p}: line {n}: expected 'key = value', got {line!r}")
-        key, value = line.split("=", 1)
-        key = key.strip().lower().replace("-", "_")
-        if key in CREDENTIAL_KEYS:
-            raise ValueError(f"{p}: line {n}: '{key}' is not allowed, a config file never carries a credential")
-        config[key] = value.strip().strip('"').strip("'")
-    return config
 
 
 def seconds_arg(text: str) -> float:

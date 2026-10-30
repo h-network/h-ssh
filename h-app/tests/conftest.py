@@ -18,7 +18,7 @@ def cli_run(monkeypatch, capsys):
     for name in ("HSSH_USER", "HSSH_STORE", "HSSH_AUDIT_LOG", "HSSH_SAFETY_FILE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(cli, "default_devices_path", lambda: "devices.csv")
-    monkeypatch.setattr(cli, "config_path", lambda: Path("/nonexistent/h-ssh-config"))
+    monkeypatch.setattr(cli.settings, "config_path", lambda: Path("/nonexistent/h-ssh-config"))
     render = cli.render
     monkeypatch.setattr(cli, "render", lambda report, args: render(report, args, out=sys.stdout))
 

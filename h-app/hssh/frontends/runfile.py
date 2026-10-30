@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from hssh.frontends.settings import CREDENTIAL_KEYS
+
 try:
     import yaml
 except ImportError:
@@ -53,9 +55,6 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "raw": ("raw", bool),
     "verbose": ("verbose", bool),
 }
-
-# A run file never carries a secret, whatever the value.
-CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 
 # Relative to the file, not to the shell's cwd.
 PATH_KEYS = ("devices", "batch", "edit_file", "edit_dir", "safety_file", "store", "audit_log", "log", "save_output")
