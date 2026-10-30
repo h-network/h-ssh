@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+from collections.abc import Sequence
 from pathlib import Path
 
 from hssh.dialects.base import Dialect
@@ -101,6 +102,7 @@ def write_audit_entry(
     operation: OperationResult,
     edit: EditSettings,
     diff: str = "",
+    lines: Sequence[str] = (),
 ) -> None:
     """Append JSONL using operation.started as time; write errors propagate.
     Actions: load, diff, commit, confirm, probe (edit stopped by probe failure), aborted (operator declined).
@@ -114,6 +116,7 @@ def write_audit_entry(
         "host": target.host,
         "driver": driver,
         "action": action,
+        "payload": redact_secrets("\n".join(lines), dialect) if action == "load" else "",
         "dry_run": not edit.apply,
         "confirmed_minutes": edit.confirmed_minutes,
         "comment": redact_secrets(edit.comment, dialect) if edit.comment is not None else None,
