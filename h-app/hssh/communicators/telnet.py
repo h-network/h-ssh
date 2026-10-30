@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import time
 
 from hssh.communicators.base import Session
 from hssh.dialects.base import Dialect
@@ -29,8 +30,13 @@ class TelnetChannel:
             raise ConnectionError("Telnet connection closed by peer")
         return data
 
-    def send(self, data: bytes) -> None:
-        self.sock.sendall(data)
+    def send(self, data: bytes, deadline: float) -> None:
+        while data:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("write not finished by its deadline")
+            self.sock.settimeout(remaining)
+            data = data[self.sock.send(data):]
 
     def close(self) -> None:
         self.sock.close()
@@ -39,6 +45,7 @@ class TelnetChannel:
 class TelnetCommunicator:
     default_port: int = 23
     banner: bytes | None = None
+    ssh_config = None
     capabilities: frozenset[str] = frozenset()
 
     def __init__(self, dialect: Dialect) -> None:

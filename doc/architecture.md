@@ -172,16 +172,22 @@ A communicator does not retry, apply policy, write records, or keep state outsid
 
 CLI-driven communicators (`ssh`, `openssh`, `telnet`) share one **CLI engine**. The engine drives an
 interactive channel: login, prompt detection, paging, command execution and line-by-line configuration.
+The channel's `send(data, deadline)` and the engine's `login(deadline)` take absolute `time.monotonic()`
+deadlines; each adapter holds one deadline across the whole write. Login takes no credentials: SSH and
+OpenSSH sessions arrive authenticated.
 It reads vendor behaviour from the dialect.
 
 ### 3.5 Dialects
 
 A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
-- the prompt pattern and paging control
+- the prompt pattern, the anchored prompt name and tail the engine learns the device's own prompt from, and the
+  context lines the CLI prints with its prompt
+- paging control: the command that turns the pager off, the pager marker as a whole line, and the reply to it
 - the refusal and warning patterns
-- how to enter and leave configuration mode, how to commit, and how to discard uncommitted changes, if the
-  vendor has a candidate model
+- how to enter and leave configuration mode, how to commit (`build_commit`), diff and read the commit history
+  (`parse_commit_history`), and how to discard uncommitted changes, if the vendor has a candidate model
+- how a validated line is typed (`encode_line`: bytes, newline included; Junos escapes a literal `?`)
 - the read-command rule, deciding which commands are safe to retry
 - a shortcut library of named commands
 
@@ -231,6 +237,7 @@ class Communicator(Protocol):
     capabilities: frozenset[str]          # e.g. {"show", "batch", "edit", "commit_confirmed"}
     default_port: int                     # e.g. 830 for netconf
     banner: bytes | None                  # what the port sends first, for the probe; None: a connect is enough
+    ssh_config: Literal["paramiko", "openssh"] | None   # whose ssh client config the transport reads, so the probe asks where the connection really goes: "paramiko" (~/.ssh/config: HostName, Port, ProxyCommand), "openssh" (as `ssh -G` prints it, ProxyJump too), None (reads none)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...

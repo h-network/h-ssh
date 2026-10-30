@@ -2,6 +2,7 @@ import re
 
 from hssh.dialects.base import Dialect
 from hssh.dialects.generic import GenericDialect, _VALUE
+from hssh.model import CommitStatus
 
 
 SET_PREFIX_VERBS = (
@@ -9,10 +10,14 @@ SET_PREFIX_VERBS = (
     "rename ", "copy ", "annotate ", "protect ", "unprotect ",
 )
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+_PENDING = re.compile(r"commit confirmed, rollback in (\d+) minutes?", re.I)
 
 
 class JunosDialect(GenericDialect):
     prompt_pattern = re.compile(r'[\w\-\.]+@[\w\-\.]+[>%#]\s*$')
+    prompt_name_pattern = re.compile(r'^([\w\-\.]+@[\w\-\.]+)')
+    prompt_tail_pattern = re.compile(r'[>%#]\s*$')
+    context_pattern = re.compile(r'^\s*(?:(?:\{\w+(?::\w+)?\})?\[edit[^\]]*\]|# commit confirmed will be rolled back in \d+ minutes?)\s*$')
     refusal_patterns = (
         re.compile(
             r'^\s*(error:|syntax error|missing argument|unknown command|commit failed)',
@@ -22,6 +27,8 @@ class JunosDialect(GenericDialect):
     config_enter_command = "configure exclusive"
     config_exit_command = "exit"
     commit_command = "commit"
+    diff_command = "show | compare"
+    history_command = "show system commit"
     # Discard only this session's uncommitted candidate on close.
     discard_commands = ("rollback 0",)
     has_candidate = True
@@ -49,6 +56,24 @@ class JunosDialect(GenericDialect):
             if not line.startswith(SET_PREFIX_VERBS):
                 return f"line {number}: invalid Junos set command: {line!r}"
         return None
+
+
+    def build_commit(self, confirmed_minutes: int | None, comment: str | None) -> str:
+        line = "commit"
+        if confirmed_minutes:
+            line += f" confirmed {confirmed_minutes}"
+        if comment:
+            line += f' comment "{comment}"'
+        return line
+
+    def parse_commit_history(self, output: str) -> CommitStatus:
+        lines = [ln for ln in output.splitlines() if ln.strip()]
+        newest = lines[0].strip() if lines else ""
+        pending = _PENDING.search(newest) or (_PENDING.search(lines[1]) if len(lines) > 1 else None)
+        return CommitStatus(pending is not None, int(pending.group(1)) if pending else None, newest)
+
+    def encode_line(self, text: str) -> bytes:
+        return text.replace("?", "\x16?").encode("utf-8") + b"\n"
 
 
 DIALECT: Dialect = JunosDialect()

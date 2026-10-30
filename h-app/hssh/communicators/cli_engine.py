@@ -1,15 +1,15 @@
 from typing import Protocol
 
 from hssh.dialects.base import Dialect
-from hssh.model import Credentials, Result, Timeouts
+from hssh.model import Result, Timeouts
 
 
 class Channel(Protocol):
-    """recv raises TimeoutError on timeout and ConnectionError on disconnect."""
+    """recv raises TimeoutError on timeout and ConnectionError on disconnect; send holds one absolute time.monotonic() deadline over the whole write."""
 
     def recv(self, n: int, timeout: float) -> bytes: ...
 
-    def send(self, data: bytes) -> None: ...
+    def send(self, data: bytes, deadline: float) -> None: ...
 
     def close(self) -> None: ...
 
@@ -33,10 +33,8 @@ class CliEngine:
         self.initial = initial
         self.prompt_pattern = dialect.prompt_pattern
 
-    def login(
-        self, creds: Credentials | None = None, *, dialogue: bool = False
-    ) -> None:
-        """Only telnet uses dialogue=True; authenticated SSH supplies no credentials."""
+    def login(self, deadline: float) -> None:
+        """Read to the first prompt and learn it, by the absolute time.monotonic() deadline; the session arrives authenticated."""
         raise NotImplementedError("CLI login and prompt detection")
 
     def disable_paging(self) -> None:

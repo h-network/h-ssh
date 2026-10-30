@@ -240,13 +240,17 @@ class ProcessChannel:
             return False
         return True
 
-    def send(self, data: bytes) -> None:
+    def send(self, data: bytes, deadline: float) -> None:
         view = memoryview(data)
-        try:
-            while view:
+        while view:
+            remaining = deadline - time.monotonic()
+            try:
+                _, ready, _ = select.select([], [self.master], [], max(0.0, remaining))
+                if not ready:
+                    raise TimeoutError("write to %s not finished by its deadline" % self.host)
                 view = view[os.write(self.master, view):]
-        except OSError as exc:
-            raise ConnectionError("connection lost: %s" % exc) from exc
+            except (OSError, ValueError) as exc:
+                raise ConnectionError("connection lost: %s" % exc) from exc
 
     def log(self) -> str:
         return _read(self.log_path)
@@ -288,6 +292,7 @@ class OpenSSH:
 
     default_port = 22
     banner = b"SSH-"
+    ssh_config = "openssh"
 
     def __init__(self, dialect: Dialect):
         self.dialect = dialect
