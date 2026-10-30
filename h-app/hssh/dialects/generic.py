@@ -24,6 +24,7 @@ class GenericDialect(Dialect):
     commit_command: str | None = None
     diff_command: str | None = None
     history_command: str | None = None
+    config_history_command: str | None = None
     discard_commands: tuple[str, ...] = ()
     has_candidate: bool = False
     redaction_patterns: tuple[re.Pattern[str], ...] = (
