@@ -14,15 +14,16 @@ from dataclasses import dataclass, field
 
 from hssh.communicators.base import Session
 from hssh.drivers import Driver, DriverRegistry
-from hssh.model import (Fault, FaultKind, OperationResult, RunReport, RunSpec, Target, TargetResult, TargetStatus)
+from hssh.model import (Fault, FaultKind, OperationResult, Result, RunReport, RunSpec, Target, TargetResult, TargetStatus)
 from hssh.orchestrator import lifecycle, probe
-from hssh.orchestrator.defaults import GRACE_SECONDS, complete
-from hssh.orchestrator.lifecycle import EditLifecycle, Stage, now, operation
+from hssh.orchestrator.defaults import GRACE_SECONDS, check_edit, complete
+from hssh.orchestrator.lifecycle import EditLifecycle, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
 from hssh.orchestrator.sessions import SessionManager, session_key
 
 READ_MODES = ("show", "batch", "structured", "commit_status")
+DISCARDING = (FaultKind.TIMEOUT, FaultKind.SESSION_LOST, FaultKind.OUTCOME_UNKNOWN)
 
 
 @dataclass
@@ -36,6 +37,7 @@ class _Run:
     begun: set[int] = field(default_factory=set)
     past_commit: set[int] = field(default_factory=set)
     interrupts: int = 0
+    not_kept: int = 0
     stopping: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -74,7 +76,8 @@ class Scheduler:
         results = [self._with_close(run, r, late[r.target.name]) if r.target.name in late else r for r in results]
         counts = {status: sum(r.status == status for r in results) for status in ("ok", "failed", "skipped")}
         report = RunReport(run.run_id, spec.mode, run.started, now(), results, counts["ok"], counts["failed"],
-                           counts["skipped"], interrupted=run.interrupts > 0, pending=self._pending(spec, results))
+                           counts["skipped"], interrupted=run.interrupts > 0, not_kept=run.not_kept,
+                           pending=self._pending(spec, results))
         self.recorder.finish(report)
         return report
 
@@ -111,10 +114,7 @@ class Scheduler:
             except Exception as e:  # noqa: BLE001 - one communicator bug is this target's failure, not the run's end
                 self.policy.settle(target, None)
                 result = self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{type(e).__name__}: {e}", True))
-            try:
-                self.recorder.log(result)
-            except OSError as e:
-                print(f"log: {e}", file=sys.stderr)
+            self._record(run, lambda: self.recorder.log(result))
             return result
 
     async def _gather(self, run: _Run) -> list[TargetResult]:
@@ -155,19 +155,25 @@ class Scheduler:
         ops = tried.operations
         if run.stopping.is_set() and self._interrupted_connect(ops):
             status = "skipped"
-        try:
-            for seq, op in enumerate(ops):
-                self.recorder.result(run.run_id, target, driver.name, seq, op)
-            if spec.mode == "edit":
-                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit, spec.config_lines)
-            elif spec.mode == "confirm":
-                self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops,
-                                      dataclasses.replace(spec.edit, apply=True))
-            self.recorder.save_output(target, ops)
-        except OSError as e:
-            ops.append(OperationResult("record", Fault(FaultKind.LOCAL, str(e), False), now(), 0))
-            status = "failed"
+        for seq, op in enumerate(ops):
+            self._record(run, lambda seq=seq, op=op: self.recorder.result(run.run_id, target, driver.name, seq, op))
+        if spec.mode == "edit":
+            self._record(run, lambda: self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops, spec.edit,
+                                                            spec.config_lines))
+        elif spec.mode == "confirm":
+            self._record(run, lambda: self.recorder.changes(run.run_id, target, driver.name, driver.dialect, ops,
+                                                            dataclasses.replace(spec.edit, apply=True)))
+        self._record(run, lambda: self.recorder.save_output(target, ops))
         return TargetResult(target, status, tuple(ops))
+
+    @staticmethod
+    def _record(run: _Run, write) -> None:
+        """One record written; a failure is counted and said, never the target's failure or cooldown."""
+        try:
+            write()
+        except OSError as e:
+            run.not_kept += 1
+            print(f"record not kept: {e}", file=sys.stderr)
 
     async def _attempt(self, run: _Run, index: int, target: Target, driver: Driver, attempt: int) -> _Attempt:
         """One login under the safety gate, the mode's operations in order on that session, the close started beside the work, the gate settled."""
@@ -196,8 +202,7 @@ class Scheduler:
         try:
             ops = await self._operations(run, index, target, driver, session)
         finally:
-            stale = any(isinstance(op.outcome, Fault) and op.outcome.kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST)
-                        for op in ops)
+            stale = any(isinstance(op.outcome, Fault) and op.outcome.kind in DISCARDING for op in ops)
             await self.sessions.release(driver, target, creds, discard=stale)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
         verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
@@ -219,12 +224,11 @@ class Scheduler:
             return [await operation(c, lambda c=c: comm.structured(session, c, spec.format), spec.timeouts.command)
                     for c in spec.commands]
         if spec.mode == "edit":
-            edit = await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(list(spec.config_lines), spec.edit)
-            if edit.stage in (Stage.COMMIT, Stage.PENDING, Stage.CLOSE):
-                run.past_commit.add(index)
+            edit = await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(
+                list(spec.config_lines), spec.edit, before_commit=lambda: run.past_commit.add(index))
             return list(edit.operations)
         if spec.mode == "confirm":
-            return [await lifecycle.confirm(comm, session, spec.timeouts)]
+            return await lifecycle.confirm(comm, session, spec.timeouts)
         return [await lifecycle.commit_history(comm, session, spec.timeouts)]
 
     @staticmethod
@@ -241,13 +245,13 @@ class Scheduler:
     def _with_close(self, run: _Run, result: TargetResult, late: tuple[str, OperationResult]) -> TargetResult:
         """The close fault appended as the trailing operation and recorded; status untouched."""
         driver, op = late
-        self.recorder.result(run.run_id, result.target, driver, len(result.operations), op)
+        self._record(run, lambda: self.recorder.result(run.run_id, result.target, driver, len(result.operations), op))
         return dataclasses.replace(result, operations=(*result.operations, op))
 
     def _failed_before(self, run: _Run, target: Target, fault: Fault, status: TargetStatus = "failed") -> TargetResult:
         """A target that failed, or was skipped, before any operation: one operation named 'open', recorded without a driver."""
         op = OperationResult(OPEN, fault, now(), 0)
-        self.recorder.result(run.run_id, target, "", 0, op)
+        self._record(run, lambda: self.recorder.result(run.run_id, target, "", 0, op))
         return TargetResult(target, status, (op,))
 
     def _dead_edit(self, spec: RunSpec, dead: dict[str, Fault | None]) -> None:
@@ -269,12 +273,13 @@ class Scheduler:
                     f"partial deployment; skip_unreachable goes on with the {reachable} reachable", False)
 
     @staticmethod
-    def _pending(spec: RunSpec, results: list[TargetResult]) -> dict[str, str]:
-        """Targets left with a pending commit-confirmed, and the command that confirms each."""
+    def _pending(spec: RunSpec, results: list[TargetResult]) -> dict[str, int]:
+        """Targets whose commit-confirmed went through, each with the minutes armed; a target whose diff was empty sent no commit."""
         edit = spec.edit
-        if spec.mode != "edit" or edit is None or not edit.apply or not edit.confirmed_minutes:
+        if spec.mode != "edit" or not edit.apply or not edit.confirmed_minutes:
             return {}
-        return {r.target.name: lifecycle.confirm_command(r.target) for r in results if r.status == "ok"}
+        return {r.target.name: edit.confirmed_minutes for r in results
+                if any(op.command == "commit" and isinstance(op.outcome, Result) for op in r.operations)}
 
 
 class _DaemonThreads(concurrent.futures.ThreadPoolExecutor):
@@ -332,6 +337,8 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
     spec = complete(spec)
     if spec.mode == "structured" and not spec.format:
         raise Fault(FaultKind.LOCAL, "structured mode needs a format, json or xml; nothing was sent", False)
+    if spec.mode == "edit" and (why := check_edit(spec.edit)):
+        raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
     if spec.safety is not None:
         _plan_logins(spec, registry)
     sessions = SessionManager(pool=pool)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import getpass
+import unicodedata
 
 from hssh.model import Credentials, EditSettings, HostKeyPolicy, PolicySettings, RunSpec, SafetySettings, Timeouts
 
@@ -21,6 +22,8 @@ DEFAULT_SAFETY = SafetySettings(cooldown_seconds=300, rate_limit=6)
 DEFAULT_TRANSPORT = "ssh"
 DEFAULT_VENDOR = "generic"
 DEFAULT_STORE = "h-ssh.db"
+MAX_CONFIRMED_MINUTES = 65535
+MAX_COMMENT_BYTES = 512
 
 
 def default_username() -> str:
@@ -29,6 +32,36 @@ def default_username() -> str:
 
 def default_credentials() -> Credentials:
     return Credentials(username=default_username())
+
+
+def check_confirmed_minutes(minutes: int) -> str | None:
+    """Why `minutes` cannot arm a commit-confirmed, or None: a whole number from 1 to MAX_CONFIRMED_MINUTES."""
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= MAX_CONFIRMED_MINUTES:
+        return f"commit-confirmed minutes must be a whole number from 1 to {MAX_CONFIRMED_MINUTES}, not {minutes!r}"
+    return None
+
+
+def check_comment(comment: str) -> str | None:
+    """Why `comment` cannot go on a commit, or None: one non-empty line of at most MAX_COMMENT_BYTES UTF-8 bytes, no control characters, no quotes."""
+    if not comment.strip():
+        return "the commit comment is empty"
+    if len(comment.encode("utf-8", "surrogatepass")) > MAX_COMMENT_BYTES:
+        return f"the commit comment is over {MAX_COMMENT_BYTES} bytes"
+    for ch in comment:
+        if unicodedata.category(ch) in ("Cc", "Cs"):
+            return f"the commit comment has a control character (U+{ord(ch):04X}); it must be one line of plain text"
+        if ch in "\"'":
+            return "the commit comment has a quote character"
+    return None
+
+
+def check_edit(edit: EditSettings) -> str | None:
+    """The first of the two checks above that the settings fail, or None."""
+    if edit.confirmed_minutes is not None and (why := check_confirmed_minutes(edit.confirmed_minutes)):
+        return why
+    if edit.comment is not None and (why := check_comment(edit.comment)):
+        return why
+    return None
 
 
 def complete(spec: RunSpec) -> RunSpec:
