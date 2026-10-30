@@ -16,7 +16,7 @@ from hssh.communicators.base import Session
 from hssh.drivers import Driver, DriverRegistry
 from hssh.model import (Fault, FaultKind, OperationResult, Result, RunReport, RunSpec, Target, TargetResult, TargetStatus)
 from hssh.orchestrator import lifecycle, probe
-from hssh.orchestrator.defaults import GRACE_SECONDS, check_edit, complete, fit_workers
+from hssh.orchestrator.defaults import FDS_PER_PROBE, GRACE_SECONDS, check_edit, complete, fit_workers, open_file_limit
 from hssh.orchestrator.lifecycle import EditLifecycle, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
@@ -71,8 +71,9 @@ class Scheduler:
     async def run(self, spec: RunSpec) -> RunReport:
         """The whole run: the record destinations proved, the probe, the run row, every target under the worker limit, the report, the run row closed. A refusal before the first device is Fault(LOCAL)."""
         loop = asyncio.get_running_loop()
-        workers = fit_workers(spec.workers)
+        workers, note = fit_workers(spec.workers)
         self.sessions.workers = workers
+        self._say(note)
         loop.set_default_executor(_DaemonThreads(workers, thread_name_prefix="hssh"))
         run = _Run(spec, 0, now())
         slots = asyncio.Semaphore(workers)
@@ -133,7 +134,17 @@ class Scheduler:
             where = probe.route(target.host, target.port, comm.default_port)
             if where is not None:
                 boxes.append((target, where[0], where[1], comm.banner))
-        return await probe.probe(boxes, spec.timeouts.connect)
+        wanted = min(probe.MAX_PROBES, len(boxes))
+        probes = await self.sessions.room(wanted * FDS_PER_PROBE) // FDS_PER_PROBE
+        if probes < wanted:
+            self._say(f"probing {max(1, probes)} at a time, not {wanted}: the open-file limit is {open_file_limit()}")
+        return await probe.probe(boxes, spec.timeouts.connect, limit=probes)
+
+    def _say(self, note: str | None) -> None:
+        """A limit note on stderr once per session manager, so a Fleet hears it once, not on every call."""
+        if note is not None and note not in self.sessions.said:
+            self.sessions.said.add(note)
+            print(note, file=sys.stderr)
 
     async def _bounded(self, run: _Run, index: int, target: Target, slots: asyncio.Semaphore,
                        dead: Fault | None, held: str | None) -> TargetResult:
