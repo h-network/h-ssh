@@ -74,8 +74,13 @@ between reports.
 
 The CLI refuses before the password is asked what the run could not go on with: a commit comment or timer the
 orchestrator's `check_comment` and `check_confirmed_minutes` reject, and a run file that applies changes
-without `commit_confirmed` (nobody watches a pipeline). An edit payload loses its blank lines and the lines
-that start with the targets' dialect comment prefixes; an inline `#` is sent as written. After an apply with
+without `commit_confirmed` (nobody watches a pipeline). An edit payload (`-eC` text, one `-eB` file for every
+target, or `-eD DIR` with one `<NAME>.set` per target, read before the password) loses its blank lines and the
+lines that start with each target's own dialect comment prefixes; an inline `#` is sent as written; a payload with
+a control character, or with nothing left after the comments, is refused naming the file and the line. With `-eD`
+a target without its file ends the run before anything is sent, unless `--allow-missing`, which skips those
+targets and says so; a set file name is the device name, checked to stay inside the directory. `--every` repeats
+reads only, never an edit. After an apply with
 a timer the CLI prints the minutes left per device and the command that confirms them, rebuilt from the run's
 own arguments. Exit codes: 0; 1 a device failed; 2 refused before anything was sent; 3 nothing failed but not
 everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exits with the worst of its runs,

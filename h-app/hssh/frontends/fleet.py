@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Callable, Union
 
@@ -177,10 +177,12 @@ class Fleet:
         self._runner = runner
 
     def spec(self, mode: Mode, commands: Sequence[str] = (), config_lines: Sequence[str] = (),
-             format: str | None = None, edit: EditSettings | None = None,
-             skip_unreachable: bool | None = None) -> RunSpec:
+             payloads: Mapping[str, Sequence[str]] | None = None, format: str | None = None,
+             edit: EditSettings | None = None, skip_unreachable: bool | None = None) -> RunSpec:
         return RunSpec(targets=self.targets, mode=mode, commands=tuple(commands),
-                       config_lines=tuple(config_lines), format=format, credentials=self.credentials,
+                       config_lines=tuple(config_lines),
+                       payloads={name: tuple(lines) for name, lines in (payloads or {}).items()},
+                       format=format, credentials=self.credentials,
                        timeouts=self.timeouts, workers=self.workers, host_key_policy=self.host_key_policy,
                        probe=self.probe, skip_unreachable=skip_unreachable, edit=edit, policy=self.policy,
                        safety=self.safety, recording=self.recording)
@@ -194,11 +196,15 @@ class Fleet:
     def structured(self, rpc: str, fmt: str) -> RunReport:
         return self._runner(self.spec("structured", commands=[rpc], format=fmt))
 
-    def edit(self, lines: Iterable[str], apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None,
-             comment: str | None = None, skip_unreachable: bool = DEFAULT_SKIP_UNREACHABLE) -> RunReport:
-        """Dry run unless `apply`; `confirmed_minutes` leaves a pending commit for confirm(); `skip_unreachable` goes on without the devices the probe found dead."""
+    def edit(self, lines: Iterable[str] | None = None, payloads: Mapping[str, Sequence[str]] | None = None,
+             apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None, comment: str | None = None,
+             skip_unreachable: bool = DEFAULT_SKIP_UNREACHABLE) -> RunReport:
+        """`lines` for every target, or `payloads` per target name (a target in neither is skipped). Dry run unless `apply`; `confirmed_minutes` leaves a pending commit for confirm(); `skip_unreachable` goes on without the devices the probe found dead."""
+        if lines is None and payloads is None:
+            raise ValueError("edit needs lines or payloads")
         edit = EditSettings(apply=apply, confirmed_minutes=confirmed_minutes, comment=comment)
-        return self._runner(self.spec("edit", config_lines=list(lines), edit=edit, skip_unreachable=skip_unreachable))
+        return self._runner(self.spec("edit", config_lines=list(lines or ()), payloads=payloads, edit=edit,
+                                      skip_unreachable=skip_unreachable))
 
     def confirm(self) -> RunReport:
         return self._runner(self.spec("confirm"))
