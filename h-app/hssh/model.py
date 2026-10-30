@@ -35,7 +35,7 @@ class Credentials:
 
 @dataclass(frozen=True)
 class Timeouts:
-    """Seconds for the TCP connect, for the session setup after it (key exchange, login, NETCONF hello) as one deadline, for each operation in a session, and for a commit."""
+    """Seconds for the TCP connect, for the session setup after the SSH banner (key exchange, login, NETCONF hello) as one deadline, for each operation in a session, and for a commit."""
 
     connect: int
     setup: int
@@ -94,6 +94,7 @@ class RunSpec:
     workers: int | None = None
     host_key_policy: HostKeyPolicy | None = None
     probe: bool | None = None
+    skip_unreachable: bool | None = None
     edit: EditSettings | None = None
     policy: PolicySettings | None = None
     safety: SafetySettings | None = None
