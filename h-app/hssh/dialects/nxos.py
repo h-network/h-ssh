@@ -1,7 +1,9 @@
-"""Cisco NX-OS: an IOS-shaped CLI."""
+from hssh.dialects.base import Dialect
+from hssh.dialects.ios import IosDialect
 
-from .base import Dialect
-from .ios import CLI, COMMENTS, INFORMATIONAL, REFUSED
 
-DIALECT = Dialect("nxos", "NX-OS", "Cisco NX-OS", refused=REFUSED, informational=INFORMATIONAL, cli=CLI,
-                  comments=COMMENTS)
+class NxosDialect(IosDialect):
+    pass
+
+
+DIALECT: Dialect = NxosDialect()

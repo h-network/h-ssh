@@ -1,99 +1,88 @@
-"""Junos: set syntax, a candidate configuration, commit confirmed."""
-
 import re
-from typing import Tuple
 
-from .base import CliSyntax, Dialect
+from hssh.dialects.base import Dialect
+from hssh.dialects.generic import GenericDialect, _VALUE
+from hssh.model import CommitStatus, Fault, FaultKind
 
-# --- the edit guard -----------------------------------------------------------
 
 SET_PREFIX_VERBS = (
-    "set ",
-    "delete ",
-    "activate ",
-    "deactivate ",
-    "insert ",
-    "rename ",
-    "copy ",
-    "annotate ",
-    "protect ",
-    "unprotect ",
+    "set ", "delete ", "activate ", "deactivate ", "insert ",
+    "rename ", "copy ", "annotate ", "protect ", "unprotect ",
 )
-SET_EXACT_VERBS = ("commit", "commit;")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
+_PENDING = re.compile(r"\bcommit confirmed, rollback in (\d+)\s*min(?:ute)?s?\b", re.I)
 
 
-def check_edit(payload: str, allow_commit: bool = True) -> Tuple[bool, str]:
-    """Every non-empty, non-comment line must start with a set verb.
+class JunosDialect(GenericDialect):
+    prompt_pattern = re.compile(r'^[\w\-\.]+@[\w\-\.]+[>%#]\s*$')
+    prompt_name_pattern = re.compile(r'^([\w\-\.]+@[\w\-\.]+)')
+    prompt_tail_pattern = re.compile(r'[>%#]\s*$')
+    paging_off_command = "set cli screen-length 0"
+    pager_pattern = re.compile(r'^\s*---?\(more(?: \d+%)?\)---?\s*$', re.I)
+    context_pattern = re.compile(r'^\s*(?:(?:\{\w+(?::\w+)?\})?\[edit[^\]]*\]|# commit confirmed will be rolled back in \d+ minutes?)\s*$')
+    refusal_patterns = (
+        re.compile(
+            r'^\s*(error:|syntax error|missing argument|unknown command|commit failed)',
+            re.M | re.I,
+        ),
+    )
+    warning_patterns = (re.compile(r'^\s*warning:\s*statement not found\b', re.M | re.I),)
+    config_enter_command = "configure exclusive"
+    config_exit_command = "exit"
+    commit_command = "commit"
+    diff_command = "show | compare"
+    history_command = "show system commit"
+    config_history_command = "run show system commit"
+    # Discard only this session's uncommitted candidate on close.
+    discard_commands = ("rollback 0",)
+    has_candidate = True
+    redaction_patterns = (
+        re.compile(r'^([^\n]*?)' + _VALUE + r'(;?[ \t]*## SECRET-DATA)', re.MULTILINE),
+    ) + GenericDialect.redaction_patterns + (
+        re.compile(r'(\btrap-group[ \t]+)' + _VALUE, re.IGNORECASE),
+    )
 
-    Comments (#) and blank lines pass. A single standalone `commit` or
-    `commit;` passes when allow_commit is True (it confirms a pending
-    commit-confirmed) and never mixes with set lines; with allow_commit False
-    (-eD/-eB config files) it is refused. Returns (is_valid, why_not).
-    """
-    meaningful = []
-    for idx, raw_line in enumerate(payload.splitlines(), 1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        meaningful.append((idx, line))
+    def check_edit(self, lines: list[str]) -> str | None:
+        refusal = super().check_edit(lines)
+        if refusal:
+            return refusal
+        for number, raw in enumerate(lines, 1):
+            line = raw.strip()
+            if line.startswith(self.comment_prefixes):
+                continue
+            if _CONTROL.search(raw):
+                return f"line {number}: control characters and Tab are not permitted: {raw!r}"
+            if not line:
+                continue
+            word = line.split()[0].rstrip(";")
+            if len(word) >= 3 and "commit".startswith(word):
+                return f"line {number}: commit is not permitted in configuration: {line!r}"
+            if not line.startswith(SET_PREFIX_VERBS):
+                return f"line {number}: invalid Junos set command: {line!r}"
+        return None
 
-    if not meaningful:
-        return False, "configuration payload contains no commands"
+    def build_commit(self, confirmed_minutes: int | None, comment: str | None) -> str:
+        line = "commit"
+        if confirmed_minutes is not None:
+            if type(confirmed_minutes) is not int or not 1 <= confirmed_minutes <= 65535:
+                raise Fault(FaultKind.LOCAL, "commit-confirmed minutes must be an integer from 1 to 65535", False)
+            line += f" confirmed {confirmed_minutes}"
+        if comment is not None:
+            if not comment.strip() or _CONTROL.search(comment) or '"' in comment:
+                raise Fault(FaultKind.LOCAL, "a CLI commit comment must be nonempty text without controls, Tab or double quotes", False)
+            if len(comment.encode("utf-8")) > 512:
+                raise Fault(FaultKind.LOCAL, "the commit comment is over 512 UTF-8 bytes", False)
+            comment = comment.replace("\\", "\\\\")
+            line += f' comment "{comment}"'
+        return line
 
-    if len(meaningful) == 1:
-        idx, line = meaningful[0]
-        if line in SET_EXACT_VERBS:
-            if not allow_commit:
-                return False, f"line {idx}: 'commit' is not permitted in configuration files (-eD/-eB)"
-            return True, ""
+    def parse_commit_history(self, output: str) -> CommitStatus:
+        newest = next((line.strip() for line in output.splitlines() if re.match(r"^\s*0\s+", line)), "")
+        pending = _PENDING.search(newest)
+        return CommitStatus(pending is not None, int(pending.group(1)) if pending else None, newest)
 
-    for idx, line in meaningful:
-        if line in SET_EXACT_VERBS:
-            return False, f"line {idx}: 'commit' cannot be combined with set commands (standalone only)"
-        # Junos CLI requires lowercase set verbs (reject uppercase like 'SET')
-        if not any(line.startswith(verb) for verb in SET_PREFIX_VERBS):
-            return False, (f"line {idx}: invalid Junos set command {line!r} "
-                           "(must start with a valid set verb such as 'set', 'delete', 'activate', etc.)")
-
-    return True, ""
+    def encode_line(self, text: str) -> bytes:
+        return text.replace("?", "\x16?").encode("utf-8") + b"\n"
 
 
-# --- how the CLI answers --------------------------------------------------------
-
-# A Junos CLI error, matched at line start on the reply without the echoed
-# command: a description that says "error-disabled" is not one.
-REFUSED = re.compile(
-    r'^\s*(error:|syntax error|missing argument|unknown command|commit failed)',
-    re.MULTILINE | re.IGNORECASE)
-
-# The note `show system commit` puts on a commit confirmed that still waits:
-# "commit confirmed, rollback in 5mins". Group 1 is the minutes left.
-COMMIT_PENDING = re.compile(r"rollback in (\d+)\s*min", re.I)
-
-CLI = CliSyntax(
-    prompt=re.compile(r'[\w\-\.]+@[\w\-\.]+[>%#]\s*$'),
-    prompt_name=re.compile(r'^([\w\-\.]+@[\w\-\.]+)[>%#]\s*$'),
-    prompt_tail=r'[>%#]\s*$',
-    # Exclusive mode keeps the candidate to this session, as the NETCONF
-    # driver's lock does: commit and rollback 0 never touch another user's
-    # pending changes, and the device refuses entry while someone else holds
-    # the lock.
-    config_enter="configure exclusive",
-    config_exit="exit",
-    compare="show | compare",
-    discard="rollback 0",
-    commit="commit",
-    # "[edit]" / "[edit system]" before the configuration-mode prompt belongs
-    # to the prompt: without this, an empty `show | compare` read as a diff.
-    # A router with two routing engines (a virtual chassis, a cluster) puts
-    # the engine's role in front, "{master}[edit]", and while a commit
-    # confirmed waits the CLI says so above it, "# commit confirmed will be
-    # rolled back in 4 minutes": the engine waits after a reply with output
-    # of its own, and neither is one (#141). Read as a diff, the note made an
-    # empty compare commit, which confirms the pending timer.
-    context=re.compile(r"^((\{[^{}]*\})?\[edit[^\]]*\]|# commit confirmed will be rolled back\b.*?)\s*$"),
-)
-
-DIALECT = Dialect("junos", "Junos", "Junos: set syntax, candidate configuration, commit confirmed",
-                  shortcuts="junos", check_edit=check_edit, refused=REFUSED, cli=CLI,
-                  commit_pending=COMMIT_PENDING)
+DIALECT: Dialect = JunosDialect()

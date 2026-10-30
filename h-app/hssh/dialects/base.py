@@ -1,94 +1,46 @@
-"""What a dialect is made of.
+"""The dialect interface: one vendor's CLI behaviour as data and small parsing hooks (section 3.5)."""
 
-A dialect is what the device speaks: the shortcut library it ships, the guard
-an edit payload must pass, which commands are reads, how its CLI refuses a
-line, how its CLI looks to a transport that types at it, and how it announces
-a pending commit-confirmed. Dialects know nothing about connections; a
-transport that needs one is handed it by the driver (today through the
-vendor_hint, until #83 passes the object).
-
-This package imports nothing from hssh.drivers, hssh.core, hssh.cli or
-hssh.runner. The registry in hssh.drivers imports it.
-"""
+from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Protocol
+
+from hssh.model import CommitStatus
 
 
-def is_read(command: str) -> bool:
-    """The default rule: a `show …` command or a `get-*` RPC name reads;
-    anything else (`request …`, `clear …`, `restart …`, a request-* RPC) acts
-    on the device and is sent once, never re-sent by a retry."""
-    text = command.strip().lower()
-    return text.startswith("show ") or text.startswith("get") or text == "show"
+class Dialect(Protocol):
+    """Vendor behaviour read by the CLI engine; a communicator receives its dialect when it is constructed, and the Driver holds both."""
 
+    prompt_pattern: re.Pattern[str]
+    prompt_name_pattern: re.Pattern[str]
+    prompt_tail_pattern: re.Pattern[str]
+    context_pattern: re.Pattern[str] | None
+    paging_off_command: str | None
+    pager_pattern: re.Pattern[str] | None
+    pager_reply: bytes
+    refusal_patterns: tuple[re.Pattern[str], ...]
+    warning_patterns: tuple[re.Pattern[str], ...]
+    config_enter_command: str | None
+    config_exit_command: str | None
+    commit_command: str | None
+    diff_command: str | None
+    history_command: str | None
+    config_history_command: str | None
+    discard_commands: tuple[str, ...]
+    has_candidate: bool
+    redaction_patterns: tuple[re.Pattern[str], ...]
+    comment_prefixes: tuple[str, ...]
 
-@dataclass(frozen=True)
-class CliSyntax:
-    """How the dialect's CLI looks to a transport that types at it.
+    def is_read(self, command: str) -> bool: ...
 
-    `prompt` matches a line that is the device waiting for input; after login
-    the transport narrows it to this device's own prompt: `prompt_name` finds
-    the name in the first prompt seen (group 1, where the prompt line
-    starts), `prompt_tail` is what may follow it, and the narrowed prompt is
-    the whole line from its start. A prompt `prompt_name` cannot name leaves
-    `prompt`, which need only end the line.
-    `config_enter`/`config_exit` bracket an edit. A dialect with a
-    candidate configuration also has `compare` (the diff), `discard` and
-    `commit`; one without applies each line as typed. `context` matches a
-    line the CLI prints with its prompt rather than as part of a reply
-    (Junos's `[edit system]` banner in configuration mode, `{master}[edit]`
-    with two routing engines, and the `# commit confirmed will be rolled
-    back in 4 minutes` above it while a timer runs): every such line at the
-    end of a reply is the prompt's, and a reply of nothing but the echo,
-    those lines and the prompt (a line of an edit) is not waited on for
-    more."""
-    prompt: re.Pattern
-    prompt_name: re.Pattern
-    prompt_tail: str
-    config_enter: str
-    config_exit: str
-    compare: Optional[str] = None
-    discard: Optional[str] = None
-    commit: Optional[str] = None
-    context: Optional[re.Pattern] = None
+    def check_edit(self, lines: list[str]) -> str | None:
+        """The refusal text for a payload the dialect will not send, or None when it is fine."""
+        ...
 
-    @property
-    def has_candidate(self) -> bool:
-        return self.commit is not None
+    def build_commit(self, confirmed_minutes: int | None, comment: str | None) -> str: ...
 
-    def __post_init__(self):
-        if self.commit is not None and (self.compare is None or self.discard is None):
-            raise ValueError("a CLI that commits needs compare and discard too")
+    def parse_commit_history(self, output: str) -> CommitStatus: ...
 
-
-@dataclass(frozen=True)
-class Dialect:
-    name: str                 # the half of a driver name before the @
-    title: str                # as printed to the operator ("Junos", "IOS")
-    description: str
-    shortcuts: Optional[str] = None      # the shipped library: a stem (hssh/dialects/<stem>.json) or a path to a .json
-    check_edit: Optional[Callable[[str, bool], Tuple[bool, str]]] = None
-    is_read: Callable[[str], bool] = is_read
-    refused: Optional[re.Pattern] = None   # a line in which the CLI refused the command (MULTILINE)
-    cli: Optional[CliSyntax] = None
-    commit_pending: Optional[re.Pattern] = None   # group 1: minutes left on a pending commit-confirmed
-    # A new field goes last (#142): a package that built its Dialect with
-    # the fields above in order, not by name, keeps each where it was.
-    # A line in which the CLI took the command and warned about it, though
-    # `refused` may match it (MULTILINE): no refusal, and a lines edit goes
-    # on and reports it with its result. None: every line `refused` matches
-    # is one.
-    informational: Optional[re.Pattern] = None
-    # What starts a full-line comment in an edit payload besides h-ssh's own
-    # `#`, which is one on every driver (#133): IOS's `!`. See comment_prefixes.
-    comments: Tuple[str, ...] = ()
-
-    @property
-    def comment_prefixes(self) -> Tuple[str, ...]:
-        """What starts a full-line comment in an edit payload for this
-        dialect: `#`, and its own `comments`. Such a line is never sent, and
-        a payload of nothing but those and blank lines is refused before the
-        device is contacted: it has nothing to apply (#142)."""
-        return ("#",) + tuple(self.comments)
+    def encode_line(self, text: str) -> bytes:
+        """The bytes to type for one validated line, newline included."""
+        ...

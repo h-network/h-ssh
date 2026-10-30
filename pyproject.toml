@@ -1,56 +1,24 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "h-ssh"
-dynamic = ["version"]
-description = "Multi-vendor network automation framework with parallel execution, job mode, and safety gate"
-readme = "README.md"
-license = "PolyForm-Noncommercial-1.0.0"
+version = "0.0.0"
+description = "Operational commands and configuration changes across fleets of network devices"
 requires-python = ">=3.10"
-dependencies = [
-    "paramiko",
-    "junos-eznc",
-]
-
-[project.urls]
-Homepage = "https://github.com/h-network/h-ssh"
-Issues = "https://github.com/h-network/h-ssh/issues"
+dependencies = ["junos-eznc"]
 
 [project.optional-dependencies]
-# Every transport installs with the package; these two names stay valid for
-# the install lines that used them.
-junos = []
-all = []
-dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "ruff>=0.5",
-]
+dev = ["pytest"]
 
 [project.scripts]
-h-ssh = "hssh.cli:main_sync"
-h-ssh-store = "hssh.store:main_sync"
-
-# Drivers from outside the package register here too: an entry point names a
-# Driver, a list of them, or a callable returning either (see hssh/drivers).
-[project.entry-points."hssh.drivers"]
-builtin = "hssh.drivers:BUILTIN"
-
-[tool.setuptools]
-package-dir = {"" = "h-app"}
-
-[tool.setuptools.dynamic]
-version = {attr = "hssh.__version__"}
+h-ssh = "hssh.frontends.cli:main_sync"
+h-ssh-store = "hssh.frontends.store:main_sync"
 
 [tool.setuptools.packages.find]
 where = ["h-app"]
 include = ["hssh*"]
 
-[tool.setuptools.package-data]
-hssh = ["dialects/*.json", "profiles/*.txt"]
-
 [tool.pytest.ini_options]
-pythonpath = ["h-app"]
 testpaths = ["h-app/tests"]
