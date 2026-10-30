@@ -62,7 +62,8 @@ The CLI, the Fleet library API, run files and profiles are front ends. Each one:
 
 - parses its input
 - resolves configuration precedence: flags, then run file, then profile, then `~/.h-ssh/config`, then
-  the orchestrator's defaults
+  the orchestrator's defaults; the user alone has an environment step: `--user`, run file, `HSSH_USER`,
+  config `user`, then the login name
 - builds a `RunSpec`
 - passes the `RunSpec` to the orchestrator and renders the `RunReport` it returns
 
