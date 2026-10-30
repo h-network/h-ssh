@@ -35,6 +35,8 @@ the file's existing content, then refreshing the file cache and its resolutions.
 A new process reads external changes to known-hosts files.
 
 Library failures become `Fault` with the library's message and whether the
-operation may have reached the device. The communicator does not retry. Closing
-a configuration session attempts candidate discard, unlock and disconnect even
+operation may have reached the device. The communicator does not retry.
+Running out of local file descriptors is a local fault with the OS error preserved;
+it does not retry or put the target into cooldown.
+Closing a configuration session attempts candidate discard, unlock and disconnect even
 if an earlier cleanup step fails, then reports the first failure.

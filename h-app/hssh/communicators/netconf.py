@@ -5,6 +5,7 @@ from __future__ import annotations
 from base64 import b64decode
 from contextvars import ContextVar
 from dataclasses import dataclass
+import errno
 import fcntl
 import hmac
 import os
@@ -98,12 +99,30 @@ class _SessionKeys:
         return known is not None and known.asbytes() == key.asbytes()
 
 
+class _SocketForNcclient:
+    def __init__(self, module):
+        self.module = module
+
+    def __getattr__(self, name):
+        return getattr(self.module, name)
+
+    def socket(self, *args, **kwargs):
+        try:
+            return self.module.socket(*args, **kwargs)
+        except OSError as error:
+            if _HOST_KEY_PORT.get() is not None and error.errno in (errno.EMFILE, errno.ENFILE):
+                # ncclient catches OSError and replaces it with an unreachable-host error.
+                raise Fault(FaultKind.LOCAL, str(error), False) from error
+            raise
+
+
 def _install_host_key_loader() -> None:
     global _HOST_KEY_LOADER_INSTALLED
     with _HOST_KEYS_LOCK:
         if _HOST_KEY_LOADER_INSTALLED:
             return
         from ncclient.transport.ssh import SSHSession
+        from ncclient.transport import ssh
 
         # PyEZ creates the SSHSession internally; the context marker scopes this hook.
         original = SSHSession.load_known_hosts
@@ -116,6 +135,7 @@ def _install_host_key_loader() -> None:
             session._host_keys = _SessionKeys(path, port)
 
         SSHSession.load_known_hosts = load_known_hosts
+        ssh.socket = _SocketForNcclient(ssh.socket)
         _HOST_KEY_LOADER_INSTALLED = True
 
 
@@ -172,6 +192,9 @@ def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> 
         errors.append(cause)
         cause = getattr(cause, "_orig", None) or cause.__cause__ or cause.__context__
     detail = str(errors[-1])
+    for cause in errors:
+        if isinstance(cause, OSError) and cause.errno in (errno.EMFILE, errno.ENFILE):
+            return Fault(FaultKind.LOCAL, str(cause), reached_device)
     mappings = (
         ((transport.SSHUnknownHostError, BadHostKeyException), FaultKind.HOST_KEY),
         ((pyez.ConnectAuthError, transport.AuthenticationError, AuthenticationException), FaultKind.AUTH),
