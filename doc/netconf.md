@@ -3,6 +3,7 @@
 The `junos@netconf` driver supports `show` and `batch` through PyEZ. Connections use
 port 830 unless the target specifies another port. The connect timeout is passed
 to PyEZ, and the command timeout applies to operations on the open session.
+TCP connect and the SSH banner share the connect timeout; after the banner, key exchange, login and NETCONF hello share one setup timeout.
 Port 23 is rejected before any connection; NETCONF never falls back to telnet.
 Show output has leading and trailing newlines removed.
 A reply beginning with a Junos refusal is reported as a failed command. Plain-text

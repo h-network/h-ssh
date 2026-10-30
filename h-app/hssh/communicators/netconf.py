@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from base64 import b64decode
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
 import fcntl
 import hmac
 import os
 from pathlib import Path
 import socket
-from threading import RLock
+from threading import RLock, Timer
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, cast
 
@@ -40,6 +41,144 @@ _REVOKED: dict[Path, set[bytes]] = {}
 _RESOLVED: dict[tuple[Path, str, int], dict[str, dict[str, PKey]]] = {}
 _HOST_KEY_PORT: ContextVar[int | None] = ContextVar("netconf_host_key_port", default=None)
 _HOST_KEY_LOADER_INSTALLED = False
+_OPENING: ContextVar[_Opening | None] = ContextVar("netconf_opening", default=None)
+_SETUP_HOOKS_INSTALLED = False
+
+
+@dataclass
+class _Opening:
+    host: str
+    port: int
+    timeouts: Timeouts
+    connected: bool = False
+    banner: bool = False
+    expired: bool = False
+    transport: object = None
+    connect_error: OSError | None = None
+    timer: Timer | None = None
+    lock: object = field(default_factory=RLock)
+
+    def __post_init__(self):
+        self.deadline = monotonic() + self.timeouts.connect
+
+    def arm(self):
+        with self.lock:
+            if self.timer:
+                self.timer.cancel()
+            deadline = self.deadline
+
+            def expire():
+                with self.lock:
+                    if self.deadline == deadline:
+                        self.expired = True
+                        self.transport.close()
+
+            self.timer = Timer(max(0, deadline - monotonic()), expire)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def finish(self):
+        with self.lock:
+            self.expired = self.expired or monotonic() >= self.deadline
+            self.deadline = float("inf")
+            if self.timer:
+                self.timer.cancel()
+
+    def timeout_fault(self):
+        if not self.connected:
+            detail = f"no TCP answer from {self.host}:{self.port} within {self.timeouts.connect}s"
+        elif not self.banner:
+            detail = f"no SSH banner from {self.host}:{self.port} within {self.timeouts.connect}s"
+        elif not self.transport.initial_kex_done:
+            detail = f"the banner came, but key exchange did not finish within {self.timeouts.setup}s"
+        else:
+            detail = f"no NETCONF hello within {self.timeouts.setup}s"
+        return Fault(FaultKind.TIMEOUT, detail, self.banner)
+
+
+@contextmanager
+def _opening(host: str, port: int, timeouts: Timeouts):
+    state = _Opening(host, port, timeouts)
+    token = _OPENING.set(state)
+    try:
+        yield state
+        state.finish()
+        if state.expired:
+            raise state.timeout_fault()
+    except Exception as error:
+        raise _fault(error, state.banner, opening=True, setup=state) from error
+    finally:
+        state.finish()
+        _OPENING.reset(token)
+
+
+def _install_setup_hooks():
+    global _SETUP_HOOKS_INSTALLED
+    with _HOST_KEYS_LOCK:
+        if _SETUP_HOOKS_INSTALLED:
+            return
+        from ncclient.transport import ssh
+
+        class ConnectSocket(socket.socket):
+            def __init__(self, *args, **kwargs):
+                try:
+                    super().__init__(*args, **kwargs)
+                except OSError as error:
+                    _OPENING.get().connect_error = error
+                    raise
+
+            def connect(self, address):
+                state = _OPENING.get()
+                self.settimeout(max(0.001, state.deadline - monotonic()))
+                try:
+                    super().connect(address)
+                except OSError as error:
+                    state.connect_error = error
+                    raise
+                state.connected = True
+
+        class DeadlineTransport(ssh.paramiko.Transport):
+            def __init__(self, *args, **kwargs):
+                self.setup = _OPENING.get()
+                super().__init__(*args, **kwargs)
+                state = self.setup
+                state.connected, state.transport = True, self
+                self.banner_timeout = max(0.001, state.deadline - monotonic())
+                self.handshake_timeout = self.auth_timeout = self.channel_timeout = state.timeouts.setup
+                state.arm()
+
+            def _check_banner(self):
+                super()._check_banner()
+                state = self.setup
+                with state.lock:
+                    if state.expired:
+                        raise TimeoutError("SSH banner deadline expired")
+                    state.banner = True
+                    state.deadline = monotonic() + state.timeouts.setup
+                    state.arm()
+
+        class ScopedModule:
+            def __init__(self, module, name, replacement):
+                self.module, self.name, self.replacement = module, name, replacement
+
+            def __getattr__(self, name):
+                if name == self.name and _OPENING.get() is not None:
+                    return self.replacement
+                return getattr(self.module, name)
+
+        original = ssh.SSHSession._post_connect
+
+        def post_connect(session, timeout=60):
+            state = _OPENING.get()
+            if state is not None:
+                timeout = max(0.001, state.deadline - monotonic())
+            return original(session, timeout)
+
+        # Only our opens use the deadline socket/transport and remaining hello budget.
+        ssh.socket = ScopedModule(ssh.socket, "socket", ConnectSocket)
+        ssh.paramiko = ScopedModule(ssh.paramiko, "Transport", DeadlineTransport)
+        ssh.SSHSession._post_connect = post_connect
+        _SETUP_HOOKS_INSTALLED = True
 
 
 def _known_keys(path: Path, host: str, port: int) -> dict[str, dict[str, PKey]]:
@@ -170,17 +309,19 @@ def _install_host_key_loader() -> None:
         _HOST_KEY_LOADER_INSTALLED = True
 
 
-def _accept_new(host: str, port: int, timeout: int) -> None:
+def _accept_new(host: str, port: int, timeouts: Timeouts) -> None:
     """Pin an unknown key before PyEZ authenticates, then let PyEZ verify it."""
     import paramiko
+    from ncclient.transport import ssh
 
+    timeout = timeouts.connect
     path = Path.home() / ".ssh" / "known_hosts"
     name = host if port == 22 else f"[{host}]:{port}"
     if any(_known_keys(path, host, port).values()):
         return
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        with paramiko.Transport(sock) as transport:
-            transport.start_client(timeout=timeout)
+    with _opening(host, port, timeouts), socket.create_connection((host, port), timeout=timeout) as sock:
+        with ssh.paramiko.Transport(sock) as transport:
+            transport.start_client()
             key = transport.get_remote_server_key()
     with _HOST_KEYS_LOCK:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -214,9 +355,11 @@ def _accept_new(host: str, port: int, timeout: int) -> None:
                 _known_keys(path, host, port)
 
 
-def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> Fault:
+def _fault(error: Exception, reached_device: bool, *, opening: bool = False, setup: _Opening | None = None) -> Fault:
     if isinstance(error, Fault):
         return error
+    if setup is not None and (setup.expired or monotonic() >= setup.deadline):
+        return setup.timeout_fault()
     if isinstance(error, ImportError):
         return Fault(FaultKind.LOCAL, str(error), reached_device)
     from jnpr.junos import exception as pyez
@@ -226,6 +369,8 @@ def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> 
     from paramiko import AuthenticationException, BadHostKeyException, SSHException
 
     errors = []
+    if setup is not None and not setup.connected and setup.connect_error is not None:
+        error = setup.connect_error
     cause = error
     while isinstance(cause, BaseException) and cause not in errors:
         if isinstance(cause, Fault):
@@ -236,20 +381,28 @@ def _fault(error: Exception, reached_device: bool, *, opening: bool = False) -> 
     for cause in errors:
         if isinstance(cause, OSError) and cause.errno in (errno.EMFILE, errno.ENFILE):
             return Fault(FaultKind.LOCAL, str(cause), reached_device)
+        if opening and isinstance(cause, OSError) and cause.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH):
+            return Fault(FaultKind.UNREACHABLE, str(cause), False)
     mappings = (
         ((transport.SSHUnknownHostError, BadHostKeyException), FaultKind.HOST_KEY),
         ((pyez.ConnectAuthError, transport.AuthenticationError, AuthenticationException), FaultKind.AUTH),
         ((ValueError, TypeError, FileNotFoundError, PermissionError), FaultKind.LOCAL),
-        ((pyez.RpcTimeoutError, TimeoutExpiredError, TimeoutError),
-         FaultKind.UNREACHABLE if opening else FaultKind.TIMEOUT),
+        ((pyez.ConnectTimeoutError, pyez.RpcTimeoutError, TimeoutExpiredError, TimeoutError), FaultKind.TIMEOUT),
         ((pyez.ConnectClosedError,), FaultKind.SESSION_LOST),
         ((pyez.RpcError, RPCError), FaultKind.REFUSED),
-        ((pyez.ConnectError, transport.TransportError, SSHException, EOFError, ConnectionError),
+        ((socket.gaierror, ConnectionRefusedError), FaultKind.UNREACHABLE if opening else FaultKind.SESSION_LOST),
+        ((transport.TransportError, SSHException, EOFError, ConnectionError), FaultKind.SESSION_LOST),
+        ((pyez.ConnectRefusedError, pyez.ConnectUnknownHostError),
          FaultKind.UNREACHABLE if opening else FaultKind.SESSION_LOST),
+        ((pyez.ConnectError,), FaultKind.SESSION_LOST),
         ((OSError,), FaultKind.UNREACHABLE if opening else FaultKind.LOCAL),
     )
     for types, kind in mappings:
         if any(isinstance(exc, types) for exc in errors):
+            if opening and kind == FaultKind.TIMEOUT and setup is not None:
+                return setup.timeout_fault()
+            if opening and kind in (FaultKind.SESSION_LOST, FaultKind.UNREACHABLE):
+                reached_device = kind == FaultKind.SESSION_LOST
             return Fault(kind, detail, reached_device)
     return Fault(FaultKind.LOCAL, detail, reached_device)
 
@@ -285,8 +438,9 @@ class NetconfCommunicator(Communicator):
         try:
             from jnpr.junos import Device
 
+            _install_setup_hooks()
             if host_key_policy == "accept-new":
-                _accept_new(target.host, port, timeouts.connect)
+                _accept_new(target.host, port, timeouts)
             device = Device(
                 host=target.host, port=port, user=creds.username, passwd=creds.password,
                 ssh_private_key_file=str(Path(creds.key_file).expanduser()) if creds.key_file else None,
@@ -298,7 +452,8 @@ class NetconfCommunicator(Communicator):
             _install_host_key_loader()
             token = _HOST_KEY_PORT.set(int(device.port))
             try:
-                device.open()
+                with _opening(target.host, port, timeouts):
+                    device.open()
             finally:
                 _HOST_KEY_PORT.reset(token)
             device.timeout = timeouts.command
