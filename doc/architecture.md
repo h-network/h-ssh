@@ -172,6 +172,14 @@ and lists. IOS, NX-OS and EOS redaction patterns wait for the CLI transport phas
 One SQLite database, `./h-ssh.db` by default. The recorder writes. `h-ssh-store` reads: it lists
 runs, shows output, compares results and exports. The schema is in section 6.
 
+The recorder proves every record destination before the probe: the audit log and the run log by a no-content
+append, the saved-output directory by a private temporary file. The store is opened and created by the run row,
+written after the probe and before the first target. A failure in either refuses the run as `LOCAL` before any
+device is contacted. Once targets run, every record is attempted on its own: each store row, each audit entry,
+the saved-output file and the log line. One that cannot be written is counted once in `RunReport.not_kept` and
+said on stderr; the device outcome stands, and no cooldown follows. Every operation row carries the target's final
+status. Saved output is named through `hssh.paths` inside its directory.
+
 ### 3.7 Audit log
 
 An append-only JSONL file. One entry per action that changed or could change a device, including dry
@@ -317,7 +325,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 ### 5.4 Cancellation
 
 1. On the first interrupt, the scheduler starts no new targets. Targets that have not started are recorded
-   as skipped.
+   as skipped. An interrupt during the probe cancels it: a read is still recorded as a run, every target skipped
+   "interrupted during the probe"; an edit stopped there is refused as `LOCAL` and leaves no run row.
 2. Targets past `COMMIT` are waited for and recorded. Other in-flight targets are cancelled and recorded as
    skipped, not failed, with the step the interrupt cut as their one operation: `open` for a connect in flight,
    `load`, `diff` or the command for a session in flight, whose close still discards and unlocks what was acquired.
