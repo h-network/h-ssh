@@ -7,15 +7,20 @@ The password is HSSH_PASSWORD or the prompt; there is no --password flag and no 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import json
 import logging
 import os
+import shlex
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
+from hssh.dialects.base import Dialect
+from hssh.drivers import Registry
 from hssh.frontends import profiles
 from hssh.frontends.fleet import (
     LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, parse_target, quiet_library_logs, run_spec,
@@ -28,7 +33,8 @@ from hssh.model import (
 from hssh.orchestrator import (
     DEFAULT_CONFIRMED_MINUTES, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SAFETY,
     DEFAULT_SKIP_UNREACHABLE,
-    DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, default_username,
+    DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, check_comment,
+    check_confirmed_minutes, default_username,
 )
 
 TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
@@ -47,7 +53,9 @@ CONFIG_DEFAULTS: dict[str, Any] = {
 }
 CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
 
-EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_SKIPPED, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_SKIPPED, EXIT_INCOMPLETE, EXIT_INTERRUPTED = 0, 1, 2, 3, 4, 130
+# Worst first, for the exit code of a --every watch.
+EXIT_ORDER = (EXIT_INTERRUPTED, EXIT_INCOMPLETE, EXIT_USAGE, EXIT_FAILED, EXIT_SKIPPED, EXIT_OK)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -203,8 +211,55 @@ def resolve_credentials(args: argparse.Namespace) -> Credentials:
     return Credentials(username=user, password=password)
 
 
+def target_dialects(targets: Sequence[Target]) -> list[Dialect]:
+    """Each target's dialect; a target without a driver is left to run() to refuse."""
+    registry = Registry()
+    registry.load_entry_points()
+    dialects = []
+    for target in targets:
+        try:
+            dialects.append(registry.resolve(target).dialect)
+        except Fault:
+            continue
+    return dialects
+
+
+def comment_prefixes(dialects: Sequence[Dialect]) -> tuple[str, ...]:
+    """What starts a full-line comment for every dialect given."""
+    common: set[str] | None = None
+    for dialect in dialects:
+        prefixes = set(dialect.comment_prefixes)
+        common = prefixes if common is None else common & prefixes
+    return tuple(sorted(common or ()))
+
+
+def check_payload(dialects: Sequence[Dialect], lines: Sequence[str]) -> None:
+    """The first dialect refusal of the payload, said before the password; the orchestrator's gate enforces the same."""
+    for dialect in dialects:
+        if why := dialect.check_edit(list(lines)):
+            raise ValueError(why)
+
+
+def payload_lines(text: str, prefixes: Sequence[str]) -> tuple[str, ...]:
+    """The configuration lines to send: blank lines and full-line comments dropped, an inline "#" kept."""
+    lines = (line.rstrip() for line in text.splitlines())
+    return tuple(line for line in lines if line.strip() and not line.lstrip().startswith(tuple(prefixes)))
+
+
+def check_edit_args(args: argparse.Namespace, edit: EditSettings) -> None:
+    """The edit settings a run cannot go on with, said before the password is asked."""
+    if edit.confirmed_minutes is not None and (why := check_confirmed_minutes(edit.confirmed_minutes)):
+        raise ValueError(why)
+    if edit.comment is not None and (why := check_comment(edit.comment)):
+        raise ValueError(why)
+    if args.run and edit.apply and edit.confirmed_minutes is None:
+        raise ValueError(f"run file '{args.run}' applies changes without a rollback timer: set commit_confirmed "
+                         "(minutes) in the file or pass --commit-confirmed, or drop yes for a dry run")
+
+
 def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
     mode = resolve_mode(args)
+    targets = resolve_targets(args)
     commands: tuple[str, ...] = ()
     config_lines: tuple[str, ...] = ()
     if mode in ("show", "structured"):
@@ -213,15 +268,18 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         commands = tuple(args.batch_commands or profiles.read_commands(Path(args.batch)))
     elif mode == "edit":
         text = args.edit_command or Path(args.edit_file).read_text(encoding="utf-8-sig")
-        config_lines = tuple(ln for ln in (l.split("#", 1)[0].rstrip() for l in text.splitlines()) if ln.strip())
+        dialects = target_dialects(targets)
+        config_lines = payload_lines(text, comment_prefixes(dialects))
+        check_payload(dialects, config_lines)
     edit = None
     if mode == "edit":
         edit = EditSettings(apply=args.yes, confirmed_minutes=args.commit_confirmed, comment=args.comment)
+        check_edit_args(args, edit)
     safety = None
     if args.safety_file:
         safety = SafetySettings(cooldown_seconds=args.cooldown, rate_limit=args.rate_limit, safety_file=args.safety_file)
     return RunSpec(
-        targets=resolve_targets(args), mode=mode, commands=commands, config_lines=config_lines,
+        targets=targets, mode=mode, commands=commands, config_lines=config_lines,
         format=args.format if mode == "structured" else None,
         credentials=resolve_credentials(args),
         timeouts=Timeouts(connect=args.connect_timeout, setup=args.session_timeout, command=args.command_timeout,
@@ -257,20 +315,52 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
             print(op.outcome.output, file=out)
     if not args.raw:
         print(f"run {report.run_id}: {report.ok} ok, {report.failed} failed, {report.skipped} skipped", file=out)
-        for name, command in report.pending.items():
-            print(f"pending commit on {name}: confirm with `{command}`", file=out)
+        for name, minutes in report.pending.items():
+            print(f"pending commit on {name}: rolls back in {minutes} minutes", file=out)
+        if report.pending:
+            print(f"confirm with: {confirm_command(args)}", file=out)
+
+
+def confirm_command(args: argparse.Namespace) -> str:
+    """The command that confirms this run's pending commits: the same program, user and targets as typed."""
+    prog = sys.argv[0] if sys.argv and sys.argv[0].endswith(".py") else "h-ssh"
+    words = [prog, "--confirm"]
+    if args.user:
+        words += ["--user", args.user]
+    if args.target:
+        words += args.hosts + [w for spec in args.target if spec not in args.hosts for w in ("--target", spec)]
+    else:
+        words += ["--devices", args.devices or default_devices_path()]
+    for flag in ("transport", "vendor"):
+        if flag in args.typed:
+            words += [f"--{flag}", getattr(args, flag)]
+    return " ".join(shlex.quote(w) for w in words)
+
+
+def summary_line(report: RunReport) -> str:
+    """One JSON line for stderr: the counts a pipeline reads."""
+    elapsed_ms = int((datetime.fromisoformat(report.finished) - datetime.fromisoformat(report.started)).total_seconds() * 1000)
+    counts = {"targets": len(report.results), "ok": report.ok, "fail": report.failed, "skipped": report.skipped}
+    if report.interrupted:
+        counts["interrupted"] = True
+    if report.not_kept:
+        counts["not_kept"] = report.not_kept
+    return "[h-ssh] " + json.dumps({**counts, "elapsed_ms": elapsed_ms, "mode": report.mode})
 
 
 def report_dict(report: RunReport) -> dict[str, Any]:
     def outcome(op) -> dict[str, Any]:
         if isinstance(op.outcome, Fault):
             return {"ok": False, "fault": op.outcome.kind.name, "detail": op.outcome.detail}
-        return {"ok": True, "output": op.outcome.output, "data": op.outcome.data}
+        data = op.outcome.data
+        if dataclasses.is_dataclass(data) and not isinstance(data, type):
+            data = dataclasses.asdict(data)
+        return {"ok": True, "output": op.outcome.output, "data": data}
 
     return {
         "run_id": report.run_id, "mode": report.mode, "started": report.started, "finished": report.finished,
         "ok": report.ok, "failed": report.failed, "skipped": report.skipped, "interrupted": report.interrupted,
-        "pending": dict(report.pending),
+        "not_kept": report.not_kept, "pending": dict(report.pending),
         "results": [{"target": tr.target.name, "host": tr.target.host, "status": tr.status,
                      "operations": [{"command": op.command, "started": op.started, "elapsed_ms": op.elapsed_ms,
                                      **outcome(op)} for op in tr.operations]} for tr in report.results],
@@ -280,11 +370,17 @@ def report_dict(report: RunReport) -> dict[str, Any]:
 def exit_code(report: RunReport) -> int:
     if report.interrupted:
         return EXIT_INTERRUPTED
+    if report.not_kept:
+        return EXIT_INCOMPLETE
     if report.failed:
         return EXIT_FAILED
     if report.skipped:
         return EXIT_SKIPPED
     return EXIT_OK
+
+
+def worst(a: int, b: int) -> int:
+    return min(a, b, key=EXIT_ORDER.index)
 
 
 def changed_lines(previous: RunReport | None, current: RunReport) -> list[str]:
@@ -308,6 +404,7 @@ def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
     typed = typed_dests(parser, argv)
     args.target = (list(args.hosts) + list(args.target or [])) or None
     args.batch_commands = None
+    args.typed = typed
     if not args.verbose:
         quiet_library_logs()
         for name in LIBRARY_LOGGERS:
@@ -329,20 +426,22 @@ def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
         if args.every is None:
             report = runner(spec)
             render(report, args)
+            print(summary_line(report), file=sys.stderr)
             return exit_code(report)
         previous = None
-        worst = EXIT_OK
+        code = EXIT_OK
         for tick in range(args.times or sys.maxsize):
             if tick:
                 time.sleep(args.every)
             report = runner(spec)
             print("\n".join(changed_lines(previous, report)) if previous else "", end="")
             render(report, args)
-            worst = max(worst, exit_code(report))
+            print(summary_line(report), file=sys.stderr)
+            code = worst(code, exit_code(report))
             previous = report
             if report.interrupted:
                 break
-        return worst
+        return code
     except Fault as e:
         print(f"ERROR: {e.kind.name}: {e.detail}", file=sys.stderr)
         return EXIT_USAGE

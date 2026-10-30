@@ -19,5 +19,10 @@ class Dialect(Protocol):
     discard_commands: tuple[str, ...]
     has_candidate: bool
     redaction_patterns: tuple[re.Pattern[str], ...]
+    comment_prefixes: tuple[str, ...]
 
     def is_read(self, command: str) -> bool: ...
+
+    def check_edit(self, lines: list[str]) -> str | None:
+        """The refusal text for a payload the dialect will not send, or None when it is fine."""
+        ...

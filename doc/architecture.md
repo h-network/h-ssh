@@ -72,6 +72,15 @@ through the same `RunSpec`.
 `--every` is a front-end loop. It submits the same `RunSpec` at an interval and renders the differences
 between reports.
 
+The CLI refuses before the password is asked what the run could not go on with: a commit comment or timer the
+orchestrator's `check_comment` and `check_confirmed_minutes` reject, and a run file that applies changes
+without `commit_confirmed` (nobody watches a pipeline). An edit payload loses its blank lines and the lines
+that start with the targets' dialect comment prefixes; an inline `#` is sent as written. After an apply with
+a timer the CLI prints the minutes left per device and the command that confirms them, rebuilt from the run's
+own arguments. Exit codes: 0; 1 a device failed; 2 refused before anything was sent; 3 nothing failed but not
+everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exits with the worst of its runs,
+in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run.
+
 ### 3.2 Orchestrator
 
 The orchestrator executes a `RunSpec` and owns all policy. It defines the default of every `RunSpec`
@@ -136,6 +145,22 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 Dialects contain no I/O and no policy.
 
+`comment_prefixes` identifies full-line comments after leading whitespace: `#` for Junos and generic,
+and `#` or `!` for IOS, NX-OS and EOS. Inline `#` remains part of the command.
+`check_edit(lines)` returns refusal text, or `None`, without changing the supplied lines. Every dialect
+refuses an empty or comment-only payload. Junos additionally requires lowercase set-style verbs:
+`set`, `delete`, `activate`, `deactivate`, `insert`, `rename`, `copy`, `annotate`, `protect`, `unprotect`.
+It refuses commit commands (including `commit;` and unique abbreviations starting at `com`), control
+characters and Tab in non-comment lines, and reports the original line number. Commit and confirm
+are separate operations, never configuration payloads.
+
+Junos and generic `redaction_patterns` identify credential text and secret XML/JSON names for the audit
+writer. Junos also recognises `## SECRET-DATA` and trap-group communities. Quoted values include escaped
+quotes; a key identifier alone does not consume the following line. The writer replaces whole matches.
+For valid JSON text, the writer parses first and detects secret keys by searching these patterns against
+`json.dumps(key) + ': "x"'` (without braces). A matching key's entire value is masked, including objects
+and lists. IOS, NX-OS and EOS redaction patterns wait for the CLI transport phase.
+
 ### 3.6 Result store
 
 One SQLite database, `./h-ssh.db` by default. The recorder writes. `h-ssh-store` reads: it lists
@@ -164,10 +189,10 @@ class Communicator(Protocol):
     def structured(self, session: Session, rpc: str, fmt: str) -> Result: ...   # NETCONF only
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
-    def diff(self, session: Session) -> Result: ...
+    def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
     def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result: ...
     def confirm(self, session: Session) -> Result: ...
-    def commit_history(self, session: Session) -> Result: ...
+    def commit_history(self, session: Session) -> Result: ...                 # data: CommitStatus
 ```
 
 Batch execution is the orchestrator calling `show` repeatedly on one session.
@@ -180,6 +205,12 @@ A refused or timed-out command does not stop the batch; a lost session does.
 class Result:
     output: str                  # device output as received
     data: object | None = None   # parsed structure, when the operation returns one
+
+@dataclass(frozen=True)
+class CommitStatus:              # commit_history's data, from the newest history entry
+    pending: bool
+    remaining_minutes: int | None
+    newest: str
 ```
 
 ### 4.3 Fault
@@ -217,11 +248,12 @@ device, unless the dialect marks it as a read.
 | `TIMEOUT` before login, the banner came but setup did not finish in the setup budget (`reached_device` true) | fail | fail | n/a |
 | `AUTH`, `HOST_KEY` | fail | fail | n/a |
 | `TIMEOUT`, `SESSION_LOST` in session | retry | fail | fail, cool down |
-| `REFUSED`, `COMMIT_FAILED` | fail | fail, cool down | fail, cool down |
-| `OUTCOME_UNKNOWN` | n/a | n/a | fail, never retried, flagged for manual check |
+| `REFUSED`, `COMMIT_FAILED` | fail | fail | fail, cool down |
+| `OUTCOME_UNKNOWN` | n/a | n/a | fail, cool down, never retried or rolled back, the session discarded, flagged for manual check |
 | `UNSUPPORTED`, `LOCAL` | fail | fail | fail |
 
-The retry count, pauses and cooldown period are policy settings, not communicator settings.
+The retry count, pauses and cooldown period are policy settings, not communicator settings. A cooldown is only
+for what the device did: no fault with `reached_device` false cools a device down.
 
 ## 5. Execution model
 
@@ -255,9 +287,17 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - The probe runs before `OPEN`. An edit whose probe found a target dead stops before any device, with one audit
   entry per dead target and no run row, unless `skip_unreachable` is set, which skips those targets; a read fails them.
   An apply the operator declines gets one audit entry per target through `audit_aborted`.
-- **Apply** requires `-y`. Without it, an edit is a dry run.
+- **Apply** requires `-y`. Without it, an edit is a dry run. A diff whose data is False sends no commit: an empty
+  commit could confirm someone else's pending commit-confirmed.
+- The target is marked past `COMMIT` before the commit is sent, so an interrupt waits for the reply.
+- Before `OPEN`, the payload goes through the driver dialect's `check_edit`; a refusal fails the target as `LOCAL`
+  with the dialect's text, so the rule holds for every caller, not only the CLI.
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
-  command that confirms them.
+  minutes left on each, from the device; the front end builds the command that confirms them. A confirm run reads the
+  commit history first and sends the confirm only when its `CommitStatus` is pending; otherwise it is `REFUSED`.
+- The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
+  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
+  ends call the same helpers before asking for a password.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
   uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.
 - The safety gate is consulted before `OPEN` for edits. Cooldowns persist across runs in the safety file. Before the
@@ -272,7 +312,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
    target whose connect the interrupt cut short, or whose connect then ran out, with `reached_device` false, is
    recorded as skipped with the reason, not failed: nothing reached it and the operator stopped the run.
 3. A second interrupt reports what is still in flight. It does not abandon records.
-4. The run is always closed in the store, with counts for ok, failed and skipped.
+4. The run is always closed in the store, with counts for ok, failed and skipped. The report also counts the
+   records that could not be kept; a record that could not be written is never the target's failure or cooldown.
 
 ## 6. Data model
 
@@ -300,6 +341,25 @@ SQLite runs in WAL mode with a busy timeout. Each run writes in its own transact
  "driver": "junos@netconf", "action": "commit", "dry_run": false,
  "confirmed_minutes": 10, "comment": "...", "diff": "...", "ok": true, "fault": null}
 ```
+
+`time` is the operation's `started` timestamp. `dry_run` is the inverse of the requested
+`EditSettings.apply`; `ok` describes the operation's outcome, not whether a commit was requested.
+`fault` is null on success, otherwise an object with `kind` (the fault kind name), `detail` and
+`reached_device`. The full fault detail, comment and diff are redacted before serialization.
+Actions are `load`, `diff`, `commit`, `confirm`, `probe` (a probe failure that stops an edit), and
+`aborted` (the operator declined). Confirm runs use `apply=true`.
+
+Each entry is one JSONL line. Appends hold an exclusive file lock through all short writes, reject
+symlinks and non-regular files without blocking on FIFOs, and set the file to 0600. Newly created
+parent directories are 0700. An append failure raises an `OSError` with the recording path;
+the recorder counts it as `not_kept` without changing the device outcome.
+
+For JSON text in audit fields, the writer parses objects and lists and masks the entire value of a
+secret key, including wrapped values. A key is secret when a dialect redaction pattern matches
+`json.dumps(key) + ': "x"'`. For other text, the dialect patterns capture the keyword/prefix in
+group 1 and an optional suffix in group 3; the writer preserves those groups and masks the value.
+JSON scalar replacements retain their quotes. Patterns without capture groups mask the whole match.
+The secret vocabulary belongs to the dialect; stored device output is left unchanged.
 
 ## 7. Security
 

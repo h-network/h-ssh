@@ -11,7 +11,7 @@ from typing import Callable
 
 from hssh.communicators.base import Communicator, Session
 from hssh.dialects.base import Dialect
-from hssh.model import EditSettings, Fault, FaultKind, OperationResult, Result, Target, Timeouts
+from hssh.model import CommitStatus, EditSettings, Fault, FaultKind, OperationResult, Result, Timeouts
 from hssh.orchestrator.defaults import GRACE_SECONDS
 
 
@@ -55,13 +55,8 @@ def failed(op: OperationResult) -> bool:
     return isinstance(op.outcome, Fault)
 
 
-def confirm_command(target: Target) -> str:
-    """The command that confirms the target's pending commit, for the report."""
-    ...
-
-
 class EditLifecycle:
-    """OPEN → LOAD → DIFF → (dry run) CLOSE, or (apply) COMMIT → PENDING → CLOSE. Faults after LOAD end at CLOSE, which discards."""
+    """OPEN → LOAD → DIFF → (dry run) CLOSE, or (apply) COMMIT → PENDING → CLOSE. Faults after LOAD end at CLOSE, which discards. Budgets allow two device calls per step (lock then load; diff then commit-check) and lock, history read and commit for a confirm."""
 
     def __init__(self, communicator: Communicator, dialect: Dialect, session: Session, timeouts: Timeouts) -> None:
         self.communicator = communicator
@@ -72,7 +67,7 @@ class EditLifecycle:
     async def load(self, lines: list[str]) -> tuple[list[OperationResult], int]:
         """The candidate loaded in one call; without a candidate model, line by line, so the lines applied are known."""
         if self.dialect.has_candidate:
-            op = await operation("load", lambda: self.communicator.load(self.session, lines), self.timeouts.command)
+            op = await operation("load", lambda: self.communicator.load(self.session, lines), 2 * self.timeouts.command)
             return [op], 0 if failed(op) else len(lines)
         ops: list[OperationResult] = []
         for line in lines:
@@ -82,27 +77,37 @@ class EditLifecycle:
         return ops, len(ops) - (1 if ops and failed(ops[-1]) else 0)
 
     async def diff(self) -> OperationResult:
-        return await operation("diff", lambda: self.communicator.diff(self.session), self.timeouts.command)
+        return await operation("diff", lambda: self.communicator.diff(self.session), 2 * self.timeouts.command)
 
     async def commit(self, edit: EditSettings) -> OperationResult:
         return await operation("commit", lambda: self.communicator.commit(self.session, edit.confirmed_minutes, edit.comment),
                                self.timeouts.commit)
 
-    async def run(self, lines: list[str], edit: EditSettings) -> EditOutcome:
-        """The state machine from LOAD; the caller has opened the session and closes it after."""
+    async def run(self, lines: list[str], edit: EditSettings, before_commit: Callable[[], None] = lambda: None) -> EditOutcome:
+        """The state machine from LOAD; the caller has opened the session and closes it after. A diff whose data is False ends it: nothing to commit. `before_commit` runs once the commit is about to be sent, so an interrupt waits for it."""
         ops, applied = await self.load(lines)
         if failed(ops[-1]):
             return EditOutcome(tuple(ops), Stage.LOAD, applied)
         ops.append(await self.diff())
-        if failed(ops[-1]) or not edit.apply:
+        if failed(ops[-1]) or not edit.apply or ops[-1].outcome.data is False:
             return EditOutcome(tuple(ops), Stage.DIFF, applied)
+        before_commit()
         ops.append(await self.commit(edit))
         pending = not failed(ops[-1]) and bool(edit.confirmed_minutes)
         return EditOutcome(tuple(ops), Stage.PENDING if pending else Stage.COMMIT, applied, pending)
 
 
-async def confirm(communicator: Communicator, session: Session, timeouts: Timeouts) -> OperationResult:
-    return await operation("confirm", lambda: communicator.confirm(session), timeouts.command)
+async def confirm(communicator: Communicator, session: Session, timeouts: Timeouts) -> list[OperationResult]:
+    """The commit history read first; the confirm is sent only when its CommitStatus says a commit is pending, else refused: a bare confirm would commit whatever waits in the candidate."""
+    history = await commit_history(communicator, session, timeouts)
+    if failed(history):
+        return [history]
+    status = history.outcome.data
+    if not isinstance(status, CommitStatus) or not status.pending:
+        refused = Fault(FaultKind.REFUSED, "nothing to confirm: no commit-confirmed is pending", True)
+        return [history, OperationResult("confirm", refused, now(), 0)]
+    return [history, await operation("confirm", lambda: communicator.confirm(session),
+                                     2 * timeouts.command + timeouts.commit)]
 
 
 async def commit_history(communicator: Communicator, session: Session, timeouts: Timeouts) -> OperationResult:
