@@ -103,7 +103,7 @@ def write_audit_entry(
     diff: str = "",
 ) -> None:
     """Append JSONL using operation.started as time; write errors propagate.
-    Actions: load, diff, commit, confirm, probe (edit stopped by probe failure), aborted (operator declined).
+    Actions: load, diff, commit, confirm, probe (edit stopped by probe failure).
     """
     fault = operation.outcome if isinstance(operation.outcome, Fault) else None
     entry = {
