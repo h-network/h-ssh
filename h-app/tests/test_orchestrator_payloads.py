@@ -64,3 +64,35 @@ def test_line_by_line_loads_are_audited_as_load_for_the_targets_own_lines(tmp_pa
     for entry in entries:
         by_target.setdefault(entry["target"], []).append(entry["action"])
     assert by_target == {"r1": ["load", "load", "diff"], "r2": ["load", "diff"]}
+
+
+def test_the_load_audit_entry_carries_the_targets_own_payload_redacted(tmp_path):
+    import json
+
+    from hssh.model import RecordSettings
+
+    comm = FakeNetconf()
+    audit = tmp_path / "audit.jsonl"
+    run(edit_spec(payloads={"r1": ('set system root-authentication encrypted-password "$6$abc"', "set a 2"),
+                            "r2": ("set b 1",)},
+                  recording=RecordSettings(audit_log_path=str(audit))), comm)
+    entries = [json.loads(line) for line in audit.read_text().splitlines()]
+    payloads = {e["target"]: e["payload"] for e in entries if e["action"] == "load"}
+    assert payloads == {"r1": "set system root-authentication encrypted-password [REDACTED]\nset a 2", "r2": "set b 1"}
+    assert all(e["payload"] == "" for e in entries if e["action"] != "load")
+    assert "$6$abc" not in audit.read_text()
+
+
+def test_a_line_by_line_load_entry_carries_just_its_line(tmp_path):
+    import json
+
+    from hssh.model import RecordSettings
+
+    class NoCandidate(type(FakeNetconf().dialect)):
+        has_candidate = False
+
+    comm = FakeNetconf(NoCandidate())
+    audit = tmp_path / "audit.jsonl"
+    run(edit_spec(payloads={"r1": ("set a 1", "set a 2")}, recording=RecordSettings(audit_log_path=str(audit))), comm)
+    entries = [json.loads(line) for line in audit.read_text().splitlines()]
+    assert [e["payload"] for e in entries if e["action"] == "load"] == ["set a 1", "set a 2"]

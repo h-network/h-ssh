@@ -42,25 +42,27 @@ class Recorder:
             self.store.add(run_id, target, driver, seq, op)
 
     def change(self, run_id: int, target: Target, driver: str, dialect: Dialect, action: str,
-               op: OperationResult, edit: EditSettings, diff: str = "") -> None:
-        """One audit entry for an action that changed or could change the device, dry runs included."""
+               op: OperationResult, edit: EditSettings, diff: str = "", lines: Sequence[str] = ()) -> None:
+        """One audit entry for an action that changed or could change the device, dry runs included; `lines` is the payload a load sent."""
         if self.settings.audit_log_path is None:
             return
         from hssh.audit import write_audit_entry
 
         write_audit_entry(self.settings.audit_log_path, run_id=run_id, user=self.user, target=target, driver=driver,
-                          dialect=dialect, action=action, operation=op, edit=edit, diff=diff)
+                          dialect=dialect, action=action, operation=op, edit=edit, diff=diff, lines=lines)
 
     def changes(self, run_id: int, target: Target, driver: str, dialect: Dialect, ops: Sequence[OperationResult],
                 edit: EditSettings, config_lines: Sequence[str] = ()) -> None:
-        """An audit entry per audited operation; a line-by-line load keeps the config line as its command and is audited as 'load'; the diff's output is carried on every entry after it."""
+        """An audit entry per audited operation; a line-by-line load keeps the config line as its command and is audited as 'load' with that line, a candidate load with the whole payload; the diff's output is carried on every entry after it."""
         diff = ""
         for op in ops:
-            action = "load" if op.command in config_lines else op.command
+            line_by_line = op.command in config_lines
+            action = "load" if line_by_line else op.command
             if action == "diff" and isinstance(op.outcome, Result):
                 diff = op.outcome.output
             if action in AUDITED:
-                self.change(run_id, target, driver, dialect, action, op, edit, diff)
+                lines = ((op.command,) if line_by_line else tuple(config_lines)) if action == "load" else ()
+                self.change(run_id, target, driver, dialect, action, op, edit, diff, lines)
 
     def save_output(self, target: Target, ops: Sequence[OperationResult]) -> None:
         """The target's device output, one file per target."""
