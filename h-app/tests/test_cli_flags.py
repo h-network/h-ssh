@@ -25,8 +25,6 @@ def test_two_modes_are_refused(cli_run):
 
 @pytest.mark.parametrize("argv, mode", [
     (["-sC", "show version"], "show"),
-    (["-sC", "show version", "--format", "json"], "structured"),
-    (["-sC", "show version", "--format", "text"], "show"),
     (["-eC", "set x"], "edit"),
     (["--confirm"], "confirm"),
     (["--commit-status"], "commit_status"),
@@ -34,13 +32,6 @@ def test_two_modes_are_refused(cli_run):
 def test_each_mode_builds_its_spec(cli_run, argv, mode):
     rc, specs, _, _ = cli_run(R1, *argv, *NETCONF)
     assert rc == 0 and specs[0].mode == mode
-
-
-def test_format_is_carried_only_in_structured_mode(cli_run):
-    _, specs, _, _ = cli_run(R1, "-sC", "show version", "--format", "xml", *NETCONF)
-    assert specs[0].format == "xml" and specs[0].commands == ("show version",)
-    _, specs, _, _ = cli_run(R1, "-sC", "show version", *NETCONF)
-    assert specs[0].format is None
 
 
 def test_a_batch_file_is_the_commands_in_order(cli_run, tmp_path):

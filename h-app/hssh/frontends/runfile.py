@@ -22,7 +22,6 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "commands": ("batch_commands", list),
     "batch": ("batch", str),
     "profile": ("profile", str),
-    "format": ("format", str),
     "edit": ("edit_command", str),
     "edit_file": ("edit_file", str),
     "edit_dir": ("edit_dir", str),
