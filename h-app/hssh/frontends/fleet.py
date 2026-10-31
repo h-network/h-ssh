@@ -31,7 +31,7 @@ from hssh.paths import validate_device_name
 from hssh.orchestrator import (
     DEFAULT_EDIT, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SKIP_UNREACHABLE, DEFAULT_TIMEOUTS,
     DEFAULT_TRANSPORT,
-    DEFAULT_VENDOR, DEFAULT_WORKERS, default_username, run,
+    DEFAULT_VENDOR, DEFAULT_WORKERS, check_label, default_username, reachable, run,
 )
 
 Runner = Callable[[RunSpec], RunReport]
@@ -195,8 +195,10 @@ class Fleet:
                  key_file: str | None = None, workers: int = DEFAULT_WORKERS, timeouts: Timeouts = DEFAULT_TIMEOUTS,
                  policy: PolicySettings = DEFAULT_POLICY, host_key_policy: HostKeyPolicy = DEFAULT_HOST_KEY_POLICY,
                  probe: bool = DEFAULT_PROBE, safety: SafetySettings | None = None,
-                 recording: RecordSettings | None = None, runner: Runner | None = None):
+                 recording: RecordSettings | None = None, label: str | None = None, runner: Runner | None = None):
         quiet_library_logs()
+        if label is not None and (why := check_label(label)):
+            raise ValueError(why)
         self.targets = as_targets(targets, transport, vendor)
         if not self.targets:
             raise ValueError("no targets")
@@ -207,9 +209,11 @@ class Fleet:
         self.host_key_policy = host_key_policy
         self.probe = probe
         self.safety = safety
+        if recording is None and label is not None:
+            recording = RecordSettings()
         if recording is not None:
             recording = dataclasses.replace(recording, origin=recording.origin or "fleet",
-                                            version=recording.version or package_version())
+                                            version=recording.version or package_version(), label=label or recording.label)
         self.recording = recording
         self._busy = threading.Lock()
         self._closed = False
@@ -284,6 +288,21 @@ class Fleet:
             raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
         commands, by_target = split_commands(command)
         return self._run(self.spec("structured", commands=commands, commands_by_target=by_target, format=fmt))
+
+    def config(self, fmt: str) -> RunReport:
+        """The whole committed configuration in `fmt`, json or xml, as the device returns it (NETCONF only); the library's alone."""
+        if fmt not in ("json", "xml"):
+            raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
+        return self._run(self.spec("config", format=fmt))
+
+    def reachable(self, timeout: int | None = None) -> dict[str, Fault | None]:
+        """Which targets answer within `timeout` seconds (the connect timeout by default): name to None, or the Fault that says why not; a target that cannot be probed is absent. No login, nothing recorded."""
+        if self._closed:
+            raise RuntimeError("this Fleet is closed")
+        registry = Registry()
+        registry.load_entry_points()
+        timeouts = self.timeouts if timeout is None else dataclasses.replace(self.timeouts, connect=timeout)
+        return asyncio.run(reachable(self.targets, registry, timeouts, self.credentials))
 
     def edit(self, lines: Iterable[str] | None = None, payloads: Mapping[str, Sequence[str]] | None = None,
              apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None, comment: str | None = None,

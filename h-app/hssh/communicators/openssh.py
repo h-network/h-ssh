@@ -495,6 +495,9 @@ class OpenSSH:
     def structured(self, session: OpenSSHSession, rpc: str, fmt: str) -> Result:
         raise Fault(FaultKind.UNSUPPORTED, "openssh has no structured output", reached_device=False)
 
+    def config(self, session: OpenSSHSession, fmt: str) -> Result:
+        raise Fault(FaultKind.UNSUPPORTED, "configuration reads need NETCONF", reached_device=False)
+
     def load(self, session: OpenSSHSession, lines: list[str]) -> Result:
         return self._shell(session).load(lines)
 

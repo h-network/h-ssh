@@ -61,13 +61,13 @@ def _filters(args) -> dict:
 
 
 def _runs(store: Store, args) -> int:
-    with closing(store.runs(args.last)) as records:
-        rows = ((r["id"], _short(r["started"], 32), _shown(r["mode"]), _shown(r["user"]),
+    with closing(store.runs(args.last, label=args.label)) as records:
+        rows = ((r["id"], r["label"] or "", _short(r["started"], 32), _shown(r["mode"]), _shown(r["user"]),
                  "/".join(str(r[key]) if r[key] is not None else "?" for key in ("targets", "ok", "failed", "skipped")),
                  r["not_kept"], "interrupted" if r["interrupted"] else "", _short(r["argv"], 60))
                 for r in records)
-        _table(("run", "started", "mode", "user", "targets/ok/failed/skipped", "not_kept", "state", "argv"), rows,
-               widths=(6, 32, 13, 12, 25, 8, 11, 60), numeric=(0, 4, 5))
+        _table(("run", "label", "started", "mode", "user", "targets/ok/failed/skipped", "not_kept", "state", "argv"), rows,
+               widths=(6, 24, 32, 13, 12, 25, 8, 11, 60), numeric=(0, 5, 6))
     return 0
 
 
@@ -255,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command_name", required=True)
     runs = commands.add_parser("runs", help="list runs, newest first")
     runs.add_argument("--last", type=_last, default=20)
+    runs.add_argument("--label", type=_nonempty, help="exact run label filter")
     runs.set_defaults(fn=_runs)
     failed = commands.add_parser("failed", help="failed operations on failed targets")
     failed.add_argument("run", nargs="?", type=_nonempty)

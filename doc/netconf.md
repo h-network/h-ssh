@@ -82,6 +82,15 @@ An empty reply, including an absent configuration path, succeeds with
 unknown-exception RuntimeWarning is suppressed; errors are reported through
 the operation's fault.
 
+## Reading the committed configuration
+
+`fleet.config("json")` or `fleet.config("xml")` reads the whole committed
+configuration over NETCONF through PyEZ's `get_config`, explicitly requesting
+`database="committed"` under the command timeout. A dictionary becomes JSON text
+and an XML element becomes an XML string in `Result.output`; `Result.data` stays
+`None`. A text reply to a JSON request fails as `UNSUPPORTED`, with the reply in
+the detail. Other library errors use the same fault handling as NETCONF reads.
+
 ## Candidate edits
 
 Edits use PyEZ's exclusive candidate lock. The Junos dialect accepts set-style

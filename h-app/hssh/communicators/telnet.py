@@ -78,6 +78,9 @@ class TelnetCommunicator:
     def structured(self, session: Session, rpc: str, fmt: str) -> Result:
         raise NotImplementedError
 
+    def config(self, session: Session, fmt: str) -> Result:
+        raise Fault(FaultKind.UNSUPPORTED, "configuration reads need NETCONF", reached_device=False)
+
     def load(self, session: Session, lines: list[str]) -> Result:
         raise NotImplementedError
 

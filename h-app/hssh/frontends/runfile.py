@@ -54,6 +54,7 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "json": ("json", bool),
     "raw": ("raw", bool),
     "verbose": ("verbose", bool),
+    "label": ("label", str),
 }
 
 # Relative to the file, not to the shell's cwd.

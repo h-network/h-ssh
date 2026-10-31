@@ -9,7 +9,11 @@ import socket
 import subprocess
 from pathlib import Path
 
-from hssh.model import Fault, FaultKind, Target
+from collections.abc import Collection, Sequence
+
+from hssh.drivers import DriverRegistry
+from hssh.model import Credentials, Fault, FaultKind, Target, Timeouts
+from hssh.orchestrator.defaults import FDS_BASE, open_file_limit
 
 MAX_PROBES = 100
 MAX_LINE = 255
@@ -59,7 +63,7 @@ def openssh_route(host: str, port: int | None, default_port: int, user: str | No
     return said["hostname"], int(said.get("port", port if port is not None else default_port))
 
 
-async def where(target: Target, reader: str | None, default_port: int, user: str | None, seconds: float,
+async def where_to(target: Target, reader: str | None, default_port: int, user: str | None, seconds: float,
                 ssh_g: asyncio.Semaphore) -> Route:
     """Where the transport that reads the ssh client's configuration as `reader` says ("paramiko", "openssh", None) connects for `target`; ssh -G runs on a thread, SSH_G_AT_ONCE at once."""
     if reader == "paramiko":
@@ -122,6 +126,32 @@ async def probe_one(host: str, port: int, banner: bytes | None, seconds: float,
     """One attempt at one address; any retry is the policy's decision."""
     async with slots:
         return await attempt(host, port, banner, seconds)
+
+
+async def reachable(targets: Sequence[Target], registry: DriverRegistry, timeouts: Timeouts, creds: Credentials, *,
+                    limit: int | None = None, held: Collection[str] = ()) -> dict[str, Fault | None]:
+    """Whether each target answers where its transport connects, with no login and nothing recorded: None when it does, else the probe's Fault. A target the gate holds (`held`), whose driver is unknown, or reached through a proxy is not probed and absent. `limit` probes run at once; None fits MAX_PROBES to the open-file limit."""
+    boxes, found = [], {}
+    ssh_g = asyncio.Semaphore(SSH_G_AT_ONCE)
+    for target in targets:
+        if target.name in held:
+            continue
+        try:
+            comm = registry.resolve(target).communicator
+        except Fault:
+            continue
+        reader = comm.ssh_config if comm.banner is not None else None
+        try:
+            where = await where_to(target, reader, comm.default_port, creds.username, timeouts.connect, ssh_g)
+        except Fault as f:
+            found[target.name] = f
+            continue
+        if where is not None:
+            boxes.append((target, where[0], where[1], comm.banner))
+    if limit is None:
+        open_files = open_file_limit()
+        limit = MAX_PROBES if open_files is None else min(MAX_PROBES, open_files - FDS_BASE)
+    return {**found, **await probe(boxes, timeouts.connect, limit=limit)}
 
 
 async def probe(boxes: list[tuple[Target, str, int, bytes | None]], seconds: float,

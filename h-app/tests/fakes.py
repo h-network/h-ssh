@@ -14,7 +14,8 @@ class FakeNetconf:
     default_port = 830
     banner = b"SSH-"
     ssh_config = "paramiko"
-    capabilities = frozenset({"show", "batch", "edit", "commit_confirmed", "confirm", "commit_status", "synchronize"})
+    capabilities = frozenset({"show", "batch", "structured", "config", "edit", "commit_confirmed", "confirm", "commit_status",
+                              "synchronize"})
 
     def __init__(self, dialect=junos.DIALECT, *, changed=True, pending=False, open_fault=None, commit_fault=None):
         self.dialect, self.changed, self.pending = dialect, changed, pending
@@ -63,6 +64,14 @@ class FakeNetconf:
     def confirm(self, session, synchronize=False):
         self.calls.append(("confirm", session["name"]))
         return Result("commit complete")
+
+    def structured(self, session, command, fmt):
+        self.calls.append(("structured", command, fmt))
+        return Result("{}")
+
+    def config(self, session, fmt):
+        self.calls.append(("config", fmt))
+        return Result("{}")
 
     def commit_history(self, session):
         self.calls.append(("history", session["name"]))

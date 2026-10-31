@@ -40,19 +40,27 @@ Built, on `junos@netconf`, `junos@ssh` and `junos@openssh`:
 - shows and batches;
 - edits on all three transports, SSH and OpenSSH included: dry run, apply, commit confirmed and confirm
   (`--synchronize` for dual routing engines, NETCONF only), commit status, per-device payload files;
-- the result store and the `h-ssh-store` reader;
+- the result store and the `h-ssh-store` reader, with run labels;
 - the audit log and the safety gate;
 - session reuse.
 
 Next: other vendors.
+
+`h-ssh-store runs` lists run IDs and labels; `h-ssh-store runs --label nightly` filters
+by exact label. Use a label wherever a run selector is accepted, for example
+`h-ssh-store diff R1 before-change after-change`; the newest run with that label wins.
+Digit selectors keep ID/prefix lookup. See [reader usage](doc/store.md).
 
 ## From Python
 
 ```python
 from hssh.frontends.fleet import Fleet
 
-with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin", password="…") as fleet:
+with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin", password="…",
+           label="pre-upgrade") as fleet:                    # the label is kept with every run, for h-ssh-store
+    dead = {name for name, fault in fleet.reachable().items() if fault}   # a TCP connect per device, no login
     report = fleet.show("show bgp summary")                 # one login per device, kept for the next call
+    report = fleet.config("xml")                            # the whole committed configuration, as returned; NETCONF only
     report = fleet.batch(["show version", "show route summary"])
     report = fleet.structured("show interfaces terse", "json")   # the reply in json, as returned; NETCONF only
     report = fleet.structured(["show version", "show interfaces terse"], "xml")   # one reply per command
@@ -68,5 +76,8 @@ with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin"
 the reply as the device returned it, nothing parsed (`Result.data` stays None). The CLI has no `--format`; its reads return the device's text.
 `show`, `batch` and `structured` take one command (or list) for every device, or a mapping of device name to
 its own command or list; a device not in the mapping is skipped, in one run with one reply per command.
+`Fleet(label=…)`, or `--label TEXT` and the run file's `label` key on the CLI, tags the run with free text that
+`h-ssh-store` lists and selects by. `reachable(timeout=None)` returns `{name: None or Fault}` without logging in (a device that cannot be probed is absent);
+a run that recorded nothing (no store) has `run_id` None, shown as "no run" in text and `null` in `--json`.
 
 Documentation: [architecture](doc/architecture.md), [testing](doc/testing.md), [result store](doc/store.md), [NETCONF](doc/netconf.md).

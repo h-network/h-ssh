@@ -549,6 +549,9 @@ class SSHCommunicator(Communicator):
     def structured(self, session: Session, rpc: str, fmt: str) -> Result:
         raise Fault(FaultKind.UNSUPPORTED, "Structured RPCs require NETCONF", False)
 
+    def config(self, session: Session, fmt: str) -> Result:
+        raise Fault(FaultKind.UNSUPPORTED, "configuration reads need NETCONF", reached_device=False)
+
     def load(self, session: Session, lines: list[str]) -> Result:
         return self._engine(session).load(lines)
 

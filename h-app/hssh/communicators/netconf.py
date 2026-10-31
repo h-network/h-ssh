@@ -432,7 +432,7 @@ class NetconfSession(Session):
 class NetconfCommunicator(Communicator):
     default_port: int = 830
     banner: bytes | None = b"SSH-"
-    capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "edit", "commit_confirmed", "confirm", "commit_status",
+    capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "config", "edit", "commit_confirmed", "confirm", "commit_status",
                                               "synchronize"})
     ssh_config = "paramiko"
 
@@ -632,6 +632,26 @@ class NetconfCommunicator(Communicator):
             if fault.kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST) or not netconf.device.connected:
                 self.discard(netconf)
             raise fault from error
+
+    def config(self, session: Session, fmt: str) -> Result:
+        from lxml import etree
+
+        netconf = cast(NetconfSession, session)
+        reached_device = bool(netconf.device.connected)
+        try:
+            reply = netconf.device.rpc.get_config(options={"database": "committed", "format": fmt},
+                                                  dev_timeout=netconf.timeouts.command)
+            if isinstance(reply, dict):
+                output = json.dumps(reply)
+            elif isinstance(reply, str):
+                if fmt == "json":
+                    raise Fault(FaultKind.UNSUPPORTED, f"the device answered get-configuration with text, not json: {reply}", True)
+                output = reply
+            else:
+                output = etree.tostring(reply, encoding="unicode")
+            return Result(output=output)
+        except Exception as error:
+            raise _fault(error, reached_device) from error
 
     def load(self, session: Session, lines: list[str]) -> Result:
         netconf = cast(NetconfSession, session)

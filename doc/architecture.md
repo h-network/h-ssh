@@ -73,7 +73,12 @@ Front ends make no decisions about devices. A behaviour available in the CLI is 
 through the same `RunSpec`; the one exception is `structured`, which is `Fleet.structured(command, fmt)` alone
 (`fmt` json or xml, required) — the CLI has no `--format` and the run file no `format` key (#220). `Fleet.show`,
 `batch` and `structured` also take a mapping of target name to its own command(s), carried as `RunSpec.commands_by_target`
-(no CLI flag), and `structured` a list of commands, one reply each.
+(no CLI flag), and `structured` a list of commands, one reply each. `Fleet.config(fmt)` is the `config`
+mode (library only), `Fleet.reachable(timeout=None)` wraps the orchestrator's `reachable()` (the connect timeout by
+default; `{name: Fault | None}`, no login, nothing recorded). `--label TEXT`, the run file's `label` key and
+`Fleet(label=)` put a free-text label into `RecordSettings.label`, checked by the orchestrator's `check_label` before the
+password; `--json` carries it. A run without a store has `run_id` None: text says "no run", `--json` and the summary
+line's `run` say null, and a watch tick with no run is not compared through the store.
 
 `--every SECONDS` (1 to 86400) is a front-end loop: one run per tick with the same `RunSpec`, every tick
 kept in the store, and each tick's rows compared with the last kept run's through the store's reader
@@ -140,7 +145,7 @@ default port is held by its protocol, and a target's own port overrides it.
 | Policy | Maps each `Fault` to an action: retry, fail, skip, or cool down. Applies the safety gate |
 | Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed and confirm |
 | Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature: a caller (the Fleet API) hands `run` or `execute` its own manager and keeps it, across event loops, and closes it with `close_all(timeout)`, which still joins the closes when the interpreter is shutting down; the CLI's run owns and closes its own. `run` refuses to start inside a running event loop and names `execute` instead. A session is keyed by driver, host, the port the connection uses, user, host-key policy and the credential as a process-secret HMAC, so a changed secret or policy opens anew. One session per key: a second borrower waits for it instead of logging in again. A kept session is offered again only after the communicator's `reuse` vouches for it (the cheap check on every borrow, the device asked past its idle threshold) under a 5 s budget; a borrow owns it through its `release` cleanup (two command timeouts), and only then is it idle. A session in doubt (timeout, loss, unknown commit outcome, a cancelled or over-budget call still running, a failed cleanup or close) is torn down by `discard` with no cleanup and never offered again. The kept sessions live inside the open-file budget (6 descriptors per worker, 4 per kept session, 1 per probe, 32 base): when a session goes idle and before every open or probe, the least recently used idle sessions are closed while the limit cannot hold the kept ones beside what is about to run, a close still running counted as held until its thread ends; before an open or the probe the manager waits for those closes (1 s in all) so the descriptors are really free, and the probe runs no more at once than the budget still has. Workers are lowered to the limit per run and said once per session manager, so a Fleet hears it once, not on every call; a lowered probe concurrency is said the same way |
-| Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, asked the way each transport's library reads the ssh client's configuration (`Communicator.ssh_config`): NETCONF as PyEZ and ncclient read `~/.ssh/config` (HostName, Port, ProxyCommand), the OpenSSH transport as `ssh -G` prints it for the run's user (HostName, Port, ProxyJump, ProxyCommand; eight at once, on threads, under the connect timeout), paramiko SSH and telnet the target's host and port directly. A target reached through a proxy is not probed; one whose route `ssh -G` cannot tell is that target's `LOCAL` failure before any login. Its outcome is expressed as the same fault kinds |
+| Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, asked the way each transport's library reads the ssh client's configuration (`Communicator.ssh_config`): NETCONF as PyEZ and ncclient read `~/.ssh/config` (HostName, Port, ProxyCommand), the OpenSSH transport as `ssh -G` prints it for the run's user (HostName, Port, ProxyJump, ProxyCommand; eight at once, on threads, under the connect timeout), paramiko SSH and telnet the target's host and port directly. A target reached through a proxy is not probed; one whose route `ssh -G` cannot tell is that target's `LOCAL` failure before any login. The same code is the library's `reachable(targets, registry, timeouts, credentials)` (`Fleet.reachable`): the probe's answer per target with no login, run row, audit entry, gate or store; the run's probe calls it with the concurrency the descriptor budget leaves beside the kept sessions. Its outcome is expressed as the same fault kinds |
 | Cancellation | Handles interruption (section 5.4) |
 | Recorder | Writes every result to the store and every change to the audit log, with redaction |
 
@@ -373,10 +378,16 @@ SSH banner, `setup` as one deadline from the banner across key exchange, login a
 operation, `commit`), the structured `format`, the worker limit, the host-key policy, the probe and
 `skip_unreachable` switches, the edit settings (`apply`, `confirmed_minutes`, `comment`, `synchronize`), the retry
 policy, the safety settings, and the recording settings (the record paths, and the run row's provenance: `argv`,
-`origin` and `version`, supplied by the front end, all optional). Every setting the orchestrator owns defaults to
-`None` and is filled by the orchestrator.
+`origin`, `version` and a free-text `label`, supplied by the front end, all optional; the label is a run selector
+and filter in `h-ssh-store`). Every setting the orchestrator owns defaults to `None` and is filled by the
+orchestrator.
 
-Structured mode is the library's call, `Fleet.structured(commands, fmt)`: one or more `show` commands, each on one line, for the run or per target, with `fmt` `json` or `xml`, all checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The commands run as a batch does (5.2), one `structured` call per command; the NETCONF communicator asks PyEZ for each in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None. The CLI has no structured mode.
+Structured mode is the library's call, `Fleet.structured(commands, fmt)`: one or more `show` commands, each on one line, for the run or per target, with `fmt` `json` or `xml`, all checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The commands run as a batch does (5.2), one `structured` call per command; the NETCONF communicator asks PyEZ for each in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None. The CLI has no structured mode. Config mode is the library's `Fleet.config(fmt)`: one operation named `config` per target, `Communicator.config(session, fmt)` under the command timeout, `fmt` `json` or `xml` by the same rule as structured and refused the same way; NETCONF only (the `config` capability), a read for the policy.
+
+`config` is the library's call too, `Fleet.config(fmt)`: the whole committed configuration, json or xml, through
+PyEZ's configuration call with `database` `committed` (Junos returns the candidate unless asked otherwise), saved as
+PyEZ returns it in `Result.output` with `data` None; NETCONF only, no paths; a read, retried as `show` is. A run
+that recorded nothing (no store) reports `run_id` None, never 0.
 
 ### 5.2 Concurrency
 
@@ -421,7 +432,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
   probe or any login. The communicators' own `UNSUPPORTED` for the flag is for callers that drive `ssh` or `openssh`
   directly; a run never reaches it.
 - The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
-  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
+  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters), and a run label
+  through `check_label` (the same rule, at most 128 bytes) when the recording settings carry one; front
   ends call the same helpers before asking for a password.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
   uncommitted changes. Where the dialect has no candidate, it stops and reports which lines were applied.
@@ -455,7 +467,7 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 
 ### 6.1 Store
 
-The schema version is `PRAGMA user_version = 1`. A new, empty database gets this schema;
+The schema version is `PRAGMA user_version = 2`. A new, empty database gets this schema;
 readers and writers refuse other versions or a mismatched table layout before changing the
 file. An unversioned database with tables is incompatible, not an empty database. The error
 is an `OSError` containing the path and: "incompatible store schema; choose a new store path".
@@ -466,7 +478,7 @@ CREATE TABLE runs (
   id INTEGER PRIMARY KEY,
   started TEXT NOT NULL, finished TEXT,
   mode TEXT NOT NULL, argv TEXT, user TEXT NOT NULL,
-  format TEXT, origin TEXT, version TEXT,
+  format TEXT, origin TEXT, version TEXT, label TEXT,
   targets INTEGER NOT NULL,
   ok INTEGER, failed INTEGER, skipped INTEGER,
   interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1)),
@@ -491,7 +503,8 @@ or use the device login. `argv` is a JSON array from `RecordSettings.argv`, or S
 when absent. Payload files are not copied into this row; an inline `-eC` payload is already
 part of argv. `format` is the requested `RunSpec.format`, or NULL when unspecified. `origin` and
 `version` are optional strings from `RecordSettings`, supplied by the front end; the store
-does not discover them. `targets` is the number requested. Until `finish_run(report)`,
+does not discover them. `label` keeps `RecordSettings.label` verbatim, or SQL NULL when
+absent. Labels need not be unique. `targets` is the number requested. Until `finish_run(report)`,
 `finished` and the three outcome counts are NULL; finalization copies the report's finished
 time, counts, interrupted flag and not-kept count. Counts describe target outcomes, not how
 many rows survived a recording failure. A missing `finished` means the run was not finalized.
@@ -548,12 +561,16 @@ the read and are reported at the query boundary and close. Pending WAL data is n
 
 The reader interfaces in `store.py` return stored column names unchanged:
 
-- `runs(last=20)` streams run rows newest first by timestamp, then ID; None means all,
-  zero means no rows, and negative limits are invalid. `last_run_id()` returns the newest
-  run's integer ID, or None for an empty store.
+- `runs(last=20, *, label=None)` streams run rows newest first by timestamp, then ID;
+  `label` filters by exact label before the limit is applied. A missing label filter means
+  all labels; an empty filter is invalid. For `last`, None means all rows, zero means no
+  rows, and negative limits are invalid. `last_run_id()` returns the newest run's integer
+  ID, or None for an empty store.
 - `resolve_run(selector=None)` accepts an integer ID, its exact decimal string, a literal
-  unambiguous decimal prefix, or None for the latest run. Exact matches win over prefixes;
-  missing, empty, ambiguous and wildcard selectors raise `ValueError`.
+  unambiguous decimal prefix, a label, or None for the latest run. Digit strings retain
+  exact-match priority and prefix lookup. Other nonempty strings match labels exactly;
+  the newest timestamp, then ID, wins when a label names several runs. There is no wildcard
+  matching. Missing/empty selectors and ambiguous numeric prefixes raise `ValueError`.
 - `results(run_id=None, target=None, command=None, ok=None, *, status=None, seq=None,
   order="sequence", limit=None)` streams operation rows. None leaves a filter unrestricted;
   target and command match exactly, and status selects `target_status`. Order is one of
@@ -573,7 +590,9 @@ The reader interfaces in `store.py` return stored column names unchanged:
 
 The `h-ssh-store` entry point is `hssh.frontends.store:main_sync`; parsing, rendering,
 configuration and default resolution belong to that front end. `store.py` imports no
-front-end modules. The reader shares `frontends.settings.store_path` with the writer.
+front-end modules. The reader shares `frontends.settings.store_path` with the writer. `runs` displays each
+run's label and accepts `--label` for exact filtering. Every run-selector argument accepts
+labels, including the two operands of `diff` and the optional selector of `export`.
 [Reader usage](store.md) covers the commands and exit codes. Display tables stream rows.
 On a terminal, runs/failed/history/slowest use declared column widths, right-aligned numeric
 cells and visibly shortened long cells, with metadata sanitized before measuring. Pipes and
@@ -597,6 +616,7 @@ Both the payload-file and saved-output callers use these shared helpers.
  "confirmed_minutes": 10, "comment": "...", "diff": "", "ok": true, "fault": null}
 ```
 
+`run_id` is the stored run's integer ID, or JSON null when there is no store.
 `time` is the operation's `started` timestamp. `dry_run` is the inverse of the requested
 `EditSettings.apply`; `ok` describes the operation's outcome, not whether a commit was requested.
 `fault` is null on success, otherwise an object with `kind` (the fault kind name), `detail` and
