@@ -27,7 +27,7 @@ A `Fleet` keeps one session per device across its calls. Three calls cost 250 lo
 
 ## Status
 
-Built, on `junos@netconf`:
+Built, on `junos@netconf`, `junos@ssh` and `junos@openssh`:
 - shows and batches;
 - edits: dry run, apply, commit confirmed and confirm (`--synchronize` for dual routing engines, NETCONF only),
   commit status, per-device payload files;
@@ -35,9 +35,7 @@ Built, on `junos@netconf`:
 - the audit log and the safety gate;
 - session reuse.
 
-On `junos@ssh`: shows, batches, candidate edits, commit confirmed, confirm and commit status.
-
-Other vendors remain pending.
+Next: other vendors.
 
 ## From Python
 
@@ -47,7 +45,7 @@ from hssh.frontends.fleet import Fleet
 with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin", password="…") as fleet:
     report = fleet.show("show bgp summary")                 # one login per device, kept for the next call
     report = fleet.batch(["show version", "show route summary"])
-    report = fleet.structured("show interfaces terse", "json")   # the reply as data, NETCONF only
+    report = fleet.structured("show interfaces terse", "json")   # the reply in json, as returned; NETCONF only
     report = fleet.edit(["set system host-name cr1"], apply=True, confirmed_minutes=5, synchronize=True)
     report = fleet.confirm(synchronize=True)                 # commit synchronize on both; NETCONF only
     for result in report.results:
@@ -55,7 +53,7 @@ with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin"
             print(result.target.name, op.command, op.outcome)
 ```
 
-`Fleet.structured(command, fmt)` is the library's alone: `fmt` is `json` or `xml`, and `Result.data`
-carries the parsed reply. The CLI has no `--format`; its reads return the device's text.
+`Fleet.structured(command, fmt)` is the library's alone: `fmt` is `json` or `xml`, and `Result.output` holds
+the reply as the device returned it, nothing parsed (`Result.data` stays None). The CLI has no `--format`; its reads return the device's text.
 
 Documentation: [architecture](doc/architecture.md), [testing](doc/testing.md), [result store](doc/store.md), [NETCONF](doc/netconf.md).
