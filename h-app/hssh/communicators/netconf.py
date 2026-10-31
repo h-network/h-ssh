@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 import socket
+import warnings
 from threading import RLock, Timer
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, cast
@@ -36,6 +37,9 @@ except ImportError:
 else:
     # Poll queued NETCONF sends every 10 ms to reduce request and close latency.
     _ncclient_session.TICK = 0.01
+
+warnings.filterwarnings("ignore", message=r"An unknown exception occurred.*please report",
+                        category=RuntimeWarning, module=r"jnpr\.junos\.device")
 
 
 IDLE_CHECK_SECONDS = 30
@@ -586,15 +590,26 @@ class NetconfCommunicator(Communicator):
         try:
             try:
                 reply = device.cli(command, format=fmt, warning=False)
-            except (JSONLoadError, json.JSONDecodeError, TypeError) as error:
+            except (JSONLoadError, json.JSONDecodeError, TypeError, IndexError) as error:
                 if fmt != "json":
                     raise
+                if isinstance(error, IndexError):
+                    if not isinstance(error.__context__, json.JSONDecodeError):
+                        raise
+                    error = error.__context__
+                text = getattr(error, "rpc_content", None)
+                if text is None:
+                    text = getattr(error, "doc", None)
+                if isinstance(text, str) and not text.strip():
+                    return Result(output="")
                 # PyEZ passes missing JSON text to json.loads(), raising TypeError.
-                detail = getattr(error, "rpc_content", None) or getattr(error, "doc", None) or str(error)
+                detail = text or str(error)
                 raise Fault(FaultKind.UNSUPPORTED, f"{unsupported}: {detail}", True) from error
             if isinstance(reply, dict):
                 output = json.dumps(reply)
             elif isinstance(reply, str):
+                if not reply.strip():
+                    return Result(output="")
                 raise Fault(FaultKind.UNSUPPORTED, f"{unsupported}: {reply}", True)
             else:
                 output = etree.tostring(reply, encoding="unicode")
