@@ -1,7 +1,7 @@
 import re
 
 from hssh.dialects.base import Dialect
-from hssh.dialects.generic import GenericDialect, _VALUE
+from hssh.dialects.generic import GenericDialect, _CONTROL, _VALUE
 from hssh.model import CommitStatus, Fault, FaultKind
 
 
@@ -9,7 +9,6 @@ SET_PREFIX_VERBS = (
     "set ", "delete ", "activate ", "deactivate ", "insert ",
     "rename ", "copy ", "annotate ", "protect ", "unprotect ",
 )
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 _PENDING = re.compile(r"\bcommit confirmed, rollback in (\d+)\s*min(?:ute)?s?\b", re.I)
 
 
@@ -17,7 +16,6 @@ class JunosDialect(GenericDialect):
     prompt_pattern = re.compile(r'^[\w\-\.]+@[\w\-\.]+[>%#]\s*$')
     prompt_name_pattern = re.compile(r'^([\w\-\.]+@[\w\-\.]+)')
     prompt_tail_pattern = re.compile(r'[>%#]\s*$')
-    paging_off_command = "set cli screen-length 0"
     pager_pattern = re.compile(r'^\s*---?\(more(?: \d+%)?\)---?\s*$', re.I)
     context_pattern = re.compile(r'^\s*(?:(?:\{\w+(?::\w+)?\})?\[edit[^\]]*\]|# commit confirmed will be rolled back in \d+ minutes?)\s*$')
     refusal_patterns = (
@@ -33,7 +31,6 @@ class JunosDialect(GenericDialect):
     diff_command = "show | compare"
     history_command = "show system commit"
     config_history_command = "run show system commit"
-    # Discard only this session's uncommitted candidate on close.
     discard_commands = ("rollback 0",)
     has_candidate = True
     redaction_patterns = (
