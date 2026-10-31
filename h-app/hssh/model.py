@@ -24,6 +24,12 @@ class Target:
     transport: str
     port: int | None = None
 
+    def __post_init__(self) -> None:
+        if self.port is None:
+            return
+        if isinstance(self.port, bool) or not isinstance(self.port, int) or not 1 <= self.port <= 65535:
+            raise ValueError(f"target {self.name!r}: port must be a whole number from 1 to 65535, not {self.port!r}")
+
 
 @dataclass(frozen=True)
 class Credentials:
