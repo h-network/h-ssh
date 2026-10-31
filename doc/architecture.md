@@ -58,7 +58,8 @@ what happens next and records the outcome.
 
 ### 3.1 Front ends
 
-The CLI, the Fleet library API, run files and profiles are front ends. Each one:
+The CLI, the Fleet library API, run files and profiles are front ends (a profile listing names a file it cannot read
+or look at with the reason, never hiding the rest). Each one:
 
 - parses its input
 - resolves configuration precedence: flags, then run file, then profile, then `~/.h-ssh/config`, then
@@ -93,7 +94,15 @@ Before anything runs the CLI refuses the flags that would do nothing or contradi
 exit 2: a second mode, `-y`/`--comment`/`--commit-confirmed` without an edit, `--synchronize` without an edit or
 `--confirm` (it rides `EditSettings.synchronize`, for a confirm through `RunSpec.edit`; the run file's `synchronize` key is the same),
 `--no-store` with `--store`, `--raw` with `--json` or `-v`, a `--save-output` path that exists and is not a
-directory, and a parser error is the message alone, not the usage block. Input is plain text: a `-sC` or batch
+directory, and a parser error is the message alone, not the usage block. A number or a choice is held to the
+same range or list wherever it comes from — flag, run file or config file (`frontends/settings.py` `RANGES`,
+`CHOICES`; `probe` and `skip_unreachable` take yes/no words) — and the refusal names the key. A run-file path,
+user, comment or label that is empty is refused, not taken for the key left out; when a typed target or
+`--devices` replaces the file's `devices`, one stderr line says so. `HSSH_PASSWORD` set but empty off a
+terminal refuses the run (a pipeline whose secret lookup came back empty), and Ctrl-D at the prompt is one line
+and exit 2. A target string that reads as a path (a separator or an inventory suffix, no colon) but is not a
+file is refused, in the CLI and the library, so a mistyped inventory path never becomes a device; the Fleet
+also refuses an empty password and an unknown vendor at construction. Input is plain text: a `-sC` or batch
 command is one line (a line break would run two commands), and the username, from whichever source, carries no
 control character; both are checked before the password. Every target name, typed or from an inventory, is a
 safe file name (`hssh.paths.validate_device_name`), in the CLI and the library alike, since the name becomes
@@ -115,7 +124,7 @@ in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to
 line (`run ID: a ok, b failed, c skipped (n reason, …); k record(s) not kept`) names what was skipped by
 reason, so a run the gate or the probe kept from every device never reads as all OK; under `--raw` stdout is
 device output only, each device's block under a `NAME:` line, and the verdict goes to stderr when something failed, was skipped or was not kept, as does
-`Interrupted. Completed a of n device(s).` `--commit-status` prints one readable line per device from the parsed `CommitStatus` (pending and the minutes left, or no pending commit); `--raw` and `--json` keep the device's reply. Device text shown on a terminal goes through `hssh.screen.terminal_safe`
+`Interrupted. Completed a of n device(s).` `--commit-status` prints one readable line per device from the parsed `CommitStatus` (pending and the minutes left, or no pending commit); `--raw` and `--json` keep the device's reply. An edit's default view is one line per device (name, host, status, time) with each operation's output — the diff, the commit's reply — indented under it; FAIL lines stay as they are. Device text shown on a terminal goes through `hssh.screen.terminal_safe`
 (control sequences stripped); a pipe, a file and the store get it as it came. A reader that leaves (`| head`)
 ends the program quietly with exit 0: the record is the store, the screen is best effort. `--json`
 renders each operation through the store's `operation_dict` (`Result.data` via `json_data`, a fault with its

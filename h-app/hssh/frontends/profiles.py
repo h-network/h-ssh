@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
 
 SHIPPED_DIR = Path(__file__).parent / "profiles"
@@ -34,29 +36,39 @@ def read_commands(path: Path) -> list[str]:
     return out
 
 
-def describe(path: Path) -> tuple[int, str]:
-    """(number of commands, description): the first `#` line, else the first command."""
-    lines = [ln.strip() for ln in path.read_text(encoding="utf-8-sig").splitlines()]
+def describe(path: Path) -> tuple[int | None, str]:
+    """(number of commands, description): the first `#` line, else the first command; a file that cannot be read is (None, why)."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as e:
+        return None, getattr(e, "strerror", None) or str(e)
+    lines = [ln.strip() for ln in text.splitlines()]
     commands = [ln for ln in lines if ln and not ln.startswith("#")]
     comments = [ln.lstrip("#").strip() for ln in lines if ln.startswith("#")]
     return len(commands), (comments[0] if comments else (commands[0] if commands else ""))
 
 
-def listing() -> list[tuple[str, str, int, str]]:
-    """(name, origin, commands, description) per profile, yours before shipped; a shipped name you also have is listed once."""
+def listing() -> list[tuple[str, str, int | None, str]]:
+    """(name, origin, commands, description) per profile, yours before shipped; a shipped name you also have is listed once. A file that cannot be read or looked at is listed with None and the reason, never hiding the rest."""
     seen: set[str] = set()
     out = []
     for origin, directory in (("yours", user_dir()), ("shipped", SHIPPED_DIR)):
         if not directory.is_dir():
             continue
         for path in sorted(directory.iterdir()):
-            if path.name.startswith(".") or not path.is_file():
+            if path.name.startswith("."):
                 continue
+            try:
+                if not stat.S_ISREG(os.stat(path).st_mode):
+                    continue
+                unreadable = None
+            except OSError as e:
+                unreadable = e.strerror or str(e)
             name = path.name[:-4] if path.name.endswith(".txt") else path.name
             if name in seen:
                 continue
             seen.add(name)
-            count, text = describe(path)
+            count, text = describe(path) if unreadable is None else (None, unreadable)
             out.append((name, origin, count, text))
     return out
 
@@ -71,5 +83,6 @@ def listing_lines() -> list[str]:
         group = [r for r in rows if r[1] == origin]
         if group:
             lines.append(f"{origin} ({user_dir() if origin == 'yours' else SHIPPED_DIR}):")
-            lines.extend(f"  {n:<{width}}  {c:>3} commands  {d}" for n, _, c, d in group)
+            lines.extend(f"  {n:<{width}}  {c:>3} commands  {d}" if c is not None else f"  {n:<{width}}    unreadable  {d}"
+                         for n, _, c, d in group)
     return lines
