@@ -15,7 +15,6 @@ class Dialect(Protocol):
     prompt_name_pattern: re.Pattern[str]
     prompt_tail_pattern: re.Pattern[str]
     context_pattern: re.Pattern[str] | None
-    paging_off_command: str | None
     pager_pattern: re.Pattern[str] | None
     pager_reply: bytes
     refusal_patterns: tuple[re.Pattern[str], ...]

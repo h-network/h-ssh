@@ -222,7 +222,7 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 - the prompt pattern, the anchored prompt name and tail the engine learns the device's own prompt from, and the
   context lines the CLI prints with its prompt
-- paging control: the command that turns the pager off, the pager marker as a whole line, and the reply to it
+- paging control: the pager marker as a whole line, and the reply to it
 - the refusal and warning patterns
 - how to enter and leave configuration mode, how to commit (`build_commit`), diff and read the commit history
   (`parse_commit_history`), and how to discard uncommitted changes, if the vendor has a candidate model
