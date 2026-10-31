@@ -222,7 +222,7 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 - the prompt pattern, the anchored prompt name and tail the engine learns the device's own prompt from, and the
   context lines the CLI prints with its prompt
-- paging control: the command that turns the pager off, the pager marker as a whole line, and the reply to it
+- paging control: the pager marker as a whole line, and the reply to it
 - the refusal and warning patterns
 - how to enter and leave configuration mode, how to commit (`build_commit`), diff and read the commit history
   (`parse_commit_history`), and how to discard uncommitted changes, if the vendor has a candidate model
@@ -288,7 +288,7 @@ class Communicator(Protocol):
     def discard(self, session: Session) -> None: ...   # session in doubt: tear down, no rollback or unlock, interrupt a running call, never raises
 
     def show(self, session: Session, command: str) -> Result: ...
-    def structured(self, session: Session, rpc: str, fmt: str) -> Result: ...   # NETCONF only
+    def structured(self, session: Session, command: str, fmt: str) -> Result: ...   # NETCONF only: one show command, fmt json or xml
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
     def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
@@ -367,10 +367,11 @@ A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`,
 lines; a target not named gets the configuration lines, and when payloads are given a target in neither has no
 payload and is skipped), credentials, timeouts (`connect` for the TCP connect and the
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
-operation, `commit`),
-the worker limit, the safety
-settings, and the recording settings (the record paths, and the run row's provenance: `argv`, `origin` and
-`version`, supplied by the front end, all optional).
+operation, `commit`), the structured `format`, the worker limit, the host-key policy, the probe and
+`skip_unreachable` switches, the edit settings (`apply`, `confirmed_minutes`, `comment`, `synchronize`), the retry
+policy, the safety settings, and the recording settings (the record paths, and the run row's provenance: `argv`,
+`origin` and `version`, supplied by the front end, all optional). Every setting the orchestrator owns defaults to
+`None` and is filled by the orchestrator.
 
 Structured mode is the library's call, `Fleet.structured(command, fmt)`: exactly one `show` command on one line, with `fmt` `json` or `xml`, both checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The NETCONF communicator asks PyEZ for the command in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; the CLI has no structured mode.
 

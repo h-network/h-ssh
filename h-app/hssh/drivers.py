@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import metadata
-from typing import Iterable, Iterator, Protocol, Union
+from typing import Iterable, Iterator, Protocol
 
 from hssh.communicators.base import Communicator
 from hssh.communicators.netconf import NetconfCommunicator
@@ -15,8 +15,6 @@ from hssh.dialects.base import Dialect
 from hssh.model import Fault, FaultKind, Mode, Target
 
 ENTRY_POINT_GROUP = "hssh.drivers"
-
-EntryPointValue = Union["Driver", list["Driver"]]
 
 
 @dataclass(frozen=True)

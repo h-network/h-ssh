@@ -11,7 +11,7 @@ from hssh.dialects.base import Dialect
 COMMUNICATOR_MEMBERS = {"capabilities", "dialect", "default_port", "banner", "ssh_config", "open", "close", "reuse", "release",
                         "discard", "show", "structured", "load", "diff", "commit", "confirm", "commit_history"}
 DIALECT_MEMBERS = {"prompt_pattern", "prompt_name_pattern", "prompt_tail_pattern", "context_pattern",
-                   "paging_off_command", "pager_pattern", "pager_reply", "refusal_patterns", "warning_patterns",
+                   "pager_pattern", "pager_reply", "refusal_patterns", "warning_patterns",
                    "config_enter_command", "config_exit_command", "commit_command", "diff_command",
                    "history_command", "config_history_command", "discard_commands", "has_candidate", "redaction_patterns",
                    "comment_prefixes", "is_read", "check_edit", "build_commit", "parse_commit_history",
