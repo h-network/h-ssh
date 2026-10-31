@@ -40,4 +40,4 @@ def test_typed_dests_counts_only_what_was_typed():
     parser = cli.build_parser()
     assert "hosts" not in cli.typed_dests(parser, ["--run", "f.yaml", "--user", "admin"])
     assert cli.typed_dests(parser, ["R1", "--run", "f.yaml"]) >= {"hosts", "run"}
-    assert "format" in cli.typed_dests(parser, ["--format", "text"])
+    assert "raw" in cli.typed_dests(parser, ["--raw"])

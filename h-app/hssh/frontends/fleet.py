@@ -257,8 +257,11 @@ class Fleet:
     def batch(self, commands: Iterable[str]) -> RunReport:
         return self._run(self.spec("batch", commands=list(commands)))
 
-    def structured(self, rpc: str, fmt: str) -> RunReport:
-        return self._run(self.spec("structured", commands=[rpc], format=fmt))
+    def structured(self, command: str, fmt: str) -> RunReport:
+        """The command's reply as data, `fmt` json or xml (NETCONF only); the library's alone, the CLI has no --format."""
+        if fmt not in ("json", "xml"):
+            raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
+        return self._run(self.spec("structured", commands=[command], format=fmt))
 
     def edit(self, lines: Iterable[str] | None = None, payloads: Mapping[str, Sequence[str]] | None = None,
              apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None, comment: str | None = None,

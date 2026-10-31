@@ -469,8 +469,8 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
                   sessions: SessionManager | None = None) -> RunReport:
     """execute() with injected collaborators, for callers that have an event loop or want to inject. A caller's `sessions` is used and left open for its next run; the run's own is closed at the end."""
     spec = complete(spec)
-    if spec.mode == "structured" and not spec.format:
-        raise Fault(FaultKind.LOCAL, "structured mode needs a format, json or xml; nothing was sent", False)
+    if spec.mode == "structured" and (why := _structured_refusal(spec)):
+        raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
     if spec.mode == "edit" and (why := check_edit(spec.edit)):
         raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
     if spec.safety is not None:
@@ -485,6 +485,18 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
             await sessions.close_all()
         if gate is not None:
             _closed_quietly("safety gate", gate.close)
+
+
+def _structured_refusal(spec: RunSpec) -> str | None:
+    """Why a structured run cannot start: it is one show command, on one line, in json or xml."""
+    if spec.format not in ("json", "xml"):
+        return "structured mode needs a format, json or xml"
+    if len(spec.commands) != 1:
+        return f"structured mode runs exactly one show command, not {len(spec.commands)}"
+    command = spec.commands[0]
+    if command.split()[:1] != ["show"] or "\n" in command or "\r" in command:
+        return f"structured mode runs one show command, not {command!r}"
+    return None
 
 
 def run(spec: RunSpec, *, sessions: SessionManager | None = None) -> RunReport:

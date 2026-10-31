@@ -89,6 +89,7 @@ worker count, and with unreachable devices mixed into the target list. A change 
 | gate | Cooldown, a held fleet, expiry, local refusals, the login budget |
 | reader | Every `h-ssh-store` command, export round trips, read watches |
 | pooling | Session reuse across calls on one Fleet |
+| structured | `Fleet.structured(command, fmt)` in JSON and XML, reuse on one Fleet, stored and exported output, local refusals |
 
 Waits on commit-confirmed timers run only when a change touches commit-confirmed or confirm behaviour.
 

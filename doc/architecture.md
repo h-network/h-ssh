@@ -70,7 +70,8 @@ The CLI, the Fleet library API, run files and profiles are front ends. Each one:
 - passes the `RunSpec` to the orchestrator and renders the `RunReport` it returns
 
 Front ends make no decisions about devices. A behaviour available in the CLI is available in the library
-through the same `RunSpec`.
+through the same `RunSpec`; the one exception is `structured`, which is `Fleet.structured(command, fmt)` alone
+(`fmt` json or xml, required) — the CLI has no `--format` and the run file no `format` key (#220).
 
 `--every SECONDS` (1 to 86400) is a front-end loop: one run per tick with the same `RunSpec`, every tick
 kept in the store, and each tick's rows compared with the last kept run's through the store's reader
@@ -82,7 +83,7 @@ exits 130. A watch is reads only, needs the store (`--no-store` is refused) and 
 `--raw`; `--times N` stops after N ticks and goes only with `--every`.
 
 Before anything runs the CLI refuses the flags that would do nothing or contradict each other, in one line and
-exit 2: a second mode, `-y`/`--comment`/`--commit-confirmed` without an edit, `--format` without `-sC`,
+exit 2: a second mode, `-y`/`--comment`/`--commit-confirmed` without an edit,
 `--no-store` with `--store`, `--raw` with `--json` or `-v`, a `--save-output` path that exists and is not a
 directory, and a parser error is the message alone, not the usage block. Input is plain text: a `-sC` or batch
 command is one line (a line break would run two commands), and the username, from whichever source, carries no
@@ -368,6 +369,8 @@ operation, `commit`),
 the worker limit, the safety
 settings, and the recording settings (the record paths, and the run row's provenance: `argv`, `origin` and
 `version`, supplied by the front end, all optional).
+
+Structured mode is the library's call, `Fleet.structured(command, fmt)`: exactly one `show` command on one line, with `fmt` `json` or `xml`, both checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The NETCONF communicator asks PyEZ for the command in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; the CLI has no structured mode.
 
 ### 5.2 Concurrency
 
