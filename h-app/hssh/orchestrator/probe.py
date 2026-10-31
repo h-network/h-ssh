@@ -7,6 +7,7 @@ import errno
 import os
 import socket
 import subprocess
+import sys
 from pathlib import Path
 
 from collections.abc import Collection, Sequence
@@ -156,7 +157,18 @@ async def reachable(targets: Sequence[Target], registry: DriverRegistry, timeout
 
 async def probe(boxes: list[tuple[Target, str, int, bytes | None]], seconds: float,
                 limit: int = MAX_PROBES) -> dict[str, Fault | None]:
-    """Every (target, host, port, banner) probed, at most `limit` at once: target name to None (live) or the Fault that stands for it."""
+    """Every (target, host, port, banner) probed, at most `limit` at once: target name to None (live) or the Fault that stands for it. A probe that says nothing about the box (no descriptor, an unexpected error) leaves its target out, as if unprobed, said once on stderr; the other probes go on."""
     slots = asyncio.Semaphore(max(1, limit))
-    faults = await asyncio.gather(*(probe_one(host, port, banner, seconds, slots) for _, host, port, banner in boxes))
-    return {t.name: f for (t, _, _, _), f in zip(boxes, faults)}
+    answers = await asyncio.gather(*(probe_one(host, port, banner, seconds, slots) for _, host, port, banner in boxes),
+                                   return_exceptions=True)
+    found, unprobed = {}, []
+    for (target, _, _, _), answer in zip(boxes, answers):
+        if isinstance(answer, Fault) and answer.kind is FaultKind.LOCAL:
+            unprobed.append(answer.detail)
+        elif isinstance(answer, BaseException) and not isinstance(answer, Fault):
+            unprobed.append(f"{type(answer).__name__}: {answer}")
+        else:
+            found[target.name] = answer
+    if unprobed:
+        print(f"{len(unprobed)} target(s) not probed, the run goes on to them: {unprobed[0]}", file=sys.stderr)
+    return found
