@@ -40,11 +40,16 @@ Built, on `junos@netconf`, `junos@ssh` and `junos@openssh`:
 - shows and batches;
 - edits on all three transports, SSH and OpenSSH included: dry run, apply, commit confirmed and confirm
   (`--synchronize` for dual routing engines, NETCONF only), commit status, per-device payload files;
-- the result store and the `h-ssh-store` reader;
+- the result store and the `h-ssh-store` reader, with run labels;
 - the audit log and the safety gate;
 - session reuse.
 
 Next: other vendors.
+
+`h-ssh-store runs` lists run IDs and labels; `h-ssh-store runs --label nightly` filters
+by exact label. Use a label wherever a run selector is accepted, for example
+`h-ssh-store diff R1 before-change after-change`; the newest run with that label wins.
+Digit selectors keep ID/prefix lookup. See [reader usage](doc/store.md).
 
 ## From Python
 

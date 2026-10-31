@@ -136,7 +136,7 @@ def secure_write(path: str, text: str) -> None:
 def write_audit_entry(
     path: str,
     *,
-    run_id: int,
+    run_id: int | None,
     user: str,
     target: Target,
     driver: str,

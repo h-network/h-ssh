@@ -24,7 +24,7 @@ from hssh.audit import check_private_file, private_dir, private_file
 from hssh.model import Fault, OperationResult, RunReport, RunSpec, Target, TargetStatus
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _BUSY_TIMEOUT = 10.0
 _WAL_WAIT = 5.0
 _SCHEMA = """
@@ -32,7 +32,7 @@ CREATE TABLE runs (
   id INTEGER PRIMARY KEY,
   started TEXT NOT NULL, finished TEXT,
   mode TEXT NOT NULL, argv TEXT, user TEXT NOT NULL,
-  format TEXT, origin TEXT, version TEXT,
+  format TEXT, origin TEXT, version TEXT, label TEXT,
   targets INTEGER NOT NULL,
   ok INTEGER, failed INTEGER, skipped INTEGER,
   interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1)),
@@ -338,10 +338,11 @@ class Store:
                 argv = json.dumps(recording.argv) if recording and recording.argv is not None else None
                 with self._transaction() as conn:
                     cursor = conn.execute(
-                        "INSERT INTO runs (started, mode, argv, user, format, origin, version, targets) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO runs (started, mode, argv, user, format, origin, version, label, targets) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (started, spec.mode, argv, user, spec.format,
                          recording.origin if recording else None, recording.version if recording else None,
+                         recording.label if recording else None,
                          len(spec.targets)),
                     )
                     run_id = cursor.lastrowid
@@ -400,9 +401,13 @@ class Store:
             except (OSError, sqlite3.Error, UnicodeError) as error:
                 raise OSError(getattr(error, "errno", None), f"cannot close store: {error}", self.path) from error
 
-    def runs(self, last: int | None = 20) -> Iterator[sqlite3.Row]:
+    def runs(self, last: int | None = 20, *, label: str | None = None) -> Iterator[sqlite3.Row]:
+        if label is not None and not label.strip():
+            raise ValueError("label filter is empty")
         limit, parameters = _limit(last)
-        return self._query("SELECT * FROM runs ORDER BY julianday(started) DESC, id DESC" + limit, parameters)
+        where = " WHERE label = ?" if label is not None else ""
+        return self._query("SELECT * FROM runs" + where + " ORDER BY julianday(started) DESC, id DESC" + limit,
+                           ([label] if label is not None else []) + parameters)
 
     def last_run_id(self) -> int | None:
         with closing(self.runs(last=1)) as rows:
@@ -415,6 +420,12 @@ class Store:
             if found is None:
                 raise ValueError("the store holds no runs")
             return found
+        if isinstance(selector, str) and not re.fullmatch(r"[0-9]+", selector):
+            with closing(self.runs(last=1, label=selector)) as rows:
+                found = next(rows, None)
+            if found is None:
+                raise ValueError(f"no run with label {selector!r}")
+            return found["id"]
         if type(selector) is int:
             _integer(selector, "run ID", 1)
         elif not isinstance(selector, str) or not re.fullmatch(r"[0-9]+", selector):

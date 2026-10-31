@@ -461,7 +461,7 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 
 ### 6.1 Store
 
-The schema version is `PRAGMA user_version = 1`. A new, empty database gets this schema;
+The schema version is `PRAGMA user_version = 2`. A new, empty database gets this schema;
 readers and writers refuse other versions or a mismatched table layout before changing the
 file. An unversioned database with tables is incompatible, not an empty database. The error
 is an `OSError` containing the path and: "incompatible store schema; choose a new store path".
@@ -472,7 +472,7 @@ CREATE TABLE runs (
   id INTEGER PRIMARY KEY,
   started TEXT NOT NULL, finished TEXT,
   mode TEXT NOT NULL, argv TEXT, user TEXT NOT NULL,
-  format TEXT, origin TEXT, version TEXT,
+  format TEXT, origin TEXT, version TEXT, label TEXT,
   targets INTEGER NOT NULL,
   ok INTEGER, failed INTEGER, skipped INTEGER,
   interrupted INTEGER NOT NULL DEFAULT 0 CHECK (interrupted IN (0, 1)),
@@ -497,7 +497,8 @@ or use the device login. `argv` is a JSON array from `RecordSettings.argv`, or S
 when absent. Payload files are not copied into this row; an inline `-eC` payload is already
 part of argv. `format` is the requested `RunSpec.format`, or NULL when unspecified. `origin` and
 `version` are optional strings from `RecordSettings`, supplied by the front end; the store
-does not discover them. `targets` is the number requested. Until `finish_run(report)`,
+does not discover them. `label` keeps `RecordSettings.label` verbatim, or SQL NULL when
+absent. Labels need not be unique. `targets` is the number requested. Until `finish_run(report)`,
 `finished` and the three outcome counts are NULL; finalization copies the report's finished
 time, counts, interrupted flag and not-kept count. Counts describe target outcomes, not how
 many rows survived a recording failure. A missing `finished` means the run was not finalized.
@@ -554,12 +555,16 @@ the read and are reported at the query boundary and close. Pending WAL data is n
 
 The reader interfaces in `store.py` return stored column names unchanged:
 
-- `runs(last=20)` streams run rows newest first by timestamp, then ID; None means all,
-  zero means no rows, and negative limits are invalid. `last_run_id()` returns the newest
-  run's integer ID, or None for an empty store.
+- `runs(last=20, *, label=None)` streams run rows newest first by timestamp, then ID;
+  `label` filters by exact label before the limit is applied. A missing label filter means
+  all labels; an empty filter is invalid. For `last`, None means all rows, zero means no
+  rows, and negative limits are invalid. `last_run_id()` returns the newest run's integer
+  ID, or None for an empty store.
 - `resolve_run(selector=None)` accepts an integer ID, its exact decimal string, a literal
-  unambiguous decimal prefix, or None for the latest run. Exact matches win over prefixes;
-  missing, empty, ambiguous and wildcard selectors raise `ValueError`.
+  unambiguous decimal prefix, a label, or None for the latest run. Digit strings retain
+  exact-match priority and prefix lookup. Other nonempty strings match labels exactly;
+  the newest timestamp, then ID, wins when a label names several runs. There is no wildcard
+  matching. Missing/empty selectors and ambiguous numeric prefixes raise `ValueError`.
 - `results(run_id=None, target=None, command=None, ok=None, *, status=None, seq=None,
   order="sequence", limit=None)` streams operation rows. None leaves a filter unrestricted;
   target and command match exactly, and status selects `target_status`. Order is one of
@@ -579,7 +584,9 @@ The reader interfaces in `store.py` return stored column names unchanged:
 
 The `h-ssh-store` entry point is `hssh.frontends.store:main_sync`; parsing, rendering,
 configuration and default resolution belong to that front end. `store.py` imports no
-front-end modules. The reader shares `frontends.settings.store_path` with the writer.
+front-end modules. The reader shares `frontends.settings.store_path` with the writer. `runs` displays each
+run's label and accepts `--label` for exact filtering. Every run-selector argument accepts
+labels, including the two operands of `diff` and the optional selector of `export`.
 [Reader usage](store.md) covers the commands and exit codes. Display tables stream rows.
 On a terminal, runs/failed/history/slowest use declared column widths, right-aligned numeric
 cells and visibly shortened long cells, with metadata sanitized before measuring. Pipes and
@@ -603,6 +610,7 @@ Both the payload-file and saved-output callers use these shared helpers.
  "confirmed_minutes": 10, "comment": "...", "diff": "", "ok": true, "fault": null}
 ```
 
+`run_id` is the stored run's integer ID, or JSON null when there is no store.
 `time` is the operation's `started` timestamp. `dry_run` is the inverse of the requested
 `EditSettings.apply`; `ok` describes the operation's outcome, not whether a commit was requested.
 `fault` is null on success, otherwise an object with `kind` (the fault kind name), `detail` and
