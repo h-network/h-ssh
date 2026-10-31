@@ -71,7 +71,9 @@ The CLI, the Fleet library API, run files and profiles are front ends. Each one:
 
 Front ends make no decisions about devices. A behaviour available in the CLI is available in the library
 through the same `RunSpec`; the one exception is `structured`, which is `Fleet.structured(command, fmt)` alone
-(`fmt` json or xml, required) — the CLI has no `--format` and the run file no `format` key (#220).
+(`fmt` json or xml, required) — the CLI has no `--format` and the run file no `format` key (#220). `Fleet.show`,
+`batch` and `structured` also take a mapping of target name to its own command(s), carried as `RunSpec.commands_by_target`
+(no CLI flag), and `structured` a list of commands, one reply each.
 
 `--every SECONDS` (1 to 86400) is a front-end loop: one run per tick with the same `RunSpec`, every tick
 kept in the store, and each tick's rows compared with the last kept run's through the store's reader
