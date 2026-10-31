@@ -24,6 +24,7 @@ DEFAULT_VENDOR = "generic"
 DEFAULT_STORE = "h-ssh.db"
 MAX_CONFIRMED_MINUTES = 65535
 MAX_COMMENT_BYTES = 512
+MAX_LABEL_BYTES = 128
 ALIVE_SECONDS = 5
 FDS_PER_WORKER = 6
 FDS_PER_SESSION = 4
@@ -74,16 +75,26 @@ def check_confirmed_minutes(minutes: int) -> str | None:
     return None
 
 
-def check_comment(comment: str) -> str | None:
-    """Why `comment` cannot go on a commit, or None: one non-empty line of at most MAX_COMMENT_BYTES UTF-8 bytes with no control characters."""
-    if not comment.strip():
-        return "the commit comment is empty"
-    if len(comment.encode("utf-8", "surrogatepass")) > MAX_COMMENT_BYTES:
-        return f"the commit comment is over {MAX_COMMENT_BYTES} bytes"
-    for ch in comment:
+def _plain_line(text: str, what: str, max_bytes: int) -> str | None:
+    """Why `text` is not one non-empty line of at most `max_bytes` UTF-8 bytes with no control characters, or None."""
+    if not text.strip():
+        return f"the {what} is empty"
+    if len(text.encode("utf-8", "surrogatepass")) > max_bytes:
+        return f"the {what} is over {max_bytes} bytes"
+    for ch in text:
         if unicodedata.category(ch) in ("Cc", "Cs"):
-            return f"the commit comment has a control character (U+{ord(ch):04X}); it must be one line of plain text"
+            return f"the {what} has a control character (U+{ord(ch):04X}); it must be one line of plain text"
     return None
+
+
+def check_comment(comment: str) -> str | None:
+    """Why `comment` cannot go on a commit, or None."""
+    return _plain_line(comment, "commit comment", MAX_COMMENT_BYTES)
+
+
+def check_label(label: str) -> str | None:
+    """Why `label` cannot name a run, or None."""
+    return _plain_line(label, "run label", MAX_LABEL_BYTES)
 
 
 def check_edit(edit: EditSettings) -> str | None:

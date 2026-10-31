@@ -3,16 +3,18 @@
 from hssh.orchestrator.defaults import (DEFAULT_CONFIRMED_MINUTES, DEFAULT_EDIT, DEFAULT_HOST_KEY_POLICY,
                                         DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SAFETY, DEFAULT_SKIP_UNREACHABLE,
                                         DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR,
-                                        DEFAULT_WORKERS, check_comment, check_confirmed_minutes, complete,
+                                        DEFAULT_WORKERS, check_comment, check_confirmed_minutes, check_label, complete,
                                         default_credentials, default_username)
 
 _RUNTIME = {"execute": "hssh.orchestrator.scheduler", "run": "hssh.orchestrator.scheduler",
-            "SessionManager": "hssh.orchestrator.sessions", "CLOSE_WAIT": "hssh.orchestrator.sessions"}
+            "SessionManager": "hssh.orchestrator.sessions", "CLOSE_WAIT": "hssh.orchestrator.sessions",
+            "reachable": "hssh.orchestrator.probe"}
 
 __all__ = ["DEFAULT_CONFIRMED_MINUTES", "DEFAULT_EDIT", "DEFAULT_HOST_KEY_POLICY", "DEFAULT_POLICY", "DEFAULT_PROBE",
            "DEFAULT_SAFETY", "DEFAULT_SKIP_UNREACHABLE", "DEFAULT_STORE", "DEFAULT_TIMEOUTS", "DEFAULT_TRANSPORT",
-           "DEFAULT_VENDOR", "DEFAULT_WORKERS", "check_comment", "check_confirmed_minutes", "complete", "default_credentials",
-           "default_username", "execute", "run", "SessionManager", "CLOSE_WAIT"]
+           "DEFAULT_VENDOR", "DEFAULT_WORKERS", "check_comment", "check_confirmed_minutes", "check_label", "complete",
+           "default_credentials",
+           "default_username", "execute", "run", "SessionManager", "CLOSE_WAIT", "reachable"]
 
 
 def __getattr__(name: str):
