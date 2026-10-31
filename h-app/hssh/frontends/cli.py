@@ -29,7 +29,7 @@ from hssh.frontends.fleet import (
 )
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
-    Credentials, EditSettings, Fault, Mode, PolicySettings, RecordSettings, RunReport, RunSpec,
+    CommitStatus, Credentials, EditSettings, Fault, Mode, PolicySettings, RecordSettings, RunReport, RunSpec,
     SafetySettings, Target, Timeouts,
 )
 from hssh.orchestrator import (
@@ -407,6 +407,8 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
             faults = [op.outcome.detail for op in tr.operations if isinstance(op.outcome, Fault)]
             print(f"{tr.target.name}: SKIPPED" + (f": {safe(faults[0])}" if faults else ""), file=out)
             continue
+        if args.raw and any(not isinstance(op.outcome, Fault) for op in tr.operations):
+            print(f"{tr.target.name}:", file=out)
         for op in tr.operations:
             if isinstance(op.outcome, Fault) and op.command == "close":
                 print(f"WARNING: {tr.target.name}: close failed: {op.outcome.detail}", file=sys.stderr)
@@ -416,6 +418,9 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
                 continue
             if not args.raw:
                 print(f"=== {tr.target.name} ({tr.target.host}) {op.command} [{op.elapsed_ms} ms]", file=out)
+            if isinstance(op.outcome.data, CommitStatus) and not args.raw:
+                print(commit_status_line(tr.target.name, op.outcome.data), file=out)
+                continue
             print(safe(op.outcome.output), file=out)
     if report.interrupted:
         print(f"Interrupted. Completed {report.ok + report.failed} of {len(report.results)} device(s).", file=sys.stderr)
@@ -427,6 +432,13 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
             print(f"confirm with: {confirm_command(args)}", file=out)
     elif report.failed or report.skipped or report.not_kept:
         print(verdict(report), file=sys.stderr)
+
+
+def commit_status_line(name: str, status: CommitStatus) -> str:
+    if not status.pending:
+        return f"{name}: no pending commit"
+    left = f"rolls back in {status.remaining_minutes} minutes" if status.remaining_minutes is not None else "minutes left unknown"
+    return f"{name}: pending commit, {left}"
 
 
 def verdict(report: RunReport) -> str:
