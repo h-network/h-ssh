@@ -58,7 +58,8 @@ what happens next and records the outcome.
 
 ### 3.1 Front ends
 
-The CLI, the Fleet library API, run files and profiles are front ends. Each one:
+The CLI, the Fleet library API, run files and profiles are front ends (a profile listing names a file it cannot read
+or look at with the reason, never hiding the rest). Each one:
 
 - parses its input
 - resolves configuration precedence: flags, then run file, then profile, then `~/.h-ssh/config`, then
@@ -93,7 +94,15 @@ Before anything runs the CLI refuses the flags that would do nothing or contradi
 exit 2: a second mode, `-y`/`--comment`/`--commit-confirmed` without an edit, `--synchronize` without an edit or
 `--confirm` (it rides `EditSettings.synchronize`, for a confirm through `RunSpec.edit`; the run file's `synchronize` key is the same),
 `--no-store` with `--store`, `--raw` with `--json` or `-v`, a `--save-output` path that exists and is not a
-directory, and a parser error is the message alone, not the usage block. Input is plain text: a `-sC` or batch
+directory, and a parser error is the message alone, not the usage block. A number or a choice is held to the
+same range or list wherever it comes from — flag, run file or config file (`frontends/settings.py` `RANGES`,
+`CHOICES`; `probe` and `skip_unreachable` take yes/no words) — and the refusal names the key. A run-file path,
+user, comment or label that is empty is refused, not taken for the key left out; when a typed target or
+`--devices` replaces the file's `devices`, one stderr line says so. `HSSH_PASSWORD` set but empty off a
+terminal refuses the run (a pipeline whose secret lookup came back empty), and Ctrl-D at the prompt is one line
+and exit 2. A target string that reads as a path (a separator or an inventory suffix, no colon) but is not a
+file is refused, in the CLI and the library, so a mistyped inventory path never becomes a device; the Fleet
+also refuses an empty password and an unknown vendor at construction. Input is plain text: a `-sC` or batch
 command is one line (a line break would run two commands), and the username, from whichever source, carries no
 control character; both are checked before the password. Every target name, typed or from an inventory, is a
 safe file name (`hssh.paths.validate_device_name`), in the CLI and the library alike, since the name becomes
@@ -115,7 +124,7 @@ in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to
 line (`run ID: a ok, b failed, c skipped (n reason, …); k record(s) not kept`) names what was skipped by
 reason, so a run the gate or the probe kept from every device never reads as all OK; under `--raw` stdout is
 device output only, each device's block under a `NAME:` line, and the verdict goes to stderr when something failed, was skipped or was not kept, as does
-`Interrupted. Completed a of n device(s).` `--commit-status` prints one readable line per device from the parsed `CommitStatus` (pending and the minutes left, or no pending commit); `--raw` and `--json` keep the device's reply. Device text shown on a terminal goes through `hssh.screen.terminal_safe`
+`Interrupted. Completed a of n device(s).` `--commit-status` prints one readable line per device from the parsed `CommitStatus` (pending and the minutes left, or no pending commit); `--raw` and `--json` keep the device's reply. An edit's default view is one line per device (name, host, status, time) with each operation's output — the diff, the commit's reply — indented under it; FAIL lines stay as they are. Device text shown on a terminal goes through `hssh.screen.terminal_safe`
 (control sequences stripped); a pipe, a file and the store get it as it came. A reader that leaves (`| head`)
 ends the program quietly with exit 0: the record is the store, the screen is best effort. `--json`
 renders each operation through the store's `operation_dict` (`Result.data` via `json_data`, a fault with its
@@ -145,7 +154,7 @@ default port is held by its protocol, and a target's own port overrides it.
 | Policy | Maps each `Fault` to an action: retry, fail, skip, or cool down. Applies the safety gate |
 | Edit lifecycle | Runs the edit state machine (section 5.3), including dry-run, commit-confirmed and confirm |
 | Session manager | Opens, reuses and closes sessions. A close runs beside the work, so it never holds a worker, and the run waits for every close before it ends. Pooling across calls is a session-manager option, not a communicator feature: a caller (the Fleet API) hands `run` or `execute` its own manager and keeps it, across event loops, and closes it with `close_all(timeout)`, which still joins the closes when the interpreter is shutting down; the CLI's run owns and closes its own. `run` refuses to start inside a running event loop and names `execute` instead. A session is keyed by driver, host, the port the connection uses, user, host-key policy and the credential as a process-secret HMAC, so a changed secret or policy opens anew. One session per key: a second borrower waits for it instead of logging in again. A kept session is offered again only after the communicator's `reuse` vouches for it (the cheap check on every borrow, the device asked past its idle threshold) under a 5 s budget; a borrow owns it through its `release` cleanup (two command timeouts), and only then is it idle. A session in doubt (timeout, loss, unknown commit outcome, a cancelled or over-budget call still running, a failed cleanup or close) is torn down by `discard` with no cleanup and never offered again. The kept sessions live inside the open-file budget (6 descriptors per worker, 4 per kept session, 1 per probe, 32 base): when a session goes idle and before every open or probe, the least recently used idle sessions are closed while the limit cannot hold the kept ones beside what is about to run, a close still running counted as held until its thread ends; before an open or the probe the manager waits for those closes (1 s in all) so the descriptors are really free, and the probe runs no more at once than the budget still has. Workers are lowered to the limit per run and said once per session manager, so a Fleet hears it once, not on every call; a lowered probe concurrency is said the same way |
-| Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, asked the way each transport's library reads the ssh client's configuration (`Communicator.ssh_config`): NETCONF as PyEZ and ncclient read `~/.ssh/config` (HostName, Port, ProxyCommand), the OpenSSH transport as `ssh -G` prints it for the run's user (HostName, Port, ProxyJump, ProxyCommand; eight at once, on threads, under the connect timeout), paramiko SSH and telnet the target's host and port directly. A target reached through a proxy is not probed; one whose route `ssh -G` cannot tell is that target's `LOCAL` failure before any login. The same code is the library's `reachable(targets, registry, timeouts, credentials)` (`Fleet.reachable`): the probe's answer per target with no login, run row, audit entry, gate or store; the run's probe calls it with the concurrency the descriptor budget leaves beside the kept sessions. Its outcome is expressed as the same fault kinds |
+| Probe | Pre-flight reachability check per target, on by default and turned off per run. It checks the address and port the connection will use, asked the way each transport's library reads the ssh client's configuration (`Communicator.ssh_config`): NETCONF as PyEZ and ncclient read `~/.ssh/config` (HostName, Port, ProxyCommand), the OpenSSH transport as `ssh -G` prints it for the run's user (HostName, Port, ProxyJump, ProxyCommand; eight at once, on threads, under the connect timeout), paramiko SSH and telnet the target's host and port directly. A target reached through a proxy is not probed; one whose route `ssh -G` cannot tell is that target's `LOCAL` failure before any login. A probe that says nothing about the box (no file descriptor left, an unexpected error) leaves that target unprobed, said once on stderr, and the run goes on to it; one such probe never ends the others. The same code is the library's `reachable(targets, registry, timeouts, credentials)` (`Fleet.reachable`): the probe's answer per target with no login, run row, audit entry, gate or store; the run's probe calls it with the concurrency the descriptor budget leaves beside the kept sessions. Its outcome is expressed as the same fault kinds |
 | Cancellation | Handles interruption (section 5.4) |
 | Recorder | Writes every result to the store and every change to the audit log, with redaction |
 
@@ -187,6 +196,11 @@ deadlines; each adapter holds one deadline across the whole write. Login takes n
 OpenSSH sessions arrive authenticated.
 It reads vendor behaviour from the dialect.
 
+An `openssh` fault's detail is ssh's own reason from its log, or, when ssh gave none, how far the session
+got (no TCP connection; connected, but no SSH banner; the banner came, but key exchange or authentication
+did not finish), followed by the ssh command line that ran, shell-quoted, without its log and multiplexing
+options.
+
 SSH and OpenSSH reads use exec channels. Their edit shells use a 511-column, 1000-row terminal and the
 engine's pager handling; login sends no paging-disable command. During login only, a prompt suffix may
 follow announcement text on the same line. The first command is read through its echo to separate any
@@ -194,13 +208,20 @@ delayed banner and learn the device's whole-line prompt; command replies always 
 Replies containing only echo, prompt context and the prompt return immediately. Replies with output settle
 for 0.15 seconds, or 0.3 seconds for a refusal. Login retains its 0.15-second settle.
 Each command's write, reply and prompt settling share one command deadline. The reader decodes UTF-8
-incrementally, handles terminal redraws and recognises pager markers only on the current terminal line.
+incrementally and handles terminal redraws. Junos pager tokens (`---(more)---`, percentage variants,
+`--More--` and `[yes,no]`) must occupy a whole terminal line outside a command echo. A pager line is
+removed without losing subsequent lines already received in the same read; if output has already
+continued, no extra continuation space is sent. Tokens embedded in other text remain output.
 It removes command echoes, prompt context and terminal control sequences, without redacting or formatting
 the reply. A refusal at the start of a reply is `REFUSED`; an error-looking line later in output stays output.
 Commands containing controls, Tab or invalid Unicode are refused before typing; Junos's encoder quotes
 literal `?` for the line editor.
 
-A timeout or disconnect makes the engine unready, so that session is discarded and a later batch command
+A disconnect during settling accepts a reply that already ends in a complete prompt, while closing the
+channel and marking the engine unusable. Releasing an already closed engine does nothing, so cleanup
+does not turn that completed reply into a failure. Disconnects before a complete prompt still fail;
+a disconnected login never supplies a usable session. A timeout or disconnect makes the engine unready,
+so that session is discarded and a later batch command
 uses a fresh login. Pooling asks the transport's cheap liveness check first; an idle probe sends one empty
 line and waits for the learned prompt under its absolute deadline. Releasing an engine session requires it
 to remain synchronized.
@@ -220,8 +241,10 @@ the channel and never sends CLI commands. A timeout or disconnect also prevents 
 
 Confirm acquires exclusive configuration and rechecks the newest commit before its one plain commit;
 no pending timer is `REFUSED`. Junos history parses only sequence zero, including the device's `5mins`
-timer format, and ignores timers on older entries. Junos commit comments reject controls, Tab and double
-quotes, quote backslashes, and retain the 512 UTF-8 byte limit; literal `?` uses the line-editor encoder.
+timer format, and ignores timers on older entries. Junos commit construction strips surrounding comment
+whitespace (including a trailing newline), then rejects empty text, controls, Tab and double quotes,
+quotes backslashes, and applies the 512 UTF-8 byte limit to the stripped text; literal `?` uses the
+line-editor encoder.
 
 ### 3.5 Dialects
 
@@ -368,6 +391,9 @@ for what the device did: no fault with `reached_device` false cools a device dow
 
 ### 5.1 RunSpec
 
+A target's port, when given, is a whole number from 1 to 65535, checked once when the `Target` is made (a boolean
+is not a number), so the CLI, run files and the library share the rule; the CLI reports it as a usage error.
+
 A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
 `commit_status`), the commands or configuration lines, the per-target commands for `show`, `batch` and
 `structured` (`commands_by_target`, a target name to its own commands; a target not named gets the commands, and
@@ -432,7 +458,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
   probe or any login. The communicators' own `UNSUPPORTED` for the flag is for callers that drive `ssh` or `openssh`
   directly; a run never reaches it.
 - The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
-  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters), and a run label
+  65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters, surrounding whitespace
+  and a trailing newline trimmed first; the trimmed comment is what is sent), and a run label
   through `check_label` (the same rule, at most 128 bytes) when the recording settings carry one; front
   ends call the same helpers before asking for a password.
 - On a fault after `LOAD` and before `COMMIT`, the orchestrator closes the session, which discards the
@@ -638,6 +665,9 @@ promises that a later write cannot fail. Both raise contextual `OSError` on fail
 `secure_write(path, text)` saves raw UTF-8 output: it checks a regular file owned by the
 current user, locks it and sets 0600 before truncating, then completes all short writes.
 It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
+Saved output uses `secure_write_unique(path, text)`, which creates a private file exclusively
+and completes short writes. Occupied names get `.2`, `.3`, and later suffixes before the
+extension; existing files are never overwritten, including across runs and concurrent saves.
 The recorder validates the target name and containment through `hssh.paths` before calling
 it. Batch mode writes `<name>.json`, an ordered array of the target's batch operations
 using `operation_dict`, including failed operations. A device that fails before its first

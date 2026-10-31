@@ -133,6 +133,25 @@ def secure_write(path: str, text: str) -> None:
     _write_recording(path, text, append=False)
 
 
+def secure_write_unique(path: str, text: str) -> None:
+    path = Path(path)
+    candidate = path
+    number = 1
+    try:
+        private_dir(path.parent)
+        while True:
+            try:
+                with private_file(str(candidate), os.O_WRONLY | os.O_CREAT | os.O_EXCL) as fd:
+                    os.fchmod(fd, 0o600)
+                    _write_all(fd, text)
+                return
+            except FileExistsError:
+                number += 1
+                candidate = path.with_name(f"{path.stem}.{number}{path.suffix}")
+    except (OSError, UnicodeError) as error:
+        raise OSError(getattr(error, "errno", None), f"cannot write saved output: {error}", str(candidate)) from error
+
+
 def write_audit_entry(
     path: str,
     *,

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from hssh.frontends.settings import CREDENTIAL_KEYS
+from hssh.frontends.settings import CREDENTIAL_KEYS, check_value
 
 try:
     import yaml
@@ -59,6 +59,8 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
 
 # Relative to the file, not to the shell's cwd.
 PATH_KEYS = ("devices", "batch", "edit_file", "edit_dir", "safety_file", "store", "audit_log", "log", "save_output")
+# An empty value is refused, not taken for the key left out.
+NOT_EMPTY_KEYS = PATH_KEYS + ("user", "comment", "label", "show", "edit", "profile", "transport", "host_key_policy")
 
 
 def _normalize_key(key: Any) -> str:
@@ -138,6 +140,12 @@ def validate_run(data: dict[str, Any], path: str) -> dict[str, Any]:
     for key, value in data.items():
         _, expected = RUN_KEYS[key]
         _check_type(path, key, value, expected)
+        if key in NOT_EMPTY_KEYS and isinstance(value, str) and not value.strip():
+            raise ValueError(f"run file '{path}': '{key}' is empty; give a value or leave the key out")
+        try:
+            value = check_value(key, value)
+        except ValueError as e:
+            raise ValueError(f"run file '{path}': {e}") from None
         if key == "commands":
             if not value or not all(isinstance(c, str) and c.strip() for c in value):
                 raise ValueError(f"run file '{path}': 'commands' must be a non-empty list of command strings")

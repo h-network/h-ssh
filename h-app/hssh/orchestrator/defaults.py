@@ -76,8 +76,9 @@ def check_confirmed_minutes(minutes: int) -> str | None:
 
 
 def _plain_line(text: str, what: str, max_bytes: int) -> str | None:
-    """Why `text` is not one non-empty line of at most `max_bytes` UTF-8 bytes with no control characters, or None."""
-    if not text.strip():
+    """Why `text`, its surrounding whitespace trimmed, is not one non-empty line of at most `max_bytes` UTF-8 bytes with no control characters, or None."""
+    text = text.strip()
+    if not text:
         return f"the {what} is empty"
     if len(text.encode("utf-8", "surrogatepass")) > max_bytes:
         return f"the {what} is over {max_bytes} bytes"
@@ -88,7 +89,7 @@ def _plain_line(text: str, what: str, max_bytes: int) -> str | None:
 
 
 def check_comment(comment: str) -> str | None:
-    """Why `comment` cannot go on a commit, or None."""
+    """Why `comment` cannot go on a commit, or None; complete() sends the trimmed comment."""
     return _plain_line(comment, "commit comment", MAX_COMMENT_BYTES)
 
 
@@ -106,6 +107,13 @@ def check_edit(edit: EditSettings) -> str | None:
     return None
 
 
+def _trimmed(edit: EditSettings) -> EditSettings:
+    """The edit settings with the comment's surrounding whitespace, a trailing newline included, removed: what the device gets."""
+    if edit.comment is None or edit.comment == edit.comment.strip():
+        return edit
+    return dataclasses.replace(edit, comment=edit.comment.strip())
+
+
 def complete(spec: RunSpec) -> RunSpec:
     """The spec with every field left None filled from the defaults above; safety and recording None stay None, meaning off."""
     return dataclasses.replace(
@@ -116,6 +124,6 @@ def complete(spec: RunSpec) -> RunSpec:
         host_key_policy=spec.host_key_policy or DEFAULT_HOST_KEY_POLICY,
         probe=DEFAULT_PROBE if spec.probe is None else spec.probe,
         skip_unreachable=DEFAULT_SKIP_UNREACHABLE if spec.skip_unreachable is None else spec.skip_unreachable,
-        edit=spec.edit or DEFAULT_EDIT,
+        edit=_trimmed(spec.edit or DEFAULT_EDIT),
         policy=spec.policy or DEFAULT_POLICY,
     )

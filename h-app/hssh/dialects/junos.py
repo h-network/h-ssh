@@ -16,7 +16,7 @@ class JunosDialect(GenericDialect):
     prompt_pattern = re.compile(r'^[\w\-\.]+@[\w\-\.]+[>%#]\s*$')
     prompt_name_pattern = re.compile(r'^([\w\-\.]+@[\w\-\.]+)')
     prompt_tail_pattern = re.compile(r'[>%#]\s*$')
-    pager_pattern = re.compile(r'^\s*---?\(more(?: \d+%)?\)---?\s*$', re.I)
+    pager_pattern = re.compile(r'^\s*(?:---?\(more(?: \d+%)?\)---?|--More--|\[yes,no\])\s*$', re.I)
     context_pattern = re.compile(r'^\s*(?:(?:\{\w+(?::\w+)?\})?\[edit[^\]]*\]|# commit confirmed will be rolled back in \d+ minutes?)\s*$')
     refusal_patterns = (
         re.compile(
@@ -65,7 +65,8 @@ class JunosDialect(GenericDialect):
                 raise Fault(FaultKind.LOCAL, "commit-confirmed minutes must be an integer from 1 to 65535", False)
             line += f" confirmed {confirmed_minutes}"
         if comment is not None:
-            if not comment.strip() or _CONTROL.search(comment) or '"' in comment:
+            comment = comment.strip()
+            if not comment or _CONTROL.search(comment) or '"' in comment:
                 raise Fault(FaultKind.LOCAL, "a CLI commit comment must be nonempty text without controls, Tab or double quotes", False)
             if len(comment.encode("utf-8")) > 512:
                 raise Fault(FaultKind.LOCAL, "the commit comment is over 512 UTF-8 bytes", False)

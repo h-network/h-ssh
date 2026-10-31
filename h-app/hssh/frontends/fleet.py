@@ -114,6 +114,16 @@ def load_devices_csv(path: str, transport: str, vendor: str = DEFAULT_VENDOR) ->
     return targets
 
 
+INVENTORY_SUFFIXES = (".csv", ".yaml", ".yml", ".json")
+
+
+def not_a_path(spec: str) -> str:
+    """A target string: one that reads as a path (a separator, an inventory suffix) but is not a file is refused, so a mistyped inventory path never becomes a device."""
+    if ":" not in spec and (os.sep in spec or (os.altsep and os.altsep in spec) or spec.lower().endswith(INVENTORY_SUFFIXES)):
+        raise ValueError(f"no inventory file at {spec!r}")
+    return spec
+
+
 def as_targets(specs: Iterable[TargetLike] | TargetLike, transport: str, vendor: str = DEFAULT_VENDOR) -> tuple[Target, ...]:
     """Targets, inline specs and inventory paths, in the order given."""
     if isinstance(specs, (str, Target, os.PathLike)):
@@ -125,7 +135,7 @@ def as_targets(specs: Iterable[TargetLike] | TargetLike, transport: str, vendor:
         elif isinstance(item, os.PathLike) or (isinstance(item, str) and Path(item).is_file()):
             out.extend(load_devices_csv(os.fspath(item), transport, vendor))
         else:
-            out.append(parse_target(item, transport, vendor))
+            out.append(parse_target(not_a_path(item), transport, vendor))
     for target in out:
         validate_device_name(target.name)
     check_unique(out)
@@ -202,6 +212,15 @@ class Fleet:
         self.targets = as_targets(targets, transport, vendor)
         if not self.targets:
             raise ValueError("no targets")
+        if password == "":
+            raise ValueError("password is empty; pass None for keys or an agent")
+        registry = Registry()
+        registry.load_entry_points()
+        for target in self.targets:
+            try:
+                registry.resolve(target)
+            except Fault as f:
+                raise ValueError(f.detail) from f
         self.credentials = Credentials(username=user or default_username(), password=password, key_file=key_file)
         self.workers = workers
         self.timeouts = timeouts

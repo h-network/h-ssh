@@ -96,10 +96,10 @@ class Recorder:
                 self.change(run_id, target, driver, dialect, action, op, edit, diff, lines)
 
     def save_output(self, target: Target, ops: Sequence[OperationResult], *, mode: Mode) -> None:
-        """The target's device output, one file per target inside the saved-output directory: a batch as <name>.json, every operation in order; any other mode as <name>.output, the outputs joined."""
+        """Save each result inside the output directory, numbering occupied names; batches keep ordered JSON, other modes join raw outputs."""
         if self.settings.save_output_path is None:
             return
-        from hssh.audit import secure_write
+        from hssh.audit import secure_write_unique
         from hssh.paths import path_inside, validate_device_name
 
         def write() -> None:
@@ -108,10 +108,10 @@ class Recorder:
                 from hssh.store import operation_dict
 
                 text = json.dumps([operation_dict(op) for op in ops], ensure_ascii=False, indent=1)
-                secure_write(str(path_inside(Path(self.settings.save_output_path), f"{name}.json")), text)
+                secure_write_unique(str(path_inside(Path(self.settings.save_output_path), f"{name}.json")), text)
                 return
             path = path_inside(Path(self.settings.save_output_path), f"{name}.output")
-            secure_write(str(path), "\n".join(op.outcome.output for op in ops if isinstance(op.outcome, Result)))
+            secure_write_unique(str(path), "\n".join(op.outcome.output for op in ops if isinstance(op.outcome, Result)))
 
         self._kept("saved output", write)
 

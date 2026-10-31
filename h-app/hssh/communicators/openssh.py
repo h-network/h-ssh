@@ -7,6 +7,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import shutil
 import stat
 import struct
@@ -48,6 +49,11 @@ _POLL = 0.1
 _PTY_SIZE = (1000, 511)
 
 _BANNER = "Remote protocol version"
+
+_CONNECTED = ("Connection established", "Executing proxy")
+
+# Options that are this module's own, not the connection's: left out of the command line a fault quotes.
+_PRIVATE_OPTIONS = ("ControlMaster=", "ControlPath=", "ControlPersist=")
 
 _SESSION_UP = ("Authenticated to ", "Entering interactive session", "master session id")
 
@@ -210,9 +216,39 @@ def _valid_command(command: str) -> str:
     return text
 
 
-def _login_fault(log: str, waited: int | None = None) -> Fault:
+def _phase(log: str) -> str:
+    """How far the session got, from ssh's log."""
+    if not any(marker in log for marker in _CONNECTED):
+        return "no TCP connection"
+    if _BANNER not in log:
+        return "connected, but no SSH banner came"
+    return "the banner came, but key exchange or authentication did not finish"
+
+
+def _command_line(argv: list[str]) -> str:
+    """The ssh this module ran, for logs and bug reports: without its -v/-E log and multiplexing options."""
+    kept: list[str] = []
+    skip = 0
+    for i, arg in enumerate(argv):
+        if skip:
+            skip -= 1
+        elif arg == "-v":
+            pass
+        elif arg == "-E" or (arg == "-o" and argv[i + 1].startswith(_PRIVATE_OPTIONS)):
+            skip = 1
+        else:
+            kept.append(arg)
+    return " ".join(shlex.quote(part) for part in kept)
+
+
+def _login_fault(log: str, argv: list[str], waited: int | None = None) -> Fault:
     """Classify a failed login from ssh's own log; `waited` is the wait that ran out, in seconds, when one did."""
-    detail = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug"))
+    fault = _classify(log, waited)
+    return Fault(fault.kind, "%s\n$ %s" % (fault.detail, _command_line(argv)), fault.reached_device)
+
+
+def _classify(log: str, waited: int | None) -> Fault:
+    detail = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug")) or _phase(log)
     reached = _BANNER in log
     if "Permission denied" in detail or "Authentication failed" in detail:
         return Fault(FaultKind.AUTH, detail, reached)
@@ -226,9 +262,7 @@ def _login_fault(log: str, waited: int | None = None) -> Fault:
     if any(marker in detail for marker in _CLOSED) or any(marker in log for marker in _SESSION_UP):
         return Fault(FaultKind.SESSION_LOST, detail, True)
     if waited is not None:
-        if reached:
-            return Fault(FaultKind.TIMEOUT, "the banner came, but key exchange did not finish within %ds" % waited, True)
-        return Fault(FaultKind.TIMEOUT, "no SSH banner within %ds" % waited, False)
+        return Fault(FaultKind.TIMEOUT, "%s within %ds" % (_phase(log), waited), reached)
     return Fault(FaultKind.UNREACHABLE, detail, reached)
 
 
@@ -368,7 +402,7 @@ class OpenSSH:
                 except (ConnectionError, TimeoutError) as exc:
                     log = _read(log_path)
                     waited = (timeouts.setup if _BANNER in log else timeouts.connect) if isinstance(exc, TimeoutError) else None
-                    raise _login_fault(log, waited) from exc
+                    raise _login_fault(log, argv, waited) from exc
         except BaseException:
             self.discard(session)
             raise
@@ -389,8 +423,8 @@ class OpenSSH:
                                       timeout=session.timeouts.command, env=_without_password())
             except subprocess.TimeoutExpired as exc:
                 self.discard(session)
-                raise Fault(FaultKind.TIMEOUT, "'%s' did not finish within %ds" % (command, session.timeouts.command),
-                            True) from exc
+                raise Fault(FaultKind.TIMEOUT, "'%s' did not finish within %ds\n$ %s"
+                            % (command, session.timeouts.command, _command_line(argv)), True) from exc
             except OSError as exc:
                 raise Fault(FaultKind.LOCAL, str(exc), False) from exc
             log = _read(log_path)
@@ -400,8 +434,8 @@ class OpenSSH:
         if proc.returncode == 255 and (said or not _control(session.target.host, session.control_path, "check",
                                                               PROBE_SECONDS)):
             self.discard(session)
-            raise Fault(FaultKind.SESSION_LOST, said or "connection to %s lost before '%s' finished"
-                        % (session.target.host, command), True)
+            raise Fault(FaultKind.SESSION_LOST, "%s\n$ %s" % (said or "connection to %s lost before '%s' finished"
+                                                              % (session.target.host, command), _command_line(argv)), True)
         if proc.returncode != 0:
             first = (proc.stderr.strip() or proc.stdout.strip() or "no diagnostic output").split("\n", 1)[0]
             raise Fault(FaultKind.REFUSED, "exit %d from '%s': %s" % (proc.returncode, command, first), True)
@@ -439,7 +473,7 @@ class OpenSSH:
             self.discard(session)
             channel.close()
             waited = session.timeouts.setup if isinstance(exc, TimeoutError) else None
-            raise _login_fault(log, waited) from exc
+            raise _login_fault(log, argv, waited) from exc
         except BaseException:
             self.discard(session)
             channel.close()

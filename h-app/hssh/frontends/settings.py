@@ -5,10 +5,21 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from hssh.orchestrator.defaults import DEFAULT_STORE
 
 CREDENTIAL_KEYS = ("password", "passwd", "secret", "token", "pass")
+TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
+HOST_KEY_CHOICES = ("accept-new", "strict", "off")
+# What a flag accepts is what the config file and the run file accept: (floor, ceiling) per key.
+RANGES: dict[str, tuple[int, int]] = {
+    "workers": (1, 256), "retries": (0, 10), "retry_pause": (0, 3600), "connect_timeout": (1, 86400),
+    "session_timeout": (1, 86400), "command_timeout": (1, 86400), "commit_timeout": (1, 86400),
+    "cooldown": (0, 86400), "rate_limit": (1, 100000),
+}
+CHOICES = {"transport": TRANSPORT_CHOICES, "host_key_policy": HOST_KEY_CHOICES}
+WORDS = {"yes": True, "true": True, "on": True, "1": True, "no": False, "false": False, "off": False, "0": False}
 
 
 def config_path() -> Path:
@@ -56,3 +67,29 @@ def audit_log_path(flag: str | None = None, config: Mapping[str, str] | None = N
 
 def safety_file_path(flag: str | None = None, config: Mapping[str, str] | None = None) -> str | None:
     return path_setting(flag, "HSSH_SAFETY_FILE", "safety_file", config, None)
+
+
+def check_value(key: str, value: Any) -> Any:
+    """A setting held to its flag's range or choices, naming the key; config-file strings are converted on the way."""
+    if key in RANGES:
+        low, high = RANGES[key]
+        try:
+            number = int(value) if not isinstance(value, bool) else None
+        except (TypeError, ValueError):
+            number = None
+        if number is None:
+            raise ValueError(f"{key} takes a whole number, not {value!r}")
+        if not low <= number <= high:
+            raise ValueError(f"{key} takes a number from {low} to {high}, not {number}")
+        return number
+    if key in CHOICES:
+        word = str(value).strip().lower()
+        if word not in CHOICES[key]:
+            raise ValueError(f"{key} is one of {', '.join(CHOICES[key])}, not {value!r}")
+        return word
+    if key in ("probe", "skip_unreachable") and not isinstance(value, bool):
+        word = str(value).strip().lower()
+        if word not in WORDS:
+            raise ValueError(f"{key} is yes or no, not {value!r}")
+        return WORDS[word]
+    return value
