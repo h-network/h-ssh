@@ -51,8 +51,11 @@ Next: other vendors.
 ```python
 from hssh.frontends.fleet import Fleet
 
-with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin", password="…") as fleet:
+with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin", password="…",
+           label="pre-upgrade") as fleet:                    # the label is kept with every run, for h-ssh-store
+    dead = {name for name, fault in fleet.reachable().items() if fault}   # a TCP connect per device, no login
     report = fleet.show("show bgp summary")                 # one login per device, kept for the next call
+    report = fleet.config("xml")                            # the whole committed configuration, as returned; NETCONF only
     report = fleet.batch(["show version", "show route summary"])
     report = fleet.structured("show interfaces terse", "json")   # the reply in json, as returned; NETCONF only
     report = fleet.structured(["show version", "show interfaces terse"], "xml")   # one reply per command
@@ -68,5 +71,8 @@ with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin"
 the reply as the device returned it, nothing parsed (`Result.data` stays None). The CLI has no `--format`; its reads return the device's text.
 `show`, `batch` and `structured` take one command (or list) for every device, or a mapping of device name to
 its own command or list; a device not in the mapping is skipped, in one run with one reply per command.
+`Fleet(label=…)`, or `--label TEXT` and the run file's `label` key on the CLI, tags the run with free text that
+`h-ssh-store` lists and selects by. `reachable(timeout=None)` returns `{name: None or Fault}` without logging in (a device that cannot be probed is absent);
+a run that recorded nothing (no store) has `run_id` None, shown as "no run" in text and `null` in `--json`.
 
 Documentation: [architecture](doc/architecture.md), [testing](doc/testing.md), [result store](doc/store.md), [NETCONF](doc/netconf.md).
