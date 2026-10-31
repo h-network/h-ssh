@@ -11,6 +11,10 @@ RPC diagnostics are checked across lines; ordinary command output is checked onl
 at the start, so later `error:` lines in logs are preserved as output.
 Loading the NETCONF communicator sets ncclient's send-queue tick to 10 ms for the whole process.
 
+Over NETCONF, the device ignores `| display json` and `| display xml` in a text
+request, so `show` and `batch` return text. Use `Fleet.structured(command, fmt)`
+for JSON or XML. Over SSH and OpenSSH, those display pipes work.
+
 For example, with a key available through SSH key discovery or the SSH agent:
 
 ```sh
@@ -59,7 +63,8 @@ PyEZ's `Device.cli(command, format=fmt, warning=False)`.
 
 The returned dictionary is serialized as JSON text and an XML element as an XML
 string. This becomes `Result.output` and the
-store's output column; `Result.data` stays `None`. The representation comes from
+store's output column; `Result.data` stays `None`. For nonempty JSON output,
+callers use `json.loads(result.output)` to read the document. The representation comes from
 PyEZ, with no field extraction or interpretation by h-ssh. The call uses the
 Fleet's existing command timeout and pooled session, with the same fault handling
 as other NETCONF operations.
@@ -71,6 +76,11 @@ format. A text reply, or PyEZ failing to read that reply as JSON, fails with
 the reply text when available. The fault has `reached_device=True` and is not
 retried. Retrieve configuration as text with a plain show call, such as
 `fleet.show("show configuration | display set")`.
+
+An empty reply, including an absent configuration path, succeeds with
+`Result.output=""` and `Result.data=None` for either format. PyEZ's
+unknown-exception RuntimeWarning is suppressed; errors are reported through
+the operation's fault.
 
 ## Candidate edits
 

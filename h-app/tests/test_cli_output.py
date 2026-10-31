@@ -29,7 +29,7 @@ def test_the_text_report_frames_each_output_and_ends_with_the_counts(cli_run):
 def test_raw_prints_the_output_alone(cli_run):
     rep = report(results=[one("ok", op("show version", Result("Junos: 24.2")))], ok=1)
     _, _, out, _ = cli_run("R1:10.0.0.1:junos", "-sC", "show version", "--raw", *NETCONF, reports=[rep])
-    assert out == "Junos: 24.2\n"
+    assert out == "R1:\nJunos: 24.2\n"
 
 
 def test_a_failed_operation_is_a_fail_line_with_kind_and_detail(cli_run):
@@ -48,7 +48,7 @@ def test_a_skipped_target_is_one_line_with_its_reason(cli_run):
 def test_a_close_fault_is_a_warning_on_stderr_not_a_failure(cli_run):
     ops = (op("show v", Result("out")), op("close", Fault(FaultKind.SESSION_LOST, "socket closed", True)))
     rc, _, out, err = cli_run("R1:10.0.0.1:junos", "-sC", "x", "--raw", *NETCONF, reports=[report(results=[one("ok", *ops)], ok=1)])
-    assert rc == 0 and out == "out\n" and "WARNING: R1: close failed: socket closed" in err
+    assert rc == 0 and out == "R1:\nout\n" and "WARNING: R1: close failed: socket closed" in err
 
 
 def test_the_summary_line_is_json_on_stderr_with_the_counts(cli_run):

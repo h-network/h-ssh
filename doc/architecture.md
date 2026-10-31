@@ -107,8 +107,8 @@ everything ran; 4 a record was not kept; 130 interrupted. A `--every` watch exit
 in that order: 130, 4, 2, 1, 3, 0. One `[h-ssh] {…}` JSON summary line goes to stderr per run. The verdict
 line (`run ID: a ok, b failed, c skipped (n reason, …); k record(s) not kept`) names what was skipped by
 reason, so a run the gate or the probe kept from every device never reads as all OK; under `--raw` stdout is
-device output only and the verdict goes to stderr when something failed, was skipped or was not kept, as does
-`Interrupted. Completed a of n device(s).` Device text shown on a terminal goes through `hssh.screen.terminal_safe`
+device output only, each device's block under a `NAME:` line, and the verdict goes to stderr when something failed, was skipped or was not kept, as does
+`Interrupted. Completed a of n device(s).` `--commit-status` prints one readable line per device from the parsed `CommitStatus` (pending and the minutes left, or no pending commit); `--raw` and `--json` keep the device's reply. Device text shown on a terminal goes through `hssh.screen.terminal_safe`
 (control sequences stripped); a pipe, a file and the store get it as it came. A reader that leaves (`| head`)
 ends the program quietly with exit 0: the record is the store, the screen is best effort. `--json`
 renders each operation through the store's `operation_dict` (`Result.data` via `json_data`, a fault with its
