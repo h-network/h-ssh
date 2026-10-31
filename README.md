@@ -46,6 +46,8 @@ with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin"
     report = fleet.show("show bgp summary")                 # one login per device, kept for the next call
     report = fleet.batch(["show version", "show route summary"])
     report = fleet.structured("show interfaces terse", "json")   # the reply in json, as returned; NETCONF only
+    report = fleet.structured(["show version", "show interfaces terse"], "xml")   # one reply per command
+    report = fleet.show({"10.0.1.1": "show version", "cr2": "show chassis hardware"})   # a command per target
     report = fleet.edit(["set system host-name cr1"], apply=True, confirmed_minutes=5, synchronize=True)
     report = fleet.confirm(synchronize=True)                 # commit synchronize on both; NETCONF only
     for result in report.results:
@@ -55,5 +57,7 @@ with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin"
 
 `Fleet.structured(command, fmt)` is the library's alone: `fmt` is `json` or `xml`, and `Result.output` holds
 the reply as the device returned it, nothing parsed (`Result.data` stays None). The CLI has no `--format`; its reads return the device's text.
+`show`, `batch` and `structured` take one command (or list) for every device, or a mapping of device name to
+its own command or list; a device not in the mapping is skipped, in one run with one reply per command.
 
 Documentation: [architecture](doc/architecture.md), [testing](doc/testing.md), [result store](doc/store.md), [NETCONF](doc/netconf.md).
