@@ -43,6 +43,10 @@ class Communicator(Protocol):
 
     def structured(self, session: Session, command: str, fmt: str) -> Result: ...
 
+    def config(self, session: Session, fmt: str) -> Result:
+        """The whole committed configuration (not the candidate) in fmt, json or xml, output as the library returns it, data None."""
+        ...
+
     def load(self, session: Session, lines: list[str]) -> Result: ...
 
     def diff(self, session: Session) -> Result:

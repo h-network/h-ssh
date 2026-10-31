@@ -633,6 +633,9 @@ class NetconfCommunicator(Communicator):
                 self.discard(netconf)
             raise fault from error
 
+    def config(self, session: Session, fmt: str) -> Result:
+        raise Fault(FaultKind.UNSUPPORTED, "configuration reads are not built yet", reached_device=False)
+
     def load(self, session: Session, lines: list[str]) -> Result:
         netconf = cast(NetconfSession, session)
         try:

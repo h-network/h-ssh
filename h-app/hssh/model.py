@@ -7,7 +7,7 @@ from enum import Enum, auto
 from types import MappingProxyType
 from typing import ClassVar, Literal, Mapping, Protocol, Sequence
 
-Mode = Literal["show", "batch", "structured", "edit", "confirm", "commit_status"]
+Mode = Literal["show", "batch", "structured", "config", "edit", "confirm", "commit_status"]
 
 HostKeyPolicy = Literal["accept-new", "strict", "off"]
 
@@ -55,7 +55,7 @@ class SafetySettings:
 
 @dataclass(frozen=True)
 class RecordSettings:
-    """Where the run is recorded: store, audit log, log and saved output, each optional; argv, origin and version are the run row's provenance, supplied by the front end."""
+    """Where the run is recorded: store, audit log, log and saved output, each optional; argv, origin, version and label are the run row's provenance, supplied by the front end."""
 
     store_path: str | None = None
     audit_log_path: str | None = None
@@ -64,6 +64,7 @@ class RecordSettings:
     argv: tuple[str, ...] | None = None
     origin: str | None = None
     version: str | None = None
+    label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,9 +181,9 @@ class TargetResult:
 
 @dataclass(frozen=True)
 class RunReport:
-    """What one run produced: per-target outcomes, counts and pending commits."""
+    """What one run produced: per-target outcomes, counts and pending commits; run_id is None when no store recorded the run."""
 
-    run_id: int
+    run_id: int | None
     mode: Mode
     started: str
     finished: str
