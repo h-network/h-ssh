@@ -35,9 +35,9 @@ Built, on `junos@netconf`:
 - the audit log and the safety gate;
 - session reuse.
 
-On `junos@ssh`: shows and batches.
+On `junos@ssh`: shows, batches, candidate edits, commit confirmed, confirm and commit status.
 
-Next: edits over SSH, then OpenSSH, then other vendors.
+Other vendors remain pending.
 
 ## From Python
 

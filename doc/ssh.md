@@ -2,7 +2,7 @@
 
 The SSH communicator connects directly to the target host. An explicit target port
 wins; otherwise SSH uses port 22. It does not read SSH client configuration.
-Junos supports `show`, `batch`, `edit`, `confirm` and `commit_status`.
+Junos supports `show`, `batch`, `edit`, `confirm`, `commit_status` and `commit_confirmed`.
 Show and batch commands use SSH exec channels on the authenticated connection,
 ending at EOF and exit status. A batch
 keeps the connection across commands. Reads do not allocate a PTY, learn prompts,
@@ -15,7 +15,7 @@ The orchestrator chooses dry run or apply and does not commit an empty diff.
 Commit uses the supplied comment and optional confirmed timer. Confirmation is a
 separate run; the engine checks the newest pending commit again while holding the
 exclusive lock before sending the confirming commit. Commit history returns the
-newest entry as `CommitStatus`.
+newest entry as `CommitStatus`. Structured reads and commit synchronize require NETCONF.
 
 Each loaded line uses the configured command budget. Commit uses the configured
 commit budget. A write or reply lost after a commit may have been sent is
@@ -39,13 +39,13 @@ reported as local errors rather than silently ignored.
 
 Parallel accept-new writers lock `known_hosts`, re-read and verify the key, then
 append. Existing contents and permissions remain intact, and a missing final
-newline is supplied. Lock acquisition uses the remaining setup deadline. Cached
+newline is supplied. Lock acquisition uses the remaining connection/setup deadline. Cached
 reads are invalidated when the file identity, size or modification time changes.
 
 TCP connection and receipt of the SSH banner share `connect` seconds. After the
 banner, one `setup` deadline covers key exchange and authentication. Each exec
 read has its own `command` deadline covering channel open, request acknowledgement,
-output and exit status. A nonzero exit status or a refusal at the start of the
+output and exit status. A positive exit status or a refusal at the start of the
 reply is reported as `REFUSED`, even when the server exits successfully. A dropped
 connection before output ends is `SESSION_LOST`; incomplete output is not returned
 as success. Expiry closes the connection to wake blocked requests. Failed or
