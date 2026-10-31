@@ -160,7 +160,7 @@ def test_success_cancels_setup_watchdog(open_local, fake_server, communicator):
             time.sleep(0.7)
             assert session.device._conn._session.transport.is_active()
         finally:
-            communicator._discard(session)
+            communicator.discard(session)
     assert netconf._OPENING.get() is None and netconf._HOST_KEY_PORT.get() is None
 
 
@@ -337,4 +337,4 @@ def test_one_expired_open_does_not_close_another(open_local, fake_server, commun
                 assert caught.value.kind == FaultKind.TIMEOUT
                 assert session.device._conn._session.transport.is_active()
             finally:
-                communicator._discard(session)
+                communicator.discard(session)

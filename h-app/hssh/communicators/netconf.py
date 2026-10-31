@@ -478,7 +478,6 @@ class NetconfCommunicator(Communicator):
             raise _fault(error, False, opening=True) from error
 
     def close(self, session: Session) -> None:
-        """Release a clean session, then bound close-session to five seconds."""
         netconf = cast(NetconfSession, session)
         if netconf.committing or netconf.doubtful:
             self.discard(netconf)
@@ -540,7 +539,15 @@ class NetconfCommunicator(Communicator):
             netconf.locked = netconf.dirty = False
 
     def discard(self, session: Session) -> None:
-        self._discard(cast(NetconfSession, session))
+        netconf = cast(NetconfSession, session)
+        netconf.doubtful = True
+        netconf.config = None
+        netconf.locked = netconf.dirty = False
+        try:
+            netconf.device.connected = False
+            netconf.device._conn._session.close()
+        except Exception:
+            pass
 
     def show(self, session: Session, command: str) -> Result:
         from lxml import etree
@@ -608,19 +615,8 @@ class NetconfCommunicator(Communicator):
         except Exception as error:
             fault = _fault(error.__context__ or error, True)
             if fault.kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST) or not netconf.device.connected:
-                self._discard(netconf)
+                self.discard(netconf)
             raise fault from error
-
-    @staticmethod
-    def _discard(netconf: NetconfSession) -> None:
-        netconf.doubtful = True
-        netconf.config = None
-        netconf.locked = netconf.dirty = False
-        try:
-            netconf.device.connected = False
-            netconf.device._conn._session.close()
-        except Exception:
-            pass
 
     def load(self, session: Session, lines: list[str]) -> Result:
         netconf = cast(NetconfSession, session)
@@ -669,7 +665,7 @@ class NetconfCommunicator(Communicator):
             raise Fault(FaultKind.COMMIT_FAILED, str(error), True) from error
         except Exception as error:
             # An unanswered commit must never trigger rollback or replay.
-            self._discard(netconf)
+            self.discard(netconf)
             raise Fault(FaultKind.OUTCOME_UNKNOWN, _fault(error, True).detail, True) from error
         finally:
             netconf.committing = False

@@ -74,9 +74,9 @@ retried. Retrieve configuration as text with a plain show call, such as
 
 ## Candidate edits
 
-Edits use PyEZ's exclusive candidate lock. Loading selects set format only when
-all nonblank, noncomment lines are set-style commands; other configuration text
-is preserved. Only full-line `#` comments are removed from set input. A delete's
+Edits use PyEZ's exclusive candidate lock. The Junos dialect accepts set-style
+commands and refuses hierarchical configuration text. Only full-line `#`
+comments are removed from set input; inline `#` text is preserved. A delete's
 “statement not found” warning is allowed; other load warnings and errors fail.
 The Junos dialect supplies the set verbs and comment prefixes and checks the payload
 before the communicator takes the lock. A refused payload is a local fault;
