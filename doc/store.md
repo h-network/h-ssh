@@ -5,9 +5,12 @@ uses the same path as `h-ssh`: `--store`, then `HSSH_STORE`, then the config fil
 then the orchestrator's default `./h-ssh.db`. `~` is expanded. Use `--config FILE` to select
 another config; otherwise it reads `~/.h-ssh/config`. An explicitly empty path is an error.
 The writer also accepts a run-file setting between its flag and environment value.
+The current store schema is version 2. Older schemas are refused; choose a new store path.
 
 ```sh
 h-ssh-store --store ./h-ssh.db runs --last 10
+h-ssh-store runs --label nightly
+h-ssh-store diff R1 before-change after-change --seq 0
 h-ssh-store failed
 h-ssh-store output R1 42 --seq 0
 h-ssh-store grep 'Junos' --run 42 --device R1
@@ -21,7 +24,7 @@ h-ssh-store export --all --format jsonl --out ./results.jsonl
 
 | Command | What it reads | Default selection |
 |---|---|---|
-| `runs` | Run metadata, counts, interruption state, not-kept count and argv | Newest 20 runs |
+| `runs` | Run label, metadata, counts, interruption state, not-kept count and argv | Newest 20 runs |
 | `failed [RUN]` | Failed operations belonging to failed targets; skips and close warnings on successful targets are excluded | Latest run |
 | `output TARGET [RUN]` | One operation's raw output; a fault is reported on stderr | Latest run, sequence 0 |
 | `grep PATTERN` | Matching logical lines in successful outputs; `-i` ignores case | All runs |
@@ -31,10 +34,18 @@ h-ssh-store export --all --format jsonl --out ./results.jsonl
 | `slowest [RUN]` | Operations ordered by elapsed milliseconds | Slowest 20 across all runs |
 | `export [RUN]` | Every stored result column, as CSV or JSONL | Latest run, CSV |
 
-A run selector is its exact decimal ID, or an unambiguous literal decimal prefix. Exact
-matches win. Wildcards, empty selectors, missing IDs and ambiguous prefixes are errors.
-Omitting a run where the table says "latest" selects by the timestamp's instant, then ID,
-not by the local-time text alone. `grep` and `field` select one run with `--run`.
+A run selector made entirely of digits is its exact decimal ID, or an unambiguous
+literal decimal prefix; exact matches win. Any other nonempty selector is an exact label.
+When a label names several runs, the newest timestamp wins, then the highest ID breaks a
+tie. Labels match literally, including spaces and punctuation; there is no wildcard matching.
+Missing IDs or labels, empty selectors and ambiguous numeric prefixes are errors.
+Labels work in `failed`, `output`, `grep --run`, `field --run`, both `diff` operands,
+`slowest` and `export`. Quote a label containing spaces.
+
+`runs --label LABEL` filters by exact label before applying `--last`. It can also list
+all-digit labels, which run selectors otherwise interpret as IDs. Runs without a label
+show an empty label cell. Omitting a run where the table says "latest" selects by the
+timestamp's instant, then ID, not by the local-time text alone.
 
 `--device` (also `--target`), `--command` and `--seq` filter `failed`, `grep`, `field`,
 `slowest` and `export`. Target and command filters are exact; empty filters are refused.
