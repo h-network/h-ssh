@@ -161,11 +161,8 @@ class SessionManager:
 
     def wait_for_closes(self, timeout: float = CLOSE_WAIT) -> dict[str, tuple[str, OperationResult]]:
         """Join the closes still in flight, `timeout` seconds in all; one not done by then goes away with the process. Returns the close faults by target name, with the driver name."""
-        deadline = time.monotonic() + timeout
+        self._join(timeout)
         closes, self._closes = self._closes, []
-        for close in closes:
-            if close.thread is not None:
-                close.thread.join(max(0.0, deadline - time.monotonic()))
         return {c.target: (c.driver, c.fault) for c in closes if c.fault is not None}
 
     def _kept_fds(self) -> int:

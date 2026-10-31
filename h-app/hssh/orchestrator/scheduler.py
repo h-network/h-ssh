@@ -333,9 +333,8 @@ class Scheduler:
                 step("commit")
                 run.past_commit.add(index)
 
-            edit = await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(
+            return await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(
                 list(self._lines_for(spec, target) or ()), spec.edit, before_commit=before_commit, on_step=step)
-            return list(edit.operations)
         step(spec.mode)
         if spec.mode == "confirm":
             return await lifecycle.confirm(comm, session, spec.timeouts, synchronize=spec.edit.synchronize)

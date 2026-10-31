@@ -173,8 +173,8 @@ A communicator:
 
 A communicator does not retry, apply policy, write records, or keep state outside its session.
 
-CLI-driven communicators (`ssh`, `openssh`, `telnet`) share one **CLI engine**. The engine drives an
-interactive channel: login, prompt detection, paging, command execution and line-by-line configuration.
+The `ssh` and `openssh` communicators share one **CLI engine** for their edit shells. The engine drives an
+interactive channel: login, prompt detection, paging, command execution and candidate configuration loading.
 The channel's `send(data, deadline)` and the engine's `login(deadline)` take absolute `time.monotonic()`
 deadlines; each adapter holds one deadline across the whole write. Login takes no credentials: SSH and
 OpenSSH sessions arrive authenticated.
@@ -195,7 +195,7 @@ literal `?` for the line editor.
 
 A timeout or disconnect makes the engine unready, so that session is discarded and a later batch command
 uses a fresh login. Pooling asks the transport's cheap liveness check first; an idle probe sends one empty
-line and waits for the learned prompt under its absolute deadline. Releasing a read session requires it
+line and waits for the learned prompt under its absolute deadline. Releasing an engine session requires it
 to remain synchronized.
 
 Candidate edits acquire exclusive configuration before loading any line. The whole payload is validated
@@ -222,7 +222,7 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 - the prompt pattern, the anchored prompt name and tail the engine learns the device's own prompt from, and the
   context lines the CLI prints with its prompt
-- paging control: the command that turns the pager off, the pager marker as a whole line, and the reply to it
+- the pager marker as a whole line and the reply to it
 - the refusal and warning patterns
 - how to enter and leave configuration mode, how to commit (`build_commit`), diff and read the commit history
   (`parse_commit_history`), and how to discard uncommitted changes, if the vendor has a candidate model
@@ -230,7 +230,6 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
   Junos uses `run show system commit`, alongside operational `history_command` (`show system commit`)
 - how a validated line is typed (`encode_line`: bytes, newline included; Junos escapes a literal `?`)
 - the read-command rule, deciding which commands are safe to retry
-- a shortcut library of named commands
 
 Dialects contain no I/O and no policy.
 
@@ -288,7 +287,7 @@ class Communicator(Protocol):
     def discard(self, session: Session) -> None: ...   # session in doubt: tear down, no rollback or unlock, interrupt a running call, never raises
 
     def show(self, session: Session, command: str) -> Result: ...
-    def structured(self, session: Session, rpc: str, fmt: str) -> Result: ...   # NETCONF only
+    def structured(self, session: Session, command: str, fmt: str) -> Result: ...   # NETCONF only: one show command, fmt json or xml
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
     def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
@@ -352,7 +351,7 @@ device, unless the dialect marks it as a read.
 | `AUTH`, `HOST_KEY` | fail | fail | n/a |
 | `TIMEOUT`, `SESSION_LOST` in session | retry | fail | fail, cool down |
 | `REFUSED`, `COMMIT_FAILED` | fail | fail | fail, cool down |
-| `OUTCOME_UNKNOWN` | n/a | n/a | fail, cool down, never retried or rolled back, the session discarded, flagged for manual check |
+| `OUTCOME_UNKNOWN` | n/a | n/a | fail, cool down, never retried or rolled back, the session discarded |
 | `UNSUPPORTED`, `LOCAL` | fail | fail | fail |
 
 The retry count, pauses and cooldown period are policy settings, not communicator settings. A cooldown is only
@@ -367,10 +366,11 @@ A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`,
 lines; a target not named gets the configuration lines, and when payloads are given a target in neither has no
 payload and is skipped), credentials, timeouts (`connect` for the TCP connect and the
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
-operation, `commit`),
-the worker limit, the safety
-settings, and the recording settings (the record paths, and the run row's provenance: `argv`, `origin` and
-`version`, supplied by the front end, all optional).
+operation, `commit`), the structured `format`, the worker limit, the host-key policy, the probe and
+`skip_unreachable` switches, the edit settings (`apply`, `confirmed_minutes`, `comment`, `synchronize`), the retry
+policy, the safety settings, and the recording settings (the record paths, and the run row's provenance: `argv`,
+`origin` and `version`, supplied by the front end, all optional). Every setting the orchestrator owns defaults to
+`None` and is filled by the orchestrator.
 
 Structured mode is the library's call, `Fleet.structured(command, fmt)`: exactly one `show` command on one line, with `fmt` `json` or `xml`, both checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The NETCONF communicator asks PyEZ for the command in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; the CLI has no structured mode.
 
@@ -454,8 +454,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 The schema version is `PRAGMA user_version = 1`. A new, empty database gets this schema;
 readers and writers refuse other versions or a mismatched table layout before changing the
 file. An unversioned database with tables is incompatible, not an empty database. The error
-is an `OSError` containing the path and: "incompatible store schema; use develop's h-ssh-store
-to read old stores, or choose a new store path". There is no migration or legacy adapter.
+is an `OSError` containing the path and: "incompatible store schema; choose a new store path".
+There is no migration or legacy adapter.
 
 ```sql
 CREATE TABLE runs (
@@ -615,8 +615,10 @@ promises that a later write cannot fail. Both raise contextual `OSError` on fail
 current user, locks it and sets 0600 before truncating, then completes all short writes.
 It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
 The recorder validates the target name and containment through `hssh.paths` before calling
-it. Saved output stays one file per target: batch mode writes `<name>.json`, an ordered
-array of every recorded operation using `operation_dict`, including failed operations.
+it. Batch mode writes `<name>.json`, an ordered array of the target's batch operations
+using `operation_dict`, including failed operations. A device that fails before its first
+operation leaves no saved file. A close fault after the batch is recorded in the store,
+not appended to the saved file.
 Other modes keep `<name>.output`. The recorder uses the explicit run mode, not the number
 of operations, to select the format; conversion or write failures count as `not_kept`.
 

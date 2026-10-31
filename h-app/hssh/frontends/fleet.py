@@ -60,11 +60,6 @@ TargetLike = Union[str, Target, os.PathLike]
 _BRACKETED_HOST = re.compile(r"^([^:]+):\[([^\]]+)\](?::(.*))?$")
 
 
-def run_spec(spec: RunSpec) -> RunReport:
-    """Hand the spec to the orchestrator; it raises Fault(LOCAL) only for a refusal before any device is contacted."""
-    return run(spec)
-
-
 def parse_target(spec: str, transport: str, vendor: str = DEFAULT_VENDOR) -> Target:
     """`host` alone, `[v6]`, or NAME:HOST[:VENDOR][:PORT] in either order of the last two."""
     spec = spec.strip()
@@ -258,7 +253,7 @@ class Fleet:
         return self._run(self.spec("batch", commands=list(commands)))
 
     def structured(self, command: str, fmt: str) -> RunReport:
-        """The command's reply as data, `fmt` json or xml (NETCONF only); the library's alone, the CLI has no --format."""
+        """The command's reply in `fmt`, json or xml, as the device returns it (NETCONF only); the library's alone, the CLI has no --format."""
         if fmt not in ("json", "xml"):
             raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
         return self._run(self.spec("structured", commands=[command], format=fmt))

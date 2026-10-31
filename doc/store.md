@@ -43,10 +43,10 @@ the target's operation order. `--last` must be positive on the command line. The
 query methods separately accept zero for no rows and None for an unlimited stream.
 
 `field` treats a present JSON null as a value and prints `null`; missing fields do not
-match. List indices may be signed decimal integers; malformed or out-of-range indices do
-not match. Empty path components are refused. `diff` refuses a missing or failed operand
-instead of comparing it as empty output. Line endings and a missing final newline do not
-cause a logical-line difference; stored output itself is unchanged.
+match. List indices are decimal integers with an optional leading `-`; malformed or
+out-of-range indices do not match. Empty path components are refused. `diff` refuses a
+missing or failed operand instead of comparing it as empty output. Line endings and a
+missing final newline do not cause a logical-line difference; stored output itself is unchanged.
 
 CSV quotes embedded newlines and includes a header. JSONL writes one result per line and
 decodes the separate `data` column into a JSON value; CSV keeps that column's JSON text.
@@ -62,8 +62,10 @@ measuring, and tabs within a terminal cell become spaces. Pipes and files keep t
 existing tab-separated table rows, with no alignment padding. Use `output` or `export`
 for full values rather than shortened table cells.
 
-Batch saved output is `<name>.json`: an ordered array of every operation, including
-failures. Each object contains `command`, `started`, `elapsed_ms` and `ok`; successful
+Batch saved output is `<name>.json`: an ordered array of the target's batch operations,
+including failures. A device that fails before its first operation leaves no saved file.
+A close fault after the batch is recorded in the store, not appended to the saved file.
+Each object contains `command`, `started`, `elapsed_ms` and `ok`; successful
 operations add raw `output` and structured `data`, and failures add `fault`, `detail` and
 `reached_device`. Non-batch saved output remains `<name>.output`. These files use the same
 private-file rules as the store; a failed save is counted as `not_kept` without changing

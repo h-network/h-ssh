@@ -4,6 +4,7 @@ from hssh.dialects.base import Dialect
 from hssh.model import CommitStatus, Fault, FaultKind
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 _VALUE = r'("(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|[^\s;"\']+)'
 _SECRET_WORDS = (r'password(?:-value)?|passwd|secret|key|key-string|key-hex|hexadecimal|'
                  r'ascii-text|token|community')
@@ -14,7 +15,6 @@ class GenericDialect(Dialect):
     prompt_name_pattern: re.Pattern[str] = re.compile(r'^([\w\-\.]+)')
     prompt_tail_pattern: re.Pattern[str] = re.compile(r'(\([^\s()]+\))?[>#]\s*$')
     context_pattern: re.Pattern[str] | None = None
-    paging_off_command: str | None = None
     pager_pattern: re.Pattern[str] | None = re.compile(r'^\s*(?:--More--|---?\(more(?: \d+%)?\)---?)\s*$', re.I)
     pager_reply: bytes = b" "
     refusal_patterns: tuple[re.Pattern[str], ...] = (re.compile(r"^\s*(error:|% )", re.M),)

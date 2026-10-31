@@ -4,12 +4,12 @@ import time
 from typing import Protocol
 
 from hssh.dialects.base import Dialect
+from hssh.dialects.generic import _CONTROL
 from hssh.model import Fault, FaultKind, Result, Timeouts
 
 _SETTLE = 0.15
 _REFUSAL_SETTLE = 0.3
 _MATCH_LIMIT = 1024
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 class Channel(Protocol):
@@ -100,12 +100,11 @@ class CliEngine:
     """One interactive session; transport wrappers diagnose setup failures."""
 
     def __init__(self, channel: Channel, dialect: Dialect, timeouts: Timeouts, *,
-                 echoes: bool = False, initial: str = "") -> None:
+                 echoes: bool = False) -> None:
         self.channel = channel
         self.dialect = dialect
         self.timeouts = timeouts
         self.echoes = echoes
-        self.initial = initial
         self.prompt_pattern = dialect.prompt_pattern
         self._login_prompt_pattern = re.compile(
             dialect.prompt_pattern.pattern.removeprefix("^").removeprefix(r"\A"),
@@ -171,7 +170,6 @@ class CliEngine:
         lines: list[str] = []
         waiting_echo = self.echoes and bool(command)
         judged = refused = False
-        initial, self.initial = self.initial, ""
 
         def consume(text: str) -> None:
             nonlocal waiting_echo, judged, refused
@@ -188,7 +186,6 @@ class CliEngine:
                             judged = True
                             refused = any(p.search(text) for p in self.dialect.refusal_patterns)
 
-        consume(initial)
         while True:
             tail = self._terminal.tail()
             prompt = not waiting_echo and self._prompt(tail, learning, login=login)
@@ -247,13 +244,6 @@ class CliEngine:
         except BaseException:
             self.ready = False
             raise
-
-    def disable_paging(self) -> None:
-        if self.dialect.paging_off_command:
-            self.show(self.dialect.paging_off_command)
-
-    def show(self, command: str) -> Result:
-        return Result(self._command(command))
 
     def _command(self, command: str, timeout: int | None = None, *, edit: bool = False) -> str:
         if not command.strip() or _CONTROL.search(command):

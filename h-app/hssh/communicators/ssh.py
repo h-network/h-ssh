@@ -236,8 +236,6 @@ class _Opening(_Deadline):
 def _open_fault(exc: Exception, opening: _Opening) -> Fault:
     import paramiko
 
-    if isinstance(exc, Fault):
-        return exc
     detail = f"{opening.stage}: {type(exc).__name__}: {exc}"
     causes = []
     cause = exc
@@ -394,7 +392,8 @@ class SSHCommunicator(Communicator):
             if host_key_policy != "off":
                 client._host_keys, revoked = _read_keys(path, opening.deadline)
             client.set_missing_host_key_policy(Policy())
-            sock = opening.connect(target.host, self.default_port if target.port is None else target.port)
+            port = self.default_port if target.port is None else target.port
+            sock = opening.connect(target.host, port)
 
             def transport_factory(sock, **kwargs):
                 transport = Transport(sock, **kwargs)
@@ -402,7 +401,7 @@ class SSHCommunicator(Communicator):
                 return transport
 
             implicit_keys = creds.password is None and creds.key_file is None
-            client.connect(hostname=target.host, port=self.default_port if target.port is None else target.port,
+            client.connect(hostname=target.host, port=port,
                            sock=sock, username=creds.username, password=creds.password,
                            key_filename=os.path.expanduser(creds.key_file) if creds.key_file else None,
                            allow_agent=implicit_keys, look_for_keys=implicit_keys,
