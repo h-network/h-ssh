@@ -410,14 +410,12 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
   minutes left on each, from the device; the front end builds the command that confirms them. A confirm run reads the
   commit history first and sends the confirm only when its `CommitStatus` is pending; otherwise it is `REFUSED`.
 - **Synchronize** (`EditSettings.synchronize`, off by default; a confirm run carries it through the same
-  `RunSpec.edit`) asks for `commit synchronize` on the edit's commit and on a confirm, for dual-routing-engine
-  routers that do not carry `system commit synchronize`. The orchestrator checks the driver's `synchronize`
-  capability before `OPEN`, as it checks the mode; only `netconf` declares it, so `ssh` and `openssh` refuse it
-  as `UNSUPPORTED` before any login.
-- **Synchronize** (`EditSettings.synchronize`, off by default) goes with the commit of an edit, commit-confirmed included, and with a
-  confirm; the dry run and an empty diff send no commit, so it changes nothing there. It is NETCONF's: a run that sets it on a target
-  whose driver lacks the `synchronize` capability is refused as `LOCAL` "synchronize needs NETCONF; nothing was sent" before the probe
-  or any login.
+  `RunSpec.edit`) asks for `commit synchronize` on the edit's commit, commit-confirmed included, and on a confirm, for
+  dual-routing-engine routers that do not carry `system commit synchronize`. The dry run and an empty diff send no
+  commit, so it changes nothing there. Only `netconf` declares the `synchronize` capability: a run that sets the flag
+  on a target whose driver lacks it is refused as `LOCAL` "synchronize needs NETCONF; nothing was sent" before the
+  probe or any login. The communicators' own `UNSUPPORTED` for the flag is for callers that drive `ssh` or `openssh`
+  directly; a run never reaches it.
 - The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
   65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
   ends call the same helpers before asking for a password.
