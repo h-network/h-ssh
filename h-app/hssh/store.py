@@ -489,9 +489,9 @@ class Store:
         if format not in ("jsonl", "csv"):
             raise ValueError(f"unknown export format {format!r}")
         with closing(self.results(run_id, target, command, ok, status=status, seq=seq)) as rows:
-            buffer = io.StringIO(newline="")
-            writer = csv.writer(buffer)
             if format == "csv":
+                buffer = io.StringIO(newline="")
+                writer = csv.writer(buffer)
                 writer.writerow(_RESULT_COLUMNS)
                 yield buffer.getvalue()
             for row in rows:

@@ -454,8 +454,8 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 The schema version is `PRAGMA user_version = 1`. A new, empty database gets this schema;
 readers and writers refuse other versions or a mismatched table layout before changing the
 file. An unversioned database with tables is incompatible, not an empty database. The error
-is an `OSError` containing the path and: "incompatible store schema; use develop's h-ssh-store
-to read old stores, or choose a new store path". There is no migration or legacy adapter.
+is an `OSError` containing the path and: "incompatible store schema; choose a new store path".
+There is no migration or legacy adapter.
 
 ```sql
 CREATE TABLE runs (
@@ -615,8 +615,10 @@ promises that a later write cannot fail. Both raise contextual `OSError` on fail
 current user, locks it and sets 0600 before truncating, then completes all short writes.
 It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
 The recorder validates the target name and containment through `hssh.paths` before calling
-it. Saved output stays one file per target: batch mode writes `<name>.json`, an ordered
-array of every recorded operation using `operation_dict`, including failed operations.
+it. Batch mode writes `<name>.json`, an ordered array of the target's batch operations
+using `operation_dict`, including failed operations. A device that fails before its first
+operation leaves no saved file. A close fault after the batch is recorded in the store,
+not appended to the saved file.
 Other modes keep `<name>.output`. The recorder uses the explicit run mode, not the number
 of operations, to select the format; conversion or write failures count as `not_kept`.
 
