@@ -196,6 +196,11 @@ deadlines; each adapter holds one deadline across the whole write. Login takes n
 OpenSSH sessions arrive authenticated.
 It reads vendor behaviour from the dialect.
 
+An `openssh` fault's detail is ssh's own reason from its log, or, when ssh gave none, how far the session
+got (no TCP connection; connected, but no SSH banner; the banner came, but key exchange or authentication
+did not finish), followed by the ssh command line that ran, shell-quoted, without its log and multiplexing
+options.
+
 SSH and OpenSSH reads use exec channels. Their edit shells use a 511-column, 1000-row terminal and the
 engine's pager handling; login sends no paging-disable command. During login only, a prompt suffix may
 follow announcement text on the same line. The first command is read through its echo to separate any
