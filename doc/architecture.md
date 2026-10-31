@@ -73,7 +73,12 @@ Front ends make no decisions about devices. A behaviour available in the CLI is 
 through the same `RunSpec`; the one exception is `structured`, which is `Fleet.structured(command, fmt)` alone
 (`fmt` json or xml, required) — the CLI has no `--format` and the run file no `format` key (#220). `Fleet.show`,
 `batch` and `structured` also take a mapping of target name to its own command(s), carried as `RunSpec.commands_by_target`
-(no CLI flag), and `structured` a list of commands, one reply each.
+(no CLI flag), and `structured` a list of commands, one reply each. `Fleet.config(fmt)` is the `config`
+mode (library only), `Fleet.reachable(timeout=None)` wraps the orchestrator's `reachable()` (the connect timeout by
+default; `{name: Fault | None}`, no login, nothing recorded). `--label TEXT`, the run file's `label` key and
+`Fleet(label=)` put a free-text label into `RecordSettings.label`, checked by the orchestrator's `check_label` before the
+password; `--json` carries it. A run without a store has `run_id` None: text says "no run", `--json` and the summary
+line's `run` say null, and a watch tick with no run is not compared through the store.
 
 `--every SECONDS` (1 to 86400) is a front-end loop: one run per tick with the same `RunSpec`, every tick
 kept in the store, and each tick's rows compared with the last kept run's through the store's reader

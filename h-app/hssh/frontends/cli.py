@@ -36,7 +36,7 @@ from hssh.orchestrator import (
     DEFAULT_CONFIRMED_MINUTES, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SAFETY,
     DEFAULT_SKIP_UNREACHABLE,
     DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, check_comment,
-    check_confirmed_minutes, default_username, run,
+    check_confirmed_minutes, check_label, default_username, run,
 )
 from hssh.paths import path_inside, validate_device_name
 from hssh.screen import is_terminal, terminal_safe
@@ -150,6 +150,7 @@ def build_parser() -> _Parser:
     out.add_argument("--audit-log", metavar="FILE", help="JSONL audit trail of changes (or HSSH_AUDIT_LOG)")
     out.add_argument("--log", metavar="FILE")
     out.add_argument("--save-output", metavar="DIR")
+    out.add_argument("--label", metavar="TEXT", help="a free-text label kept with the run, a selector and filter in h-ssh-store")
     out.add_argument("--list-profiles", action="store_true")
     return p
 
@@ -241,6 +242,8 @@ def check_flags(args: argparse.Namespace) -> None:
         raise ValueError(f"--save-output {args.save_output} exists and is not a directory")
     if args.user and (why := plain_line(args.user)):
         raise ValueError(f"the username has {why}; a username is plain text")
+    if args.label is not None and (why := check_label(args.label)):
+        raise ValueError(why)
 
 
 def check_commands(commands: Sequence[str], source: str) -> None:
@@ -393,13 +396,13 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         recording=RecordSettings(store_path=None if args.no_store else args.store,
                                  audit_log_path=args.audit_log, log_path=args.log,
                                  save_output_path=args.save_output, argv=tuple(argv),
-                                 origin="h-ssh", version=package_version()),
+                                 origin="h-ssh", version=package_version(), label=args.label),
     )
 
 
 def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
     if args.json:
-        print(json.dumps(report_dict(report), indent=2), file=out)
+        print(json.dumps(report_dict(report, args.label), indent=2), file=out)
         return
     safe = terminal_safe if is_terminal(out) else (lambda text: text)
     for tr in report.results:
@@ -441,9 +444,13 @@ def commit_status_line(name: str, status: CommitStatus) -> str:
     return f"{name}: pending commit, {left}"
 
 
+def run_name(report: RunReport) -> str:
+    return f"run {report.run_id}" if report.run_id is not None else "no run"
+
+
 def verdict(report: RunReport) -> str:
     """The run's counts; what was skipped is named by reason, and a record not kept is said, so a run that did not reach every device never reads as all OK."""
-    line = f"run {report.run_id}: {report.ok} ok, {report.failed} failed, {report.skipped} skipped"
+    line = f"{run_name(report)}: {report.ok} ok, {report.failed} failed, {report.skipped} skipped"
     reasons: dict[str, int] = {}
     for tr in report.results:
         if tr.status == "skipped":
@@ -476,7 +483,8 @@ def confirm_command(args: argparse.Namespace) -> str:
 def summary_line(report: RunReport) -> str:
     """One JSON line for stderr: the counts a pipeline reads."""
     elapsed_ms = int((datetime.fromisoformat(report.finished) - datetime.fromisoformat(report.started)).total_seconds() * 1000)
-    counts = {"targets": len(report.results), "ok": report.ok, "fail": report.failed, "skipped": report.skipped}
+    counts = {"run": report.run_id, "targets": len(report.results), "ok": report.ok, "fail": report.failed,
+              "skipped": report.skipped}
     if report.interrupted:
         counts["interrupted"] = True
     if report.not_kept:
@@ -484,10 +492,10 @@ def summary_line(report: RunReport) -> str:
     return "[h-ssh] " + json.dumps({**counts, "elapsed_ms": elapsed_ms, "mode": report.mode})
 
 
-def report_dict(report: RunReport) -> dict[str, Any]:
+def report_dict(report: RunReport, label: str | None = None) -> dict[str, Any]:
     """The report as JSON data; each operation is the store's operation_dict, so --json, saved batches and the store rows agree."""
     return {
-        "run_id": report.run_id, "mode": report.mode, "started": report.started, "finished": report.finished,
+        "run_id": report.run_id, "label": label, "mode": report.mode, "started": report.started, "finished": report.finished,
         "ok": report.ok, "failed": report.failed, "skipped": report.skipped, "interrupted": report.interrupted,
         "not_kept": report.not_kept, "pending": dict(report.pending),
         "results": [{"target": tr.target.name, "host": tr.target.host, "status": tr.status,
@@ -528,7 +536,7 @@ def watch_tick(tick: int, report: RunReport, rows: Rows, previous: Rows | None, 
     safe = terminal_safe if is_terminal(out) else (lambda text: text)
     stamp = time.strftime("%H:%M:%S")
     counts = f"{report.ok} OK, {report.failed} failed" + (f", {report.skipped} skipped" if report.skipped else "")
-    kept = f"run {report.run_id}" + (f", {report.not_kept} record(s) not kept" if report.not_kept else "")
+    kept = run_name(report) + (f", {report.not_kept} record(s) not kept" if report.not_kept else "")
     if previous is None:
         print(f"tick {tick} {stamp}: {counts}; baseline {kept}", file=out, flush=True)
         return
@@ -560,7 +568,7 @@ def watch(args: argparse.Namespace, spec: RunSpec, runner: Runner, reader: Calla
                 time.sleep(args.every)
             report = runner(spec)
             try:
-                rows = reader(args.store, report.run_id)
+                rows = reader(args.store, report.run_id) if report.run_id is not None else {}
             except OSError as e:
                 print(f"ERROR: --every: store {args.store}: {e}; a watch keeps all its ticks in one store, so it stops here",
                       file=sys.stderr)

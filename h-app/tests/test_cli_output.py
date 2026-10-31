@@ -55,13 +55,13 @@ def test_the_summary_line_is_json_on_stderr_with_the_counts(cli_run):
     rep = report(ok=2, failed=1, skipped=1, results=[one("ok")] * 4, not_kept=2, interrupted=True)
     _, _, _, err = cli_run("R1:10.0.0.1:junos", "-sC", "x", "--raw", *NETCONF, reports=[rep])
     summary = json.loads(err.strip().splitlines()[-1].removeprefix("[h-ssh] "))
-    assert summary == {"targets": 4, "ok": 2, "fail": 1, "skipped": 1, "interrupted": True, "not_kept": 2,
+    assert summary == {"run": 1, "targets": 4, "ok": 2, "fail": 1, "skipped": 1, "interrupted": True, "not_kept": 2,
                        "elapsed_ms": 1500, "mode": "show"}
 
 
 def test_the_summary_line_omits_what_did_not_happen(cli_run):
     _, _, _, err = cli_run("R1:10.0.0.1:junos", "-sC", "x", "--raw", *NETCONF, reports=[report(ok=1)])
-    assert set(json.loads(err.strip().removeprefix("[h-ssh] "))) == {"targets", "ok", "fail", "skipped", "elapsed_ms", "mode"}
+    assert set(json.loads(err.strip().removeprefix("[h-ssh] "))) == {"run", "targets", "ok", "fail", "skipped", "elapsed_ms", "mode"}
 
 
 def test_json_carries_the_whole_report_with_dataclass_data_as_dicts(cli_run):
