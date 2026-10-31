@@ -265,16 +265,17 @@ class Fleet:
 
     def edit(self, lines: Iterable[str] | None = None, payloads: Mapping[str, Sequence[str]] | None = None,
              apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None, comment: str | None = None,
-             skip_unreachable: bool = DEFAULT_SKIP_UNREACHABLE) -> RunReport:
-        """`lines` for every target, or `payloads` per target name (a target in neither is skipped). Dry run unless `apply`; `confirmed_minutes` leaves a pending commit for confirm(); `skip_unreachable` goes on without the devices the probe found dead."""
+             skip_unreachable: bool = DEFAULT_SKIP_UNREACHABLE, synchronize: bool = False) -> RunReport:
+        """`lines` for every target, or `payloads` per target name (a target in neither is skipped). Dry run unless `apply`; `confirmed_minutes` leaves a pending commit for confirm(); `skip_unreachable` goes on without the devices the probe found dead; `synchronize` asks for commit synchronize (NETCONF only)."""
         if lines is None and payloads is None:
             raise ValueError("edit needs lines or payloads")
-        edit = EditSettings(apply=apply, confirmed_minutes=confirmed_minutes, comment=comment)
+        edit = EditSettings(apply=apply, confirmed_minutes=confirmed_minutes, comment=comment, synchronize=synchronize)
         return self._run(self.spec("edit", config_lines=list(lines or ()), payloads=payloads, edit=edit,
                                    skip_unreachable=skip_unreachable))
 
-    def confirm(self) -> RunReport:
-        return self._run(self.spec("confirm"))
+    def confirm(self, synchronize: bool = False) -> RunReport:
+        edit = EditSettings(apply=True, synchronize=True) if synchronize else None
+        return self._run(self.spec("confirm", edit=edit))
 
     def commit_status(self) -> RunReport:
         return self._run(self.spec("commit_status"))

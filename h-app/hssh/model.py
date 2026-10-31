@@ -68,11 +68,12 @@ class RecordSettings:
 
 @dataclass(frozen=True)
 class EditSettings:
-    """How an edit run commits: dry run unless apply is set."""
+    """How an edit run commits: dry run unless apply is set; synchronize asks for commit synchronize on edit and confirm, NETCONF only."""
 
     apply: bool
     confirmed_minutes: int | None = None
     comment: str | None = None
+    synchronize: bool = False
 
 
 @dataclass(frozen=True)

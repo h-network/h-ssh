@@ -502,10 +502,15 @@ class OpenSSH:
     def diff(self, session: OpenSSHSession) -> Result:
         return self._shell(session).diff()
 
-    def commit(self, session: OpenSSHSession, confirmed_minutes: int | None, comment: str | None) -> Result:
+    def commit(self, session: OpenSSHSession, confirmed_minutes: int | None, comment: str | None,
+               synchronize: bool = False) -> Result:
+        if synchronize:
+            raise Fault(FaultKind.UNSUPPORTED, "commit synchronize needs NETCONF", False)
         return self._shell(session).commit(confirmed_minutes, comment)
 
-    def confirm(self, session: OpenSSHSession) -> Result:
+    def confirm(self, session: OpenSSHSession, synchronize: bool = False) -> Result:
+        if synchronize:
+            raise Fault(FaultKind.UNSUPPORTED, "commit synchronize needs NETCONF", False)
         return self._shell(session).confirm()
 
     def commit_history(self, session: OpenSSHSession) -> Result:

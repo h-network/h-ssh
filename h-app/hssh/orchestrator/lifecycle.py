@@ -83,7 +83,8 @@ class EditLifecycle:
         return await operation("diff", lambda: self.communicator.diff(self.session), 2 * self.timeouts.command)
 
     async def commit(self, edit: EditSettings) -> OperationResult:
-        return await operation("commit", lambda: self.communicator.commit(self.session, edit.confirmed_minutes, edit.comment),
+        return await operation("commit", lambda: self.communicator.commit(self.session, edit.confirmed_minutes, edit.comment,
+                                                                            synchronize=edit.synchronize),
                                self.timeouts.commit)
 
     async def run(self, lines: list[str], edit: EditSettings, before_commit: Callable[[], None] = lambda: None,
@@ -103,8 +104,9 @@ class EditLifecycle:
         return EditOutcome(tuple(ops), Stage.PENDING if pending else Stage.COMMIT, applied, pending)
 
 
-async def confirm(communicator: Communicator, session: Session, timeouts: Timeouts) -> list[OperationResult]:
-    """The commit history read first; the confirm is sent only when its CommitStatus says a commit is pending, else refused: a bare confirm would commit whatever waits in the candidate."""
+async def confirm(communicator: Communicator, session: Session, timeouts: Timeouts,
+                  synchronize: bool = False) -> list[OperationResult]:
+    """The commit history read first; the confirm is sent only when its CommitStatus says a commit is pending, else refused: a bare confirm would commit whatever waits in the candidate. `synchronize` goes with the confirm."""
     history = await commit_history(communicator, session, timeouts)
     if failed(history):
         return [history]
@@ -112,7 +114,7 @@ async def confirm(communicator: Communicator, session: Session, timeouts: Timeou
     if not isinstance(status, CommitStatus) or not status.pending:
         refused = Fault(FaultKind.REFUSED, "nothing to confirm: no commit-confirmed is pending", True)
         return [history, OperationResult("confirm", refused, now(), 0)]
-    return [history, await operation("confirm", lambda: communicator.confirm(session),
+    return [history, await operation("confirm", lambda: communicator.confirm(session, synchronize=synchronize),
                                      2 * timeouts.command + timeouts.commit)]
 
 

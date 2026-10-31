@@ -32,6 +32,7 @@ RUN_KEYS: dict[str, tuple[str, type | tuple[type, ...]]] = {
     "assume_yes": ("yes", bool),
     "commit_confirmed": ("commit_confirmed", int),
     "comment": ("comment", str),
+    "synchronize": ("synchronize", bool),
     "retries": ("retries", int),
     "retry_pause": ("retry_pause", int),
     "workers": ("workers", int),

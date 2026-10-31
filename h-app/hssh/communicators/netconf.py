@@ -428,7 +428,8 @@ class NetconfSession(Session):
 class NetconfCommunicator(Communicator):
     default_port: int = 830
     banner: bytes | None = b"SSH-"
-    capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "edit", "commit_confirmed", "confirm", "commit_status"})
+    capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "edit", "commit_confirmed", "confirm", "commit_status",
+                                              "synchronize"})
     ssh_config = "paramiko"
 
     def __init__(self, dialect: Dialect) -> None:
@@ -655,6 +656,7 @@ class NetconfCommunicator(Communicator):
         session: Session,
         confirmed_minutes: int | None,
         comment: str | None,
+        synchronize: bool = False,
     ) -> Result:
         from jnpr.junos.exception import CommitError
 
@@ -662,7 +664,7 @@ class NetconfCommunicator(Communicator):
         config = self._lock(netconf)
         netconf.committing = True
         try:
-            config.commit(timeout=netconf.timeouts.commit, confirm=confirmed_minutes, comment=comment)
+            config.commit(timeout=netconf.timeouts.commit, confirm=confirmed_minutes, comment=comment, sync=synchronize)
         except CommitError as error:
             raise Fault(FaultKind.COMMIT_FAILED, str(error), True) from error
         except Exception as error:
@@ -674,13 +676,13 @@ class NetconfCommunicator(Communicator):
         netconf.dirty = False
         return Result(output="commit complete")
 
-    def confirm(self, session: Session) -> Result:
+    def confirm(self, session: Session, synchronize: bool = False) -> Result:
         netconf = cast(NetconfSession, session)
         self._lock(netconf)
         status = cast(CommitStatus, self.commit_history(netconf).data)
         if not status.pending:
             raise Fault(FaultKind.REFUSED, "nothing to confirm", True)
-        return self.commit(netconf, None, None)
+        return self.commit(netconf, None, None, synchronize=synchronize)
 
     def commit_history(self, session: Session) -> Result:
         from lxml import etree

@@ -29,7 +29,8 @@ A `Fleet` keeps one session per device across its calls. Three calls cost 250 lo
 
 Built, on `junos@netconf`:
 - shows and batches;
-- edits: dry run, apply, commit confirmed and confirm, commit status, per-device payload files;
+- edits: dry run, apply, commit confirmed and confirm (`--synchronize` for dual routing engines, NETCONF only),
+  commit status, per-device payload files;
 - the result store and the `h-ssh-store` reader;
 - the audit log and the safety gate;
 - session reuse.
@@ -47,6 +48,8 @@ with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin"
     report = fleet.show("show bgp summary")                 # one login per device, kept for the next call
     report = fleet.batch(["show version", "show route summary"])
     report = fleet.structured("show interfaces terse", "json")   # the reply as data, NETCONF only
+    report = fleet.edit(["set system host-name cr1"], apply=True, confirmed_minutes=5, synchronize=True)
+    report = fleet.confirm(synchronize=True)                 # commit synchronize on both; NETCONF only
     for result in report.results:
         for op in result.operations:
             print(result.target.name, op.command, op.outcome)
