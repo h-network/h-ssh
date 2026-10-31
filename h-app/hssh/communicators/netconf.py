@@ -664,7 +664,7 @@ class NetconfCommunicator(Communicator):
         config = self._lock(netconf)
         netconf.committing = True
         try:
-            config.commit(timeout=netconf.timeouts.commit, confirm=confirmed_minutes, comment=comment)
+            config.commit(timeout=netconf.timeouts.commit, confirm=confirmed_minutes, comment=comment, sync=synchronize)
         except CommitError as error:
             raise Fault(FaultKind.COMMIT_FAILED, str(error), True) from error
         except Exception as error:
@@ -682,7 +682,7 @@ class NetconfCommunicator(Communicator):
         status = cast(CommitStatus, self.commit_history(netconf).data)
         if not status.pending:
             raise Fault(FaultKind.REFUSED, "nothing to confirm", True)
-        return self.commit(netconf, None, None)
+        return self.commit(netconf, None, None, synchronize=synchronize)
 
     def commit_history(self, session: Session) -> Result:
         from lxml import etree
