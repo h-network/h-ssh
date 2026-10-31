@@ -57,12 +57,20 @@ Call `fleet.structured("show version", "json")` or
 The format is required, and each call runs one show command through
 PyEZ's `Device.cli(command, format=fmt, warning=False)`.
 
-The returned dictionary is serialized as JSON text, an XML element as an XML
-string, and returned text is kept as text. This becomes `Result.output` and the
+The returned dictionary is serialized as JSON text and an XML element as an XML
+string. This becomes `Result.output` and the
 store's output column; `Result.data` stays `None`. The representation comes from
 PyEZ, with no field extraction or interpretation by h-ssh. The call uses the
 Fleet's existing command timeout and pooled session, with the same fault handling
 as other NETCONF operations.
+
+h-ssh uses PyEZ as is and does not work around its behavior. Junos answers some
+commands, including `show configuration`, with text regardless of the requested
+format. A text reply, or PyEZ failing to read that reply as JSON, fails with
+`UNSUPPORTED`: `the device answered <command> with text, not <fmt>`, including
+the reply text when available. The fault has `reached_device=True` and is not
+retried. Retrieve configuration as text with a plain show call, such as
+`fleet.show("show configuration | display set")`.
 
 ## Candidate edits
 
