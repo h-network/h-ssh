@@ -655,6 +655,7 @@ class NetconfCommunicator(Communicator):
         session: Session,
         confirmed_minutes: int | None,
         comment: str | None,
+        synchronize: bool = False,
     ) -> Result:
         from jnpr.junos.exception import CommitError
 
@@ -674,7 +675,7 @@ class NetconfCommunicator(Communicator):
         netconf.dirty = False
         return Result(output="commit complete")
 
-    def confirm(self, session: Session) -> Result:
+    def confirm(self, session: Session, synchronize: bool = False) -> Result:
         netconf = cast(NetconfSession, session)
         self._lock(netconf)
         status = cast(CommitStatus, self.commit_history(netconf).data)

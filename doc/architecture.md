@@ -291,8 +291,9 @@ class Communicator(Protocol):
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
     def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
-    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result: ...
-    def confirm(self, session: Session) -> Result: ...
+    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None,
+               synchronize: bool = False) -> Result: ...                      # synchronize: NETCONF only; others raise UNSUPPORTED
+    def confirm(self, session: Session, synchronize: bool = False) -> Result: ...
     def commit_history(self, session: Session) -> Result: ...                 # data: CommitStatus
 ```
 
@@ -407,6 +408,9 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
   minutes left on each, from the device; the front end builds the command that confirms them. A confirm run reads the
   commit history first and sends the confirm only when its `CommitStatus` is pending; otherwise it is `REFUSED`.
+- **Synchronize** (`EditSettings.synchronize`, off by default) asks for `commit synchronize` on the edit's commit
+  and on a confirm, for dual-routing-engine routers that do not carry `system commit synchronize`. NETCONF only:
+  `ssh` and `openssh` refuse it as `UNSUPPORTED` before any login.
 - The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
   65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
   ends call the same helpers before asking for a password.

@@ -7,7 +7,7 @@ import time
 
 from hssh.communicators.base import Session
 from hssh.dialects.base import Dialect
-from hssh.model import Credentials, HostKeyPolicy, Result, Target, Timeouts
+from hssh.model import Credentials, Fault, FaultKind, HostKeyPolicy, Result, Target, Timeouts
 
 
 def negotiate(sock: socket.socket) -> str:
@@ -86,10 +86,15 @@ class TelnetCommunicator:
 
     def commit(
         self, session: Session, confirmed_minutes: int | None, comment: str | None,
+        synchronize: bool = False,
     ) -> Result:
+        if synchronize:
+            raise Fault(FaultKind.UNSUPPORTED, "commit synchronize needs NETCONF", False)
         raise NotImplementedError
 
-    def confirm(self, session: Session) -> Result:
+    def confirm(self, session: Session, synchronize: bool = False) -> Result:
+        if synchronize:
+            raise Fault(FaultKind.UNSUPPORTED, "commit synchronize needs NETCONF", False)
         raise NotImplementedError
 
     def commit_history(self, session: Session) -> Result:

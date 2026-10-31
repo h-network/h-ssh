@@ -556,10 +556,15 @@ class SSHCommunicator(Communicator):
     def diff(self, session: Session) -> Result:
         return self._engine(session).diff()
 
-    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result:
+    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None,
+               synchronize: bool = False) -> Result:
+        if synchronize:
+            raise Fault(FaultKind.UNSUPPORTED, "commit synchronize needs NETCONF", False)
         return self._engine(session).commit(confirmed_minutes, comment)
 
-    def confirm(self, session: Session) -> Result:
+    def confirm(self, session: Session, synchronize: bool = False) -> Result:
+        if synchronize:
+            raise Fault(FaultKind.UNSUPPORTED, "commit synchronize needs NETCONF", False)
         return self._engine(session).confirm()
 
     def commit_history(self, session: Session) -> Result:
