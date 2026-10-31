@@ -14,7 +14,7 @@ class FakeNetconf:
     default_port = 830
     banner = b"SSH-"
     ssh_config = "paramiko"
-    capabilities = frozenset({"show", "batch", "edit", "commit_confirmed", "confirm", "commit_status"})
+    capabilities = frozenset({"show", "batch", "edit", "commit_confirmed", "confirm", "commit_status", "synchronize"})
 
     def __init__(self, dialect=junos.DIALECT, *, changed=True, pending=False, open_fault=None, commit_fault=None):
         self.dialect, self.changed, self.pending = dialect, changed, pending
@@ -54,13 +54,13 @@ class FakeNetconf:
         self.calls.append(("diff", session["name"]))
         return Result("+ change" if self.changed else "", self.changed)
 
-    def commit(self, session, minutes, comment):
+    def commit(self, session, minutes, comment, synchronize=False):
         self.calls.append(("commit", minutes, comment))
         if self.commit_fault is not None:
             raise self.commit_fault
         return Result("commit complete")
 
-    def confirm(self, session):
+    def confirm(self, session, synchronize=False):
         self.calls.append(("confirm", session["name"]))
         return Result("commit complete")
 
