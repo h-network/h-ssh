@@ -92,6 +92,12 @@ An unanswered commit has an unknown outcome: the transport is discarded without
 rollback or replay. Verify the device before trying again. A successful commit
 leaves only unlock and disconnect for cleanup.
 
+Commit synchronize is available only over NETCONF and is off by default.
+Setting `EditSettings.synchronize=True` passes `sync=True` to PyEZ for both
+edits and confirm, alongside any commit comment and confirmed timer. PyEZ asks
+both Routing Engines to commit; a commit error from the other Routing Engine
+is reported as `COMMIT_FAILED`. h-ssh uses PyEZ's behavior without a workaround.
+
 Confirm takes the exclusive lock and rechecks commit history before sending a
 plain commit. With nothing pending it returns a refusal. Commit history returns
 the device's XML and `CommitStatus` from sequence zero only, including the
