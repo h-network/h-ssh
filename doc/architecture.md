@@ -194,13 +194,20 @@ delayed banner and learn the device's whole-line prompt; command replies always 
 Replies containing only echo, prompt context and the prompt return immediately. Replies with output settle
 for 0.15 seconds, or 0.3 seconds for a refusal. Login retains its 0.15-second settle.
 Each command's write, reply and prompt settling share one command deadline. The reader decodes UTF-8
-incrementally, handles terminal redraws and recognises pager markers only on the current terminal line.
+incrementally and handles terminal redraws. Junos pager tokens (`---(more)---`, percentage variants,
+`--More--` and `[yes,no]`) must occupy a whole terminal line outside a command echo. A pager line is
+removed without losing subsequent lines already received in the same read; if output has already
+continued, no extra continuation space is sent. Tokens embedded in other text remain output.
 It removes command echoes, prompt context and terminal control sequences, without redacting or formatting
 the reply. A refusal at the start of a reply is `REFUSED`; an error-looking line later in output stays output.
 Commands containing controls, Tab or invalid Unicode are refused before typing; Junos's encoder quotes
 literal `?` for the line editor.
 
-A timeout or disconnect makes the engine unready, so that session is discarded and a later batch command
+A disconnect during settling accepts a reply that already ends in a complete prompt, while closing the
+channel and marking the engine unusable. Releasing an already closed engine does nothing, so cleanup
+does not turn that completed reply into a failure. Disconnects before a complete prompt still fail;
+a disconnected login never supplies a usable session. A timeout or disconnect makes the engine unready,
+so that session is discarded and a later batch command
 uses a fresh login. Pooling asks the transport's cheap liveness check first; an idle probe sends one empty
 line and waits for the learned prompt under its absolute deadline. Releasing an engine session requires it
 to remain synchronized.
@@ -220,8 +227,10 @@ the channel and never sends CLI commands. A timeout or disconnect also prevents 
 
 Confirm acquires exclusive configuration and rechecks the newest commit before its one plain commit;
 no pending timer is `REFUSED`. Junos history parses only sequence zero, including the device's `5mins`
-timer format, and ignores timers on older entries. Junos commit comments reject controls, Tab and double
-quotes, quote backslashes, and retain the 512 UTF-8 byte limit; literal `?` uses the line-editor encoder.
+timer format, and ignores timers on older entries. Junos commit construction strips surrounding comment
+whitespace (including a trailing newline), then rejects empty text, controls, Tab and double quotes,
+quotes backslashes, and applies the 512 UTF-8 byte limit to the stripped text; literal `?` uses the
+line-editor encoder.
 
 ### 3.5 Dialects
 

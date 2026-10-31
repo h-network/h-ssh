@@ -165,6 +165,10 @@ class CliEngine:
             lines.pop()
         return "\n".join(lines)
 
+    def _pager(self, line: str) -> bool:
+        pattern = self.dialect.pager_pattern
+        return pattern is not None and bool(line.strip()) and pattern.fullmatch(line) is not None
+
     def _read(self, deadline: float, command: str = "", *, learning: bool = False,
               login: bool = False) -> tuple[str, str]:
         lines: list[str] = []
@@ -173,24 +177,30 @@ class CliEngine:
 
         def consume(text: str) -> None:
             nonlocal waiting_echo, judged, refused
+            page_break = False
             for line in self._terminal.feed(text):
                 if waiting_echo:
                     if self._echo(line, command):
                         waiting_echo = False
                         lines.clear()
+                elif self._pager(line):
+                    page_break = True
                 else:
                     lines.append(line)
                     text = line.strip()
+                    if text:
+                        page_break = False
                     if not judged and text and set(text) != {"^"}:
                         if not any(p.search(text) for p in self.dialect.warning_patterns):
                             judged = True
                             refused = any(p.search(text) for p in self.dialect.refusal_patterns)
+            if page_break and not self._terminal.line:
+                self.channel.send(self.dialect.pager_reply, deadline)
 
         while True:
             tail = self._terminal.tail()
             prompt = not waiting_echo and self._prompt(tail, learning, login=login)
-            pager = (not waiting_echo and self.dialect.pager_pattern is not None
-                     and bool(tail.strip()) and self.dialect.pager_pattern.fullmatch(tail) is not None)
+            pager = not waiting_echo and self._pager(tail)
             if prompt and not login and not self._output(lines.copy()).strip():
                 self._terminal.clear_line()
                 return self._output(lines), tail
@@ -214,6 +224,12 @@ class CliEngine:
                     self.channel.send(self.dialect.pager_reply, deadline)
                     self._terminal.clear_line()
                     continue
+                raise
+            except OSError:
+                if prompt:
+                    self._terminal.clear_line()
+                    self.discard()
+                    return self._output(lines), tail
                 raise
             consume(self._decoder.decode(data))
 
@@ -240,6 +256,8 @@ class CliEngine:
                 _, prompt = self._read(deadline, login=True)
             if self._prompt(prompt, learning=True):
                 self._learn_prompt(prompt)
+            if self._closed:
+                raise ConnectionError("CLI channel closed during login")
             self.ready = True
         except BaseException:
             self.ready = False
@@ -274,12 +292,14 @@ class CliEngine:
             return False
         try:
             self._exchange("", deadline)
-            return True
+            return self.ready
         except (Fault, OSError):
             self.ready = False
             return False
 
     def release(self) -> None:
+        if self._closed:
+            return
         if not self.ready or self._commit_sent:
             self.discard()
             raise Fault(FaultKind.SESSION_LOST, "CLI session is not synchronized", True)
