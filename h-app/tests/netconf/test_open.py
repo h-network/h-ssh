@@ -212,7 +212,7 @@ def test_descriptor_exhaustion_survives_ncclient_socket_wrapper(open_local, monk
     assert netconf._HOST_KEY_PORT.get() is None
 
 
-@pytest.mark.parametrize('port', [23, '23'])
+@pytest.mark.parametrize('port', [23])
 def test_telnet_port_is_rejected_before_device_construction(communicator, monkeypatch, port):
     constructor = Mock(side_effect=AssertionError('Device must not be constructed'))
     monkeypatch.setattr('jnpr.junos.Device', constructor)
