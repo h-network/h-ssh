@@ -327,10 +327,10 @@ def commits(comm):
 
 def test_a_target_past_commit_is_waited_for_when_interrupted():
     class Commits(FakeNetconf):
-        def commit(self, session, minutes, comment):
+        def commit(self, session, minutes, comment, synchronize=False):
             interrupt_self()
             time.sleep(0.2)
-            return super().commit(session, minutes, comment)
+            return super().commit(session, minutes, comment, synchronize)
 
     report = run(edit_spec(T1, T2, workers=1), Commits())
     assert report.interrupted

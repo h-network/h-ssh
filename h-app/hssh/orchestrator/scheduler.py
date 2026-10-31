@@ -338,7 +338,7 @@ class Scheduler:
             return list(edit.operations)
         step(spec.mode)
         if spec.mode == "confirm":
-            return await lifecycle.confirm(comm, session, spec.timeouts)
+            return await lifecycle.confirm(comm, session, spec.timeouts, synchronize=spec.edit.synchronize)
         return [await lifecycle.commit_history(comm, session, spec.timeouts)]
 
     async def _fresh(self, run: _Run, index: int, target: Target, driver: Driver, borrow: _Borrow) -> Session:
@@ -473,6 +473,8 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
         raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
     if spec.mode == "edit" and (why := check_edit(spec.edit)):
         raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
+    if spec.mode in ("edit", "confirm") and spec.edit.synchronize and not _all_synchronize(spec, registry):
+        raise Fault(FaultKind.LOCAL, "synchronize needs NETCONF; nothing was sent", False)
     if spec.safety is not None:
         _plan_logins(spec, registry)
     own = sessions is None
@@ -485,6 +487,18 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
             await sessions.close_all()
         if gate is not None:
             _closed_quietly("safety gate", gate.close)
+
+
+def _all_synchronize(spec: RunSpec, registry: DriverRegistry) -> bool:
+    """Whether every target's driver has the synchronize capability; a target whose driver is unknown fails at open on its own."""
+    for target in spec.targets:
+        try:
+            driver = registry.resolve(target)
+        except Fault:
+            continue
+        if "synchronize" not in driver.communicator.capabilities:
+            return False
+    return True
 
 
 def _structured_refusal(spec: RunSpec) -> str | None:

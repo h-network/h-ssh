@@ -413,6 +413,10 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
   routers that do not carry `system commit synchronize`. The orchestrator checks the driver's `synchronize`
   capability before `OPEN`, as it checks the mode; only `netconf` declares it, so `ssh` and `openssh` refuse it
   as `UNSUPPORTED` before any login.
+- **Synchronize** (`EditSettings.synchronize`, off by default) goes with the commit of an edit, commit-confirmed included, and with a
+  confirm; the dry run and an empty diff send no commit, so it changes nothing there. It is NETCONF's: a run that sets it on a target
+  whose driver lacks the `synchronize` capability is refused as `LOCAL` "synchronize needs NETCONF; nothing was sent" before the probe
+  or any login.
 - The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
   65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
   ends call the same helpers before asking for a password.
