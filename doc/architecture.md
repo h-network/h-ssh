@@ -274,7 +274,7 @@ runs. The format is in section 6.
 
 ```python
 class Communicator(Protocol):
-    capabilities: frozenset[str]          # e.g. {"show", "batch", "edit", "commit_confirmed"}
+    capabilities: frozenset[str]          # the mode names plus "commit_confirmed" and "synchronize", e.g. {"show", "batch", "edit", "commit_confirmed"}
     default_port: int                     # e.g. 830 for netconf
     banner: bytes | None                  # what the port sends first, for the probe; None: a connect is enough
     ssh_config: Literal["paramiko", "openssh"] | None   # whose ssh client config the transport reads, so the probe asks where the connection really goes: "paramiko" (~/.ssh/config: HostName, Port, ProxyCommand), "openssh" (as `ssh -G` prints it, ProxyJump too), None (reads none)
@@ -291,8 +291,9 @@ class Communicator(Protocol):
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
     def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
-    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result: ...
-    def confirm(self, session: Session) -> Result: ...
+    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None,
+               synchronize: bool = False) -> Result: ...                      # synchronize: NETCONF only; others raise UNSUPPORTED
+    def confirm(self, session: Session, synchronize: bool = False) -> Result: ...
     def commit_history(self, session: Session) -> Result: ...                 # data: CommitStatus
 ```
 
@@ -407,6 +408,11 @@ OPEN → LOAD → DIFF ──(dry run)──────────────
 - **Commit-confirmed** leaves a pending commit. The report lists the devices with a pending commit and the
   minutes left on each, from the device; the front end builds the command that confirms them. A confirm run reads the
   commit history first and sends the confirm only when its `CommitStatus` is pending; otherwise it is `REFUSED`.
+- **Synchronize** (`EditSettings.synchronize`, off by default; a confirm run carries it through the same
+  `RunSpec.edit`) asks for `commit synchronize` on the edit's commit and on a confirm, for dual-routing-engine
+  routers that do not carry `system commit synchronize`. The orchestrator checks the driver's `synchronize`
+  capability before `OPEN`, as it checks the mode; only `netconf` declares it, so `ssh` and `openssh` refuse it
+  as `UNSUPPORTED` before any login.
 - The orchestrator checks the timer and comment before anything is sent, through `check_confirmed_minutes` (1 to
   65535) and `check_comment` (one non-empty line, at most 512 UTF-8 bytes, no control characters); front
   ends call the same helpers before asking for a password.

@@ -13,7 +13,7 @@ class Session(Protocol):
 
 
 class Communicator(Protocol):
-    """One transport: opens sessions, executes one operation per call, returns Result or raises Fault; capability names are the mode names plus commit_confirmed."""
+    """One transport: opens sessions, executes one operation per call, returns Result or raises Fault; capability names are the mode names plus commit_confirmed and synchronize."""
 
     capabilities: frozenset[str]
     dialect: Dialect
@@ -49,9 +49,12 @@ class Communicator(Protocol):
         """Result.data is a bool: whether anything changed."""
         ...
 
-    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None) -> Result: ...
+    def commit(self, session: Session, confirmed_minutes: int | None, comment: str | None,
+               synchronize: bool = False) -> Result:
+        """synchronize asks for commit synchronize; only a communicator with the synchronize capability accepts it, the others raise Fault(UNSUPPORTED)."""
+        ...
 
-    def confirm(self, session: Session) -> Result: ...
+    def confirm(self, session: Session, synchronize: bool = False) -> Result: ...
 
     def commit_history(self, session: Session) -> Result:
         """Result.data is a CommitStatus."""
