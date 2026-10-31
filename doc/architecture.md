@@ -83,7 +83,8 @@ exits 130. A watch is reads only, needs the store (`--no-store` is refused) and 
 `--raw`; `--times N` stops after N ticks and goes only with `--every`.
 
 Before anything runs the CLI refuses the flags that would do nothing or contradict each other, in one line and
-exit 2: a second mode, `-y`/`--comment`/`--commit-confirmed` without an edit,
+exit 2: a second mode, `-y`/`--comment`/`--commit-confirmed` without an edit, `--synchronize` without an edit or
+`--confirm` (it rides `EditSettings.synchronize`, for a confirm through `RunSpec.edit`; the run file's `synchronize` key is the same),
 `--no-store` with `--store`, `--raw` with `--json` or `-v`, a `--save-output` path that exists and is not a
 directory, and a parser error is the message alone, not the usage block. Input is plain text: a `-sC` or batch
 command is one line (a line break would run two commands), and the username, from whichever source, carries no
