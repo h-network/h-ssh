@@ -4,34 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from enum import Enum, auto
 from typing import Callable
 
 from hssh.communicators.base import Communicator, Session
 from hssh.dialects.base import Dialect
 from hssh.model import CommitStatus, EditSettings, Fault, FaultKind, OperationResult, Result, Timeouts
 from hssh.orchestrator.defaults import GRACE_SECONDS
-
-
-class Stage(Enum):
-    OPEN = auto()
-    LOAD = auto()
-    DIFF = auto()
-    COMMIT = auto()
-    PENDING = auto()
-    CLOSE = auto()
-
-
-@dataclass(frozen=True)
-class EditOutcome:
-    """What an edit came to: its operations, the stage reached, the lines the device took, and whether a commit is pending."""
-
-    operations: tuple[OperationResult, ...]
-    stage: Stage
-    applied: int = 0
-    pending: bool = False
 
 
 def now() -> str:
@@ -64,12 +43,12 @@ class EditLifecycle:
         self.session = session
         self.timeouts = timeouts
 
-    async def load(self, lines: list[str]) -> tuple[list[OperationResult], int]:
-        """The candidate loaded in one call, under a command timeout per line and one for the lock, since a CLI types it line by line; without a candidate model, line by line here, so the lines applied are known. The first call is the session's first operation, so it has the setup timeout too: a transport may start its shell there."""
+    async def load(self, lines: list[str]) -> list[OperationResult]:
+        """The candidate loaded in one call, under a command timeout per line and one for the lock, since a CLI types it line by line; without a candidate model, line by line here, one operation per line, so the lines applied are known. The first call is the session's first operation, so it has the setup timeout too: a transport may start its shell there."""
         if self.dialect.has_candidate:
             op = await operation("load", lambda: self.communicator.load(self.session, lines),
                                  max(2, len(lines) + 1) * self.timeouts.command + self.timeouts.setup)
-            return [op], 0 if failed(op) else len(lines)
+            return [op]
         ops: list[OperationResult] = []
         for line in lines:
             first = self.timeouts.setup if not ops else 0
@@ -77,7 +56,7 @@ class EditLifecycle:
                                        self.timeouts.command + first))
             if failed(ops[-1]):
                 break
-        return ops, len(ops) - (1 if ops and failed(ops[-1]) else 0)
+        return ops
 
     async def diff(self) -> OperationResult:
         return await operation("diff", lambda: self.communicator.diff(self.session), 2 * self.timeouts.command)
@@ -88,20 +67,19 @@ class EditLifecycle:
                                self.timeouts.commit)
 
     async def run(self, lines: list[str], edit: EditSettings, before_commit: Callable[[], None] = lambda: None,
-                  on_step: Callable[[str], None] = lambda name: None) -> EditOutcome:
-        """The state machine from LOAD; the caller has opened the session and closes it after. A diff whose data is False ends it: nothing to commit. `on_step` names each step as it starts; `before_commit` runs once the commit is about to be sent, so an interrupt waits for it."""
+                  on_step: Callable[[str], None] = lambda _: None) -> list[OperationResult]:
+        """The operations from LOAD on; the caller has opened the session and closes it after. A diff whose data is False ends it: nothing to commit. `on_step` names each step as it starts; `before_commit` runs once the commit is about to be sent, so an interrupt waits for it."""
         on_step("load")
-        ops, applied = await self.load(lines)
+        ops = await self.load(lines)
         if failed(ops[-1]):
-            return EditOutcome(tuple(ops), Stage.LOAD, applied)
+            return ops
         on_step("diff")
         ops.append(await self.diff())
         if failed(ops[-1]) or not edit.apply or ops[-1].outcome.data is False:
-            return EditOutcome(tuple(ops), Stage.DIFF, applied)
+            return ops
         before_commit()
         ops.append(await self.commit(edit))
-        pending = not failed(ops[-1]) and bool(edit.confirmed_minutes)
-        return EditOutcome(tuple(ops), Stage.PENDING if pending else Stage.COMMIT, applied, pending)
+        return ops
 
 
 async def confirm(communicator: Communicator, session: Session, timeouts: Timeouts,
