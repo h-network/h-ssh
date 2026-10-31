@@ -65,9 +65,9 @@ def test_a_local_failure_never_cools_the_device():
     assert in_session(FaultKind.LOCAL, True, read=False) == Verdict(Action.FAIL)
 
 
-def test_an_unknown_commit_outcome_fails_cools_and_is_flagged():
+def test_an_unknown_commit_outcome_fails_and_cools():
     verdict = in_session(FaultKind.OUTCOME_UNKNOWN, True, read=False)
-    assert verdict.action is Action.FAIL and verdict.cool_down and "check the device" in verdict.note
+    assert verdict.action is Action.FAIL and verdict.cool_down
 
 
 def test_retries_come_from_the_settings():

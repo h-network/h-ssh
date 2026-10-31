@@ -24,11 +24,10 @@ class Action(Enum):
 
 @dataclass(frozen=True)
 class Verdict:
-    """What the policy decided for one fault: the action, whether the device is cooled down, and a note for the report."""
+    """What the policy decided for one fault: the action and whether the device is cooled down."""
 
     action: Action
     cool_down: bool = False
-    note: str | None = None
 
 
 class SafetyGate(Protocol):
@@ -70,7 +69,7 @@ def decide(fault: Fault, *, read: bool, editing: bool, operation: str, attempt: 
     if kind in (FaultKind.UNREACHABLE, FaultKind.AUTH, FaultKind.HOST_KEY, FaultKind.UNSUPPORTED, FaultKind.LOCAL):
         return Verdict(Action.FAIL)
     if kind is FaultKind.OUTCOME_UNKNOWN:
-        return Verdict(Action.FAIL, cool_down=True, note="commit outcome unknown: check the device")
+        return Verdict(Action.FAIL, cool_down=True)
     if kind in (FaultKind.TIMEOUT, FaultKind.SESSION_LOST):
         if read and retries_left:
             return Verdict(Action.RETRY)

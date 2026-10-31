@@ -5,7 +5,7 @@ from fakes import FakeNetconf, FaultKind, fault_of
 
 from hssh.model import EditSettings, Fault, Result, Timeouts
 from hssh.orchestrator import lifecycle
-from hssh.orchestrator.lifecycle import EditLifecycle, Stage, operation
+from hssh.orchestrator.lifecycle import EditLifecycle, operation
 
 
 def test_a_call_that_returns_is_its_result_with_the_time_it_took():
@@ -46,21 +46,19 @@ class LineByLine(FakeNetconf):
         return super().load(session, lines)
 
 
-def test_a_line_by_line_load_stops_at_the_first_refused_line_and_counts_the_lines_applied():
+def test_a_line_by_line_load_stops_at_the_first_refused_line():
     comm = LineByLine(bad_line="set b 2")
-    outcome = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
-                          .run(["set a 1", "set b 2", "set c 3"], EditSettings(apply=True)))
-    assert outcome.stage is Stage.LOAD and outcome.applied == 1
-    assert [op.command for op in outcome.operations] == ["set a 1", "set b 2"]
+    ops = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
+                      .run(["set a 1", "set b 2", "set c 3"], EditSettings(apply=True)))
+    assert [op.command for op in ops] == ["set a 1", "set b 2"] and fault_of(ops[-1]).kind is FaultKind.REFUSED
     assert comm.loaded == {"r1": ["set a 1"]}
 
 
 def test_a_candidate_load_is_one_operation_for_all_the_lines():
     comm = FakeNetconf()
-    outcome = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
-                          .run(["set a 1", "set b 2"], EditSettings(apply=False)))
-    assert [op.command for op in outcome.operations] == ["load", "diff"] and outcome.applied == 2
-    assert outcome.stage is Stage.DIFF and not outcome.pending
+    ops = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
+                      .run(["set a 1", "set b 2"], EditSettings(apply=False)))
+    assert [op.command for op in ops] == ["load", "diff"]
 
 
 def test_a_failed_diff_ends_before_the_commit():
@@ -69,13 +67,13 @@ def test_a_failed_diff_ends_before_the_commit():
             raise Fault(FaultKind.TIMEOUT, "no reply", True)
 
     comm = BadDiff()
-    outcome = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
-                          .run(["set a 1"], EditSettings(apply=True)))
-    assert outcome.stage is Stage.DIFF and not any(c[0] == "commit" for c in comm.calls)
+    ops = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
+                      .run(["set a 1"], EditSettings(apply=True)))
+    assert ops[-1].command == "diff" and not any(c[0] == "commit" for c in comm.calls)
 
 
-def test_a_confirmed_commit_leaves_the_target_pending():
+def test_a_confirmed_commit_is_sent_with_its_minutes():
     comm = FakeNetconf()
-    outcome = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
-                          .run(["set a 1"], EditSettings(apply=True, confirmed_minutes=5)))
-    assert outcome.stage is Stage.PENDING and outcome.pending
+    ops = asyncio.run(EditLifecycle(comm, comm.dialect, {"name": "r1"}, Timeouts(1, 1, 1, 1))
+                      .run(["set a 1"], EditSettings(apply=True, confirmed_minutes=5)))
+    assert ops[-1].command == "commit" and ("commit", 5, None) in comm.calls

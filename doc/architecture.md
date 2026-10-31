@@ -351,7 +351,7 @@ device, unless the dialect marks it as a read.
 | `AUTH`, `HOST_KEY` | fail | fail | n/a |
 | `TIMEOUT`, `SESSION_LOST` in session | retry | fail | fail, cool down |
 | `REFUSED`, `COMMIT_FAILED` | fail | fail | fail, cool down |
-| `OUTCOME_UNKNOWN` | n/a | n/a | fail, cool down, never retried or rolled back, the session discarded, flagged for manual check |
+| `OUTCOME_UNKNOWN` | n/a | n/a | fail, cool down, never retried or rolled back, the session discarded |
 | `UNSUPPORTED`, `LOCAL` | fail | fail | fail |
 
 The retry count, pauses and cooldown period are policy settings, not communicator settings. A cooldown is only
