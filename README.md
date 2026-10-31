@@ -79,5 +79,7 @@ its own command or list; a device not in the mapping is skipped, in one run with
 `Fleet(label=…)`, or `--label TEXT` and the run file's `label` key on the CLI, tags the run with free text that
 `h-ssh-store` lists and selects by. `reachable(timeout=None)` returns `{name: None or Fault}` without logging in (a device that cannot be probed is absent);
 a run that recorded nothing (no store) has `run_id` None, shown as "no run" in text and `null` in `--json`.
+A Fleet refuses an empty password (pass `None` for keys or an agent), an unknown vendor and a target string that
+reads as a path but is not a file, at construction.
 
 Documentation: [architecture](doc/architecture.md), [testing](doc/testing.md), [result store](doc/store.md), [NETCONF](doc/netconf.md).

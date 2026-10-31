@@ -23,9 +23,10 @@ from typing import Any, Callable, Sequence
 from hssh.dialects.base import Dialect
 from hssh.drivers import Registry
 from hssh.frontends import profiles, settings
-from hssh.frontends.settings import load_config
+from hssh.frontends.settings import HOST_KEY_CHOICES, TRANSPORT_CHOICES, check_value, load_config
 from hssh.frontends.fleet import (
-    LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, package_version, parse_target, quiet_library_logs,
+    LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, not_a_path, package_version, parse_target,
+    quiet_library_logs,
 )
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
@@ -42,8 +43,6 @@ from hssh.paths import path_inside, validate_device_name
 from hssh.screen import is_terminal, terminal_safe
 from hssh.store import Store, operation_dict
 
-TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
-HOST_KEY_CHOICES = ("accept-new", "strict", "off")
 
 CONFIG_DEFAULTS: dict[str, Any] = {
     "transport": DEFAULT_TRANSPORT, "vendor": DEFAULT_VENDOR, "user": None, "workers": DEFAULT_WORKERS,
@@ -67,6 +66,15 @@ class _Parser(argparse.ArgumentParser):
 def default_devices_path() -> str:
     home = Path.home() / ".h-ssh" / "devices.csv"
     return str(home) if home.exists() else "devices.csv"
+
+
+def ranged_int(key: str):
+    def convert(text: str) -> int:
+        try:
+            return check_value(key, text)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e)) from None
+    return convert
 
 
 def seconds_arg(text: str) -> float:
@@ -121,21 +129,21 @@ def build_parser() -> _Parser:
                       help="commit synchronize on the edit or the confirm (dual routing engines; NETCONF only)")
 
     behaviour = p.add_argument_group("behaviour")
-    behaviour.add_argument("--workers", type=int)
-    behaviour.add_argument("--retries", type=int)
-    behaviour.add_argument("--retry-pause", type=int, metavar="SECONDS")
-    behaviour.add_argument("--connect-timeout", type=int, metavar="SECONDS")
-    behaviour.add_argument("--session-timeout", type=int, metavar="SECONDS",
+    behaviour.add_argument("--workers", type=ranged_int("workers"))
+    behaviour.add_argument("--retries", type=ranged_int("retries"))
+    behaviour.add_argument("--retry-pause", type=ranged_int("retry_pause"), metavar="SECONDS")
+    behaviour.add_argument("--connect-timeout", type=ranged_int("connect_timeout"), metavar="SECONDS")
+    behaviour.add_argument("--session-timeout", type=ranged_int("session_timeout"), metavar="SECONDS",
                            help="seconds for the session setup after the SSH banner: key exchange, login, NETCONF hello")
-    behaviour.add_argument("--command-timeout", type=int, metavar="SECONDS")
-    behaviour.add_argument("--commit-timeout", type=int, metavar="SECONDS")
+    behaviour.add_argument("--command-timeout", type=ranged_int("command_timeout"), metavar="SECONDS")
+    behaviour.add_argument("--commit-timeout", type=ranged_int("commit_timeout"), metavar="SECONDS")
     behaviour.add_argument("--host-key-policy", choices=HOST_KEY_CHOICES)
     behaviour.add_argument("--probe", dest="probe", action="store_const", const=True, default=None, help="reachability check before the run")
     behaviour.add_argument("--no-probe", dest="probe", action="store_const", const=False)
     behaviour.add_argument("--skip-unreachable", action="store_const", const=True, default=None,
                            help="edits: go on without the devices the probe found dead; they are skipped")
-    behaviour.add_argument("--cooldown", type=int, metavar="SECONDS")
-    behaviour.add_argument("--rate-limit", type=int, metavar="PER_MINUTE")
+    behaviour.add_argument("--cooldown", type=ranged_int("cooldown"), metavar="SECONDS")
+    behaviour.add_argument("--rate-limit", type=ranged_int("rate_limit"), metavar="PER_MINUTE")
     behaviour.add_argument("--safety-file", metavar="FILE", help="safety gate state (or HSSH_SAFETY_FILE); off without one")
     behaviour.add_argument("--every", type=seconds_arg, metavar="SECONDS",
                            help="watch: run the reads again every SECONDS and print, per tick, what changed since the last kept run")
@@ -180,17 +188,12 @@ def apply_config_defaults(args: argparse.Namespace, config: dict[str, str]) -> N
         if key not in config:
             setattr(args, key, fallback)
             continue
-        value: Any = config[key]
-        if isinstance(fallback, bool):
-            value = value.lower() in ("yes", "true", "1", "on")
-        elif isinstance(fallback, int):
-            value = int(value)
-        setattr(args, key, value)
+        setattr(args, key, check_value(key, config[key]))
 
 
 def resolve_targets(args: argparse.Namespace) -> tuple[Target, ...]:
     if args.target:
-        targets = [parse_target(s, args.transport, args.vendor) for s in args.target]
+        targets = [parse_target(not_a_path(s), args.transport, args.vendor) for s in args.target]
     else:
         targets = load_devices_csv(args.devices or default_devices_path(), args.transport, args.vendor)
     for target in targets:
@@ -265,9 +268,14 @@ def resolve_credentials(args: argparse.Namespace) -> Credentials:
     """The user as resolved (flag, run file, HSSH_USER, config), else the login name; the password from HSSH_PASSWORD or a prompt."""
     user = args.user or default_username()
     password = os.environ.get("HSSH_PASSWORD")
-    if password is None and sys.stdin.isatty():
-        password = getpass.getpass(f"Password for {user}: ") or None
-    return Credentials(username=user, password=password)
+    if password == "" and not sys.stdin.isatty():
+        raise ValueError("HSSH_PASSWORD is set but empty; a pipeline whose secret lookup came back empty does not run")
+    if not password and sys.stdin.isatty():
+        try:
+            password = getpass.getpass(f"Password for {user} (Enter skips to keys): ") or None
+        except EOFError:
+            raise ValueError("no password given at the prompt (Enter skips it); nothing was sent") from None
+    return Credentials(username=user, password=password or None)
 
 
 def target_dialects(targets: Sequence[Target]) -> dict[str, Dialect]:
@@ -412,12 +420,18 @@ def render(report: RunReport, args: argparse.Namespace, out=sys.stdout) -> None:
             continue
         if args.raw and any(not isinstance(op.outcome, Fault) for op in tr.operations):
             print(f"{tr.target.name}:", file=out)
+        elif report.mode == "edit" and not args.raw:
+            print(f"=== {tr.target.name} ({tr.target.host}) {tr.status} [{sum(op.elapsed_ms for op in tr.operations)} ms]", file=out)
         for op in tr.operations:
             if isinstance(op.outcome, Fault) and op.command == "close":
                 print(f"WARNING: {tr.target.name}: close failed: {op.outcome.detail}", file=sys.stderr)
                 continue
             if isinstance(op.outcome, Fault):
                 print(f"{tr.target.name}: FAIL {op.command}: {op.outcome.kind.name} {safe(op.outcome.detail)}", file=out)
+                continue
+            if report.mode == "edit" and not args.raw:
+                if op.outcome.output.strip():
+                    print("\n".join(f"  {line}" if line.strip() else "" for line in safe(op.outcome.output).splitlines()), file=out)
                 continue
             if not args.raw:
                 print(f"=== {tr.target.name} ({tr.target.host}) {op.command} [{op.elapsed_ms} ms]", file=out)
@@ -602,7 +616,10 @@ def main(argv: list[str] | None = None, runner: Runner = run) -> int:
             print("\n".join(profiles.listing_lines()))
             return EXIT_OK
         if args.run:
-            apply_run(args, validate_run(load_run_file(args.run), args.run), typed)
+            run_file = validate_run(load_run_file(args.run), args.run)
+            applied = apply_run(args, run_file, typed)
+            if "devices" in run_file and "devices" not in applied:
+                print(f"Run file '{args.run}': 'devices' is ignored; the targets on the command line win", file=sys.stderr)
         if args.profile:
             args.batch = str(profiles.profile_path(args.profile))
         apply_config_defaults(args, load_config(args.config))
