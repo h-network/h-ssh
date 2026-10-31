@@ -23,6 +23,7 @@ from hssh.orchestrator.recorder import Recorder, StoreWriter
 from hssh.orchestrator.sessions import LoginRefused, SessionManager, session_key
 
 READ_MODES = ("show", "batch", "structured", "commit_status")
+COMMAND_MODES = ("show", "batch", "structured")
 DISCARDING = (FaultKind.TIMEOUT, FaultKind.SESSION_LOST, FaultKind.OUTCOME_UNKNOWN)
 
 
@@ -208,6 +209,8 @@ class Scheduler:
                                            "skipped")
             if why := driver.dialect.check_edit(list(lines)):
                 return self._failed_before(run, target, Fault(FaultKind.LOCAL, why, False))
+        elif spec.mode in COMMAND_MODES and self._commands_for(spec, target) is None:
+            return self._failed_before(run, target, Fault(FaultKind.LOCAL, "no commands for this target", False), "skipped")
         attempt = 1
         while True:
             tried = await self._attempt(run, index, target, driver, attempt)
@@ -265,7 +268,7 @@ class Scheduler:
             else:
                 f = Fault(FaultKind.LOCAL, "interrupted while connecting", False)
             opened = OperationResult(OPEN, f, started, int((time.monotonic() - t0) * 1000))
-            verdict = self._judge(spec, driver, opened, attempt)
+            verdict = self._judge(spec, driver, target, opened, attempt)
             self.policy.settle(device, verdict)
             return _Attempt([opened], verdict)
         ops: list[OperationResult] = []
@@ -282,7 +285,7 @@ class Scheduler:
             await self.sessions.release(driver, target, creds, discard=stale, timeouts=timeouts,
                                         host_key_policy=spec.host_key_policy)
         first_fault = next((op for op in ops if isinstance(op.outcome, Fault)), None)
-        verdict = None if first_fault is None else self._judge(spec, driver, first_fault, attempt)
+        verdict = None if first_fault is None else self._judge(spec, driver, target, first_fault, attempt)
         self.policy.settle(device, verdict)
         return _Attempt(ops, verdict)
 
@@ -304,29 +307,30 @@ class Scheduler:
         def step(name: str) -> None:
             run.steps[index] = name
 
-        if spec.mode in ("show", "batch"):
+        if spec.mode in COMMAND_MODES:
+            if spec.mode == "structured":
+                def call(c: str) -> Result:
+                    return comm.structured(session, c, spec.format)
+            else:
+                def call(c: str) -> Result:
+                    return comm.show(session, c)
+
             ops: list[OperationResult] = []
-            for command in spec.commands:
+            commands = self._commands_for(spec, target) or ()
+            for n, command in enumerate(commands):
                 step(command)
-                ops.append(await operation(command, lambda c=command: comm.show(session, c), spec.timeouts.command))
+                ops.append(await operation(command, lambda c=command: call(c), spec.timeouts.command))
                 if not isinstance(ops[-1].outcome, Fault):
                     continue
                 if ops[-1].outcome.kind is FaultKind.SESSION_LOST:
                     break
-                if ops[-1].outcome.kind is FaultKind.TIMEOUT and command != spec.commands[-1]:
+                if ops[-1].outcome.kind is FaultKind.TIMEOUT and n < len(commands) - 1:
                     try:
                         session = await self._fresh(run, index, target, driver, borrow)
                     except Fault as f:
                         ops.append(OperationResult(OPEN, f, now(), 0))
                         break
                     borrow.fresh_at = len(ops)
-            return ops
-        if spec.mode == "structured":
-            ops = []
-            for command in spec.commands:
-                step(command)
-                ops.append(await operation(command, lambda c=command: comm.structured(session, c, spec.format),
-                                           spec.timeouts.command))
             return ops
         if spec.mode == "edit":
             def before_commit() -> None:
@@ -363,13 +367,18 @@ class Scheduler:
         return spec.payloads.get(target.name) or spec.config_lines or (None if spec.payloads else ())
 
     @staticmethod
+    def _commands_for(spec: RunSpec, target: Target) -> tuple[str, ...] | None:
+        """The target's own commands, else the run's; None when per-target commands are given and it has neither."""
+        return spec.commands_by_target.get(target.name) or spec.commands or (None if spec.commands_by_target else ())
+
+    @staticmethod
     def _interrupted_connect(ops: list[OperationResult]) -> bool:
         """A connect the interrupt cut short, or an unanswered one the interrupt kept from its retry: the only operation is an open fault that reached nothing (never message text)."""
         return len(ops) == 1 and ops[0].command == OPEN and isinstance(ops[0].outcome, Fault) and not ops[0].outcome.reached_device
 
-    def _judge(self, spec: RunSpec, driver: Driver, op: OperationResult, attempt: int) -> Verdict:
-        """The policy's verdict on a failed operation; a run reads when its mode and every command do."""
-        read = spec.mode in READ_MODES and all(is_read(driver.dialect, c) for c in spec.commands)
+    def _judge(self, spec: RunSpec, driver: Driver, target: Target, op: OperationResult, attempt: int) -> Verdict:
+        """The policy's verdict on a failed operation; a target's run reads when its mode and every one of its commands do."""
+        read = spec.mode in READ_MODES and all(is_read(driver.dialect, c) for c in self._commands_for(spec, target) or ())
         return decide(op.outcome, read=read, editing=spec.mode == "edit", operation=op.command, attempt=attempt,
                       settings=self.policy.settings)
 
@@ -501,14 +510,15 @@ def _all_synchronize(spec: RunSpec, registry: DriverRegistry) -> bool:
 
 
 def _structured_refusal(spec: RunSpec) -> str | None:
-    """Why a structured run cannot start: it is one show command, on one line, in json or xml."""
+    """Why a structured run cannot start: show commands, each on one line, at least one for the run or per target, in json or xml."""
     if spec.format not in ("json", "xml"):
         return "structured mode needs a format, json or xml"
-    if len(spec.commands) != 1:
-        return f"structured mode runs exactly one show command, not {len(spec.commands)}"
-    command = spec.commands[0]
-    if command.split()[:1] != ["show"] or "\n" in command or "\r" in command:
-        return f"structured mode runs one show command, not {command!r}"
+    lists = [spec.commands, *spec.commands_by_target.values()]
+    if not any(lists):
+        return "structured mode needs at least one show command"
+    for command in (c for commands in lists for c in commands):
+        if command.split()[:1] != ["show"] or "\n" in command or "\r" in command:
+            return f"structured mode runs show commands, not {command!r}"
     return None
 
 
