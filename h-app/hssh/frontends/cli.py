@@ -119,6 +119,8 @@ def build_parser() -> _Parser:
                       help=f"commit confirmed, minutes (default {DEFAULT_CONFIRMED_MINUTES})")
     edit.add_argument("--comment", metavar="TEXT", help="commit comment")
     edit.add_argument("--allow-missing", action="store_true", help="-eD: skip the targets that have no <NAME>.set")
+    edit.add_argument("--synchronize", action="store_true",
+                      help="commit synchronize on the edit or the confirm (dual routing engines; NETCONF only)")
 
     behaviour = p.add_argument_group("behaviour")
     behaviour.add_argument("--workers", type=int)
@@ -215,6 +217,8 @@ def resolve_mode(args: argparse.Namespace) -> Mode:
                             ("--commit-confirmed", args.commit_confirmed is not None)):
             if given:
                 raise ValueError(f"{flag} goes with an edit (-eC, -eB, -eD); it would do nothing here")
+    if args.synchronize and chosen[0] not in ("edit", "confirm"):
+        raise ValueError("--synchronize goes with an edit (-eC, -eB, -eD) or --confirm; it would do nothing here")
     if args.every is not None and chosen[0] not in ("show", "batch"):
         raise ValueError("--every repeats reads (-sC, --batch, --profile), not edits, confirms or the commit status")
     return chosen[0]
@@ -371,8 +375,11 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         payloads = edit_payloads(args, targets)
     edit = None
     if mode == "edit":
-        edit = EditSettings(apply=args.yes, confirmed_minutes=args.commit_confirmed, comment=args.comment)
+        edit = EditSettings(apply=args.yes, confirmed_minutes=args.commit_confirmed, comment=args.comment,
+                            synchronize=args.synchronize)
         check_edit_args(args, edit)
+    elif mode == "confirm" and args.synchronize:
+        edit = EditSettings(apply=True, synchronize=True)
     safety = None
     if args.safety_file:
         safety = SafetySettings(cooldown_seconds=args.cooldown, rate_limit=args.rate_limit, safety_file=args.safety_file)
