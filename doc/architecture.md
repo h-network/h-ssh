@@ -373,10 +373,16 @@ SSH banner, `setup` as one deadline from the banner across key exchange, login a
 operation, `commit`), the structured `format`, the worker limit, the host-key policy, the probe and
 `skip_unreachable` switches, the edit settings (`apply`, `confirmed_minutes`, `comment`, `synchronize`), the retry
 policy, the safety settings, and the recording settings (the record paths, and the run row's provenance: `argv`,
-`origin` and `version`, supplied by the front end, all optional). Every setting the orchestrator owns defaults to
-`None` and is filled by the orchestrator.
+`origin`, `version` and a free-text `label`, supplied by the front end, all optional; the label is a run selector
+and filter in `h-ssh-store`). Every setting the orchestrator owns defaults to `None` and is filled by the
+orchestrator.
 
 Structured mode is the library's call, `Fleet.structured(commands, fmt)`: one or more `show` commands, each on one line, for the run or per target, with `fmt` `json` or `xml`, all checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The commands run as a batch does (5.2), one `structured` call per command; the NETCONF communicator asks PyEZ for each in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None. The CLI has no structured mode.
+
+`config` is the library's call too, `Fleet.config(fmt)`: the whole committed configuration, json or xml, through
+PyEZ's configuration call with `database` `committed` (Junos returns the candidate unless asked otherwise), saved as
+PyEZ returns it in `Result.output` with `data` None; NETCONF only, no paths; a read, retried as `show` is. A run
+that recorded nothing (no store) reports `run_id` None, never 0.
 
 ### 5.2 Concurrency
 

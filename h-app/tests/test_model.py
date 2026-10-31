@@ -62,7 +62,7 @@ def test_policy_retries_and_pause_have_no_defaults():
 
 def test_safety_file_and_every_record_path_are_optional():
     assert SafetySettings(300, 6).safety_file is None
-    assert dataclasses.astuple(RecordSettings()) == (None, None, None, None, None, None, None)
+    assert dataclasses.astuple(RecordSettings()) == (None, None, None, None, None, None, None, None)
 
 
 def test_record_provenance_is_optional_and_kept_as_given():
@@ -85,7 +85,7 @@ def test_a_run_spec_leaves_every_orchestrator_owned_setting_unset():
 
 
 def test_the_literal_types_name_exactly_the_documented_values():
-    assert typing.get_args(model.Mode) == ("show", "batch", "structured", "edit", "confirm", "commit_status")
+    assert typing.get_args(model.Mode) == ("show", "batch", "structured", "config", "edit", "confirm", "commit_status")
     assert typing.get_args(model.HostKeyPolicy) == ("accept-new", "strict", "off")
     assert typing.get_args(model.TargetStatus) == ("ok", "failed", "skipped")
 
