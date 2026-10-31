@@ -1,4 +1,4 @@
-"""The openssh communicator: the system ssh binary on a forced pty, driven by the CLI engine (section 3.4)."""
+"""The openssh communicator: the system ssh binary, shows on exec over one ControlMaster per session, edits on a pty shell through it driven by the CLI engine (section 3.4)."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ PROBE_SECONDS = 5
 
 _POLL = 0.1
 
-# Rows and columns ssh requests for the remote pty, the size paramiko's shell asks for (#166).
+# Rows and columns ssh requests for the remote pty, the size paramiko's shell asks for.
 _PTY_SIZE = (1000, 511)
 
 _BANNER = "Remote protocol version"
@@ -113,7 +113,6 @@ class _AskPass:
     @property
     def env(self) -> dict[str, str]:
         env = _without_password()
-        env["TERM"] = "vt100"
         if not self.password:
             return env
         env["SSH_ASKPASS"] = self.path
@@ -211,7 +210,7 @@ def _valid_command(command: str) -> str:
     return text
 
 
-def _login_fault(host: str, log: str, waited: int | None = None) -> Fault:
+def _login_fault(log: str, waited: int | None = None) -> Fault:
     """Classify a failed login from ssh's own log; `waited` is the wait that ran out, in seconds, when one did."""
     detail = "\n".join(ln for ln in log.splitlines() if ln.strip() and not ln.startswith("debug"))
     reached = _BANNER in log
@@ -369,7 +368,7 @@ class OpenSSH:
                 except (ConnectionError, TimeoutError) as exc:
                     log = _read(log_path)
                     waited = (timeouts.setup if _BANNER in log else timeouts.connect) if isinstance(exc, TimeoutError) else None
-                    raise _login_fault(target.host, log, waited) from exc
+                    raise _login_fault(log, waited) from exc
         except BaseException:
             self.discard(session)
             raise
@@ -440,7 +439,7 @@ class OpenSSH:
             self.discard(session)
             channel.close()
             waited = session.timeouts.setup if isinstance(exc, TimeoutError) else None
-            raise _login_fault(session.target.host, log, waited) from exc
+            raise _login_fault(log, waited) from exc
         except BaseException:
             self.discard(session)
             channel.close()
