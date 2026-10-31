@@ -23,10 +23,9 @@ from typing import Any, Callable, Sequence
 from hssh.dialects.base import Dialect
 from hssh.drivers import Registry
 from hssh.frontends import profiles, settings
-from hssh.frontends.settings import CREDENTIAL_KEYS, load_config  # noqa: F401
+from hssh.frontends.settings import load_config
 from hssh.frontends.fleet import (
     LIBRARY_LOGGERS, Runner, check_unique, load_devices_csv, package_version, parse_target, quiet_library_logs,
-    run_spec,
 )
 from hssh.frontends.runfile import apply_run, load_run_file, validate_run
 from hssh.model import (
@@ -37,7 +36,7 @@ from hssh.orchestrator import (
     DEFAULT_CONFIRMED_MINUTES, DEFAULT_HOST_KEY_POLICY, DEFAULT_POLICY, DEFAULT_PROBE, DEFAULT_SAFETY,
     DEFAULT_SKIP_UNREACHABLE,
     DEFAULT_STORE, DEFAULT_TIMEOUTS, DEFAULT_TRANSPORT, DEFAULT_VENDOR, DEFAULT_WORKERS, check_comment,
-    check_confirmed_minutes, default_username,
+    check_confirmed_minutes, default_username, run,
 )
 from hssh.paths import path_inside, validate_device_name
 from hssh.screen import is_terminal, terminal_safe
@@ -46,7 +45,6 @@ from hssh.store import Store, operation_dict
 TRANSPORT_CHOICES = ("ssh", "openssh", "netconf", "telnet")
 HOST_KEY_CHOICES = ("accept-new", "strict", "off")
 
-# Config-file keys with the orchestrator's default; None means "no value".
 CONFIG_DEFAULTS: dict[str, Any] = {
     "transport": DEFAULT_TRANSPORT, "vendor": DEFAULT_VENDOR, "user": None, "workers": DEFAULT_WORKERS,
     "connect_timeout": DEFAULT_TIMEOUTS.connect, "session_timeout": DEFAULT_TIMEOUTS.setup,
@@ -567,7 +565,7 @@ def watch(args: argparse.Namespace, spec: RunSpec, runner: Runner, reader: Calla
         return EXIT_INTERRUPTED
 
 
-def main(argv: list[str] | None = None, runner: Runner = run_spec) -> int:
+def main(argv: list[str] | None = None, runner: Runner = run) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     parser = build_parser()
     args = parser.parse_intermixed_args(argv)
