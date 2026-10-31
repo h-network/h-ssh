@@ -368,6 +368,9 @@ for what the device did: no fault with `reached_device` false cools a device dow
 
 ### 5.1 RunSpec
 
+A target's port, when given, is a whole number from 1 to 65535, checked once when the `Target` is made (a boolean
+is not a number), so the CLI, run files and the library share the rule; the CLI reports it as a usage error.
+
 A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
 `commit_status`), the commands or configuration lines, the per-target commands for `show`, `batch` and
 `structured` (`commands_by_target`, a target name to its own commands; a target not named gets the commands, and
