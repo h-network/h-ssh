@@ -428,7 +428,8 @@ class NetconfSession(Session):
 class NetconfCommunicator(Communicator):
     default_port: int = 830
     banner: bytes | None = b"SSH-"
-    capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "edit", "commit_confirmed", "confirm", "commit_status"})
+    capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "edit", "commit_confirmed", "confirm", "commit_status",
+                                              "synchronize"})
     ssh_config = "paramiko"
 
     def __init__(self, dialect: Dialect) -> None:
