@@ -297,7 +297,7 @@ class Communicator(Protocol):
     def commit_history(self, session: Session) -> Result: ...                 # data: CommitStatus
 ```
 
-Batch execution is the orchestrator calling `show` repeatedly on one session.
+Batch execution is the orchestrator calling `show` (or `structured`, in a structured run) repeatedly on one session.
 A refused or timed-out command does not stop the batch; a lost session does.
 
 ### 4.2 Result
@@ -374,7 +374,7 @@ policy, the safety settings, and the recording settings (the record paths, and t
 `origin` and `version`, supplied by the front end, all optional). Every setting the orchestrator owns defaults to
 `None` and is filled by the orchestrator.
 
-Structured mode is the library's call, `Fleet.structured(command, fmt)`: exactly one `show` command on one line, with `fmt` `json` or `xml`, both checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The NETCONF communicator asks PyEZ for the command in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; the CLI has no structured mode.
+Structured mode is the library's call, `Fleet.structured(commands, fmt)`: one or more `show` commands, each on one line, for the run or per target, with `fmt` `json` or `xml`, all checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The commands run as a batch does (5.2), one `structured` call per command; the NETCONF communicator asks PyEZ for each in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None. The CLI has no structured mode.
 
 ### 5.2 Concurrency
 
