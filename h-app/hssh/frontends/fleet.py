@@ -164,6 +164,24 @@ def check_unique(targets: Sequence[Target]) -> None:
         by_host[where] = t.name
 
 
+Commands = Union[str, Sequence[str], Mapping[str, Union[str, Sequence[str]]]]
+
+
+def split_commands(given: Commands) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    """(commands for every target, commands by target name): a string is one command, a sequence several, a mapping per target."""
+    def lines(value: str | Sequence[str]) -> tuple[str, ...]:
+        return (value,) if isinstance(value, str) else tuple(value)
+
+    if isinstance(given, Mapping):
+        if not given:
+            raise ValueError("no commands: the mapping is empty")
+        return (), {name: lines(value) for name, value in given.items()}
+    commands = lines(given)
+    if not commands:
+        raise ValueError("no commands")
+    return commands, {}
+
+
 def close_sessions(sessions, wait: float) -> None:
     """Close a Fleet's kept sessions; also what a Fleet dropped without close() runs on collection or at exit."""
     asyncio.run(sessions.close_all(timeout=wait))
@@ -237,8 +255,10 @@ class Fleet:
 
     def spec(self, mode: Mode, commands: Sequence[str] = (), config_lines: Sequence[str] = (),
              payloads: Mapping[str, Sequence[str]] | None = None, format: str | None = None,
-             edit: EditSettings | None = None, skip_unreachable: bool | None = None) -> RunSpec:
+             edit: EditSettings | None = None, skip_unreachable: bool | None = None,
+             commands_by_target: Mapping[str, Sequence[str]] | None = None) -> RunSpec:
         return RunSpec(targets=self.targets, mode=mode, commands=tuple(commands),
+                       commands_by_target={name: tuple(lines) for name, lines in (commands_by_target or {}).items()},
                        config_lines=tuple(config_lines),
                        payloads={name: tuple(lines) for name, lines in (payloads or {}).items()},
                        format=format, credentials=self.credentials,
@@ -246,17 +266,24 @@ class Fleet:
                        probe=self.probe, skip_unreachable=skip_unreachable, edit=edit, policy=self.policy,
                        safety=self.safety, recording=self.recording)
 
-    def show(self, command: str) -> RunReport:
-        return self._run(self.spec("show", commands=[command]))
+    def show(self, command: Commands) -> RunReport:
+        """One command on every target, or a mapping of target name to its own command (a target not named is skipped)."""
+        commands, by_target = split_commands(command)
+        if len(commands) > 1 or any(len(c) != 1 for c in by_target.values()):
+            raise ValueError("show takes one command per target; use batch for several")
+        return self._run(self.spec("show", commands=commands, commands_by_target=by_target))
 
-    def batch(self, commands: Iterable[str]) -> RunReport:
-        return self._run(self.spec("batch", commands=list(commands)))
+    def batch(self, commands: Commands) -> RunReport:
+        """Commands in order on every target, or a mapping of target name to its own list (a target not named is skipped)."""
+        commands, by_target = split_commands(commands)
+        return self._run(self.spec("batch", commands=commands, commands_by_target=by_target))
 
-    def structured(self, command: str, fmt: str) -> RunReport:
-        """The command's reply in `fmt`, json or xml, as the device returns it (NETCONF only); the library's alone, the CLI has no --format."""
+    def structured(self, command: Commands, fmt: str) -> RunReport:
+        """The replies in `fmt`, json or xml, as the device returns them (NETCONF only): one command, a list (one reply each) or a mapping per target; the library's alone, the CLI has no --format."""
         if fmt not in ("json", "xml"):
             raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
-        return self._run(self.spec("structured", commands=[command], format=fmt))
+        commands, by_target = split_commands(command)
+        return self._run(self.spec("structured", commands=commands, commands_by_target=by_target, format=fmt))
 
     def edit(self, lines: Iterable[str] | None = None, payloads: Mapping[str, Sequence[str]] | None = None,
              apply: bool = DEFAULT_EDIT.apply, confirmed_minutes: int | None = None, comment: str | None = None,

@@ -71,7 +71,9 @@ The CLI, the Fleet library API, run files and profiles are front ends. Each one:
 
 Front ends make no decisions about devices. A behaviour available in the CLI is available in the library
 through the same `RunSpec`; the one exception is `structured`, which is `Fleet.structured(command, fmt)` alone
-(`fmt` json or xml, required) — the CLI has no `--format` and the run file no `format` key (#220).
+(`fmt` json or xml, required) — the CLI has no `--format` and the run file no `format` key (#220). `Fleet.show`,
+`batch` and `structured` also take a mapping of target name to its own command(s), carried as `RunSpec.commands_by_target`
+(no CLI flag), and `structured` a list of commands, one reply each.
 
 `--every SECONDS` (1 to 86400) is a front-end loop: one run per tick with the same `RunSpec`, every tick
 kept in the store, and each tick's rows compared with the last kept run's through the store's reader
@@ -297,7 +299,7 @@ class Communicator(Protocol):
     def commit_history(self, session: Session) -> Result: ...                 # data: CommitStatus
 ```
 
-Batch execution is the orchestrator calling `show` repeatedly on one session.
+Batch execution is the orchestrator calling `show` (or `structured`, in a structured run) repeatedly on one session.
 A refused or timed-out command does not stop the batch; a lost session does.
 
 ### 4.2 Result
@@ -362,9 +364,11 @@ for what the device did: no fault with `reached_device` false cools a device dow
 ### 5.1 RunSpec
 
 A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`, `confirm`,
-`commit_status`), the commands or configuration lines, the per-target payloads (a target name to its own
-lines; a target not named gets the configuration lines, and when payloads are given a target in neither has no
-payload and is skipped), credentials, timeouts (`connect` for the TCP connect and the
+`commit_status`), the commands or configuration lines, the per-target commands for `show`, `batch` and
+`structured` (`commands_by_target`, a target name to its own commands; a target not named gets the commands, and
+when the mapping is given a target in neither has no commands and is skipped), the per-target payloads (a target
+name to its own lines; a target not named gets the configuration lines, and when payloads are given a target in
+neither has no payload and is skipped), credentials, timeouts (`connect` for the TCP connect and the
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
 operation, `commit`), the structured `format`, the worker limit, the host-key policy, the probe and
 `skip_unreachable` switches, the edit settings (`apply`, `confirmed_minutes`, `comment`, `synchronize`), the retry
@@ -372,7 +376,7 @@ policy, the safety settings, and the recording settings (the record paths, and t
 `origin` and `version`, supplied by the front end, all optional). Every setting the orchestrator owns defaults to
 `None` and is filled by the orchestrator.
 
-Structured mode is the library's call, `Fleet.structured(command, fmt)`: exactly one `show` command on one line, with `fmt` `json` or `xml`, both checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The NETCONF communicator asks PyEZ for the command in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; the CLI has no structured mode.
+Structured mode is the library's call, `Fleet.structured(commands, fmt)`: one or more `show` commands, each on one line, for the run or per target, with `fmt` `json` or `xml`, all checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The commands run as a batch does (5.2), one `structured` call per command; the NETCONF communicator asks PyEZ for each in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None. The CLI has no structured mode.
 
 ### 5.2 Concurrency
 

@@ -91,6 +91,7 @@ class RunSpec:
     targets: tuple[Target, ...]
     mode: Mode
     commands: tuple[str, ...] = ()
+    commands_by_target: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     config_lines: tuple[str, ...] = ()
     payloads: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     format: str | None = None
@@ -106,6 +107,7 @@ class RunSpec:
     recording: RecordSettings | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "commands_by_target", MappingProxyType(dict(self.commands_by_target)))
         object.__setattr__(self, "payloads", MappingProxyType(dict(self.payloads)))
 
 
