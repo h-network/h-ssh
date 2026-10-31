@@ -25,12 +25,21 @@ Measured on 250 Junos devices over NETCONF and SSH, the previous build (`develop
 
 A `Fleet` keeps one session per device across its calls. Three calls cost 250 logins instead of 750, and take 2.2–2.5× less time than three separate runs.
 
+## Install
+
+```sh
+pip install .
+```
+
+That is all: PyEZ (`junos-eznc`) is a required dependency, so there is no `[junos]` extra to ask for. The
+commands are `h-ssh` and `h-ssh-store`.
+
 ## Status
 
 Built, on `junos@netconf`, `junos@ssh` and `junos@openssh`:
 - shows and batches;
-- edits: dry run, apply, commit confirmed and confirm (`--synchronize` for dual routing engines, NETCONF only),
-  commit status, per-device payload files;
+- edits on all three transports, SSH and OpenSSH included: dry run, apply, commit confirmed and confirm
+  (`--synchronize` for dual routing engines, NETCONF only), commit status, per-device payload files;
 - the result store and the `h-ssh-store` reader;
 - the audit log and the safety gate;
 - session reuse.
