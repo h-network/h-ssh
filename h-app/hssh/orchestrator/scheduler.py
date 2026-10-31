@@ -16,13 +16,14 @@ from hssh.communicators.base import Session
 from hssh.drivers import Driver, DriverRegistry
 from hssh.model import (Fault, FaultKind, OperationResult, Result, RunReport, RunSpec, Target, TargetResult, TargetStatus)
 from hssh.orchestrator import lifecycle, probe
-from hssh.orchestrator.defaults import FDS_PER_PROBE, GRACE_SECONDS, check_edit, complete, fit_workers, open_file_limit
+from hssh.orchestrator.defaults import (FDS_PER_PROBE, GRACE_SECONDS, check_edit, check_label, complete, fit_workers,
+                                        open_file_limit)
 from hssh.orchestrator.lifecycle import EditLifecycle, now, operation
 from hssh.orchestrator.policy import OPEN, Action, Policy, SafetyGate, Verdict, decide, is_read
 from hssh.orchestrator.recorder import Recorder, StoreWriter
 from hssh.orchestrator.sessions import LoginRefused, SessionManager, session_key
 
-READ_MODES = ("show", "batch", "structured", "commit_status")
+READ_MODES = ("show", "batch", "structured", "config", "commit_status")
 COMMAND_MODES = ("show", "batch", "structured")
 DISCARDING = (FaultKind.TIMEOUT, FaultKind.SESSION_LOST, FaultKind.OUTCOME_UNKNOWN)
 
@@ -32,7 +33,7 @@ class _Run:
     """One run's live state: its tasks in target order, and what cancellation needs to know."""
 
     spec: RunSpec
-    run_id: int
+    run_id: int | None
     started: str
     tasks: list[asyncio.Task] = field(default_factory=list)
     begun: set[int] = field(default_factory=set)
@@ -76,7 +77,7 @@ class Scheduler:
         self.sessions.workers = workers
         self._say(note)
         loop.set_default_executor(_DaemonThreads(workers, thread_name_prefix="hssh"))
-        run = _Run(spec, 0, now())
+        run = _Run(spec, None, now())
         slots = asyncio.Semaphore(workers)
         with _on_interrupt(loop, lambda: self._interrupt(run)):
             try:
@@ -120,30 +121,12 @@ class Scheduler:
             run.probing = None
 
     async def _probe(self, spec: RunSpec, held: dict[str, str]) -> dict[str, Fault | None]:
-        """Dead targets by name, asked where the connection will go; a target the gate holds, whose driver is unknown, or reached through a proxy is not probed."""
-        boxes, unknown = [], {}
-        ssh_g = asyncio.Semaphore(probe.SSH_G_AT_ONCE)
-        for target in spec.targets:
-            if target.name in held:
-                continue
-            try:
-                comm = self.registry.resolve(target).communicator
-            except Fault:
-                continue
-            reader = comm.ssh_config if comm.banner is not None else None
-            try:
-                where = await probe.where(target, reader, comm.default_port, spec.credentials.username,
-                                          spec.timeouts.connect, ssh_g)
-            except Fault as f:
-                unknown[target.name] = f
-                continue
-            if where is not None:
-                boxes.append((target, where[0], where[1], comm.banner))
-        wanted = min(probe.MAX_PROBES, len(boxes))
+        """Dead targets by name through probe.reachable(), at most what the descriptor budget allows beside the kept sessions at once."""
+        wanted = min(probe.MAX_PROBES, len(spec.targets) - len(held))
         probes = await self.sessions.room(wanted * FDS_PER_PROBE) // FDS_PER_PROBE
         if probes < wanted:
             self._say(f"probing {max(1, probes)} at a time, not {wanted}: the open-file limit is {open_file_limit()}")
-        return {**unknown, **await probe.probe(boxes, spec.timeouts.connect, limit=probes)}
+        return await probe.reachable(spec.targets, self.registry, spec.timeouts, spec.credentials, limit=probes, held=held)
 
     def _say(self, note: str | None) -> None:
         """A limit note on stderr once per session manager, so a Fleet hears it once, not on every call."""
@@ -340,6 +323,8 @@ class Scheduler:
             return await EditLifecycle(comm, driver.dialect, session, spec.timeouts).run(
                 list(self._lines_for(spec, target) or ()), spec.edit, before_commit=before_commit, on_step=step)
         step(spec.mode)
+        if spec.mode == "config":
+            return [await operation("config", lambda: comm.config(session, spec.format), spec.timeouts.command)]
         if spec.mode == "confirm":
             return await lifecycle.confirm(comm, session, spec.timeouts, synchronize=spec.edit.synchronize)
         return [await lifecycle.commit_history(comm, session, spec.timeouts)]
@@ -479,6 +464,10 @@ async def execute(spec: RunSpec, registry: DriverRegistry, *, gate: SafetyGate |
     spec = complete(spec)
     if spec.mode == "structured" and (why := _structured_refusal(spec)):
         raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
+    if spec.mode == "config" and (why := _format_refusal(spec)):
+        raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
+    if spec.recording is not None and spec.recording.label is not None and (why := check_label(spec.recording.label)):
+        raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
     if spec.mode == "edit" and (why := check_edit(spec.edit)):
         raise Fault(FaultKind.LOCAL, f"{why}; nothing was sent", False)
     if spec.mode in ("edit", "confirm") and spec.edit.synchronize and not _all_synchronize(spec, registry):
@@ -509,10 +498,17 @@ def _all_synchronize(spec: RunSpec, registry: DriverRegistry) -> bool:
     return True
 
 
+def _format_refusal(spec: RunSpec) -> str | None:
+    """Why a run that asks the device for a document cannot start: its format is not json or xml."""
+    if spec.format not in ("json", "xml"):
+        return f"{spec.mode} mode needs a format, json or xml"
+    return None
+
+
 def _structured_refusal(spec: RunSpec) -> str | None:
     """Why a structured run cannot start: show commands, each on one line, at least one for the run or per target, in json or xml."""
-    if spec.format not in ("json", "xml"):
-        return "structured mode needs a format, json or xml"
+    if why := _format_refusal(spec):
+        return why
     lists = [spec.commands, *spec.commands_by_target.values()]
     if not any(lists):
         return "structured mode needs at least one show command"

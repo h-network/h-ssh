@@ -51,9 +51,9 @@ class Recorder:
 
             probe_output_dir(self.settings.save_output_path)
 
-    def begin(self, spec: RunSpec, started: str) -> int:
+    def begin(self, spec: RunSpec, started: str) -> int | None:
         """Open the run's row, which creates the store; 0 without a store. An OSError here refuses the run."""
-        return self.store.start_run(spec, started, user=self.user) if self.store is not None else 0
+        return self.store.start_run(spec, started, user=self.user) if self.store is not None else None
 
     def _kept(self, destination: str, write: Callable[[], None]) -> None:
         """Every lost record is counted; each destination's failure is said once, with its first error."""
@@ -66,12 +66,12 @@ class Recorder:
                 print(f"{destination} not kept: {type(e).__name__ if not str(e) else e}; the run goes on, "
                       "its lost records are counted", file=sys.stderr)
 
-    def result(self, run_id: int, target: Target, driver: str, seq: int, op: OperationResult, status: TargetStatus) -> None:
+    def result(self, run_id: int | None, target: Target, driver: str, seq: int, op: OperationResult, status: TargetStatus) -> None:
         """One operation's row with the target's final status; `driver` is "" when the target failed before a driver was resolved."""
         if self.store is not None:
             self._kept("store", lambda: self.store.add(run_id, target, driver, seq, op, status=status))
 
-    def change(self, run_id: int, target: Target, driver: str, dialect: Dialect, action: str,
+    def change(self, run_id: int | None, target: Target, driver: str, dialect: Dialect, action: str,
                op: OperationResult, edit: EditSettings, diff: str = "", lines: Sequence[str] = ()) -> None:
         """One audit entry for an action that changed or could change the device, dry runs included; `lines` is the payload a load sent."""
         if self.settings.audit_log_path is None:
@@ -82,7 +82,7 @@ class Recorder:
                                              driver=driver, dialect=dialect, action=action, operation=op, edit=edit,
                                              diff=diff, lines=lines))
 
-    def changes(self, run_id: int, target: Target, driver: str, dialect: Dialect, ops: Sequence[OperationResult],
+    def changes(self, run_id: int | None, target: Target, driver: str, dialect: Dialect, ops: Sequence[OperationResult],
                 edit: EditSettings, config_lines: Sequence[str] = ()) -> None:
         """An audit entry per audited operation; a line-by-line load keeps the config line as its command and is audited as 'load' with that line, a candidate load with the whole payload; the diff's output is carried on every entry after it."""
         diff = ""
