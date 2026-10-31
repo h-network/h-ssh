@@ -288,7 +288,7 @@ class Communicator(Protocol):
     def discard(self, session: Session) -> None: ...   # session in doubt: tear down, no rollback or unlock, interrupt a running call, never raises
 
     def show(self, session: Session, command: str) -> Result: ...
-    def structured(self, session: Session, rpc: str, fmt: str) -> Result: ...   # NETCONF only
+    def structured(self, session: Session, command: str, fmt: str) -> Result: ...   # NETCONF only: one show command, fmt json or xml
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
     def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
