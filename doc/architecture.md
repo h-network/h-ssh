@@ -638,6 +638,9 @@ promises that a later write cannot fail. Both raise contextual `OSError` on fail
 `secure_write(path, text)` saves raw UTF-8 output: it checks a regular file owned by the
 current user, locks it and sets 0600 before truncating, then completes all short writes.
 It refuses symlinks and FIFOs without blocking, and propagates errors as `OSError`.
+Saved output uses `secure_write_unique(path, text)`, which creates a private file exclusively
+and completes short writes. Occupied names get `.2`, `.3`, and later suffixes before the
+extension; existing files are never overwritten, including across runs and concurrent saves.
 The recorder validates the target name and containment through `hssh.paths` before calling
 it. Batch mode writes `<name>.json`, an ordered array of the target's batch operations
 using `operation_dict`, including failed operations. A device that fails before its first

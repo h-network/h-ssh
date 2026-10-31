@@ -82,6 +82,12 @@ operations add raw `output` and structured `data`, and failures add `fault`, `de
 private-file rules as the store; a failed save is counted as `not_kept` without changing
 the device outcome.
 
+Saved files are never overwritten, including across runs using the same directory.
+The first save uses `<name>.output` or `<name>.json`; occupied names are skipped with
+suffixes `.2`, `.3`, and so on before the extension (for example, `R1.2.output`).
+Each file is created exclusively, so concurrent saves keep distinct files too.
+Target names are validated and file paths stay inside the chosen output directory.
+
 Device output, stored values and exports are left raw in pipes and files. Terminal output
 uses the shared terminal filter; table fields are sanitized before shortening. `output`
 writes the stored text without adding a newline. If a downstream reader closes a pipe,
