@@ -367,10 +367,11 @@ A `RunSpec` holds: the targets, the mode (`show`, `batch`, `structured`, `edit`,
 lines; a target not named gets the configuration lines, and when payloads are given a target in neither has no
 payload and is skipped), credentials, timeouts (`connect` for the TCP connect and the
 SSH banner, `setup` as one deadline from the banner across key exchange, login and the NETCONF hello, `command` per
-operation, `commit`),
-the worker limit, the safety
-settings, and the recording settings (the record paths, and the run row's provenance: `argv`, `origin` and
-`version`, supplied by the front end, all optional).
+operation, `commit`), the structured `format`, the worker limit, the host-key policy, the probe and
+`skip_unreachable` switches, the edit settings (`apply`, `confirmed_minutes`, `comment`, `synchronize`), the retry
+policy, the safety settings, and the recording settings (the record paths, and the run row's provenance: `argv`,
+`origin` and `version`, supplied by the front end, all optional). Every setting the orchestrator owns defaults to
+`None` and is filled by the orchestrator.
 
 Structured mode is the library's call, `Fleet.structured(command, fmt)`: exactly one `show` command on one line, with `fmt` `json` or `xml`, both checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The NETCONF communicator asks PyEZ for the command in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; the CLI has no structured mode.
 
