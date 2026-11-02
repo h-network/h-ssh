@@ -61,6 +61,19 @@ test "$rc" -eq 1 && grep -q 'x: FAIL open: UNREACHABLE .*Connection refused' /tm
     && grep -q '^\[h-ssh\] {' /tmp/hssh-err && ! grep -q Traceback /tmp/hssh-err
 ```
 
+The bare job (nothing installed, the system `ssh` only) builds and runs the single file. One command builds it,
+from the repository root, on Python 3.10 or later (`zipapp`'s filter is a library argument, so the command is
+`python3 -c`):
+
+```sh
+python3 -c 'import zipapp; zipapp.create_archive("h-app", "hssh.pyz", main="hssh.__main__:main", filter=lambda p: p.parts[0] == "hssh" and "__pycache__" not in p.parts)'
+python3 hssh.pyz --help >/dev/null
+python3 -I -c 'import sys; sys.path.insert(0, "hssh.pyz"); from hssh import Fleet'
+```
+
+The bare check by hand, from `h-app`, with nothing but the standard library on the path:
+`env -i PATH=/usr/bin:/bin HOME=$HOME python3 -I -c 'import sys; sys.path.insert(0, "."); from hssh import Fleet'`.
+
 To match CI's Python versions and unprivileged user exactly, run the suite in the same containers:
 
 ```sh
