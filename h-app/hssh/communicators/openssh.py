@@ -347,12 +347,17 @@ class OpenSSH:
         caps = {"show", "batch"}
         if dialect.has_candidate:
             caps |= {"edit", "confirm", "commit_status", "commit_confirmed"}
+        if dialect.format_pipes:
+            caps.add("structured")
+            if dialect.config_show_command:
+                caps.add("config")
         self.capabilities = frozenset(caps)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> OpenSSHSession:
         if not AVAILABLE:
-            raise Fault(FaultKind.LOCAL, "no 'ssh' binary found on PATH", reached_device=False)
+            raise Fault(FaultKind.LOCAL, "no 'ssh' binary found on PATH (the openssh transport drives the system ssh client)",
+                        reached_device=False)
         control_dir = tempfile.mkdtemp(prefix="hssh-")
         # Unix socket paths cap near 104 bytes, so the name stays short.
         session = OpenSSHSession(target, creds, timeouts, host_key_policy, control_dir,
@@ -493,11 +498,18 @@ class OpenSSH:
     def show(self, session: OpenSSHSession, command: str) -> Result:
         return self._exec(session, _valid_command(command))
 
-    def structured(self, session: OpenSSHSession, rpc: str, fmt: str) -> Result:
-        raise Fault(FaultKind.UNSUPPORTED, "openssh has no structured output", reached_device=False)
+    def _pipe(self, fmt: str) -> str:
+        if fmt not in self.formats:
+            raise Fault(FaultKind.UNSUPPORTED, "format %s is not available over openssh with this dialect" % fmt, False)
+        return self.dialect.format_pipes[fmt]
+
+    def structured(self, session: OpenSSHSession, command: str, fmt: str) -> Result:
+        return self._exec(session, _valid_command(command) + self._pipe(fmt))
 
     def config(self, session: OpenSSHSession, fmt: str) -> Result:
-        raise Fault(FaultKind.UNSUPPORTED, "configuration reads need NETCONF", reached_device=False)
+        if self.dialect.config_show_command is None:
+            raise Fault(FaultKind.UNSUPPORTED, "this dialect has no command that prints the configuration", False)
+        return self._exec(session, self.dialect.config_show_command + self._pipe(fmt))
 
     def load(self, session: OpenSSHSession, lines: list[str]) -> Result:
         return self._shell(session).load(lines)
