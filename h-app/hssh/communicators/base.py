@@ -13,13 +13,14 @@ class Session(Protocol):
 
 
 class Communicator(Protocol):
-    """One transport: opens sessions, executes one operation per call, returns Result or raises Fault; capability names are the mode names plus commit_confirmed and synchronize."""
+    """One transport: opens sessions, executes one operation per call, returns Result or raises Fault; capability names are the mode names plus commit_confirmed and synchronize; formats are what structured and config serve (NETCONF json and xml, a CLI transport its dialect's format_pipes)."""
 
     capabilities: frozenset[str]
     dialect: Dialect
     default_port: int
     banner: bytes | None
     ssh_config: Literal["paramiko", "openssh"] | None
+    formats: frozenset[str]
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts, host_key_policy: HostKeyPolicy) -> Session: ...
 
@@ -41,10 +42,12 @@ class Communicator(Protocol):
 
     def show(self, session: Session, command: str) -> Result: ...
 
-    def structured(self, session: Session, command: str, fmt: str) -> Result: ...
+    def structured(self, session: Session, command: str, fmt: str) -> Result:
+        """One show command's reply in fmt, exactly as received, data None: NETCONF asks the library, a CLI transport types command + dialect.format_pipes[fmt] as a show."""
+        ...
 
     def config(self, session: Session, fmt: str) -> Result:
-        """The whole committed configuration (not the candidate) in fmt, json or xml, output as the library returns it, data None."""
+        """The whole committed configuration (not the candidate) in fmt, exactly as received, data None: NETCONF asks the library, a CLI transport types dialect.config_show_command + dialect.format_pipes[fmt] as a show."""
         ...
 
     def load(self, session: Session, lines: list[str]) -> Result: ...
