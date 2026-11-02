@@ -283,14 +283,14 @@ class Fleet:
         return self._run(self.spec("batch", commands=commands, commands_by_target=by_target))
 
     def structured(self, command: Commands, fmt: str) -> RunReport:
-        """The replies in `fmt`, json or xml, as the device returns them (NETCONF only): one command, a list (one reply each) or a mapping per target; the library's alone, the CLI has no --format."""
+        """The replies in `fmt`, json or xml, as the device returns them: one command, a list (one reply each) or a mapping per target; the library's alone, the CLI has no --format."""
         if fmt not in ("json", "xml"):
             raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
         commands, by_target = split_commands(command)
         return self._run(self.spec("structured", commands=commands, commands_by_target=by_target, format=fmt))
 
     def config(self, fmt: str) -> RunReport:
-        """The whole committed configuration in `fmt`, json or xml, as the device returns it (NETCONF only); the library's alone."""
+        """The whole committed configuration in `fmt`, json or xml, as the device returns it; the library's alone."""
         if fmt not in ("json", "xml"):
             raise ValueError(f"fmt must be 'json' or 'xml', not {fmt!r}")
         return self._run(self.spec("config", format=fmt))

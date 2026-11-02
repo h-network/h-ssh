@@ -371,7 +371,7 @@ def build_spec(args: argparse.Namespace, argv: list[str]) -> RunSpec:
         check_commands(commands, "-sC")
     elif mode == "batch":
         commands = tuple(args.batch_commands or profiles.read_commands(Path(args.batch)))
-        check_commands(commands, f"--batch {args.batch}" if args.batch else "commands")
+        check_commands(commands, f"--batch {args.batch}" if args.batch else (f"--profile {args.profile}" if args.profile else "commands"))
     elif mode == "edit":
         payloads = edit_payloads(args, targets)
     edit = None
@@ -604,7 +604,7 @@ def main(argv: list[str] | None = None, runner: Runner = run) -> int:
         if args.run:
             apply_run(args, validate_run(load_run_file(args.run), args.run), typed)
         if args.profile:
-            args.batch = str(profiles.profile_path(args.profile))
+            args.batch_commands = profiles.read_commands(profiles.profile_path(args.profile))
         apply_config_defaults(args, load_config(args.config))
         spec = build_spec(args, argv)
     except (ValueError, OSError) as e:

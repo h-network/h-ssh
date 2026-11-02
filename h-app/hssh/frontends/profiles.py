@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+from importlib.resources import files
 from pathlib import Path
 
-SHIPPED_DIR = Path(__file__).parent / "profiles"
+# A Traversable, so the shipped profiles are found inside hssh.pyz as well as in a checkout.
+SHIPPED_DIR = files("hssh.frontends") / "profiles"
 
 
 def user_dir() -> Path:
     return Path.home() / ".h-ssh" / "profiles"
 
 
-def profile_path(name: str) -> Path:
-    """Yours first, then the shipped one; a name with a slash is a path taken as given."""
+def profile_path(name: str):
+    """Yours first, then the shipped one; a name with a slash is a path taken as given. A Path, or a Traversable inside hssh.pyz."""
     if "/" in name:
         path = Path(name).expanduser()
         if not path.is_file():
@@ -24,7 +26,7 @@ def profile_path(name: str) -> Path:
     raise ValueError(f"no profile {name!r}: not in {user_dir()} and not shipped")
 
 
-def read_commands(path: Path) -> list[str]:
+def read_commands(path) -> list[str]:
     """One command per line; blank lines and `#` comments dropped."""
     out = []
     for line in path.read_text(encoding="utf-8-sig").splitlines():
@@ -34,7 +36,7 @@ def read_commands(path: Path) -> list[str]:
     return out
 
 
-def describe(path: Path) -> tuple[int, str]:
+def describe(path) -> tuple[int, str]:
     """(number of commands, description): the first `#` line, else the first command."""
     lines = [ln.strip() for ln in path.read_text(encoding="utf-8-sig").splitlines()]
     commands = [ln for ln in lines if ln and not ln.startswith("#")]

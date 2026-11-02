@@ -91,3 +91,43 @@ jobs:
           grep -q 'x: FAIL open: UNREACHABLE 127\.0\.0\.1:830: Connect call failed' /tmp/out
           grep -q '^\[h-ssh\] {' /tmp/err
           ! grep -q Traceback /tmp/err
+
+  bare:
+    runs-on: ubuntu-latest
+    container: python:3.12
+    steps:
+      - name: Check out ${{ github.ref }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git init -q .
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch -q --depth 1 origin "${GITHUB_REF}"
+          git checkout -q FETCH_HEAD
+          git remote remove origin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Nothing installed but the system ssh
+        run: |
+          apt-get -qq update && apt-get -qq install -y openssh-client >/dev/null
+          python3 -c 'import jnpr' 2>/dev/null && exit 1 || true
+          python3 -c 'import paramiko' 2>/dev/null && exit 1 || true
+      - name: The library, the CLI and a refused connection over openssh, from the checkout
+        run: |
+          cd h-app
+          env -i PATH=/usr/bin:/bin:/usr/local/bin HOME=$HOME python3 -I -c 'import sys; sys.path.insert(0, "."); from hssh import Fleet, RunReport, Target, Fault, FaultKind'
+          python3 -m hssh --help >/dev/null
+          run() { rc=0; python3 -m hssh --no-store --no-probe --transport "$1" --user u --target x:127.0.0.1:junos \
+                  --session-timeout 1 --retries 0 -sC "show version" >/tmp/out 2>/tmp/err || rc=$?; test "$rc" -eq 1; \
+                  grep -q '^\[h-ssh\] {' /tmp/err; ! grep -q Traceback /tmp/err; }
+          run openssh && grep -q 'x: FAIL open: UNREACHABLE' /tmp/out
+          run netconf && grep -qi 'jnpr\|PyEZ\|junos-eznc' /tmp/out
+          run ssh && grep -qi paramiko /tmp/out
+      - name: The same through hssh.pyz, as a file and on sys.path
+        run: |
+          python3 -c 'import zipapp; zipapp.create_archive("h-app", "hssh.pyz", main="hssh.__main__:main", filter=lambda p: p.parts[0] == "hssh" and "__pycache__" not in p.parts)'
+          env -i PATH=/usr/bin:/bin:/usr/local/bin HOME=$HOME python3 -I -c 'import sys; sys.path.insert(0, "hssh.pyz"); from hssh import Fleet'
+          python3 hssh.pyz --help >/dev/null
+          python3 hssh.pyz store --help >/dev/null
+          rc=0; python3 hssh.pyz --no-store --no-probe --transport openssh --user u --target x:127.0.0.1:junos \
+              --session-timeout 1 --retries 0 -sC "show version" >/tmp/out 2>/tmp/err || rc=$?
+          test "$rc" -eq 1 && grep -q 'x: FAIL open: UNREACHABLE' /tmp/out && ! grep -q Traceback /tmp/err
