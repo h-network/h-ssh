@@ -1,4 +1,5 @@
 import re
+from types import MappingProxyType
 
 from hssh.dialects.base import Dialect
 from hssh.dialects.generic import GenericDialect, _CONTROL, _VALUE
@@ -31,6 +32,8 @@ class JunosDialect(GenericDialect):
     diff_command = "show | compare"
     history_command = "show system commit"
     config_history_command = "run show system commit"
+    format_pipes = MappingProxyType({"json": " | display json", "xml": " | display xml"})
+    config_show_command = "show configuration"
     discard_commands = ("rollback 0",)
     has_candidate = True
     redaction_patterns = (

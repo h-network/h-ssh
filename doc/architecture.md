@@ -244,6 +244,9 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 
 Dialects contain no I/O and no policy.
 
+Junos exposes both format pipes as immutable data. Generic exposes an empty mapping and no configuration
+show command, so it advertises neither CLI structured output nor configuration retrieval.
+
 `comment_prefixes` identifies full-line comments after leading whitespace: `#` for Junos and generic,
 and `#` or `!` for IOS, NX-OS and EOS. Inline `#` remains part of the command.
 `check_edit(lines)` returns refusal text, or `None`, without changing the supplied lines. Every dialect
