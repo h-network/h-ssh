@@ -1,4 +1,6 @@
 import re
+from types import MappingProxyType
+from typing import Mapping
 
 from hssh.dialects.base import Dialect
 from hssh.model import CommitStatus, Fault, FaultKind
@@ -25,6 +27,8 @@ class GenericDialect(Dialect):
     diff_command: str | None = None
     history_command: str | None = None
     config_history_command: str | None = None
+    format_pipes: Mapping[str, str] = MappingProxyType({})
+    config_show_command: str | None = None
     discard_commands: tuple[str, ...] = ()
     has_candidate: bool = False
     redaction_patterns: tuple[re.Pattern[str], ...] = (

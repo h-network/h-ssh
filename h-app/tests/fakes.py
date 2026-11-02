@@ -14,6 +14,7 @@ class FakeNetconf:
     default_port = 830
     banner = b"SSH-"
     ssh_config = "paramiko"
+    formats = frozenset({"json", "xml"})
     capabilities = frozenset({"show", "batch", "structured", "config", "edit", "commit_confirmed", "confirm", "commit_status",
                               "synchronize"})
 

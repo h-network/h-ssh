@@ -236,6 +236,10 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 - `config_history_command`: the history command while configuration is held, or `None` when unsupported;
   Junos uses `run show system commit`, alongside operational `history_command` (`show system commit`)
 - how a validated line is typed (`encode_line`: bytes, newline included; Junos escapes a literal `?`)
+- `format_pipes`: the pipe typed after a show command for each format it can ask for (Junos `" | display json"`,
+  `" | display xml"`; empty for a vendor without one), and `config_show_command`: the operational command that
+  prints the committed configuration (Junos `show configuration`, `None` without one). A CLI transport serves
+  `structured` and `config` from these two; the reply is saved as received and never parsed
 - the read-command rule, deciding which commands are safe to retry
 
 Dialects contain no I/O and no policy.
@@ -285,6 +289,7 @@ class Communicator(Protocol):
     default_port: int                     # e.g. 830 for netconf
     banner: bytes | None                  # what the port sends first, for the probe; None: a connect is enough
     ssh_config: Literal["paramiko", "openssh"] | None   # whose ssh client config the transport reads, so the probe asks where the connection really goes: "paramiko" (~/.ssh/config: HostName, Port, ProxyCommand), "openssh" (as `ssh -G` prints it, ProxyJump too), None (reads none)
+    formats: frozenset[str]               # what structured and config serve: netconf {"json", "xml"}; a CLI transport frozenset(dialect.format_pipes)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...
@@ -294,7 +299,7 @@ class Communicator(Protocol):
     def discard(self, session: Session) -> None: ...   # session in doubt: tear down, no rollback or unlock, interrupt a running call, never raises
 
     def show(self, session: Session, command: str) -> Result: ...
-    def structured(self, session: Session, command: str, fmt: str) -> Result: ...   # NETCONF only: one show command, fmt json or xml
+    def structured(self, session: Session, command: str, fmt: str) -> Result: ...   # one show command, fmt json or xml; a CLI transport types command + dialect.format_pipes[fmt]
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
     def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed

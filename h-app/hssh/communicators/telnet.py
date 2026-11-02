@@ -50,6 +50,7 @@ class TelnetCommunicator:
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
+        self.formats = frozenset(dialect.format_pipes)
 
     def open(
         self, target: Target, creds: Credentials, timeouts: Timeouts,

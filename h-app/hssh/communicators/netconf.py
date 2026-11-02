@@ -435,6 +435,7 @@ class NetconfCommunicator(Communicator):
     capabilities: frozenset[str] = frozenset({"show", "batch", "structured", "config", "edit", "commit_confirmed", "confirm", "commit_status",
                                               "synchronize"})
     ssh_config = "paramiko"
+    formats: frozenset[str] = frozenset({"json", "xml"})
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect

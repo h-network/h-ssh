@@ -343,6 +343,7 @@ class OpenSSH:
 
     def __init__(self, dialect: Dialect):
         self.dialect = dialect
+        self.formats = frozenset(dialect.format_pipes)
         caps = {"show", "batch"}
         if dialect.has_candidate:
             caps |= {"edit", "confirm", "commit_status", "commit_confirmed"}

@@ -349,6 +349,7 @@ class SSHCommunicator(Communicator):
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
+        self.formats = frozenset(dialect.format_pipes)
         if dialect.has_candidate:
             self.capabilities = self.capabilities | {"edit", "confirm", "commit_status", "commit_confirmed"}
 

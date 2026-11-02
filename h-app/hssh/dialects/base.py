@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
-from typing import Protocol
+from typing import Mapping, Protocol
 
 from hssh.model import CommitStatus
 
 
 class Dialect(Protocol):
-    """Vendor behaviour read by the CLI engine; a communicator receives its dialect when it is constructed, and the Driver holds both."""
+    """Vendor behaviour read by the CLI engine; a communicator receives its dialect when it is constructed, and the Driver holds both. format_pipes maps a format name to the pipe typed after a show command for it (Junos " | display json"); config_show_command prints the committed configuration."""
 
     prompt_pattern: re.Pattern[str]
     prompt_name_pattern: re.Pattern[str]
@@ -29,6 +29,8 @@ class Dialect(Protocol):
     has_candidate: bool
     redaction_patterns: tuple[re.Pattern[str], ...]
     comment_prefixes: tuple[str, ...]
+    format_pipes: Mapping[str, str]
+    config_show_command: str | None
 
     def is_read(self, command: str) -> bool: ...
 
