@@ -120,8 +120,8 @@ jobs:
                   --session-timeout 1 --retries 0 -sC "show version" >/tmp/out 2>/tmp/err || rc=$?; test "$rc" -eq 1; \
                   grep -q '^\[h-ssh\] {' /tmp/err; ! grep -q Traceback /tmp/err; }
           run openssh && grep -q 'x: FAIL open: UNREACHABLE' /tmp/out
-          run netconf && grep -qi 'jnpr\|PyEZ\|junos-eznc' /tmp/out
-          run ssh && grep -qi paramiko /tmp/out
+          run netconf && grep -q 'junos-eznc' /tmp/out && grep -q 'openssh' /tmp/out
+          run ssh && grep -q 'paramiko' /tmp/out && grep -q 'openssh' /tmp/out
       - name: The same through hssh.pyz, as a file and on sys.path
         run: |
           python3 -c 'import zipapp; zipapp.create_archive("h-app", "hssh.pyz", main="hssh.__main__:main", filter=lambda p: p.parts[0] == "hssh" and "__pycache__" not in p.parts)'
