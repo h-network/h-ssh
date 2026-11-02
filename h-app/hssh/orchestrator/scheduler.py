@@ -185,6 +185,8 @@ class Scheduler:
             self.registry.check_mode(driver, spec.mode)
         except Fault as f:
             return self._failed_before(run, target, f)
+        if spec.mode in ("structured", "config") and spec.format not in driver.communicator.formats:
+            return self._failed_before(run, target, Fault(FaultKind.LOCAL, f"{spec.format} is not available over {driver.name}; nothing was sent", False))
         lines = self._lines_for(spec, target)
         if spec.mode == "edit":
             if lines is None:
