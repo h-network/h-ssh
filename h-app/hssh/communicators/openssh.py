@@ -165,7 +165,7 @@ def _ssh_argv(target: Target, creds: Credentials, timeouts: Timeouts, policy: Ho
     else:
         argv += ["-o", "BatchMode=yes"]
     if creds.key_file:
-        argv += ["-i", creds.key_file]
+        argv += ["-i", creds.key_file, "-o", "IdentitiesOnly=yes"]
     if target.port:
         argv += ["-p", str(target.port)]
     return argv + ["--", "%s@%s" % (creds.username, target.host)]
