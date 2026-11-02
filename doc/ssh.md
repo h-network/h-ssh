@@ -2,11 +2,20 @@
 
 The SSH communicator connects directly to the target host. An explicit target port
 wins; otherwise SSH uses port 22. It does not read SSH client configuration.
-Junos supports `show`, `batch`, `edit`, `confirm`, `commit_status` and `commit_confirmed`.
-Show and batch commands use SSH exec channels on the authenticated connection,
+Junos supports `show`, `batch`, `structured`, `config`, `edit`, `confirm`,
+`commit_status` and `commit_confirmed`.
+Show, batch, structured and configuration reads use SSH exec channels on the authenticated connection,
 ending at EOF and exit status. A batch
 keeps the connection across commands. Reads do not allocate a PTY, learn prompts,
 disable paging or wait for a quiet prompt.
+
+`Fleet.structured(command, fmt)` appends the dialect's output pipe to the command.
+`Fleet.config(fmt)` uses the dialect's committed-configuration show command and
+the same pipe. Junos uses ` | display json` or ` | display xml`; configuration
+reads use `show configuration`. The reply stays in `Result.output` exactly as
+received, without parsing or reformatting; `Result.data` is `None`. Supported
+formats and capabilities come from the dialect. A dialect without output pipes
+does not advertise either operation; configuration reads also require its show command.
 
 Edits, confirmations and commit history use one lazily opened interactive shell.
 The shared engine acquires the exclusive candidate before loading, stops at the
@@ -15,7 +24,7 @@ The orchestrator chooses dry run or apply and does not commit an empty diff.
 Commit uses the supplied comment and optional confirmed timer. Confirmation is a
 separate run; the engine checks the newest pending commit again while holding the
 exclusive lock before sending the confirming commit. Commit history returns the
-newest entry as `CommitStatus`. Structured reads and commit synchronize require NETCONF.
+newest entry as `CommitStatus`. Commit synchronize requires NETCONF.
 
 Each loaded line uses the configured command budget. Commit uses the configured
 commit budget. A write or reply lost after a commit may have been sent is
@@ -27,6 +36,10 @@ explicit key file is expanded from `~` and passed to Paramiko; it also disables
 implicit discovery. When neither is supplied, Paramiko uses the agent and its
 usual key-file discovery. Authentication happens in SSH. Credentials are never
 sent to the interactive CLI.
+
+The `ssh` transport needs the `paramiko` package (`pip install paramiko`). If it
+is missing, opening a connection reports a local error and points to `openssh`,
+which needs only Python and the system SSH client.
 
 Host-key policy comes from the run settings; the orchestrator defaults it to
 `off`. Under `off`, the communicator does not read or write known hosts, including

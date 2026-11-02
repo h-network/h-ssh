@@ -349,6 +349,11 @@ class SSHCommunicator(Communicator):
 
     def __init__(self, dialect: Dialect) -> None:
         self.dialect = dialect
+        self.formats = frozenset(dialect.format_pipes)
+        if self.formats:
+            self.capabilities = self.capabilities | {"structured"}
+            if dialect.config_show_command:
+                self.capabilities = self.capabilities | {"config"}
         if dialect.has_candidate:
             self.capabilities = self.capabilities | {"edit", "confirm", "commit_status", "commit_confirmed"}
 
@@ -357,7 +362,9 @@ class SSHCommunicator(Communicator):
         try:
             import paramiko
         except ImportError as exc:
-            raise Fault(FaultKind.LOCAL, "Paramiko is required for SSH", False) from exc
+            raise Fault(FaultKind.LOCAL,
+                        "the ssh transport needs the paramiko package (pip install paramiko); "
+                        "the openssh transport needs nothing beyond Python and the system ssh", False) from exc
         client = paramiko.SSHClient()
         opening = _Opening(client, timeouts)
         path = Path("~/.ssh/known_hosts").expanduser()
@@ -546,11 +553,15 @@ class SSHCommunicator(Communicator):
             out += ("\n" if out and not out.endswith("\n") else "") + err
         return Result(out)
 
-    def structured(self, session: Session, rpc: str, fmt: str) -> Result:
-        raise Fault(FaultKind.UNSUPPORTED, "Structured RPCs require NETCONF", False)
+    def structured(self, session: Session, command: str, fmt: str) -> Result:
+        if fmt not in self.formats:
+            raise Fault(FaultKind.UNSUPPORTED, f"this SSH dialect has no {fmt} output pipe", False)
+        return self.show(session, command + self.dialect.format_pipes[fmt])
 
     def config(self, session: Session, fmt: str) -> Result:
-        raise Fault(FaultKind.UNSUPPORTED, "configuration reads need NETCONF", reached_device=False)
+        if not self.dialect.config_show_command:
+            raise Fault(FaultKind.UNSUPPORTED, "this SSH dialect has no configuration show command", False)
+        return self.structured(session, self.dialect.config_show_command, fmt)
 
     def load(self, session: Session, lines: list[str]) -> Result:
         return self._engine(session).load(lines)

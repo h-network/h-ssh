@@ -51,6 +51,27 @@ by exact label. Use a label wherever a run selector is accepted, for example
 `h-ssh-store diff R1 before-change after-change`; the newest run with that label wins.
 Digit selectors keep ID/prefix lookup. See [reader usage](doc/store.md).
 
+## Without installing anything
+
+On a host where nothing can be installed — no root, no pip, no virtual environment — h-ssh runs from plain
+Python 3.10 or later and the system OpenSSH client. The package imports nothing outside the standard library,
+and the `openssh` transport drives the system `ssh` (one ControlMaster per device, one password prompt). Three
+ways to run it:
+
+```sh
+git clone … h-ssh && cd h-ssh
+python3 -m hssh --transport openssh --user admin 10.0.1.1 -sC "show version"   # the CLI, from h-app/
+python3 -c 'import sys; sys.path.insert(0, "h-app"); from hssh import Fleet'    # the library, from the checkout
+python3 hssh.pyz --transport openssh --user admin 10.0.1.1 -sC "show version"  # one file, built as doc/testing.md says
+python3 -c 'import sys; sys.path.insert(0, "hssh.pyz"); from hssh import Fleet'
+```
+
+`python3 -m hssh store …` and `python3 hssh.pyz store …` are `h-ssh-store`. Over `openssh` everything works that
+works over `ssh`: shows, batches, edits with commit confirmed and confirm, the store, the gate, pooled
+sessions; `Fleet.structured` and `Fleet.config` use the vendor's own CLI pipe (Junos: `| display json`). Two
+transports need a package: NETCONF needs PyEZ (`junos-eznc`) and `ssh` needs paramiko; each says so in one
+line and names `openssh` as the standard-library transport. The default vendor is `junos`.
+
 ## From Python
 
 ```python
@@ -60,9 +81,9 @@ with Fleet(["10.0.1.1", "cr2:10.0.1.2:junos"], transport="netconf", user="admin"
            label="pre-upgrade") as fleet:                    # the label is kept with every run, for h-ssh-store
     dead = {name for name, fault in fleet.reachable().items() if fault}   # a TCP connect per device, no login
     report = fleet.show("show bgp summary")                 # one login per device, kept for the next call
-    report = fleet.config("xml")                            # the whole committed configuration, as returned; NETCONF only
+    report = fleet.config("xml")                            # the whole committed configuration, as returned
     report = fleet.batch(["show version", "show route summary"])
-    report = fleet.structured("show interfaces terse", "json")   # the reply in json, as returned; NETCONF only
+    report = fleet.structured("show interfaces terse", "json")   # the reply in json, as returned
     report = fleet.structured(["show version", "show interfaces terse"], "xml")   # one reply per command
     report = fleet.show({"10.0.1.1": "show version", "cr2": "show chassis hardware"})   # a command per target
     report = fleet.edit(["set system host-name cr1"], apply=True, confirmed_minutes=5, synchronize=True)

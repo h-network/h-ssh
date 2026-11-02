@@ -236,9 +236,16 @@ A dialect describes one vendor's CLI behaviour as data and small parsing hooks:
 - `config_history_command`: the history command while configuration is held, or `None` when unsupported;
   Junos uses `run show system commit`, alongside operational `history_command` (`show system commit`)
 - how a validated line is typed (`encode_line`: bytes, newline included; Junos escapes a literal `?`)
+- `format_pipes`: the pipe typed after a show command for each format it can ask for (Junos `" | display json"`,
+  `" | display xml"`; empty for a vendor without one), and `config_show_command`: the operational command that
+  prints the committed configuration (Junos `show configuration`, `None` without one). A CLI transport serves
+  `structured` and `config` from these two; the reply is saved as received and never parsed
 - the read-command rule, deciding which commands are safe to retry
 
 Dialects contain no I/O and no policy.
+
+Junos exposes both format pipes as immutable data. Generic exposes an empty mapping and no configuration
+show command, so it advertises neither CLI structured output nor configuration retrieval.
 
 `comment_prefixes` identifies full-line comments after leading whitespace: `#` for Junos and generic,
 and `#` or `!` for IOS, NX-OS and EOS. Inline `#` remains part of the command.
@@ -285,6 +292,7 @@ class Communicator(Protocol):
     default_port: int                     # e.g. 830 for netconf
     banner: bytes | None                  # what the port sends first, for the probe; None: a connect is enough
     ssh_config: Literal["paramiko", "openssh"] | None   # whose ssh client config the transport reads, so the probe asks where the connection really goes: "paramiko" (~/.ssh/config: HostName, Port, ProxyCommand), "openssh" (as `ssh -G` prints it, ProxyJump too), None (reads none)
+    formats: frozenset[str]               # what structured and config serve: netconf {"json", "xml"}; a CLI transport frozenset(dialect.format_pipes)
 
     def open(self, target: Target, creds: Credentials, timeouts: Timeouts,
              host_key_policy: HostKeyPolicy) -> Session: ...
@@ -294,7 +302,8 @@ class Communicator(Protocol):
     def discard(self, session: Session) -> None: ...   # session in doubt: tear down, no rollback or unlock, interrupt a running call, never raises
 
     def show(self, session: Session, command: str) -> Result: ...
-    def structured(self, session: Session, command: str, fmt: str) -> Result: ...   # NETCONF only: one show command, fmt json or xml
+    def structured(self, session: Session, command: str, fmt: str) -> Result: ...   # one show command, fmt json or xml; a CLI transport types command + dialect.format_pipes[fmt]
+    def config(self, session: Session, fmt: str) -> Result: ...                 # the committed configuration (database committed, not the candidate), fmt json or xml, as received, data None; a CLI transport types dialect.config_show_command + format_pipes[fmt]
 
     def load(self, session: Session, lines: list[str]) -> Result: ...           # candidate or line-by-line
     def diff(self, session: Session) -> Result: ...                           # data: bool, whether anything changed
@@ -382,11 +391,12 @@ policy, the safety settings, and the recording settings (the record paths, and t
 and filter in `h-ssh-store`). Every setting the orchestrator owns defaults to `None` and is filled by the
 orchestrator.
 
-Structured mode is the library's call, `Fleet.structured(commands, fmt)`: one or more `show` commands, each on one line, for the run or per target, with `fmt` `json` or `xml`, all checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The commands run as a batch does (5.2), one `structured` call per command; the NETCONF communicator asks PyEZ for each in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None. The CLI has no structured mode. Config mode is the library's `Fleet.config(fmt)`: one operation named `config` per target, `Communicator.config(session, fmt)` under the command timeout, `fmt` `json` or `xml` by the same rule as structured and refused the same way; NETCONF only (the `config` capability), a read for the policy.
+Structured mode is the library's call, `Fleet.structured(commands, fmt)`: one or more `show` commands, each on one line, for the run or per target, with `fmt` `json` or `xml`, all checked before login planning, the probe or any login and refused as `LOCAL` ("…; nothing was sent") otherwise. The commands run as a batch does (5.2), one `structured` call per command; the NETCONF communicator asks PyEZ for each in that format and puts what PyEZ returns, serialized, in `Result.output` with `data` None; a CLI transport (`ssh`, `openssh`) types the command with the dialect's `format_pipes[fmt]` as a show and saves the reply as received. A driver declares `structured` only when it can serve a format, and `formats` says which: per target, after `check_mode` and before `OPEN`, a format the driver's communicator does not list fails the target as `LOCAL` ("format json is not available over junos@ssh; nothing was sent"). The CLI has no structured mode. Config mode is the library's `Fleet.config(fmt)`: one operation named `config` per target, `Communicator.config(session, fmt)` under the command timeout, `fmt` `json` or `xml` by the same rule as structured and refused the same way; the `config` capability, a read for the policy. The default vendor is `junos` while it is the only vendor with drivers.
 
 `config` is the library's call too, `Fleet.config(fmt)`: the whole committed configuration, json or xml, through
 PyEZ's configuration call with `database` `committed` (Junos returns the candidate unless asked otherwise), saved as
-PyEZ returns it in `Result.output` with `data` None; NETCONF only, no paths; a read, retried as `show` is. A run
+PyEZ returns it in `Result.output` with `data` None, or over `ssh` and `openssh` the dialect's `config_show_command`
+typed with `format_pipes[fmt]`, the reply as received; no paths; a read, retried as `show` is. A run
 that recorded nothing (no store) reports `run_id` None, never 0.
 
 ### 5.2 Concurrency

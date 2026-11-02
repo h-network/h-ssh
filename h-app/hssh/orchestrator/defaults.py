@@ -20,7 +20,7 @@ DEFAULT_EDIT = EditSettings(apply=False)
 DEFAULT_CONFIRMED_MINUTES = 10
 DEFAULT_SAFETY = SafetySettings(cooldown_seconds=300, rate_limit=6)
 DEFAULT_TRANSPORT = "ssh"
-DEFAULT_VENDOR = "generic"
+DEFAULT_VENDOR = "junos"
 DEFAULT_STORE = "h-ssh.db"
 MAX_CONFIRMED_MINUTES = 65535
 MAX_COMMENT_BYTES = 512
