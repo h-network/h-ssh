@@ -1,5 +1,10 @@
 # NETCONF
 
+NETCONF requires the `junos-eznc` package (`pip install junos-eznc`). If it is
+missing, opening a session fails locally with installation guidance before any
+NETCONF connection. The `openssh` transport needs only Python and the system `ssh`.
+NETCONF advertises `json` and `xml` for structured and configuration reads.
+
 The `junos@netconf` driver supports `show`, `batch`, library structured reads, candidate edits, confirm and commit history through PyEZ. Connections use
 port 830 unless the target specifies another port. The connect timeout is passed
 to PyEZ, and the command timeout applies to operations on the open session.

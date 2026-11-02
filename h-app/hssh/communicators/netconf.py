@@ -372,7 +372,9 @@ def _fault(error: Exception, reached_device: bool, *, opening: bool = False, set
     if setup is not None and (setup.expired or monotonic() >= setup.deadline):
         return setup.timeout_fault()
     if isinstance(error, ImportError):
-        return Fault(FaultKind.LOCAL, str(error), reached_device)
+        return Fault(FaultKind.LOCAL,
+                     "NETCONF needs the junos-eznc package (pip install junos-eznc); "
+                     "the openssh transport needs nothing beyond Python and the system ssh", reached_device)
     from jnpr.junos import exception as pyez
     from ncclient.operations.errors import TimeoutExpiredError
     from ncclient.operations.rpc import RPCError
